@@ -44,7 +44,7 @@ build/stub/lib%.so: src/stub_%.c
 
 # native sources: UI/JNI core, BLE transport, protocol driver, self-contained crypto
 SRC := src/main.c src/font.c src/plot.c src/util.c src/stats.c src/store.c src/settings.c src/ui.c \
-       src/alarmlogic.c src/scanlogic.c \
+       src/alarmlogic.c src/scanlogic.c src/insulin.c \
        src/sensors.c src/otble.c \
        src/dexble.c src/dexdriver.c \
        src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
@@ -158,7 +158,7 @@ TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 # one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
 # whole alarm actuation end (Alarm.java, PancraService.java, Ble.java)
 # unchecked by anything.
-check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest done
+check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest done
 
 format:
 	grep -rlP '\r' --exclude='.*' src test res Makefile AndroidManifest.xml \
@@ -353,6 +353,19 @@ settingstest:
 	    && printf '\033[1;32msettingstest\033[0m: settings persistence OK\n' \
 	    || { cat tmp/uitest/settingstest.log; exit 1; }
 
+# Behavioural gate for the insulin dose log. Doses are user-entered facts in an
+# append-only file the app reloads at every launch: the load-time validation is
+# what keeps a corrupt row from resurrecting forever, and last-units-per-type is
+# what the LOG INSULIN form pre-populates with.
+insulintest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/insulintest.c src/insulin.c src/util.c \
+	    -o tmp/uitest/insulintest
+	@./tmp/uitest/insulintest > tmp/uitest/insulintest.log 2>&1 \
+	    && grep -q "ALL INSULIN TESTS PASSED" tmp/uitest/insulintest.log \
+	    && printf '\033[1;32minsulintest\033[0m: insulin dose log OK\n' \
+	    || { cat tmp/uitest/insulintest.log; exit 1; }
+
 # Behavioural gate for the scan-lifecycle decision, which governs whether an
 # already-paired CGM can reconnect at all. It has been wrong in both directions.
 scantest:
@@ -386,4 +399,4 @@ drivertest:
 	    && printf '\033[1;32mdrivertest\033[0m: pairing + auth + EGV decode OK\n' \
 	    || { tail -20 tmp/uitest/drivertest.log; exit 1; }
 
-.PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest
+.PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest

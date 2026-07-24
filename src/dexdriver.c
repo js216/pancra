@@ -63,6 +63,13 @@ struct dex_ctx {
     * so this tokenHash is the ONLY thing authenticating the peer. */
    int chal_ok;
    uint32_t last_clock; /* sensor session-time from the latest 4e */
+   long last_clock_t;   /* wall clock when last_clock was read, so the
+                           session time can be projected forward between
+                           responses (the official app's warmup countdown
+                           ticks per second; ours must too) */
+   uint8_t last_state;  /* raw session-state byte from the latest 4e --
+                           logged and surfaced; during warmup the sensor
+                           answers with no glucose but a running clock */
    uint16_t last_age;   /* age of that current reading, seconds */
    int last_glucose, last_trend, last_predicted, last_seq;
    int g_bonded; /* last AuthStatus was the fast (auth==1) path */
@@ -189,16 +196,24 @@ void driver_get_session(struct dex_session *out)
    int i = 0;
    for (; ctx->g_mac[i] && i < 23; i++)
       out->mac[i] = ctx->g_mac[i];
-   out->mac[i]          = 0;
-   out->bonded          = ctx->g_bonded;
-   out->paired          = ctx->have_key;
-   out->have_reading    = (ctx->last_clock != 0);
-   out->session_seconds = ctx->last_clock;
-   out->glucose         = ctx->last_glucose;
-   out->trend           = ctx->last_trend;
-   out->age             = ctx->last_age;
-   out->predicted       = ctx->last_predicted;
-   out->sequence        = ctx->last_seq;
+   out->mac[i]       = 0;
+   out->bonded       = ctx->g_bonded;
+   out->paired       = ctx->have_key;
+   out->have_reading = (ctx->last_clock != 0);
+   /* LIVE session time: the sensor's clock at the last response, projected
+    * forward by the wall time since. Responses arrive minutes apart, but
+    * countdowns built on this (warmup, session end) must tick per second,
+    * exactly as the official app's do. */
+   out->session_seconds =
+       ctx->last_clock
+           ? ctx->last_clock + (uint32_t)(realtime_s() - ctx->last_clock_t)
+           : 0;
+   out->state     = ctx->last_state;
+   out->glucose   = ctx->last_glucose;
+   out->trend     = ctx->last_trend;
+   out->age       = ctx->last_age;
+   out->predicted = ctx->last_predicted;
+   out->sequence  = ctx->last_seq;
 }
 
 /* Send our certificate once the sensor's is fully received. Called from BOTH
@@ -863,20 +878,25 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
                 "!! AuthChallenge tokenHash MISMATCH -- peer does not hold the "
                 "shared key; refusing");
             drv_status("AUTH FAILED");
-            /* Run the stale-key recovery HERE, because setting P_FAIL below
-             * takes us out of P_AUTH and driver_on_disconnected's
-             * `was == P_AUTH` test would then never fire.
+            /* Discard the saved key IMMEDIATELY, not after three failures.
              *
-             * A tokenHash mismatch means the peer does not hold our key --
-             * exactly the "something else re-paired this sensor, our saved key
-             * is stale" condition that the authfails >= 3 -> drv_key_clear()
-             * recovery exists for. Without this the link looped
-             * connect -> refuse -> drop forever, recoverable only by a manual
-             * forget plus the applicator code the user may no longer have. */
-            if (ctx->have_key && ++ctx->authfails >= 3) {
-               LOGI("!! %d auth failures -- discarding the saved key so the "
-                    "sensor can be re-paired",
-                    ctx->authfails);
+             * A tokenHash mismatch is CRYPTOGRAPHIC PROOF the peer does not
+             * hold our key -- a retry with the same key cannot ever succeed,
+             * so there is nothing to gain by keeping it for two more
+             * connect->refuse->drop cycles. It means exactly one thing:
+             * something else re-paired this sensor (e.g. the user paired it
+             * to the official Dexcom app), so our stored key is now stale.
+             * Drop it here and the next connection re-pairs via J-PAKE with
+             * the pairing code (have_key == 0 path). The old authfails >= 3
+             * gate was for AMBIGUOUS failures (a drop mid-cert); a mismatch
+             * is not ambiguous.
+             *
+             * Run it HERE, because setting P_FAIL below takes us out of
+             * P_AUTH and driver_on_disconnected's `was == P_AUTH` test would
+             * then never fire. */
+            if (ctx->have_key) {
+               LOGI("!! stale key proven by tokenHash mismatch -- discarding "
+                    "it now so the sensor re-pairs on the next connect");
                ctx->have_key  = 0;
                ctx->authfails = 0;
                drv_key_clear();
@@ -963,13 +983,26 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
          struct dex_egv ev;
          if (dexdata_egv(buf, (size_t)n, &ev)) {
             ctx->last_clock     = ev.clock;
+            ctx->last_clock_t   = realtime_s();
+            ctx->last_state     = ev.state;
             ctx->last_age       = ev.age;
             ctx->last_glucose   = ev.glucose;
             ctx->last_trend     = (int)ev.trend;
             ctx->last_predicted = ev.predicted;
             ctx->last_seq       = ev.sequence;
-            LOGI("   EGV glucose=%d age=%d trend=%d clock=%u", ev.glucose,
-                 ev.age, ev.trend, ev.clock);
+            /* state is LOGGED on purpose: the warmup-phase value has never
+             * been captured from a live sensor here, and it is the byte
+             * that would let the UI say WARMUP from the sensor's own mouth
+             * rather than by inference. */
+            LOGI("   EGV glucose=%d age=%d trend=%d clock=%u state=%d",
+                 ev.glucose, ev.age, ev.trend, ev.clock, ev.state);
+            /* state 0x02 = WARMUP (captured live 2026-07-23): a fresh
+             * session answers with state=2, a running clock, AND a glucose
+             * value. The official Dexcom UIs hide warmup glucose; here it is
+             * DELIBERATELY kept -- the standing rule is that every datapoint
+             * the sensor produces is stored, recorded and displayed. The
+             * state byte still drives the WARMUP label, so the user can see
+             * the value is a warmup one. */
             drv_glucose(ev.glucose, ev.trend, ev.age);
             ctx->streamed = 1;
             remember_sensor();

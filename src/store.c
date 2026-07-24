@@ -83,26 +83,30 @@ void hist_refresh_current(int prime)
    /* `prime` is resolved by the caller under the registry lock, BEFORE it takes
     * hist_lock -- reading g_slot here would be both unsynchronized and a lock
     * order inversion. -1 means "no primary", which skips pass 0. */
-   /* Pass 0 takes the primary's newest sample, pass 1 any CGM's. Choosing the
-    * primary is the whole point of the setting: with two sensors running, the
-    * big number and the alarm would otherwise flip between them every few
-    * minutes on whichever happened to report last. Pass 1 is the fallback for
-    * a primary that has not reported yet (or was just forgotten) -- showing a
-    * stale number, or none, would be worse than showing the other sensor. */
-   for (int pass = 0; pass < 2; pass++) {
-      if (pass == 0 && prime < 0)
+   /* With a primary configured, ONLY its samples qualify -- that is the
+    * contract of the setting. A primary with no data yet used to fall back to
+    * whichever other CGM reported last, so a freshly paired sensor promoted to
+    * primary kept showing the OLD sensor's value as the big number -- data the
+    * user explicitly asked to stop headlining. No data is shown as no data.
+    * Only with no primary at all (no CGM registered: a pre-registry install)
+    * does the newest sample of any CGM source fill in. */
+   for (int i = 0; i < g_nhist; i++) {
+      if (g_hist[i].kind == KIND_BGM)
          continue;
-      for (int i = 0; i < g_nhist; i++) {
-         if (g_hist[i].kind == KIND_BGM)
-            continue;
-         if (pass == 0 && g_hist[i].src != (unsigned short)prime)
-            continue;
-         g_cur_glu   = g_hist[i].glu;
-         g_cur_trend = g_hist[i].trend;
-         g_cur_time  = g_hist[i].t;
-         return;
-      }
+      if (prime >= 0 && g_hist[i].src != (unsigned short)prime)
+         continue;
+      g_cur_glu   = g_hist[i].glu;
+      g_cur_trend = g_hist[i].trend;
+      g_cur_time  = g_hist[i].t;
+      return;
    }
+   /* Nothing qualified: CLEAR the current reading rather than leaving a stale
+    * value latched. Without this, switching primary to a sensor with no data
+    * left the previous sensor's number (and timestamp) on screen and feeding
+    * the alarm indefinitely. */
+   g_cur_glu   = -1;
+   g_cur_trend = 0;
+   g_cur_time  = 0;
 }
 
 int hist_insert(long t, int glu, int trend, int src, int kind)

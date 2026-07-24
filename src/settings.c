@@ -22,8 +22,11 @@ int g_units;
 int g_disc;
 int g_plot_max      = PLOT_GLU_MAX;
 char g_code_str[16] = "9973"; /* Stelo applicator default (rebuild to change) */
+int g_remote_on;              /* push each new datapoint; default off */
+char g_remote_ip[16];         /* dotted quad; "" until the user sets one */
+int g_remote_port = 80;       /* glucoserve.py's default */
 char g_info_path[256], g_alarm_path[256], g_settings_path[256],
-    g_code_path[256];
+    g_code_path[256], g_remote_path[256];
 
 void info_save(void)
 {
@@ -202,6 +205,106 @@ void code_save(void)
    if (write(fd, g_code_str, n) != n) {
    }
    close(fd);
+}
+
+int remote_ip_valid(const char *s)
+{
+   if (!s)
+      return 0;
+   int octets = 0;
+   while (*s) {
+      if (*s < '0' || *s > '9')
+         return 0; /* each group starts with a digit */
+      int v  = 0;
+      int nd = 0;
+      while (*s >= '0' && *s <= '9') {
+         if (nd >= 3)
+            return 0; /* >3 digits can wrap; reject before accumulating */
+         v = (v * 10) + (*s - '0');
+         nd++;
+         s++;
+      }
+      if (v > 255)
+         return 0;
+      octets++;
+      if (*s == '.') {
+         if (!s[1])
+            return 0; /* trailing dot: "1.2.3." */
+         s++;
+      } else if (*s) {
+         return 0; /* anything but a digit or a separating dot */
+      }
+   }
+   return octets == 4;
+}
+
+void remote_save(void)
+{
+   int fd = open(g_remote_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (fd < 0)
+      return;
+   char b[48];
+   int n = snprintf(b, sizeof b, "%d %s %d\n", g_remote_on ? 1 : 0,
+                    g_remote_ip[0] ? g_remote_ip : "-", g_remote_port);
+   n     = clampn(n, sizeof b);
+   if (write(fd, b, n) != n) {
+   }
+   close(fd);
+}
+
+void remote_load(void)
+{
+   int fd = open(g_remote_path, O_RDONLY, 0);
+   if (fd < 0)
+      return;
+   char b[48];
+   int n = (int)read(fd, b, sizeof b - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   b[n]    = 0;
+   char *q = b;
+   if (*q != '0' && *q != '1')
+      return; /* garbage: keep the prior values, like every sibling loader */
+   int on = *q++ - '0';
+   while (*q == ' ')
+      q++;
+   char ip[sizeof g_remote_ip];
+   int k = 0;
+   while (*q && *q != ' ' && *q != '\n') {
+      if (k >= (int)sizeof ip - 1)
+         return; /* an address that long cannot be valid */
+      ip[k++] = *q++;
+   }
+   ip[k] = 0;
+   while (*q == ' ')
+      q++;
+   int port = 0;
+   int nd   = 0; /* see alarm_load: cap the digits, advance outside the cap */
+   while (*q >= '0' && *q <= '9') {
+      if (nd < 9) {
+         port = (port * 10) + (*q - '0');
+         nd++;
+      }
+      q++;
+   }
+   /* "-" is the saver's own empty-address marker; anything else must be a
+    * well-formed dotted quad, and the port must be a real TCP port. Commit all
+    * three together or nothing: a half-applied file (say, a valid port with a
+    * corrupt address) could silently re-point the push at the wrong host. */
+   int ip_ok = (ip[0] == '-' && ip[1] == 0) || remote_ip_valid(ip);
+   if (!ip_ok || port < 1 || port > 65535)
+      return;
+   g_remote_on   = on;
+   g_remote_port = port;
+   if (ip[0] == '-')
+      g_remote_ip[0] = 0;
+   else
+      for (int i = 0;; i++) {
+         g_remote_ip[i] = ip[i];
+         if (!ip[i])
+            break;
+      }
 }
 
 void code_load(void)

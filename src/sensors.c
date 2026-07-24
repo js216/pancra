@@ -85,6 +85,21 @@ long sensor_session_len(int type)
    return 0;
 }
 
+long sensor_wear_seconds(int type, int wear_days, const char *model)
+{
+   /* The user's explicit override wins outright. */
+   if (wear_days == 10 || wear_days == 15)
+      return wear_days * 86400L;
+   /* Dexcom sells the G7 in 10-day and 15-day versions and the sensor never
+    * states its wear length in any field we parse -- only the DIS model
+    * distinguishes them. Judging a 15-day G7 against the 10-day default
+    * declared it ENDED five days early, while it was visibly still
+    * delivering. Models learned in the field; extend as they appear. */
+   if (model && !strcmp(model, "SW14758"))
+      return 15L * 86400; /* G7 15 Day */
+   return sensor_session_len(type);
+}
+
 const char *sensor_type_name(int type)
 {
    if (type <= SENSOR_NONE || type >= SENSOR_NTYPES)
@@ -151,6 +166,15 @@ static void rdsep(char **p, const char *e)
  * a sensor you still own must never be the thing that gets dropped. */
 static void srec_push(const struct sensor_rec *r)
 {
+   /* Last row wins per id: sensor_complete() appends a corrected row for an
+    * id that already has one, and on load the correction must supersede the
+    * original -- in place, so one id never occupies two cache rows. Minted
+    * ids are unique (maxid + 1), so this changes nothing for them. */
+   for (int i = 0; i < g_nsrec; i++)
+      if (g_srec[i].id == r->id) {
+         g_srec[i] = *r;
+         return;
+      }
    if (g_nsrec < MAX_SENSOR_RECS) {
       g_srec[g_nsrec++] = *r;
       return;
@@ -249,12 +273,80 @@ void sensor_set_primary(int idx)
    const struct sensor_rec *r =
        (idx >= 0 && idx < g_nslot) ? sensor_rec_by_id(g_slot[idx].id) : 0;
    /* A BGM must never own the big number: a hours-old fingerstick rendered as
-    * the headline value (with a trend arrow) would actively mislead. */
-   if (r && sensor_kind(r->type) == KIND_CGM) {
+    * the headline value (with a trend arrow) would actively mislead. An OLD
+    * (disconnected) device cannot be primary either -- it is not streaming. */
+   if (r && sensor_kind(r->type) == KIND_CGM && !g_slot[idx].old) {
       for (int i = 0; i < g_nslot; i++)
          g_slot[i].primary = (i == idx);
       slots_save();
    }
+   reg_unlock();
+}
+
+int sensor_live_cgm_count(void)
+{
+   int n = 0;
+   reg_lock();
+   for (int i = 0; i < g_nslot; i++) {
+      if (g_slot[i].old)
+         continue;
+      const struct sensor_rec *r = sensor_rec_by_id(g_slot[i].id);
+      if (r && sensor_kind(r->type) == KIND_CGM)
+         n++;
+   }
+   reg_unlock();
+   return n;
+}
+
+/* Hand the primary to the first LIVE CGM, if the current one is gone/old. */
+static void reassign_primary_locked(void)
+{
+   int have = 0;
+   for (int i = 0; i < g_nslot; i++)
+      if (g_slot[i].primary && !g_slot[i].old) {
+         have = 1;
+         break;
+      }
+   if (have)
+      return;
+   for (int i = 0; i < g_nslot; i++)
+      g_slot[i].primary = 0;
+   for (int i = 0; i < g_nslot; i++) {
+      const struct sensor_rec *r = sensor_rec_by_id(g_slot[i].id);
+      if (!g_slot[i].old && r && sensor_kind(r->type) == KIND_CGM) {
+         g_slot[i].primary = 1;
+         break;
+      }
+   }
+}
+
+void sensor_retire_slot(int idx)
+{
+   reg_lock();
+   if (idx < 0 || idx >= g_nslot) {
+      reg_unlock();
+      return;
+   }
+   g_slot[idx].old     = 1;
+   g_slot[idx].primary = 0;
+   reassign_primary_locked();
+   slots_save();
+   reg_unlock();
+}
+
+void sensor_revive_slot(int idx)
+{
+   reg_lock();
+   if (idx < 0 || idx >= g_nslot) {
+      reg_unlock();
+      return;
+   }
+   g_slot[idx].old = 0;
+   /* If nothing else is primary and this is a CGM, it takes the big number. */
+   const struct sensor_rec *r = sensor_rec_by_id(g_slot[idx].id);
+   if (r && sensor_kind(r->type) == KIND_CGM && sensor_primary_slot() < 0)
+      g_slot[idx].primary = 1;
+   slots_save();
    reg_unlock();
 }
 
@@ -364,6 +456,12 @@ static void slots_load(void)
       s.primary = (int)rdnum(&q, e) ? 1 : 0;
       rdsep(&q, e);
       s.size = (int)rdnum(&q, e); /* 6th field; absent in pre-size files -> 0 */
+      rdsep(&q, e);
+      /* 7th field; absent in older files -> 0 = resolve by model/type. */
+      s.wear_days = (int)rdnum(&q, e);
+      rdsep(&q, e);
+      /* 8th field; absent in older files -> 0 = live (not an old device). */
+      s.old = (int)rdnum(&q, e) ? 1 : 0;
       if (s.id > 0) {
          if (s.marker < 0 || s.marker >= MARK_N)
             s.marker = MARK_SQUARE_F;
@@ -373,6 +471,10 @@ static void slots_load(void)
             s.color = 0;
          if (s.size < 1 || s.size > MARK_SIZE_MAX)
             s.size = MARK_SIZE_DEF; /* default / migrate old files */
+         if (s.wear_days != 10 && s.wear_days != 15)
+            s.wear_days = 0; /* anything else means "not overridden" */
+         if (s.old)
+            s.primary = 0; /* an old device can never be the primary */
          g_slot[g_nslot++] = s;
       }
       p = (*e == '\n') ? e + 1 : e;
@@ -399,6 +501,8 @@ void sensors_load(void)
    reg_unlock();
 }
 
+/* ---- old-device marker store ---- */
+
 void slots_save(void)
 {
    reg_lock();
@@ -409,9 +513,10 @@ void slots_save(void)
    }
    for (int i = 0; i < g_nslot; i++) {
       char b[96];
-      int n = snprintf(b, sizeof b, "%d,%s,%d,%d,%d,%d\n", g_slot[i].id,
+      int n = snprintf(b, sizeof b, "%d,%s,%d,%d,%d,%d,%d,%d\n", g_slot[i].id,
                        g_slot[i].label, g_slot[i].marker, g_slot[i].color,
-                       g_slot[i].primary, g_slot[i].size);
+                       g_slot[i].primary, g_slot[i].size, g_slot[i].wear_days,
+                       g_slot[i].old);
       n     = clampn(n, sizeof b);
       if (write(fd, b, n) != n) { /* best effort: preferences, not data */
       }
@@ -421,6 +526,36 @@ void slots_save(void)
 }
 
 /* ---- minting ---- */
+
+/* Append one provenance row durably. 0 on success, -1 on failure -- and on a
+ * short write the partial line is rolled back: left in place it would merge
+ * with the next append into one unparseable row, hiding an id from the parser,
+ * after which maxid goes backwards and the NEXT mint reissues a live id. */
+static int srec_append_row(const struct sensor_rec *r)
+{
+   int fd = open(g_sensors_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+   if (fd < 0)
+      return -1;
+   if (lseek(fd, 0, SEEK_END) == 0) { /* self-describing header on a new file */
+      if (write(fd, g_sensors_hdr, sizeof g_sensors_hdr - 1) <
+          0) { /* best eff */
+      }
+   }
+   char b[192];
+   int n  = snprintf(b, sizeof b, "%d,%d,%s,%s,%s,%s,%ld,%ld\n", r->id, r->type,
+                     r->identity, r->serial, r->model, r->fw, r->activation,
+                     r->paired);
+   n      = clampn(n, sizeof b);
+   long w = write(fd, b, n);
+   if (w != n) {
+      if (w > 0)
+         (void)ftruncate(fd, lseek(fd, 0, SEEK_END) - w);
+      close(fd);
+      return -1;
+   }
+   close(fd);
+   return 0;
+}
 
 int sensor_mint(int type, const char *identity, const char *serial,
                 const char *model, const char *fw, long activation)
@@ -494,39 +629,61 @@ int sensor_mint(int type, const char *identity, const char *serial,
    str_snapshot(r.model, sizeof r.model, mo);
    str_snapshot(r.fw, sizeof r.fw, fv);
 
-   int fd = open(g_sensors_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-   if (fd < 0) {
-      reg_unlock();
-      return -1;
-   }
-   if (lseek(fd, 0, SEEK_END) == 0) { /* self-describing header on a new file */
-      if (write(fd, g_sensors_hdr, sizeof g_sensors_hdr - 1) <
-          0) { /* best eff */
-      }
-   }
-   char b[192];
-   int n =
-       snprintf(b, sizeof b, "%d,%d,%s,%s,%s,%s,%ld,%ld\n", r.id, r.type,
-                r.identity, r.serial, r.model, r.fw, r.activation, r.paired);
-   n      = clampn(n, sizeof b);
-   long w = write(fd, b, n);
-   if (w != n) {
-      /* Roll the partial line back. Left in place it would merge with the next
-       * append into one unparseable row, hiding an id from the parser -- after
-       * which maxid goes backwards and the NEXT mint reissues a live id. That
-       * is the only way this design can reuse an id, so it must not happen. */
-      if (w > 0)
-         (void)ftruncate(fd, lseek(fd, 0, SEEK_END) - w);
-      close(fd);
+   if (srec_append_row(&r) < 0) {
       reg_unlock();
       return -1; /* provenance MUST be durable: refuse the id if it did not
                     reach the disk, or readings would cite a row nobody has */
    }
-   close(fd);
 
    srec_push(&r);
    reg_unlock();
    return r.id;
+}
+
+int sensor_complete(int id, const char *serial, const char *model,
+                    const char *fw, long activation)
+{
+   reg_lock();
+   /* Locate the row by INDEX and work on a copy: srec_push memmoves the array
+    * when full, and the durable append must precede the in-memory update so a
+    * failed write leaves the row still-incomplete and the caller retries. */
+   int idx = -1;
+   for (int i = 0; i < g_nsrec && idx < 0; i++)
+      if (g_srec[i].id == id)
+         idx = i;
+   if (idx < 0) {
+      reg_unlock();
+      return 0; /* aged out of the cache: nothing to complete against */
+   }
+   struct sensor_rec r = g_srec[idx];
+   int changed         = 0;
+   if (!r.serial[0] && serial && serial[0]) {
+      str_snapshot(r.serial, sizeof r.serial, serial);
+      changed = 1;
+   }
+   if (!r.model[0] && model && model[0]) {
+      str_snapshot(r.model, sizeof r.model, model);
+      changed = 1;
+   }
+   if (!r.fw[0] && fw && fw[0]) {
+      str_snapshot(r.fw, sizeof r.fw, fw);
+      changed = 1;
+   }
+   if (!r.activation && activation) {
+      r.activation = activation;
+      changed      = 1;
+   }
+   if (!changed) {
+      reg_unlock();
+      return 0;
+   }
+   if (srec_append_row(&r) < 0) {
+      reg_unlock();
+      return -1;
+   }
+   g_srec[idx] = r;
+   reg_unlock();
+   return 1;
 }
 
 int sensor_claim_slot(int id, int type, const char *identity)
@@ -537,6 +694,15 @@ int sensor_claim_slot(int id, int type, const char *identity)
    struct sensor_slot *have = sensor_slot_by_id(id);
    if (have) {
       int idx = (int)(have - g_slot);
+      /* Re-adding a device that was DISCONNECTED revives its existing slot --
+       * keeping the marker/label/colour the user chose -- instead of leaving
+       * it stranded as an old device with a duplicate live one. */
+      if (have->old) {
+         have->old = 0;
+         if (sensor_kind(type) == KIND_CGM && sensor_primary_slot() < 0)
+            have->primary = 1;
+         slots_save();
+      }
       reg_unlock();
       return idx;
    }
@@ -606,6 +772,9 @@ void sensor_forget_slot(int idx)
       reg_unlock();
       return;
    }
+   /* NOTE: the DISCONNECT flow uses sensor_retire_slot (which keeps the slot
+    * and its appearance); this hard-delete remains only for a true removal
+    * and for the test suite. */
    int was_primary = g_slot[idx].primary;
    for (int i = idx + 1; i < g_nslot; i++)
       g_slot[i - 1] = g_slot[i];

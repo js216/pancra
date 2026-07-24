@@ -47,8 +47,10 @@ void fmt_dur(long seconds, char *out, int n);
 #define UI_MIN_SLOTS 3
 
 /* Rows the settings screen consumes ABOVE (and below) the sensor entries: title
- * (2), DISPLAY (6), ALARM (5), PERMISSIONS (8), the DEVICES header (1), and the
- * two trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA -- each a
+ * (2), DISPLAY (7 -- including the REMOTE summary row), ALARM (5), the
+ * PERMISSIONS summary row (2 -- the full section moved to its own screen so
+ * the DEVICES list gets the space), the DEVICES header (1), and the two
+ * trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA -- each a
  * separator + a ~1-row button (4 total). Keep in step with render_settings.
  *
  * Exported deliberately. It used to be private to ui.c while test/uitest.c
@@ -57,7 +59,7 @@ void fmt_dur(long seconds, char *out, int n);
  * exactly the mistake that leaves sensor rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_SET_ABOVE 26
+#define UI_SET_ABOVE 22
 
 /* How many sensor rows fit in the settings screen at this geometry, given
  * everything above the SENSORS section. The whole UI never scrolls, so this is
@@ -110,6 +112,14 @@ enum ui_screen {
    SCR_MARKPICK,   /* marker-shape picker */
    SCR_COLORPICK,  /* colour picker */
    SCR_METERHELP,  /* OneTouch: how-to-connect + Scan button */
+   SCR_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
+   SCR_ADDMENU,    /* main-screen '+': ADD ... (NEW DEVICE / INSULIN) */
+   SCR_INSULIN,    /* LOG INSULIN entry form */
+   SCR_PRIMPICK,   /* big-number tap with >1 registered CGM: choose primary */
+   SCR_PERMS,      /* permissions + background controls, moved off SETTINGS */
+   SCR_OLDDEV, /* previously-used (forgotten) devices: restyle their trace */
+   SCR_RECONF, /* confirm reconnecting an EXPIRED old device */
+   SCR_REMOTE, /* remote push: enable/disable, server IP and port */
    SCR_N
 };
 
@@ -136,12 +146,19 @@ struct ui_sensor {
     * padding (clang-analyzer-optin.performance.Padding). */
    long last;            /* last reading (CGM) or sync (BGM); 0 = never */
    long session_seconds; /* CGM session length */
+   long wear_len;        /* nominal wear budget, seconds (0 for a meter) */
+   long paired;          /* when this device was registered (warmup display) */
    long rssi_t;       /* wall-clock of the RSSI sample, for its "N M AGO" age */
    long meter_sync_t; /* meter only: when the app last synced it (vs last
                          datapoint) */
    long cal_t;        /* when the last calibration RESOLVED; 0 = never */
+   long activation;   /* provenance session start (epoch); for an OLD device,
+                       * STARTED/ENDS come from this, not the live clock */
+   int sess_state;    /* SENSOR_STATE_* from its link's last 4e; 0 unknown */
    int id, type, kind;
    int color, marker, primary, size;
+   int old; /* 1 = DISCONNECTED: shown under OLD DEVICES, state EXPIRED, but
+             * the SAME full per-device menu; excluded from the live list */
    int glu, trend, predicted, sequence;
    int rssi, rssi_ok, connected;
    /* Calibration state for this CGM's LAST CAL row. cal_pending!=0 means a
@@ -189,6 +206,7 @@ struct screen {
    const char *status;              /* top status text */
    const char *mac, *model, *fw, *mfr, *code; /* device-info strings */
    const char *entry;                         /* keypad digits typed so far */
+   const char *remote_ip; /* remote-push server address; "" = not set */
 
    /* --- int members --- */
    enum ui_screen scr;
@@ -197,12 +215,18 @@ struct screen {
    int disc_alarmed; /* stale-data alarm latched (drives the STALE banner) */
    /* plot: point count, scrub cursor (-1 = none), span, vertical max */
    int nhist, scrub, plot_hours, plot_max;
-   /* session facts from the driver */
-   int bonded, paired, have_reading, predicted, sequence;
+   /* session facts from the driver (sess_state: the PRIMARY's SENSOR_STATE_*
+    * from its last 4e; the sensor's own verdict outranks arithmetic) */
+   int bonded, paired, have_reading, predicted, sequence, sess_state;
+   /* 1 when at least one CGM is registered. The STATE/SESSION/PRED block
+    * describes a CGM, so with none it must blank to dashes -- never inherit
+    * the global status line, which a meter sync leaves reading "SYNCED". */
+   int has_cgm;
    /* settings (values, not the module's globals) */
    int units, alarm_low, alarm_high, sound_on, vib_on, orient, disc;
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
-   int newdata_beep; /* 1 = beep on each new primary-CGM datapoint */
+   int newdata_beep;           /* 1 = beep on each new primary-CGM datapoint */
+   int remote_on, remote_port; /* remote push enabled; server TCP port */
    /* sensor registry: the list in settings, and which one a detail screen is
     * showing (sel indexes `sensors`; -1 when no detail screen is open) */
    int nsensors, sel;
@@ -220,6 +244,17 @@ struct screen {
    /* Type being added (ADD SENSOR flow), for the PAIR / SELECT titles. */
    const char *add_type; /* display name, e.g. "STELO", "G7" */
    int add_kind;         /* KIND_CGM / KIND_BGM of that type */
+   /* The picked device awaiting the SCR_PAIRCONF yes/no (borrowed). */
+   const char *pair_name, *pair_mac;
+   /* LOG INSULIN form state (ins_t rendered via tz_off). */
+   long ins_t;
+   int ins_type, ins_units;
+   /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none.
+    * DEVICES shows it as a tappable PENDING row (MA_PEND_CANCEL); the
+    * choose-primary screen offers it too (MA_PRIM_PEND), and pend_primary
+    * marks that it will take the big number when it lands. */
+   int pend_type, pend_primary;
+   int old_page; /* OLD DEVICES: which page of the list is showing */
    unsigned adv_total;
    /* system snapshot for the settings screen (perm[]: BT scan/connect/notify)
     */
@@ -241,9 +276,10 @@ enum {
    ACT_PLOT_TAB,      /* arg = plot span in hours */
    ACT_ALARM_LOW,     /* arg = +-1 (minus/plus) */
    ACT_ALARM_HIGH,    /* arg = +-1 */
-   ACT_PAIR_NEW,      /* "SENSOR EXPIRED" prompt -> pairing keypad */
    ACT_SCRUB,         /* a press inside the plot; shell resolves the point */
    ACT_GATE_CONTINUE, /* first-run rationale: request permissions */
+   ACT_PICK_PRIMARY,  /* big-number tap: choose the primary (shell decides
+                         whether >1 active CGM makes it worth asking) */
    /* Modal screens (settings / keypad / device list) speak the shell's
     * menu_action protocol; arg carries that integer code so menu_action stays
     * the single dispatch point for their JNI/pairing side effects. */
@@ -269,7 +305,16 @@ enum ui_menu {
    MA_BGEXEC    = 22,
    MA_PAIR_CODE = 30,
    MA_PLOTMAX   = 31,
-   MA_SENSOR    = 40, /* + slot index; opens that sensor's screen */
+   MA_REMOTE_OPEN   = 32, /* settings: open the REMOTE submenu */
+   MA_REMOTE_TOGGLE = 33, /* remote menu: enable/disable the push */
+   MA_REMOTE_IP     = 34, /* remote menu: edit the server IP (keypad) */
+   MA_REMOTE_PORT   = 35, /* remote menu: edit the server port (keypad) */
+   MA_REMOTE_BACK   = 36, /* remote menu: back to settings */
+   /* Rebased from 40 when MAX_SLOTS grew to 10: the old base had only 8
+    * values of room before MA_SENSOR_BACK. These are runtime touch codes,
+    * never persisted, so the move is safe; the assert below now guards the
+    * new neighbourhood. */
+   MA_SENSOR      = 130, /* + slot index; opens that sensor's screen */
    MA_SENSOR_BACK = 48,
    MA_ADDSENSOR   = 49,
    MA_PRIMARY     = 50,
@@ -293,10 +338,38 @@ enum ui_menu {
    MA_RESCALE_CHANGE = 68, /* active screen: enter a new value */
    MA_RESCALE_STOP   = 69, /* active screen: turn rescaling off */
    MA_TYPE           = 70, /* + sensor type (SENSOR_STELO..) */
-   MA_EXPORT     = 75, /* settings: EXPORT DATA via the system share sheet */
+   MA_EXPORT      = 75,  /* settings: EXPORT DATA via the system share sheet */
+   MA_PAIR_YES    = 76,  /* pairing confirmation: commit to the picked device */
+   MA_PAIR_NO     = 77,  /* pairing confirmation: back to the device list */
+   MA_ADD_OPEN    = 78,  /* main-screen '+': open the ADD menu */
+   MA_INS_OPEN    = 79,  /* ADD menu: open the LOG INSULIN form */
+   MA_INS_TYPE    = 80,  /* LOG INSULIN: toggle SLOW / FAST */
+   MA_INS_UMINUS  = 81,  /* LOG INSULIN: units - 1 */
+   MA_INS_UPLUS   = 82,  /* LOG INSULIN: units + 1 */
+   MA_INS_DMINUS  = 83,  /* LOG INSULIN: date - 1 day */
+   MA_INS_DPLUS   = 84,  /* LOG INSULIN: date + 1 day */
+   MA_INS_TMINUS  = 85,  /* LOG INSULIN: time - 5 min */
+   MA_INS_TPLUS   = 86,  /* LOG INSULIN: time + 5 min */
+   MA_INS_CONFIRM = 87,  /* LOG INSULIN: append the dose */
+   MA_INS_DISCARD = 88,  /* LOG INSULIN: leave without logging */
+   MA_WEAR        = 89,  /* device screen: toggle wear length 10 D / 15 D */
+   MA_PEND_CANCEL = 90,  /* DEVICES: cancel the armed (pending) pairing */
+   MA_PERMS_OPEN  = 91,  /* settings: open the PERMISSIONS submenu */
+   MA_PERMS_BACK  = 92,  /* permissions submenu: back to settings */
+   MA_PRIM_PEND   = 93,  /* choose-primary: the PENDING sensor becomes primary
+                            the moment its pairing commits */
+   MA_OLDDEV_OPEN  = 94, /* settings DEVICES: open the OLD DEVICES list */
+   MA_OLDDEV_BACK  = 95, /* OLD DEVICES list: back to settings */
+   MA_OLDPAGE_PREV = 97, /* OLD DEVICES: previous page */
+   MA_OLDPAGE_NEXT = 98, /* OLD DEVICES: next page */
+   MA_RECONNECT    = 96, /* old device: revive it (direct if not yet expired,
+                          * else via a confirmation screen) */
+   MA_RECON_YES  = 8,    /* reconnect-expired confirmation: do it */
+   MA_RECON_NO   = 9,    /* reconnect-expired confirmation: cancel */
    MA_CLOSE      = 99,
    MA_DIGIT      = 100, /* + digit 0..9 */
    MA_OK         = 111, /* keypad / label confirm */
+   MA_DOT        = 112, /* keypad '.' (remote-IP entry only) */
    MA_BACKSPACE  = 110,
    MA_KP_CLOSE   = 113,
    MA_DEV_CANCEL = 199,
@@ -304,6 +377,7 @@ enum ui_menu {
    MA_MARK_PICK  = 220, /* + marker enum value */
    MA_COLOR_PICK = 240, /* + colour index */
    MA_SIZE_PICK  = 250, /* + size 1..MARK_SIZE_MAX */
+   MA_PRIM_PICK  = 260, /* + slot index: make that CGM the primary */
    MA_CHAR       = 300  /* + index into ui_label_chars[] */
 };
 
@@ -323,12 +397,15 @@ enum ui_menu {
  * If one of these fires, MOVE THE LATER BASE UP -- do not renumber history. */
 /* MA_PERM and MA_DEV_PICK are asserted in main.c, which owns NPERMS and
  * MAX_DEVS. */
-_Static_assert(MA_SENSOR + MAX_SLOTS <= MA_SENSOR_BACK,
-               "MA_SENSOR range hits MA_SENSOR_BACK");
+_Static_assert(MA_SENSOR + MAX_SLOTS <= MA_DEV_CANCEL,
+               "MA_SENSOR range hits MA_DEV_CANCEL");
+_Static_assert(MA_SENSOR > MA_KP_CLOSE, "MA_SENSOR range hits the keypad");
 _Static_assert(MA_TYPE + SENSOR_NTYPES <= MA_CLOSE,
                "MA_TYPE range hits MA_CLOSE");
 _Static_assert(MA_DIGIT + 10 <= MA_BACKSPACE,
                "MA_DIGIT range hits MA_BACKSPACE");
+_Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_CHAR,
+               "MA_PRIM_PICK range hits MA_CHAR");
 
 /* Up to this many touch targets per frame. */
 #define UI_MAX_HITS 48

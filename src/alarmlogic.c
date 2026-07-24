@@ -26,6 +26,19 @@ int alarm_stale(int glu, long glu_t, long now, long launch_t, long disc_s)
    return (glu < 0 || now - glu_t > disc_s);
 }
 
+int alarm_zone_merge(int a, int b)
+{
+   /* Combine verdicts from DIFFERENT sensors: the alarm watches every CGM
+    * the user wears, and the worst excursion anywhere wins. A LOW outranks a
+    * HIGH -- hypoglycemia is the one that kills quickly -- so two sensors
+    * disagreeing in opposite directions ring LOW. */
+   if (a == 1 || b == 1)
+      return 1;
+   if (a == 2 || b == 2)
+      return 2;
+   return 0;
+}
+
 int alarm_stranded(int glu, long glu_t, long now, int lo, int hi)
 {
    if (glu < 0)

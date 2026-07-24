@@ -123,7 +123,10 @@ struct dex_session {
    int bonded;               /* authenticated on the fast saved-key path */
    int paired;               /* we hold a shared key */
    int have_reading;         /* a 4e EGV has been decoded this run */
-   uint32_t session_seconds; /* sensor clock at the last reading */
+   uint32_t session_seconds; /* LIVE sensor session time: the clock from the
+                                last 4e projected forward by wall time, so
+                                countdowns tick per second between responses */
+   int state; /* raw session-state byte from the last 4e (0 = none seen) */
    int glucose, trend, age, predicted, sequence;
 };
 

@@ -129,6 +129,31 @@ int main(void)
    ck(g_nhist == NHIST, "...without growing past NHIST");
    ck(g_hist[NHIST - 1].t > oldest, "...by evicting the oldest");
 
+   printf("== the big number belongs to the primary, or to nobody ==\n");
+   reset();
+   hist_insert(t0, 100, 1, 7, KIND_CGM);       /* old primary sample */
+   hist_insert(t0 + 300, 140, 2, 8, KIND_CGM); /* other CGM, newer */
+   hist_insert(t0 + 600, 190, 0, 3, KIND_BGM); /* fingerstick, newest */
+   hist_refresh_current(7);
+   ck(g_cur_glu == 100 && g_cur_time == t0,
+      "primary's sample wins over a newer secondary and a fingerstick");
+   hist_refresh_current(8);
+   ck(g_cur_glu == 140, "switching primary re-binds to the new owner's data");
+   /* The contract the display promises: a primary with NO data shows no data,
+    * never another sensor's. Falling back used to keep the old sensor's value
+    * as the big number after the user explicitly promoted a fresh sensor. */
+   hist_refresh_current(9);
+   ck(g_cur_glu == -1 && g_cur_time == 0,
+      "a primary with no data CLEARS the current reading");
+   /* Only with no primary at all (pre-registry install) may any CGM fill in --
+    * and a fingerstick is still never eligible. */
+   hist_refresh_current(-1);
+   ck(g_cur_glu == 140, "no primary: newest CGM of any source fills in");
+   reset();
+   hist_insert(t0, 190, 0, 3, KIND_BGM);
+   hist_refresh_current(-1);
+   ck(g_cur_glu == -1, "a lone fingerstick never becomes the big number");
+
    printf("== the FILE path: append, reload, and the load-time bounds ==\n");
    /* Everything above exercises hist_insert only. store_append, store_load,
     * store_count and rdfield had no coverage at all -- which is how an

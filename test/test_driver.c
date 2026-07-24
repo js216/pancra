@@ -367,7 +367,12 @@ int main(void)
       driver_get_session(&ds);
       int okseq = (ds.sequence == 1757);
       int okpre = (ds.predicted == 165);
-      int okclk = (ds.session_seconds == 526385U);
+      /* session_seconds is now LIVE (the decoded clock projected forward by
+       * wall time since the response), so allow the seconds the test itself
+       * may consume between decode and this read -- the offset being pinned
+       * is still the decode, a wrong offset is off by orders of magnitude. */
+      int okclk =
+          (ds.session_seconds >= 526385U && ds.session_seconds <= 526385U + 5U);
       printf("  [%s] sequence = %d (expect 1757)\n", okseq ? "PASS" : "FAIL",
              ds.sequence);
       all = all && okseq;

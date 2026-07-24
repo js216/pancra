@@ -36,6 +36,10 @@
  * zone: a latched zone outranks the stale warning in alarm_want(), so a sensor
  * dropping out while low would otherwise mask the DISCONNECT alarm forever. */
 int alarm_zone(int glu, long glu_t, long now, int lo, int hi);
+/* Combine two sensors' zone verdicts: LOW (1) anywhere outranks HIGH (2)
+ * anywhere outranks in-range (0). Commutative and associative, so a caller
+ * can fold it over any number of sensors. */
+int alarm_zone_merge(int a, int b);
 
 /* Is the stale-data ("DISCONNECT") alarm justified?
  *

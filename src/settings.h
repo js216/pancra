@@ -19,9 +19,12 @@ extern int
 extern int g_units;    /* 0 mg/dL, 1 mmol/L */
 extern int g_disc;     /* stale-data alarm: index into disc_min */
 extern int g_plot_max; /* plot vertical-scale top, mg/dL */
-extern char g_code_str[16]; /* runtime pairing code (PAIR NEW SENSOR) */
+extern char g_code_str[16];  /* runtime pairing code (PAIR NEW SENSOR) */
+extern int g_remote_on;      /* 1 = push each new datapoint to the server */
+extern char g_remote_ip[16]; /* dotted-quad server address; "" = not set */
+extern int g_remote_port;    /* server TCP port, 1..65535 */
 extern char g_info_path[256], g_alarm_path[256], g_settings_path[256],
-    g_code_path[256];
+    g_code_path[256], g_remote_path[256];
 
 void info_save(void); /* device-info strings "model\nfw\nmfr\n" */
 void info_load(void);
@@ -34,5 +37,10 @@ void settings_save(void);
 void settings_load(void); /* also applies plot_set_max() */
 void code_save(void);     /* pairing code digits */
 void code_load(void);
+/* "on ip port\n" -- garbage keeps the prior values, like every loader here. */
+void remote_save(void);
+void remote_load(void);
+/* 1 iff s is a well-formed dotted quad (four octets, each 0..255). Pure. */
+int remote_ip_valid(const char *s);
 
 #endif

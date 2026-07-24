@@ -322,6 +322,20 @@ int main(void)
          "an absurd entry is refused without overflowing");
    }
 
+   printf("== zone merge: the alarm watches every sensor, worst wins ==\n");
+   {
+      /* The shell folds this over every CGM's own verdict; the rule that a
+       * LOW anywhere outranks a HIGH anywhere is what makes two sensors
+       * disagreeing in opposite directions ring the one that kills. */
+      ck(alarm_zone_merge(0, 0) == 0, "in-range everywhere stays quiet");
+      ck(alarm_zone_merge(0, 1) == 1, "a LOW on either sensor rings LOW");
+      ck(alarm_zone_merge(1, 0) == 1, "...in either order");
+      ck(alarm_zone_merge(0, 2) == 2, "a HIGH on either sensor rings HIGH");
+      ck(alarm_zone_merge(2, 0) == 2, "...in either order");
+      ck(alarm_zone_merge(1, 2) == 1, "LOW outranks HIGH");
+      ck(alarm_zone_merge(2, 1) == 1, "...in either order");
+   }
+
    printf("\n%s\n", all ? "ALL ALARM TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

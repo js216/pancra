@@ -57,6 +57,7 @@ static void paths(void)
    (void)snprintf(g_settings_path, sizeof g_settings_path, "tmp/uitest/st-set");
    (void)snprintf(g_code_path, sizeof g_code_path, "tmp/uitest/st-code");
    (void)snprintf(g_info_path, sizeof g_info_path, "tmp/uitest/st-info");
+   (void)snprintf(g_remote_path, sizeof g_remote_path, "tmp/uitest/st-remote");
 }
 
 /* Write raw bytes to a settings file, so corruption can be simulated exactly.
@@ -198,6 +199,70 @@ int main(void)
       ck(strlen(g_code_str) < sizeof g_code_str,
          "an over-long code cannot overflow the buffer");
    }
+
+   printf("== remote push config round-trips ==\n");
+   g_remote_on = 1;
+   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "192.168.1.42");
+   g_remote_port = 8080;
+   remote_save();
+   g_remote_on    = 0;
+   g_remote_ip[0] = 0;
+   g_remote_port  = 80;
+   remote_load();
+   ck(g_remote_on == 1 && strcmp(g_remote_ip, "192.168.1.42") == 0 &&
+          g_remote_port == 8080,
+      "what was saved is what comes back");
+   /* An UNSET address must round-trip as unset (the "-" marker), not clobber
+    * itself into a literal dash the validator would then refuse forever. */
+   g_remote_on    = 0;
+   g_remote_ip[0] = 0;
+   remote_save();
+   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "10.0.0.1");
+   remote_load();
+   ck(g_remote_ip[0] == 0, "an unset address stays unset across a reload");
+
+   printf("== a corrupt remote file keeps the prior values ==\n");
+   /* Half-applying a corrupt file could silently re-point the push at the
+    * wrong host, so the loader must commit all three fields or none. */
+   g_remote_on = 1;
+   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "10.0.0.9");
+   g_remote_port = 8080;
+   put(g_remote_path, "1 999.168.1.1 80\n");
+   remote_load();
+   ck(strcmp(g_remote_ip, "10.0.0.9") == 0 && g_remote_port == 8080,
+      "an out-of-range octet is rejected whole");
+   put(g_remote_path, "1 10.0.0.5 0\n");
+   remote_load();
+   ck(g_remote_port == 8080, "port 0 is rejected whole");
+   put(g_remote_path, "1 10.0.0.5 99999\n");
+   remote_load();
+   ck(g_remote_port == 8080, "a port above 65535 is rejected whole");
+   put(g_remote_path, "garbage\n");
+   remote_load();
+   ck(g_remote_on == 1 && strcmp(g_remote_ip, "10.0.0.9") == 0,
+      "non-numeric changes nothing");
+   put(g_remote_path, "");
+   remote_load();
+   ck(g_remote_on == 1, "an empty file changes nothing");
+   unlink(g_remote_path);
+   remote_load();
+   ck(g_remote_on == 1, "a missing file changes nothing");
+
+   printf("== remote_ip_valid: the keypad's whole defence ==\n");
+   /* The IP keypad offers only digits and dots, so this predicate is the ONLY
+    * thing standing between a mistyped entry and a push aimed at nothing. */
+   ck(remote_ip_valid("192.168.1.1"), "a normal LAN address passes");
+   ck(remote_ip_valid("255.255.255.255"), "all-255 passes");
+   ck(remote_ip_valid("0.0.0.0"), "all-zero is well-formed (if useless)");
+   ck(!remote_ip_valid(""), "empty fails");
+   ck(!remote_ip_valid("1.2.3"), "three octets fail");
+   ck(!remote_ip_valid("1.2.3.4.5"), "five octets fail");
+   ck(!remote_ip_valid("256.1.1.1"), "an octet above 255 fails");
+   ck(!remote_ip_valid("1..2.3"), "an empty octet fails");
+   ck(!remote_ip_valid(".1.2.3"), "a leading dot fails");
+   ck(!remote_ip_valid("1.2.3."), "a trailing dot fails");
+   ck(!remote_ip_valid("1111.2.3.4"), "a four-digit octet fails before it "
+                                      "can wrap");
 
    printf("\n%s\n", all ? "ALL SETTINGS TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;

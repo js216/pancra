@@ -442,7 +442,9 @@ int main(void)
          int ssc  = ui_settings_scale(sw, sh);
          int scap = ui_sensor_capacity(sw, sh);
          int slh  = 16 * ssc;
-         int need = (sh / 20) + (8 * ssc) + ((23 + scap + 1) * slh);
+         /* UI_SET_ABOVE, not a literal: a stale copy of the overhead here is
+          * exactly the drift the dense sweep below exists to catch. */
+         int need = (sh / 20) + (8 * ssc) + ((UI_SET_ABOVE + scap + 1) * slh);
          if (scap < UI_MIN_SLOTS || need > sh) {
             printf("  FAIL: %dx%d capacity %d (min %d), needs %d of %d px\n",
                    sw, sh, scap, UI_MIN_SLOTS, need, sh);
@@ -501,10 +503,11 @@ int main(void)
                                            .bits   = g_px};
          /* Sweep EVERY screen, not just three -- the excluded ones were
           * exactly where the un-converted width-only scaling survived. */
-         static const int scrs[] = {
-             SCR_MAIN,  SCR_SETTINGS, SCR_SENSOR,  SCR_CAL,  SCR_FORGET,
-             SCR_LABEL, SCR_KEYPAD,   SCR_DEVLIST, SCR_GATE, SCR_SENSTYPE};
-         nscr = (int)(sizeof scrs / sizeof scrs[0]);
+         static const int scrs[] = {SCR_MAIN,     SCR_SETTINGS, SCR_SENSOR,
+                                    SCR_CAL,      SCR_FORGET,   SCR_LABEL,
+                                    SCR_KEYPAD,   SCR_DEVLIST,  SCR_GATE,
+                                    SCR_SENSTYPE, SCR_REMOTE};
+         nscr                    = (int)(sizeof scrs / sizeof scrs[0]);
          for (int c = 0; c < (int)(sizeof scrs / sizeof scrs[0]); c++) {
             struct screen rr = set;
             rr.scr           = scrs[c];
@@ -597,11 +600,15 @@ int main(void)
                    sh, ui_clipped());
             fail = 1;
          }
-         int saw_pair = 0;
+         /* The SENSOR EXPIRED prompt is gone (it read as an error banner); the
+          * '+' ADD entry point is now the in-app route to a replacement, so it
+          * must exist on this screen -- at every geometry. */
+         int saw_add = 0;
          for (int k = 0; k < h.n; k++)
-            saw_pair = saw_pair || (h.box[k].kind == ACT_PAIR_NEW);
-         if (!saw_pair) {
-            printf("  FAIL: %dx%d: expired sensor has no PAIR NEW target\n", sw,
+            saw_add = saw_add || (h.box[k].kind == ACT_MENU &&
+                                  h.box[k].arg == MA_ADD_OPEN);
+         if (!saw_add) {
+            printf("  FAIL: %dx%d: main screen has no '+' ADD target\n", sw,
                    sh);
             fail = 1;
          }
@@ -744,9 +751,9 @@ int main(void)
     * force-stop required. Every modal must offer a way out regardless of state.
     */
    {
-      static const int modal[] = {SCR_SENSOR,   SCR_CAL,      SCR_FORGET,
-                                  SCR_LABEL,    SCR_KEYPAD,   SCR_DEVLIST,
-                                  SCR_SENSTYPE, SCR_SETTINGS, SCR_GATE};
+      static const int modal[] = {
+          SCR_SENSOR,  SCR_CAL,      SCR_FORGET,   SCR_LABEL, SCR_KEYPAD,
+          SCR_DEVLIST, SCR_SENSTYPE, SCR_SETTINGS, SCR_GATE,  SCR_REMOTE};
       for (int i = 0; i < (int)(sizeof modal / sizeof modal[0]); i++) {
          struct screen bad = set;
          bad.scr           = modal[i];
@@ -831,9 +838,9 @@ int main(void)
        * such mutants (the sensor-detail MAC row, the settings STANDBY row)
        * survived a screen-local check. Scan every screen instead. */
       {
-         static const int allscr[] = {SCR_MAIN,     SCR_SETTINGS, SCR_SENSOR,
-                                      SCR_CAL,      SCR_KEYPAD,   SCR_DEVLIST,
-                                      SCR_SENSTYPE, SCR_LABEL,    SCR_GATE};
+         static const int allscr[] = {
+             SCR_MAIN,    SCR_SETTINGS, SCR_SENSOR, SCR_CAL,  SCR_KEYPAD,
+             SCR_DEVLIST, SCR_SENSTYPE, SCR_LABEL,  SCR_GATE, SCR_REMOTE};
          struct ANativeWindow_Buffer db = {.width  = W,
                                            .height = TALL_H,
                                            .stride = W,
@@ -914,6 +921,161 @@ int main(void)
             fail = 1;
          }
          printf("uitest: destructive code appears once, below cancel\n");
+
+         /* The pairing confirmation follows the same discipline: the code
+          * that commits (MA_PAIR_YES reaches commit_pair, which registers the
+          * device and drops the chosen link's old bond) appears exactly once,
+          * with the safe NO above it -- and the screen must render even
+          * before any device was proposed (null pair_name/pair_mac). */
+         fm.scr       = SCR_PAIRCONF;
+         fm.pair_name = 0;
+         fm.pair_mac  = 0;
+         ui_render(&fb2, &fm, &fh); /* null-safe: must not crash */
+         fm.pair_name = "DXCM77";
+         fm.pair_mac  = "C1:22:33:44:55:66";
+         ui_render(&fb2, &fm, &fh);
+         nyes     = 0;
+         nno      = 0;
+         ymin_yes = 1073741824;
+         ymax_no  = -1;
+         for (int i = 0; i < fh.n; i++) {
+            if (fh.box[i].kind != ACT_MENU)
+               continue;
+            if (fh.box[i].arg == MA_PAIR_YES) {
+               nyes++;
+               if (fh.box[i].y < ymin_yes)
+                  ymin_yes = fh.box[i].y;
+            }
+            if (fh.box[i].arg == MA_PAIR_NO) {
+               nno++;
+               if (fh.box[i].y > ymax_no)
+                  ymax_no = fh.box[i].y;
+            }
+         }
+         if (nyes != 1) {
+            printf("  FAIL: SCR_PAIRCONF records %d MA_PAIR_YES targets, want "
+                   "exactly 1\n",
+                   nyes);
+            fail = 1;
+         }
+         if (nno < 1) {
+            printf("  FAIL: SCR_PAIRCONF records no MA_PAIR_NO target\n");
+            fail = 1;
+         }
+         if (nyes == 1 && ymax_no > ymin_yes) {
+            printf("  FAIL: SCR_PAIRCONF has a NO target BELOW the committing "
+                   "one (no=%d yes=%d)\n",
+                   ymax_no, ymin_yes);
+            fail = 1;
+         }
+         printf("uitest: pairconf commits once, below NO\n");
+
+         /* LOG INSULIN: the one writing control (CONFIRM) appears exactly
+          * once, and every field the form promises is actually adjustable --
+          * type toggle, units steppers, date steppers, time steppers. */
+         fm.scr       = SCR_INSULIN;
+         fm.ins_t     = now_ts;
+         fm.ins_type  = 1;
+         fm.ins_units = 12;
+         ui_render(&fb2, &fm, &fh);
+         {
+            int nconf   = 0;
+            int codes[] = {MA_INS_TYPE,   MA_INS_UMINUS, MA_INS_UPLUS,
+                           MA_INS_DMINUS, MA_INS_DPLUS,  MA_INS_TMINUS,
+                           MA_INS_TPLUS,  MA_INS_DISCARD};
+            int seen[8] = {0};
+            for (int i = 0; i < fh.n; i++) {
+               if (fh.box[i].kind != ACT_MENU)
+                  continue;
+               if (fh.box[i].arg == MA_INS_CONFIRM)
+                  nconf++;
+               for (int k = 0; k < 8; k++)
+                  if (fh.box[i].arg == codes[k])
+                     seen[k] = 1;
+            }
+            if (nconf != 1) {
+               printf("  FAIL: SCR_INSULIN records %d MA_INS_CONFIRM targets, "
+                      "want exactly 1\n",
+                      nconf);
+               fail = 1;
+            }
+            for (int k = 0; k < 8; k++)
+               if (!seen[k]) {
+                  printf("  FAIL: SCR_INSULIN is missing control %d "
+                         "(index %d) -- that field cannot be adjusted\n",
+                         codes[k], k);
+                  fail = 1;
+               }
+            printf("uitest: insulin form carries every control, one CONFIRM\n");
+         }
+
+         /* CHOOSE PRIMARY: EVERY registered CGM is offered -- including one
+          * just paired with no session and no datapoint yet (promoting it is
+          * how the user pre-arms the switch to a new sensor). A meter never
+          * appears, however fresh its data. The row's code must index the
+          * sensor MODEL (MA_PRIM_PICK + slot), the same discipline as the
+          * device pick. */
+         {
+            struct ui_sensor ps[3] = {sens[0], sens[1], sens[2]};
+            ps[0].session_seconds  = 3L * 86400; /* live session */
+            ps[1].session_seconds  = 0;          /* just paired: no session,
+                                                    no data */
+            ps[1].last            = 0;
+            ps[2].session_seconds = 5; /* BGM: never eligible */
+            ps[2].last            = now_ts - 60;
+            struct screen pm      = set;
+            pm.scr                = SCR_PRIMPICK;
+            pm.now                = now_ts;
+            pm.sensors            = ps;
+            pm.nsensors           = 3;
+            ui_render(&fb2, &pm, &fh);
+            int rows    = 0;
+            int saw_bgm = 0;
+            for (int i = 0; i < fh.n; i++)
+               if (fh.box[i].kind == ACT_MENU &&
+                   fh.box[i].arg >= MA_PRIM_PICK &&
+                   fh.box[i].arg < MA_PRIM_PICK + UI_MAX_SLOTS) {
+                  rows++;
+                  if (fh.box[i].arg == MA_PRIM_PICK + 2)
+                     saw_bgm = 1;
+               }
+            if (rows != 2 || saw_bgm) {
+               printf("  FAIL: PRIMPICK offers %d rows (bgm=%d); want both "
+                      "CGMs (even the dataless one) and never the meter\n",
+                      rows, saw_bgm);
+               fail = 1;
+            }
+            printf("uitest: choose-primary lists every CGM, never a meter\n");
+         }
+
+         /* An ARMED (pending) pairing must be visible in DEVICES and
+          * cancellable -- an invisible armed state that auto-pairs later
+          * would be indistinguishable from the app acting on its own. */
+         {
+            struct screen sm = set;
+            sm.scr           = SCR_SETTINGS;
+            sm.pend_type     = SENSOR_G7;
+            ui_render(&fb2, &sm, &fh);
+            int saw_cancel = 0;
+            for (int i = 0; i < fh.n; i++)
+               if (fh.box[i].kind == ACT_MENU &&
+                   fh.box[i].arg == MA_PEND_CANCEL)
+                  saw_cancel = 1;
+            if (!saw_cancel) {
+               printf("  FAIL: SETTINGS shows no cancellable PENDING row "
+                      "while a pairing is armed\n");
+               fail = 1;
+            }
+            sm.pend_type = 0;
+            ui_render(&fb2, &sm, &fh);
+            for (int i = 0; i < fh.n; i++)
+               if (fh.box[i].kind == ACT_MENU &&
+                   fh.box[i].arg == MA_PEND_CANCEL) {
+                  printf("  FAIL: PENDING row rendered with nothing armed\n");
+                  fail = 1;
+               }
+            printf("uitest: armed pairing is visible and cancellable\n");
+         }
 
          /* THE DEVICE PICK MUST INDEX THE MODEL, NOT THE SORTED ROW.
           *
@@ -1083,6 +1245,73 @@ int main(void)
          printf("uitest: no sub-fingertip keypad targets\n");
       }
 
+      /* THE REMOTE-IP KEYPAD (kp_mode 4) IS ITS OWN GEOMETRY PATH: a 5-row
+       * grid with a '.' key and a full-width OK. The 4-row grid once laid out
+       * NEGATIVE-height keys in landscape (drawn but untappable), so the new
+       * row count must be swept too, and positions checked in reading order --
+       * 7 8 9 / 4 5 6 / 1 2 3 / . 0 < / OK -- since a transposed dot types a
+       * malformed address the OK then refuses, with no hint why. */
+      {
+         static const int ipwant[13] = {107, 108, 109,    104, 105, 106,  101,
+                                        102, 103, MA_DOT, 100, 110, MA_OK};
+         static const int ipgeo[][2] = {
+             {720,  1440},
+             {1080, 1920},
+             {1920, 1080},
+             {480,  720 }
+         };
+         for (unsigned g = 0; g < sizeof ipgeo / sizeof ipgeo[0]; g++) {
+            struct hits kh;
+            struct screen km               = set;
+            km.scr                         = SCR_KEYPAD;
+            km.kp_mode                     = 4;
+            struct ANativeWindow_Buffer kb = {.width  = ipgeo[g][0],
+                                              .height = ipgeo[g][1],
+                                              .stride = ipgeo[g][0],
+                                              .format = 1,
+                                              .bits   = g_px};
+            ui_render(&kb, &km, &kh);
+            int idx[64];
+            int n = 0;
+            for (int i = 0; i < kh.n && n < 64; i++)
+               if (kh.box[i].kind == ACT_MENU &&
+                   ((kh.box[i].arg >= 100 && kh.box[i].arg <= MA_OK) ||
+                    kh.box[i].arg == MA_DOT))
+                  idx[n++] = i;
+            for (int a = 0; a < n; a++)
+               for (int b = a + 1; b < n; b++) {
+                  int ia   = idx[a];
+                  int ib   = idx[b];
+                  int rowa = kh.box[ia].y;
+                  int rowb = kh.box[ib].y;
+                  if (rowb < rowa - 4 ||
+                      (rowb < rowa + 4 && kh.box[ib].x < kh.box[ia].x)) {
+                     int t  = idx[a];
+                     idx[a] = idx[b];
+                     idx[b] = t;
+                  }
+               }
+            if (n != 13) {
+               printf("  FAIL: IP keypad at %dx%d recorded %d key targets, "
+                      "want 13\n",
+                      ipgeo[g][0], ipgeo[g][1], n);
+               fail = 1;
+               continue;
+            }
+            for (int k = 0; k < 13; k++)
+               if (kh.box[idx[k]].arg != ipwant[k] || kh.box[idx[k]].w < 8 ||
+                   kh.box[idx[k]].h < 8) {
+                  printf("  FAIL: IP keypad at %dx%d position %d carries arg "
+                         "%d (%dx%d px), want %d at fingertip size\n",
+                         ipgeo[g][0], ipgeo[g][1], k, kh.box[idx[k]].arg,
+                         kh.box[idx[k]].w, kh.box[idx[k]].h, ipwant[k]);
+                  fail = 1;
+                  break;
+               }
+         }
+         printf("uitest: IP keypad grid verified (5 rows, dot key, wide OK)\n");
+      }
+
       /* EVERY MODAL MUST CARRY ITS OWN ESCAPE CODE, and ui_hit must return it.
        *
        * The existing dead-end sweep only checks that SOME box has w>0 and h>0
@@ -1108,6 +1337,13 @@ int main(void)
              {SCR_FORGET,   MA_FORGET_NO,   "FORGET"  },
              {SCR_SENSTYPE, MA_SENSOR_BACK, "SENSTYPE"},
              {SCR_LABEL,    MA_KP_CLOSE,    "LABEL"   },
+             {SCR_PAIRCONF, MA_PAIR_NO,     "PAIRCONF"},
+             {SCR_ADDMENU,  MA_CLOSE,       "ADDMENU" },
+             {SCR_INSULIN,  MA_INS_DISCARD, "INSULIN" },
+             {SCR_PRIMPICK, MA_CLOSE,       "PRIMPICK"},
+             {SCR_PERMS,    MA_PERMS_BACK,  "PERMS"   },
+             {SCR_OLDDEV,   MA_OLDDEV_BACK, "OLDDEV"  },
+             {SCR_RECONF,   MA_RECON_NO,    "RECONF"  },
          };
          struct ANativeWindow_Buffer eb = {.width  = W,
                                            .height = TALL_H,
@@ -1247,6 +1483,33 @@ int main(void)
       ui_render(&tall, &ms, &h);
       if (count_color(&tall, 0xFF8A8AA0) > 0) {
          printf("  FAIL: orphan styling applied with an empty registry\n");
+         fail = 1;
+      }
+
+      /* Legacy (src 0) points must NOT follow the primary flag. Attributing
+       * them to the current primary at display time meant that promoting a
+       * freshly paired sensor to primary re-labelled days of another sensor's
+       * pre-registry data with the new sensor's colour. Render the same
+       * legacy-only history with and without a distinctively coloured primary:
+       * the primary's colour count must not change. */
+      struct ui_sensor lp   = sens[1]; /* colour 1, distinct */
+      lp.primary            = 1;
+      struct ui_point lh[1] = {
+          {.t = now_ts - 2100, .glu = 160, .src = 0}
+      };
+      ms.hist     = lh;
+      ms.nhist    = 1;
+      ms.sensors  = &lp;
+      ms.nsensors = 1;
+      ui_render(&tall, &ms, &h);
+      long with_pt = count_color(&tall, ui_sensor_color(lp.color));
+      ms.nhist     = 0;
+      ui_render(&tall, &ms, &h);
+      long without_pt = count_color(&tall, ui_sensor_color(lp.color));
+      printf("uitest: legacy-vs-primary px with=%ld without=%ld\n", with_pt,
+             without_pt);
+      if (with_pt != without_pt) {
+         printf("  FAIL: legacy (src 0) point styled as the current primary\n");
          fail = 1;
       }
    }

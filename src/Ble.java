@@ -43,17 +43,22 @@ public final class Ble {
     /* ---- settings-menu helpers (ctx is the NativeActivity, i.e. an Activity) ---- */
 
     /* EXPORT DATA: build ONE file -- sensors.csv (the device map), a blank line,
-     * then readings.csv (the log) -- and hand it to another app via the system
-     * share sheet. The content:// URI comes from PancraFiles (see the manifest);
-     * FLAG_GRANT_READ_URI_PERMISSION lets the chosen app read it. */
+     * readings.csv (the glucose log), a blank line, then insulin.csv (the dose
+     * log) -- and hand it to another app via the system share sheet. Each
+     * section carries its own '#' header row, so the three stay self-describing
+     * and a reader can tell them apart. The content:// URI comes from
+     * PancraFiles (see the manifest); FLAG_GRANT_READ_URI_PERMISSION lets the
+     * chosen app read it. */
     public static void exportData(Context ctx) {
         try {
             java.io.File dir = ctx.getFilesDir();
             java.io.File out = new java.io.File(dir, "pancra.csv");
             java.io.FileOutputStream os = new java.io.FileOutputStream(out);
             copyInto(os, new java.io.File(dir, "sensors.csv"));
-            os.write('\n'); /* blank line between the two sections */
+            os.write('\n'); /* blank line between sections */
             copyInto(os, new java.io.File(dir, "readings.csv"));
+            os.write('\n');
+            copyInto(os, new java.io.File(dir, "insulin.csv"));
             os.close();
             if (out.length() == 0) return;
             Uri uri = Uri.parse("content://com.jk.pancra.files/pancra.csv");
@@ -75,6 +80,54 @@ public final class Ble {
         int n;
         while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
         is.close();
+    }
+
+    /* ---- REMOTE push: one datapoint per call to the configured server ---- */
+
+    /* One background thread with a small BOUNDED queue. Pushes must never block
+     * the BLE binder thread that decoded the reading (it holds the driver lock),
+     * and an unreachable server must not accumulate work without bound -- when
+     * the queue fills, the OLDEST pending push is dropped: the server's page
+     * shows recent data, so the newest points are the ones worth keeping. */
+    private static final java.util.concurrent.ThreadPoolExecutor pushExec =
+        new java.util.concurrent.ThreadPoolExecutor(0, 1, 30,
+            java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<Runnable>(64),
+            new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
+
+    /* Called from native on every newly stored datapoint (CGM, backfill, and
+     * meter fingersticks alike). Enqueue-and-return; the network happens on
+     * pushExec's thread. The body is one line of plain text --
+     * "<epoch seconds> <mg/dL>\n" -- POSTed to http://ip:port/ (glucoserve.py
+     * appends it to data.txt). Failures are logged and dropped: the phone's
+     * readings.csv stays the record of truth, the remote page is a mirror. */
+    public static void remotePush(final String ip, final int port,
+                                  final long t, final int glu) {
+        try {
+            pushExec.execute(new Runnable() { @Override public void run() {
+                java.net.HttpURLConnection c = null;
+                try {
+                    c = (java.net.HttpURLConnection)
+                        new java.net.URL("http", ip, port, "/").openConnection();
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(5000);
+                    c.setRequestMethod("POST");
+                    c.setDoOutput(true);
+                    byte[] body = (t + " " + glu + "\n").getBytes("UTF-8");
+                    c.setFixedLengthStreamingMode(body.length);
+                    java.io.OutputStream os = c.getOutputStream();
+                    os.write(body);
+                    os.close();
+                    int code = c.getResponseCode();
+                    if (code / 100 != 2)
+                        Log.i(TAG, "remote push: HTTP " + code);
+                } catch (Throwable e) {
+                    Log.i(TAG, "remote push: " + e);
+                } finally {
+                    if (c != null) c.disconnect();
+                }
+            }});
+        } catch (Throwable e) { Log.i(TAG, "remote push enqueue: " + e); }
     }
 
     /* mode: 0 portrait, 1 landscape, 2 gravity (sensor always), 3 system (sensor

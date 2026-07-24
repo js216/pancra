@@ -37,6 +37,15 @@ public final class PancraService extends Service {
     private static final long WAKE_INTERVAL_MS = 5 * 60 * 1000L;   /* ~one sensor cycle */
     private static PowerManager.WakeLock wakelock;
 
+    /* LAST glucose notification content, cached so EVERY (re)post of the
+     * foreground notification -- including the wake-alarm restart every cycle --
+     * re-shows the value + plot instead of a placeholder. Without this, each
+     * onStartCommand stamped the plain "Reading glucose" over the live reading,
+     * so the shade showed neither number nor plot until the next reading. */
+    private static volatile String sTitle, sText;
+    private static volatile int[] sPx;
+    private static volatile int sW, sH;
+
     /* Hold a partial wakelock so the CPU keeps processing BLE while the screen is
      * off. The foreground service keeps the process alive, but without this the
      * CPU can suspend between the sensor's 5-min cycles and the reconnect stalls.
@@ -84,56 +93,62 @@ public final class PancraService extends Service {
         return id != 0 ? id : android.R.drawable.ic_dialog_info;
     }
 
-    private Notification build() {
-        NotificationManager nm = getSystemService(NotificationManager.class);
+    /* Build the ongoing notification. If a glucose reading has been seen, this
+     * reconstructs the FULL notification (value + trend in the title, plot as
+     * both the collapsed large-icon and the expanded big-picture) from the
+     * cache -- so a restart or wake-alarm re-post never downgrades it to a bare
+     * placeholder. Before the first reading it shows "Reading glucose". */
+    private static Notification buildNotif(Context app) {
+        NotificationManager nm = app.getSystemService(NotificationManager.class);
         nm.createNotificationChannel(
             new NotificationChannel(CH, "Pancra", NotificationManager.IMPORTANCE_LOW));
-        /* tapping the notification brings the app back to the foreground */
-        Intent open = new Intent(this, android.app.NativeActivity.class);
+        Intent open = new Intent(app, android.app.NativeActivity.class);
         open.setAction(Intent.ACTION_MAIN);
         open.addCategory(Intent.CATEGORY_LAUNCHER);
         open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+        PendingIntent pi = PendingIntent.getActivity(app, 0, open,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(this, CH)
-            .setContentTitle("Pancra")
-            .setContentText("Reading glucose")
-            .setSmallIcon(notifIcon(this))
+        String title = (sTitle != null) ? sTitle : "Pancra";
+        String text  = (sText  != null) ? sText  : "Reading glucose";
+        Notification.Builder b = new Notification.Builder(app, CH)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(notifIcon(app))
             .setContentIntent(pi)
             .setOngoing(true)
-            .build();
+            .setOnlyAlertOnce(true);
+        int[] px = sPx; int w = sW; int h = sH;
+        if (px != null && w > 0 && h > 0 && px.length >= w * h) {
+            Bitmap bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
+            /* Large icon shows the plot in the COLLAPSED view; BigPicture shows
+             * the full plot when expanded (bigLargeIcon(null) hides the small
+             * duplicate there). So the plot is visible either way. */
+            b.setLargeIcon(bmp);
+            b.setStyle(new Notification.BigPictureStyle()
+                .bigPicture(bmp).bigLargeIcon((Bitmap) null));
+        }
+        return b.build();
+    }
+
+    private Notification build() {
+        return buildNotif(this);
     }
 
     /* Update the ongoing (foreground-service) notification with the live glucose
-     * value + trend and a small 3H plot bitmap (px = ARGB int[w*h]), so the
-     * reading shows on the lock screen and in the shade. Called from native on
-     * each new reading. Uses the same notification id (1) so it just refreshes
-     * the FGS notification; setOnlyAlertOnce so refreshes never buzz. */
+     * value + trend and a small 3H plot bitmap (px = ARGB int[w*h]). Called from
+     * native on each new reading. Caches the content so subsequent restarts /
+     * wakes re-post the SAME rich notification (see buildNotif); uses id 1 so it
+     * refreshes the FGS notification, setOnlyAlertOnce so refreshes never buzz. */
     public static void showGlucose(Context ctx, String title, String text,
                                    int[] px, int w, int h) {
         try {
             Context app = ctx.getApplicationContext();
-            NotificationManager nm = app.getSystemService(NotificationManager.class);
-            nm.createNotificationChannel(
-                new NotificationChannel(CH, "Pancra", NotificationManager.IMPORTANCE_LOW));
-            Intent open = new Intent(app, android.app.NativeActivity.class);
-            open.setAction(Intent.ACTION_MAIN);
-            open.addCategory(Intent.CATEGORY_LAUNCHER);
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            PendingIntent pi = PendingIntent.getActivity(app, 0, open,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-            Notification.Builder b = new Notification.Builder(app, CH)
-                .setContentTitle(title)
-                .setContentText(text)
-                .setSmallIcon(notifIcon(app))
-                .setContentIntent(pi)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true);
+            sTitle = title; sText = text;
             if (px != null && w > 0 && h > 0 && px.length >= w * h) {
-                Bitmap bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
-                b.setStyle(new Notification.BigPictureStyle().bigPicture(bmp));
+                sPx = px; sW = w; sH = h;
             }
-            nm.notify(1, b.build());
+            NotificationManager nm = app.getSystemService(NotificationManager.class);
+            nm.notify(1, buildNotif(app));
         } catch (Throwable t) { Log.i("pancra", "showGlucose: " + t); }
     }
 

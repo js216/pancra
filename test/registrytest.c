@@ -202,6 +202,46 @@ int main(void)
       "id 0 (legacy/unregistered) resolves to no row");
    ck(sensor_rec_by_id(-5) == 0, "a negative id resolves to no row");
 
+   printf("== completion fills missing attributes without forking the id ==\n");
+   /* A sensor is now registered the moment the user commits to pairing it, so
+    * its row is minted BARE (no model/fw, activation unknown) and completed
+    * later, when the DIS strings and the session clock arrive. The mechanism
+    * must fill only what is missing, survive a reload, and never touch the
+    * id -- the old completion path (mint a second id + rebind) is exactly the
+    * orphan bug the MAC-only identity key was built to end. */
+   {
+      fresh();
+      int c1 = sensor_mint(SENSOR_G7, "55:55:55:55:55:55", "", "", "", 0);
+      ck(c1 > 0, "a bare mint (no attributes yet) succeeds");
+      ck(sensor_complete(c1, "", "SW77", "2.1.0", 7777) == 1,
+         "completing the bare row reports work done");
+      const struct sensor_rec *cr = sensor_rec_by_id(c1);
+      ck(cr && !strcmp(cr->model, "SW77") && !strcmp(cr->fw, "2.1.0") &&
+             cr->activation == 7777,
+         "...and the row now carries model, fw and activation");
+      ck(sensor_complete(c1, "", "SW77", "2.1.0", 7777) == 0,
+         "completing again is a no-op (idempotent)");
+      ck(sensor_complete(c1, "", "EVIL", "9.9.9", 1) == 0,
+         "a learned value is never overwritten by a later claim");
+      cr = sensor_rec_by_id(c1);
+      ck(cr && !strcmp(cr->model, "SW77") && cr->activation == 7777,
+         "...so the original truth stands");
+      sensors_load(); /* the corrected row must be the one that loads back */
+      cr = sensor_rec_by_id(c1);
+      ck(cr && !strcmp(cr->model, "SW77") && !strcmp(cr->fw, "2.1.0") &&
+             cr->activation == 7777,
+         "completion survives a reload (last row wins per id)");
+      int dups = 0;
+      for (int i = 0; i < g_nsrec; i++)
+         if (g_srec[i].id == c1)
+            dups++;
+      ck(dups == 1, "...as ONE cache row, not a duplicate id");
+      int after = sensor_mint(SENSOR_G7, "66:66:66:66:66:66", "", "", "", 0);
+      ck(after > c1, "minting after a completion still climbs past every id");
+      ck(sensor_complete(4242, "", "M", "1", 1) == 0,
+         "completing an unknown id is a refused no-op");
+   }
+
    printf("== the FILE parsers: rows this process did not write ==\n");
    /* Everything above round-trips rows the app itself wrote, so the parsers
     * were never exercised on anything unexpected -- 16 of 18 mutants of

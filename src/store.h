@@ -82,9 +82,14 @@ int hist_insert(long t, int glu, int trend, int src, int kind);
  * The `glu` passed is the ALREADY-rescaled value. */
 void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                   long raw, long tz, int kind, int rescale_pm);
-/* Recompute g_cur_* from the newest CGM sample in g_hist, preferring source
- * `prime` (the primary sensor's id, or -1 for none). A BGM fingerstick is
- * never eligible. Call with the history lock held after any insert.
+/* Recompute g_cur_* from the newest CGM sample in g_hist. With a primary
+ * configured (`prime` >= 0), ONLY the primary's samples qualify: a primary
+ * with no data yet clears the current reading (glu -1 = none) rather than
+ * borrowing another sensor's -- the primary IS the big-number contract. Only
+ * with no primary at all (prime -1: no CGM registered, e.g. a pre-registry
+ * install) does the newest sample of any CGM source fill in. A BGM
+ * fingerstick is never eligible. Call with the history lock held after any
+ * insert, and after any primary change.
  *
  * `prime` is passed in rather than looked up because the caller must resolve it
  * under the registry lock BEFORE taking hist_lock: looking it up here would be

@@ -429,7 +429,12 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
 
    char big[8];
    uint32_t bigcol = 0;
-   if (m->stale) {
+   /* glu < 0 is "no current reading" -- the primary has no data yet (the big
+    * number never borrows another sensor's). With NO live CGM at all the big
+    * number is meaningless, so it (and its age below) blank out entirely
+    * rather than showing a stale value from a disconnected sensor. Same
+    * placeholder as stale. */
+   if (m->stale || m->glu < 0 || !m->has_cgm) {
       (void)snprintf(big, sizeof big, "---");
       bigcol = 0xFF888888;
    } else {
@@ -443,14 +448,17 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    /* Sized for the widest formatted age. `a` is clamped below, but the
     * compiler cannot see that, and a genuinely huge value would truncate. */
    char agestr[24];
-   if (m->stale)
+   if (m->stale || m->glu < 0 || !m->has_cgm)
       (void)snprintf(tr, sizeof tr, "---");
    else
       fmt_trend(m->trend, tr, sizeof tr);
    long a = m->now - m->t;
    if (a < 0)
       a = 0;
-   if (a < 600)
+   if (m->t <= 0 ||
+       !m->has_cgm) /* no live CGM (or no reading): blank the age */
+      (void)snprintf(agestr, sizeof agestr, "--");
+   else if (a < 600)
       (void)snprintf(agestr, sizeof agestr, "%ld S", a);
    else
       (void)snprintf(agestr, sizeof agestr, "%ld M", a / 60);
@@ -471,6 +479,13 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    if (bx < cx + (2 * sc))
       bx = cx + (2 * sc);
    draw_str(px, fb, bx, y, bigsc, big, bigcol);
+   /* The NUMBER ITSELF is the choose-primary target: with more than one
+    * active CGM the shell opens the CHOOSE PRIMARY screen (it knows the live
+    * session count; the renderer does not), with zero or one it ignores the
+    * tap -- so this never navigates away by accident, which is why the old
+    * whole-band settings target was removed. The glyphs only, not the band:
+    * the hamburger (settings) and the tab row keep their own pixels. */
+   add_hit(h, bx, y, big_w, 7 * bigsc, ACT_PICK_PRIMARY, 0);
    int colx  = bx + big_w + gap;
    int gh    = 7 * sc;    /* a label glyph is 7 rows tall */
    int num_h = 7 * bigsc; /* the big number's exact glyph height */
@@ -566,17 +581,37 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    }
    y += rowh;
 
-   /* fixed-scale plot -- fixed height in portrait, fills the column landscape
-    */
-   int ph = landscape ? (bottom - y - (26 * sc)) : 12 * bigsc;
-   /* The expired-sensor prompt is appended below everything else, so in
-    * portrait it has to be paid for HERE -- it used to be drawn past the
-    * bottom of the buffer on every 16:9/18:9 phone, which meant the one
-    * in-app affordance to pair a replacement did not exist at the moment the
-    * sensor expired. Scrolling is ruled out, so the plot yields the space. */
-   int expired = (m->have_reading && m->session_seconds >= 15L * 86400);
-   if (expired && !landscape)
-      ph -= (3 * 16 * sc) + (10 * sc); /* 2*lh gap + second line + hit pad */
+   /* Plot height: in landscape it fills the column; in PORTRAIT it grows to
+    * consume the screen down to a RESERVED band that exactly holds the info
+    * block plus the alarm banner with a blank line above and below the alarm's
+    * large letters -- so the bottom is never a large dead gap, and the layout
+    * does not jump when an alarm appears (the space is always held).
+    *
+    * The reserve is the info block's own vertical budget (render_info's needv:
+    * 5 info rows + gap + 4 stat rows + the banner's advance and 7*5 glyph) plus
+    * one blank line (16) for the gap BELOW the alarm. render_info fits itself
+    * into whatever is left, so reserving at least this much can only leave it
+    * room to spare -- never clip. */
+   /* Reserve, in sc units, everything drawn between the plot bottom and the
+    * screen bottom AT FULL FONT:
+    *   34 = what render_glucose itself adds after the plot (the ALARM LOW/HIGH
+    *        config row: 9 gap + 7 row + 18 portrait pad),
+    *  202 = render_info's own budget (needv: 5 info rows + gap + 4 stat rows +
+    *        the banner's advance and glyph),
+    *   16 = one blank line BELOW the alarm's large letters.
+    * Reserving render_info's full budget keeps its font at sc (it only
+    * downscales when squeezed), which is the point -- the plot grows into the
+    * dead space, the text below it does NOT shrink. */
+   int reserve = (34 + 202 + 16) * sc;
+   int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
+   int ph   = 0;
+   if (landscape)
+      ph = bottom - y - (26 * sc);
+   else
+      /* Never below the old fixed height (short screens keep exactly the
+       * previous layout, so nothing that used to fit now clips); grow only
+       * into genuine excess on taller screens. */
+      ph = (grow > 12 * bigsc) ? grow : 12 * bigsc;
    if (ph < 20 * sc)
       ph = 20 * sc;
    int plot_x = cx + (2 * sc);
@@ -607,14 +642,15 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       pts[i].size   = MARK_SIZE_DEF;
       int matched   = 0;
       for (int k = 0; k < m->nsensors; k++) {
-         /* Pre-registry legacy CGM readings (src 0) are this user's own earlier
-          * data from before the registry existed -- one CGM behind all of it --
-          * so attribute them to the PRIMARY sensor at DISPLAY time. That
-          * colours the whole trace consistently (not just post-migration
-          * points) without rewriting the append-only readings log. */
-         int primary_legacy = (m->hist[i].src == 0 && m->sensors[k].primary &&
-                               m->hist[i].kind != KIND_BGM);
-         if (m->sensors[k].id == m->hist[i].src || primary_legacy) {
+         /* Pre-registry legacy readings (src 0) match NO sensor and keep the
+          * default value-based styling below. They used to be attributed to
+          * the PRIMARY sensor at display time ("one CGM behind all of it"),
+          * but the primary flag is mutable: the moment the user made a
+          * freshly paired G7 primary, days of another sensor's legacy data
+          * flipped to the G7's colour and marker on the plot -- a provenance
+          * lie the append-only log exists to prevent. Unknown provenance is
+          * rendered as the neutral main trace, never as a live device. */
+         if (m->sensors[k].id == m->hist[i].src && m->hist[i].src != 0) {
             matched       = 1;
             pts[i].col    = ui_sensor_color(m->sensors[k].color);
             pts[i].marker = m->sensors[k].marker; /* shape applies to ALL,
@@ -626,13 +662,14 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
             break;
          }
       }
-      /* A source with no live slot is ORPHANED, not primary: its sensor was
-       * forgotten, or it was re-minted under a new id (a firmware bump does
-       * that). Leaving it at the default styling drew a stranger's readings as
-       * the main trace -- a forgotten meter's fingersticks would appear to be
-       * CGM data. Draw it muted and crossed so it reads as "historical, not
-       * from a sensor you still have". src 0 is pre-registry legacy data,
-       * which genuinely IS the primary trace, so it keeps the default. */
+      /* A DISCONNECTED (old) device keeps its slot, so it is matched by the
+       * loop above and its historical trace stays in the device's own marker
+       * and colour -- consistent with what the OLD DEVICES menu shows. Only a
+       * source with NO slot at all (re-minted under a new id, e.g. a firmware
+       * bump) is a true orphan: draw it muted and crossed so it reads as
+       * "historical, not from a sensor you still have". src 0 is pre-registry
+       * legacy data, which genuinely IS the primary trace, so it keeps the
+       * default. */
       if (!matched && m->nsensors > 0 && m->hist[i].src != 0) {
          pts[i].marker = MARK_CROSS;
          pts[i].col    = UI_ORPHAN;
@@ -688,8 +725,8 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    return y;
 }
 
-/* Right/bottom column: sensor+session panel, rolling-stats table, alarm banner,
- * and the tappable "SENSOR EXPIRED" prompt. */
+/* Right/bottom column: sensor+session panel, rolling-stats table and the
+ * alarm banner. */
 static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                         struct hits *h, int cx, int cw, int y, int sc)
 {
@@ -704,12 +741,10 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * indication that the user is out of range, so it must render.
     *
     * Vertical budget in units of sc: 4 info rows (4*16) + a 7 gap + 4 stats
-    * rows (4*16) + the banner (7+9 advance, then a 7*5 glyph), plus the
-    * expired prompt (2*16 advance + a 16 line + 10 hit pad) when shown.
+    * rows (4*16) + the banner (7+9 advance, then a 7*5 glyph).
     * Horizontal: the stats rows format 34 fixed columns plus a units label of
     * up to 6, and a glyph is 6*sc wide -- so 40*6 = 240 units of sc, which is
     * wider than UI_COLS implies and was clipping "MG/DL" off the right edge. */
-   int expired = (m->have_reading && m->session_seconds >= 15L * 86400);
    /* Fit to the space left below the plot in BOTH axes -- the downscale is
     * kept, because it is what makes this block fit on smaller screens. The bug
     * was not the downscale, it was OVER-BUDGETING the width: `wide` reserved 53
@@ -723,9 +758,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * budget. On a normal-width phone this yields the same `sc` as everywhere
     * else; on a narrow or split-screen window it still steps down gracefully.
     */
-   int needv = (4 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
-   if (expired)
-      needv += (2 * 16) + 16 + 10;
+   int needv  = (5 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
    int availv = fb->height - y;
    int vsc    = availv > 0 ? availv / needv : 1;
    int hsc    = cw / (2 + (35 * 6)); /* 35 = the stats table's fixed width */
@@ -744,7 +777,40 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * and the stats rows (4 + 5*6 + a 6-char unit, with each cell up to 15 now
     * that hc[] is wider). 96 covers both with room to spare. */
    char row[96];
-   if (m->bonded) {
+   /* PRIMARY row (top of the block): the marker glyph + label of the CGM that
+    * owns the big number, so at a glance you know WHICH sensor this block and
+    * the number describe. Dashes when no CGM is primary. */
+   {
+      int pk = -1;
+      for (int k = 0; k < m->nsensors; k++)
+         if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
+            pk = k;
+            break;
+         }
+      if (pk >= 0) {
+         const struct ui_sensor *ps = &m->sensors[pk];
+         draw_str(px, fb, x, y, sc, "PRIMARY", col);
+         /* glyph in the sensor's colour, centred in its own cell, then the
+          * label a FULL character-cell further right -- the same marker + gap
+          * + name spacing the SETTINGS and PRIMARY CGM lists use. */
+         int gx = x + (8 * 6 * sc);
+         if (ps->marker != MARK_HIDE)
+            plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                              gx + (3 * sc), y + (3 * sc), 2 * sc, ps->marker,
+                              ui_sensor_color(ps->color));
+         draw_str(px, fb, gx + (2 * 6 * sc), y, sc, ps->label, col);
+      } else {
+         draw_str(px, fb, x, y, sc, "PRIMARY --", col);
+      }
+      y += lh;
+   }
+   if (!m->has_cgm) {
+      /* No CGM registered: this whole block describes a CGM, so it must NOT
+       * borrow the global status line (a meter sync leaves it "SYNCED") or
+       * a stale session. Blank STATE here; SESSION and PRED/SEQ blank below
+       * on the same flag. STORED is a global reading count and stays. */
+      (void)snprintf(row, sizeof row, "STATE   --");
+   } else if (m->bonded) {
       (void)snprintf(row, sizeof row, "STATE   CONNECTED");
    } else {
       /* TRUNCATE the status so the ENTIRE row fits the column at the normal
@@ -774,20 +840,108 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    (void)snprintf(row, sizeof row, "STORED  %d readings", m->stored);
    draw_str(px, fb, x, y, sc, row, col);
    y += lh;
-   if (m->have_reading) {
-      long ss   = m->session_seconds;
-      long left = (15L * 86400) - ss;
-      if (left < 0)
-         left = 0;
-      (void)snprintf(row, sizeof row, "SESSION %ldD %ldH   LEFT %ldD %ldH",
-                     ss / 86400, (ss % 86400) / 3600, left / 86400,
-                     (left % 86400) / 3600);
+   if (!m->has_cgm) {
+      /* CGM-only row, blanked when no CGM exists (see STATE above). The PRED
+       * row is blanked on the same flag further down. */
+      draw_str(px, fb, x, y, sc, "SESSION --", col);
+   } else if (m->have_reading) {
+      long ss = m->session_seconds;
+      /* The PRIMARY CGM's own wear budget (per-device: user override, DIS
+       * model, or type default -- see sensor_wear_seconds), and whether it
+       * has delivered yet (warmup detection). */
+      long len   = 15L * 86400;
+      long plast = -1;
+      for (int k = 0; k < m->nsensors; k++)
+         if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
+            if (m->sensors[k].wear_len > 0)
+               len = m->sensors[k].wear_len;
+            plast = m->sensors[k].last;
+            break;
+         }
+      (void)plast;
+      if (m->sess_state == SENSOR_STATE_WARMUP ||
+          (m->sess_state == 0 && ss > 0 && ss < SENSOR_WARMUP_S)) {
+         /* The primary is mid-warmup, per the SENSOR'S OWN state byte (or
+          * the clock heuristic before any 4e answered). Count the warmup
+          * down to the second (the live clock from driver_get_session is
+          * what makes this match the official reader). Warmup readings are
+          * recorded and shown as the big number meanwhile. */
+         long r = SENSOR_WARMUP_S - ss;
+         if (r < 0)
+            r = 0;
+         (void)snprintf(row, sizeof row, "SESSION WARMUP %ld:%02ld LEFT",
+                        r / 60, r % 60);
+         draw_str(px, fb, x, y, sc, row, 0xFF00CCFF);
+      } else {
+         long left = len - ss;
+         (void)snprintf(row, sizeof row, "SESSION %ldD %ldH   ", ss / 86400,
+                        (ss % 86400) / 3600);
+         draw_str(px, fb, x, y, sc, row, col);
+         /* The countdown is drawn separately so imminence can carry colour: the
+          * last day counts in hours and minutes (a bare "0D" reads as already
+          * over), in YELLOW, turning RED inside the final two hours. Past the
+          * nominal end the sensor still runs for SENSOR_GRACE_S, so the row
+          * says exactly that -- GRACE and what is left of it -- rather than the
+          * old dead-end "LEFT 0D 0H"; after the grace too, ENDED. */
+         char lrow[48];
+         uint32_t lcol = col;
+         long grace    = left + SENSOR_GRACE_S; /* time to the hard stop */
+         if (m->sess_state == SENSOR_STATE_ENDED) {
+            /* The sensor SAID the session is over -- its own state byte,
+             * not arithmetic on a wear budget. The one allowed ENDED. */
+            (void)snprintf(lrow, sizeof lrow, "ENDED");
+            lcol = 0xFF4466FF;
+         } else if (left <= 0) {
+            /* Past the nominal end the sensor still runs for SENSOR_GRACE_S,
+             * so count THAT down -- and past the grace too, keep counting into
+             * the NEGATIVE rather than switching to a dead-end word: the sign
+             * says "past the hard stop" while still showing by how much, which
+             * stays honest even when the wear budget is set wrong for a sensor
+             * that is visibly alive. Minutes-only inside the last hour, so
+             * the boundary never renders as the nonsense "-0H 0M". */
+            long ag        = (grace < 0) ? -grace : grace;
+            const char *sg = (grace <= -60) ? "-" : "";
+            if (ag >= 3600)
+               (void)snprintf(lrow, sizeof lrow, "GRACE %s%ldH %ldM", sg,
+                              ag / 3600, (ag % 3600) / 60);
+            else
+               (void)snprintf(lrow, sizeof lrow, "GRACE %s%ldM", sg, ag / 60);
+            lcol = (grace < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+         } else if (left < 86400) {
+            (void)snprintf(lrow, sizeof lrow, "LEFT %ldH %ldM", left / 3600,
+                           (left % 3600) / 60);
+            lcol = (left < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+         } else {
+            (void)snprintf(lrow, sizeof lrow, "LEFT %ldD %ldH", left / 86400,
+                           (left % 86400) / 3600);
+         }
+         draw_str(px, fb, x + (str_len(row) * 6 * sc), y, sc, lrow, lcol);
+      }
    } else {
-      (void)snprintf(row, sizeof row, "SESSION --");
+      /* No reading yet: if the primary is in its warmup window, SAY so with
+       * the minutes left -- an unexplained "--" for the first half hour of a
+       * new sensor reads as broken, and warmup is the one wait that is by
+       * design. */
+      long wpair = 0;
+      for (int k = 0; k < m->nsensors; k++)
+         if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
+            if (m->sensors[k].last == 0)
+               wpair = m->sensors[k].paired;
+            break;
+         }
+      if (wpair > 0 && m->now - wpair < SENSOR_WARMUP_S) {
+         (void)snprintf(row, sizeof row, "SESSION WARMUP ~%ldM LEFT",
+                        (wpair + SENSOR_WARMUP_S - m->now) / 60);
+         draw_str(px, fb, x, y, sc, row, 0xFF00CCFF);
+      } else {
+         (void)snprintf(row, sizeof row, "SESSION --");
+         draw_str(px, fb, x, y, sc, row, col);
+      }
    }
-   draw_str(px, fb, x, y, sc, row, col);
    y += lh;
-   if (m->have_reading) {
+   /* PRED/SEQ blanks when there is no CGM (block is CGM-only) OR no reading
+    * yet -- one condition, so the two identical blank bodies are one. */
+   if (m->has_cgm && m->have_reading) {
       /* predicted is a 10-bit field; 0x3ff (1023) is the sensor's "no
        * prediction" sentinel and no real value exceeds Dexcom's 400 mg/dL cap
        * -- show "--" rather than the raw sentinel. SEQ is still valid. */
@@ -812,6 +966,19 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
          add_hit(h, cx, info_y0, cw, y - info_y0, ACT_MENU, MA_SENSOR + k);
          break;
       }
+   /* A big '+' in the empty space right of the table: the ADD entry point
+    * (new device / log insulin) reachable without a trip through SETTINGS.
+    * Recorded AFTER the block shortcut above -- ui_hit takes the LAST box, so
+    * the '+' wins inside its own square and the shortcut keeps the rest. */
+   {
+      int psc = 3 * sc;
+      int pw  = 6 * psc;
+      int pxx = cx + cw - pw - (2 * sc);
+      int pyy = info_y0 + (((y - info_y0) - (7 * psc)) / 2);
+      draw_str(px, fb, pxx, pyy, psc, "+", 0xFFCCCCCC);
+      add_hit(h, pxx - (3 * sc), info_y0, pw + (5 * sc), y - info_y0, ACT_MENU,
+              MA_ADD_OPEN);
+   }
 
    /* rolling stats table: TIR / AVG / A1C across 1D/3D/7D/30D/90D */
    char tc[5][8];
@@ -853,8 +1020,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    uint32_t c      = 0;
    if (m->disc_alarmed) {
       msg = "STALE";
-      /* Distinct from the SENSOR EXPIRED prompt's colour for the same reason.
-       */
+      /* A banner-only colour, for the same visibility-check reason as LOW. */
       c = 0xFF00D0FF;
    } else if (m->now - m->t <= 360) {
       if (m->glu < m->alarm_low) {
@@ -885,27 +1051,10 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, mx, y, msc, msg, c);
    }
 
-   /* past its rated 15-day life: a tappable prompt to pair a replacement.
-    * render_glucose reserves the space for this by shortening the plot (they
-    * are stacked in portrait), and the clamp below is the backstop. */
-   if (expired) {
-      const char *l1 = "SENSOR EXPIRED";
-      const char *l2 = "PAIR NEW SENSOR ...";
-      uint32_t ec    = 0xFF00A0FF;
-      int w1         = str_len(l1) * 6 * sc;
-      int w2         = str_len(l2) * 6 * sc;
-      y += 2 * lh;
-      /* Backstop: whatever the layout above did, this must land inside the
-       * buffer. An off-screen prompt is not a cosmetic defect here -- it is
-       * the only route to pairing a replacement sensor, and it is untappable
-       * as well as invisible. */
-      int maxy = fb->height - lh - (10 * sc);
-      if (y > maxy)
-         y = maxy > 0 ? maxy : 0;
-      draw_str(px, fb, cx + ((cw - w1) / 2), y, sc, l1, ec);
-      draw_str(px, fb, cx + ((cw - w2) / 2), y + lh, sc, l2, ec);
-      add_hit(h, cx, y - (3 * sc), cw, lh + (10 * sc), ACT_PAIR_NEW, 0);
-   }
+   /* No SENSOR EXPIRED prompt any more: it read as an error banner and
+    * confused more than it helped, and the main-screen '+' (ADD -> NEW
+    * DEVICE) is now a permanent, calmer route to pairing a replacement. The
+    * SESSION row's GRACE/ENDED countdown is what states expiry. */
 }
 
 /* Before any reading arrives: scan status lines + the scanned-sensor list. */
@@ -982,7 +1131,12 @@ static void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
       sc = mvsc;
    int y = (fb->height / 20) + (2 * sc); /* clear the system status bar */
 
-   if (m->glu >= 0) {
+   /* The full screen renders whenever there is anything to show: a current
+    * reading, OR any registered device (the plot may hold another sensor's
+    * trace while the primary has no data yet -- the big number then shows the
+    * "---" placeholder, not the scan screen). Only a genuinely fresh install
+    * (no reading, no devices) gets the no-reading scan screen. */
+   if (m->glu >= 0 || m->nsensors > 0) {
       if (landscape) {
          int gw   = 2 * 6 * sc;
          int cwid = (fb->width - gw) / 2;
@@ -1093,7 +1247,24 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    fmt_glu(m->plot_max, m->units, pmvv, sizeof pmvv);
    (void)snprintf(pmv, sizeof pmv, "%s %s", pmvv, UI_LBL(m->units));
    menu_row(fb, h, y, sc, lh, "PLOT MAX", pmv, 0xFFFFFFFF, MA_PLOTMAX);
-   y += 2 * lh;
+   y += lh;
+   /* REMOTE: one summary row opening the submenu, like PERMISSIONS below. The
+    * value is the push state, so whether datapoints are leaving the phone is
+    * visible without opening the submenu. */
+   menu_row(fb, h, y, sc, lh, "REMOTE", m->remote_on ? "ON" : "OFF",
+            m->remote_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_REMOTE_OPEN);
+   y += lh;
+   /* PERMISSIONS lives at the END of DISPLAY, as one summary row -- green OK
+    * when everything a CGM needs is granted, red CHECK otherwise -- opening
+    * the full submenu. The eight raw permission rows moved off this
+    * unscrollable screen so the DEVICES list gets the space. */
+   {
+      int ok = m->perm[0] && m->perm[1] && m->perm[2] && m->batt_ok &&
+               !m->bg_restricted;
+      menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
+               ok ? 0xFF33FF88 : 0xFF4466FF, MA_PERMS_OPEN);
+      y += 2 * lh;
+   }
 
    draw_str(px, fb, x, y, sc, "ALARM", 0xFF888888);
    y += lh;
@@ -1110,10 +1281,147 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
             0xFFFFFFFF, MA_NEWDATA);
    y += 2 * lh;
 
-   /* permissions + the background controls a CGM needs alive. Values are the
-    * shell's cached snapshot -- never live JNI from a render. */
-   draw_str(px, fb, x, y, sc, "PERMISSIONS", 0xFF888888);
+   /* SENSORS: one row per configured sensor, then the add action. The old
+    * single-sensor block moved into the per-sensor screen, which is what frees
+    * the space this list needs. Never scrolls -- see ui_sensor_capacity(). */
+   draw_str(px, fb, x, y, sc, "DEVICES", 0xFF888888);
    y += lh;
+   int cap = ui_sensor_capacity(fb->width, fb->height);
+   if (cap < UI_MIN_SLOTS) {
+      /* Too short a screen to show even the minimum honestly. Say so rather
+       * than silently truncating, which would read as "these are all of them".
+       */
+      draw_str(px, fb, x, y, sc, "SCREEN TOO SHORT", 0xFF4466FF);
+      y += lh;
+      draw_str(px, fb, x, y, sc, "FOR SENSOR LIST", 0xFF4466FF);
+      return;
+   }
+   int shown = 0;
+   int nold  = 0;
+   for (int i = 0; i < m->nsensors; i++)
+      if (m->sensors[i].old)
+         nold++;
+   for (int i = 0; i < m->nsensors && shown < cap; i++) {
+      const struct ui_sensor *s = &m->sensors[i];
+      if (s->old) /* disconnected: lives under OLD DEVICES, not here */
+         continue;
+      shown++;
+      char val[28]; /* status[12] + ' ' + ago[12], with room to spare */
+      char ago[12];
+      /* For a meter the age is its last SYNC, never its last fingerstick -- so
+       * "SYNCED 2 M" means synced 2 min ago, not a datapoint 2 min old. The
+       * sync time is persisted, so it survives a restart; if a meter has
+       * genuinely never synced it reads NEVER rather than mislabelling a
+       * datapoint age. */
+      long agot = (s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
+      fmt_ago(m->now, agot, ago, sizeof ago);
+      int warm_clk =
+          s->session_seconds > 0 && s->session_seconds < SENSOR_WARMUP_S;
+      int warm_est = s->session_seconds == 0 && s->paired > 0 &&
+                     m->now - s->paired < SENSOR_WARMUP_S;
+      if (s->kind == KIND_CGM && s->last == 0 && (warm_clk || warm_est)) {
+         /* Warmup: time REMAINING, not "NEVER" -- the wait is by design and
+          * the countdown says when data starts. With the sensor's own clock
+          * it is exact to the second (matching the official reader); off the
+          * pairing instant it is an estimate, and the '~' says so. */
+         if (warm_clk) {
+            long r = SENSOR_WARMUP_S - s->session_seconds;
+            (void)snprintf(val, sizeof val, "WARMUP %d:%02d", (int)(r / 60),
+                           (int)(r % 60));
+         } else {
+            long r = (s->paired + SENSOR_WARMUP_S - m->now) / 60;
+            (void)snprintf(val, sizeof val, "WARMUP ~%dM", (int)r);
+         }
+      } else {
+         (void)snprintf(val, sizeof val, "%s %s", s->status, ago);
+      }
+      /* '>' marks the primary -- the sensor that owns the big number. It goes
+       * in the label rather than left of the row, where it overlapped. The
+       * blank cell after it holds this device's plot marker (its shape, colour
+       * and size), so the list answers "which trace is which" at a glance. */
+      /* Holds the primary marker (1), the reserved glyph cell (2) plus a full
+       * label (sizeof s->label, which grew to 20 for the long OneTouch default
+       * names) plus the terminator. Undersizing it truncated the MAC tail that
+       * tells two meters apart. */
+      char name[3 + sizeof s->label];
+      (void)snprintf(name, sizeof name, "%s  %s", s->primary ? ">" : " ",
+                     s->label);
+      menu_row(fb, h, y, sc, lh, name, val,
+               s->connected ? 0xFF33FF88 : 0xFFAAAAAA, MA_SENSOR + i);
+      if (s->marker != MARK_HIDE) { /* hidden-from-plot draws no glyph */
+         /* Centred in the reserved cell (text starts at 4*sc; the cell is the
+          * second character, 6*sc wide). Radius follows the configured SIZE,
+          * clamped to the cell so a large marker cannot strike the label. */
+         int gr = (2 * sc * s->size) / MARK_SIZE_DEF;
+         if (gr < sc)
+            gr = sc;
+         if (gr > 3 * sc)
+            gr = 3 * sc;
+         plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                           (4 * sc) + (9 * sc), y + (3 * sc), gr, s->marker,
+                           ui_sensor_color(s->color));
+      }
+      y += lh;
+   }
+   if (m->pend_type > 0) {
+      /* An ARMED pairing: registered intent, no sensor on the air yet. The
+       * row is the visible promise that the code was accepted and the app is
+       * watching -- and the tap is the way to change one's mind. */
+      char pn[24];
+      (void)snprintf(pn, sizeof pn, " %s", sensor_type_name(m->pend_type));
+      menu_row(fb, h, y, sc, lh, pn, "PENDING...", 0xFF00CCFF, MA_PEND_CANCEL);
+      y += lh;
+   }
+   int nlive = m->nsensors - nold;
+   if (shown < nlive) { /* never claim to have listed them all */
+      char more[32];
+      int nmore = nlive - shown;
+      if (nmore > 99)
+         nmore = 99; /* bounded by MAX_SLOTS in practice */
+      (void)snprintf(more, sizeof more, "%d MORE NOT SHOWN", nmore);
+      draw_str(px, fb, x, y, sc, more, 0xFF4466FF);
+      y += lh;
+   }
+   /* OLD DEVICES: DISCONNECTED devices. Each keeps its full slot, so the row
+    * opens the SAME per-device menu (state EXPIRED). Only shown when there is
+    * at least one, so it never adds noise on a fresh install. */
+   if (nold > 0) {
+      char od[32];
+      (void)snprintf(od, sizeof od, "OLD DEVICES (%d)", nold);
+      menu_row(fb, h, y, sc, lh, od, ">", 0xFFAAAAAA, MA_OLDDEV_OPEN);
+      y += lh;
+   }
+   int bw = fb->width - (2 * x);
+   if (nlive < UI_MAX_SLOTS) {
+      /* A real framed button, like SYNC NOW / FORGET DEVICE, not a plain row.
+       */
+      y += lh; /* separate it from the device list above */
+      y = menu_button(fb, h, x, y, bw, sc, "ADD NEW DEVICE", 0xFFFFFFFF,
+                      MA_ADDSENSOR);
+   }
+   /* EXPORT DATA: build the combined CSV and open the system share sheet. */
+   y += lh;
+   menu_button(fb, h, x, y, bw, sc, "EXPORT DATA", 0xFFFFFFFF, MA_EXPORT);
+}
+
+/* ---- permissions + background controls (opened from SETTINGS) ---- */
+
+static void render_perms(struct ANativeWindow_Buffer *fb,
+                         const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "PERMISSIONS", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_PERMS_BACK);
+   y += 2 * lh;
+
    for (int i = 0; i < 3; i++) {
       int g = m->perm[i];
       menu_row(fb, h, y, sc, lh, ui_perm_lbl[i], g ? "GRANTED" : "DENIED",
@@ -1132,70 +1440,54 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    menu_row(fb, h, y, sc, lh, "BG EXEC",
             m->bg_restricted ? "RESTRICTED" : "ALLOWED",
             m->bg_restricted ? 0xFF4466FF : 0xFF33FF88, MA_BGEXEC);
+}
+
+/* ---- remote push (opened from SETTINGS) ---- */
+
+static void render_remote(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 14);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "REMOTE", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_REMOTE_BACK);
    y += 2 * lh;
 
-   /* SENSORS: one row per configured sensor, then the add action. The old
-    * single-sensor block moved into the per-sensor screen, which is what frees
-    * the space this list needs. Never scrolls -- see ui_sensor_capacity(). */
-   draw_str(px, fb, x, y, sc, "DEVICES", 0xFF888888);
+   const char *ip = (m->remote_ip && m->remote_ip[0]) ? m->remote_ip : 0;
+   /* PUSH reflects what will actually happen: enabling without an address set
+    * shows WAITING (amber), not ON -- nothing leaves the phone until the IP
+    * exists, and pretending otherwise would be a silent lie. */
+   const char *pv = "OFF";
+   uint32_t pc    = 0xFFFFFFFF;
+   if (m->remote_on && ip) {
+      pv = "ON";
+      pc = 0xFF33FF88;
+   } else if (m->remote_on) {
+      pv = "NO ADDRESS";
+      pc = 0xFFAA8844;
+   }
+   menu_row(fb, h, y, sc, lh, "PUSH", pv, pc, MA_REMOTE_TOGGLE);
    y += lh;
-   int cap = ui_sensor_capacity(fb->width, fb->height);
-   if (cap < UI_MIN_SLOTS) {
-      /* Too short a screen to show even the minimum honestly. Say so rather
-       * than silently truncating, which would read as "these are all of them".
-       */
-      draw_str(px, fb, x, y, sc, "SCREEN TOO SHORT", 0xFF4466FF);
-      y += lh;
-      draw_str(px, fb, x, y, sc, "FOR SENSOR LIST", 0xFF4466FF);
-      return;
-   }
-   int shown = m->nsensors < cap ? m->nsensors : cap;
-   for (int i = 0; i < shown; i++) {
-      const struct ui_sensor *s = &m->sensors[i];
-      char val[28]; /* status[12] + ' ' + ago[12], with room to spare */
-      char ago[12];
-      /* For a meter the age is its last SYNC, never its last fingerstick -- so
-       * "SYNCED 2 M" means synced 2 min ago, not a datapoint 2 min old. The
-       * sync time is persisted, so it survives a restart; if a meter has
-       * genuinely never synced it reads NEVER rather than mislabelling a
-       * datapoint age. */
-      long agot = (s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
-      fmt_ago(m->now, agot, ago, sizeof ago);
-      (void)snprintf(val, sizeof val, "%s %s", s->status, ago);
-      /* '>' marks the primary -- the sensor that owns the big number. It goes
-       * in the label rather than left of the row, where it overlapped. */
-      /* Holds the primary marker (1) plus a full label (sizeof s->label, which
-       * grew to 20 for the long OneTouch default names) plus the terminator.
-       * Undersizing it truncated the MAC tail that tells two meters apart. */
-      char name[1 + sizeof s->label];
-      (void)snprintf(name, sizeof name, "%s%s", s->primary ? ">" : " ",
-                     s->label);
-      menu_row(fb, h, y, sc, lh, name, val,
-               s->connected ? 0xFF33FF88 : 0xFFAAAAAA, MA_SENSOR + i);
-      y += lh;
-   }
-   if (shown < m->nsensors) { /* never claim to have listed them all */
-      char more[32];
-      int nmore = m->nsensors - shown;
-      if (nmore < 0)
-         nmore = 0;
-      if (nmore > 99)
-         nmore = 99; /* bounded by MAX_SLOTS in practice */
-      (void)snprintf(more, sizeof more, "%d MORE NOT SHOWN", nmore);
-      draw_str(px, fb, x, y, sc, more, 0xFF4466FF);
-      y += lh;
-   }
-   int bw = fb->width - (2 * x);
-   if (m->nsensors < UI_MAX_SLOTS) {
-      /* A real framed button, like SYNC NOW / FORGET DEVICE, not a plain row.
-       */
-      y += lh; /* separate it from the device list above */
-      y = menu_button(fb, h, x, y, bw, sc, "ADD NEW DEVICE", 0xFFFFFFFF,
-                      MA_ADDSENSOR);
-   }
-   /* EXPORT DATA: build the combined CSV and open the system share sheet. */
+   menu_row(fb, h, y, sc, lh, "IP ADDRESS", ip ? ip : "NOT SET",
+            ip ? 0xFFFFFFFF : 0xFFAAAAAA, MA_REMOTE_IP);
    y += lh;
-   menu_button(fb, h, x, y, bw, sc, "EXPORT DATA", 0xFFFFFFFF, MA_EXPORT);
+   char pt[8];
+   (void)snprintf(pt, sizeof pt, "%d", m->remote_port);
+   menu_row(fb, h, y, sc, lh, "PORT", pt, 0xFFFFFFFF, MA_REMOTE_PORT);
+   y += 2 * lh;
+
+   draw_str(px, fb, x, y, sc, "Each new datapoint is sent", 0xFF888888);
+   y += lh;
+   draw_str(px, fb, x, y, sc, "to this server as plain,", 0xFF888888);
+   y += lh;
+   draw_str(px, fb, x, y, sc, "unencrypted HTTP.", 0xFF888888);
 }
 
 /* ---- per-sensor screen: attributes above, actions below ---- */
@@ -1243,9 +1535,20 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
    y += lh;
    menu_row(fb, h, y, sc, lh, "NAME", s->label, 0xFFFFFFFF, MA_LABEL);
    y += lh;
-   if (s->kind == KIND_CGM) {
+   if (s->kind == KIND_CGM && !s->old) {
+      /* PRIMARY only for a LIVE CGM -- a disconnected one cannot own the big
+       * number. */
       menu_row(fb, h, y, sc, lh, "PRIMARY", s->primary ? "YES" : "NO",
                s->primary ? 0xFF33FF88 : 0xFFFFFFFF, MA_PRIMARY);
+      y += lh;
+   }
+   if (s->kind == KIND_CGM) {
+      /* WEAR: the nominal budget the countdown judges against. Dexcom sells
+       * 10- and 15-day G7s that are indistinguishable on the air, so when the
+       * auto-resolution guesses wrong this row is the correction. */
+      char wd[24];
+      (void)snprintf(wd, sizeof wd, "%d DAYS", (int)(s->wear_len / 86400));
+      menu_row(fb, h, y, sc, lh, "WEAR", wd, 0xFFFFFFFF, MA_WEAR);
       y += lh;
    }
    /* One MARKER row -- shows the ACTUAL glyph (in the device's colour), not a
@@ -1271,8 +1574,14 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
    y += lh; /* blank line between sections, matching the SETTINGS menu */
    draw_str(px, fb, x, y, sc, "STATUS", 0xFF888888);
    y += lh;
-   menu_row(fb, h, y, sc, lh, "STATE", s->status,
-            s->connected ? 0xFF33FF88 : 0xFFAAAAAA, -1);
+   /* A disconnected device reads EXPIRED (red); otherwise its live status. */
+   uint32_t stcol = 0xFFAAAAAA;
+   if (s->old)
+      stcol = 0xFF4466FF;
+   else if (s->connected)
+      stcol = 0xFF33FF88;
+   menu_row(fb, h, y, sc, lh, "STATE", s->old ? "EXPIRED" : s->status, stcol,
+            -1);
    y += lh;
    {
       char rs[16]; /* link RSSI (moved off the main screen). No age here -- LAST
@@ -1323,12 +1632,22 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       /* Only show session timing once a real session is known. Before the first
        * reading session_seconds is 0, which otherwise renders as "started 0s
        * ago, ends in 15 days" -- misleading, so show "--" instead. */
-      int have_session = (s->session_seconds > 0);
       char when[20];
       char rel[12];
       char val[36];
-      long began = m->now - s->session_seconds;
-      long len   = sensor_session_len(s->type);
+      /* An OLD device has no live session clock, so its STARTED/ENDS/ELAPSED
+       * come from the PERSISTED activation instant instead of `now - clock`.
+       * A live one uses the running clock as before. */
+      int have_session = 0;
+      long began       = 0;
+      if (s->old) {
+         have_session = (s->activation > 0);
+         began        = s->activation;
+      } else {
+         have_session = (s->session_seconds > 0);
+         began        = m->now - s->session_seconds;
+      }
+      long len = s->wear_len; /* per-device: override / model / type */
       /* STARTED shows the absolute instant only. The relative age lives in the
        * ELAPSED row, so a parenthetical "(N AGO)" here was pure duplication. */
       if (have_session)
@@ -1350,8 +1669,14 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
                   -1);
          y += lh;
       }
+      /* ELAPSED: a live device's running clock; an old device's final run
+       * (last reading minus its start), which is how long it actually lasted.
+       */
+      long elapsed = s->session_seconds;
+      if (s->old)
+         elapsed = (s->last > began) ? s->last - began : len;
       if (have_session)
-         fmt_dur(s->session_seconds, b, sizeof b);
+         fmt_dur(elapsed, b, sizeof b);
       else
          (void)snprintf(b, sizeof b, "--");
       menu_row(fb, h, y, sc, lh, "ELAPSED", b, 0xFFFFFFFF, -1);
@@ -1361,14 +1686,37 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       if (len > 0) {
          long ends     = began + len;
          uint32_t rcol = 0xFFFFFFFF;
-         if (!have_session) {
-            (void)snprintf(val, sizeof val, "--");
-         } else if (ends >= m->now) {
-            fmt_dur(ends - m->now, rel, sizeof rel);
-            (void)snprintf(val, sizeof val, "%s", rel);
-         } else {
+         if (s->old) {
+            /* A disconnected device is done -- no countdown, just EXPIRED. */
             (void)snprintf(val, sizeof val, "EXPIRED");
             rcol = 0xFF4466FF;
+         } else if (!have_session) {
+            (void)snprintf(val, sizeof val, "--");
+         } else if (ends >= m->now) {
+            /* Imminence carries colour here too: YELLOW inside the last day
+             * (fmt_dur already switches to hours + minutes there), RED inside
+             * the final two hours. */
+            long left = ends - m->now;
+            if (left < 86400)
+               rcol = (left < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+            fmt_dur(left, rel, sizeof rel);
+            (void)snprintf(val, sizeof val, "%s", rel);
+         } else if (s->sess_state == SENSOR_STATE_ENDED) {
+            /* The sensor's own verdict, same rule as the main screen. */
+            (void)snprintf(val, sizeof val, "ENDED");
+            rcol = 0xFF4466FF;
+         } else {
+            /* Past the nominal end: count the grace down -- and past the
+             * grace, KEEP counting into the negative (same rule as the main
+             * screen's SESSION row): the sign says "past the hard stop"
+             * while still showing by how much, which stays honest even when
+             * the wear budget is set wrong for a sensor visibly alive. No
+             * sign inside the first negative minute (never "-0 M"). */
+            long gl = ends + SENSOR_GRACE_S - m->now;
+            fmt_dur((gl < 0) ? -gl : gl, rel, sizeof rel);
+            (void)snprintf(val, sizeof val, "GRACE %s%s",
+                           (gl <= -60) ? "-" : "", rel);
+            rcol = (gl < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
          }
          menu_row(fb, h, y, sc, lh, "REMAINING", val, rcol, -1);
          y += lh;
@@ -1477,15 +1825,24 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
    /* --- actions as framed buttons, kept together at the bottom --- */
    int bw = fb->width - (2 * x);
    y += 2 * lh;
+   if (s->old) {
+      /* A DISCONNECTED device: no live actions (calibrate/sync need a link).
+       * RECONNECT revives it -- sensible for a sensor pulled BEFORE it expired
+       * (still within its wear window). The handler shows a confirmation first
+       * when the sensor is already expired, since reconnecting a dead sensor
+       * rarely makes sense. */
+      menu_button(fb, h, x, y, bw, sc, "RECONNECT", 0xFF00FF00, MA_RECONNECT);
+      return;
+   }
    if (s->kind == KIND_CGM)
       y = menu_button(fb, h, x, y, bw, sc, "CALIBRATION", 0xFFFFFFFF,
                       MA_CAL_OPEN);
    else
       y = menu_button(fb, h, x, y, bw, sc, "SYNC NOW", 0xFFFFFFFF, MA_SYNC);
-   /* FORGET is destructive: red, and well clear of the action above it rather
-    * than one fat finger below. It only opens a confirmation. */
+   /* DISCONNECT is destructive: red, and well clear of the action above it
+    * rather than one fat finger below. It only opens a confirmation. */
    y += 2 * lh;
-   menu_button(fb, h, x, y, bw, sc, "FORGET DEVICE", 0xFF0000FF, MA_FORGET);
+   menu_button(fb, h, x, y, bw, sc, "DISCONNECT", 0xFF0000FF, MA_FORGET);
 }
 
 /* ---- calibration confirmation ---- */
@@ -1717,16 +2074,16 @@ static void render_forget(struct ANativeWindow_Buffer *fb,
    const struct ui_sensor *s = &m->sensors[m->sel];
 
    int rx = fb->width - (4 * sc);
-   draw_str(px, fb, x, y, tsc, "FORGET?", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "DISCONNECT?", 0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X",
             0xFFFFFFFF); /* close = cancel */
    y += 2 * lh;
    draw_str(px, fb, x, y, sc, s->label, 0xFFFFFFFF);
    y += 2 * lh;
    static const char *const note[] = {
-       "REMOVES THIS DEVICE FROM",
-       "THE LIST. READINGS AND",
-       "DEVICE HISTORY ARE KEPT.",
+       "STOPS THIS DEVICE AND MOVES",
+       "IT TO OLD DEVICES. READINGS",
+       "AND HISTORY ARE KEPT.",
    };
    for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
       draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
@@ -1735,12 +2092,387 @@ static void render_forget(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
 
    /* Two consistent framed buttons, well separated so they cannot be confused:
-    * CANCEL (safe, white) and FORGET (destructive, RED). This IS the
-    * confirmation step -- MA_FORGET_YES is what actually forgets. */
+    * CANCEL (safe, white) and DISCONNECT (RED). This IS the confirmation step
+    * -- MA_FORGET_YES is what actually disconnects (the device becomes an OLD
+    * DEVICE; nothing is deleted). */
    int bw = fb->width - (2 * x);
    y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_FORGET_NO);
-   y += 3 * lh; /* wide gap so FORGET is not tapped by accident */
-   menu_button(fb, h, x, y, bw, sc, "FORGET", 0xFF0000FF, MA_FORGET_YES);
+   y += 3 * lh; /* wide gap so DISCONNECT is not tapped by accident */
+   menu_button(fb, h, x, y, bw, sc, "DISCONNECT", 0xFF0000FF, MA_FORGET_YES);
+}
+
+/* ---- reconnect-an-EXPIRED-device confirmation ----
+ * Reconnecting a sensor pulled BEFORE it expired is direct; reconnecting one
+ * that has already expired rarely makes sense, so it lands here first. ---- */
+static void render_reconf(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_RECON_NO);
+   if (m->sel < 0 || m->sel >= m->nsensors)
+      return;
+   const struct ui_sensor *s = &m->sensors[m->sel];
+
+   draw_str(px, fb, x, y, tsc, "RECONNECT?", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, s->label, 0xFFFFFFFF);
+   y += 2 * lh;
+   static const char *const note[] = {
+       "THIS SENSOR IS EXPIRED.",
+       "RECONNECTING RARELY WORKS;",
+       "IT WILL JUST WAIT FOREVER.",
+   };
+   for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
+      draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
+      y += lh;
+   }
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_RECON_NO);
+   y += 3 * lh;
+   menu_button(fb, h, x, y, bw, sc, "RECONNECT", 0xFF00FF00, MA_RECON_YES);
+}
+
+/* ---- pairing confirmation ----
+ * Tapping a row in the device list used to commit the pairing on the spot,
+ * and commit_pair is consequential: it registers the device and (for a CGM)
+ * drops the chosen link's old bond before the J-PAKE. One mis-tap in a list
+ * ordered by live RSSI -- rows can reorder under the finger -- did all of
+ * that to the wrong device. So the pick only proposes; this screen's explicit
+ * YES is what commits, and NO returns to the list with nothing changed. */
+
+static void render_pairconf(struct ANativeWindow_Buffer *fb,
+                            const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   /* Height-bounded as well as width-bounded, for the same landscape reason
+    * as render_forget. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int y   = (fb->height / 20) + (8 * sc);
+   /* A way out, recorded BEFORE anything can bail: a screen with no
+    * dispatchable escape is a dead end that swallows every tap. */
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_PAIR_NO);
+
+   char title[24];
+   (void)snprintf(title, sizeof title, "PAIR %s?",
+                  m->add_type ? m->add_type : "SENSOR");
+   draw_str(px, fb, x, y, tsc, title, 0xFFFFFFFF);
+   int rx = fb->width - (4 * sc);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF); /* close = NO */
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, m->pair_name ? m->pair_name : "", 0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, m->pair_mac ? m->pair_mac : "", 0xFF888888);
+   y += 2 * lh;
+
+   /* Two consistent framed buttons, well separated so they cannot be
+    * confused: NO (safe, white) first, YES (commits, green) below. */
+   int bw = fb->width - (2 * x);
+   y      = menu_button(fb, h, x, y, bw, sc, "NO", 0xFFFFFFFF, MA_PAIR_NO);
+   y += 3 * lh; /* wide gap so YES is not tapped by accident */
+   menu_button(fb, h, x, y, bw, sc, "YES", 0xFF00FF00, MA_PAIR_YES);
+}
+
+/* ---- CHOOSE PRIMARY CGM: big-number tap with more than one active CGM ----
+ * The big number belongs to exactly one sensor by contract, so when several
+ * CGMs hold live sessions the tap that used to open SETTINGS instead asks
+ * which one should own it. Each row shows the sensor's own newest value and
+ * age, so the choice is informed; '>' marks the current owner. */
+
+static void render_primpick(struct ANativeWindow_Buffer *fb,
+                            const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "PRIMARY CGM", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_CLOSE);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, "Owns the big number + alarm:", 0xFF888888);
+   y += 2 * lh;
+
+   int shown = 0;
+   for (int i = 0; i < m->nsensors && i < UI_MAX_SLOTS; i++) {
+      const struct ui_sensor *s = &m->sensors[i];
+      /* EVERY registered CGM is offered -- including one just paired that
+       * has no session and no datapoint yet: making it primary is precisely
+       * how the user pre-arms the display for the sensor they are switching
+       * to. Only a meter never qualifies. Rows without data say so. */
+      if (s->kind != KIND_CGM)
+         continue;
+      shown++;
+      char val[28];
+      if (s->sess_state == SENSOR_STATE_ENDED) {
+         /* Lifecycle policy: the sensor's own verdict labels the row; its
+          * history keeps its colours. Still selectable -- browsing a dead
+          * sensor's trace as the headline is legitimate. */
+         (void)snprintf(val, sizeof val, "ENDED");
+      } else if (s->last > 0) {
+         char gv[12];
+         char ago[12];
+         fmt_glu(s->glu, m->units, gv, sizeof gv);
+         fmt_ago(m->now, s->last, ago, sizeof ago);
+         (void)snprintf(val, sizeof val, "%s  %s", gv, ago);
+      } else if ((s->sess_state == SENSOR_STATE_WARMUP || s->sess_state == 0) &&
+                 s->session_seconds > 0 &&
+                 s->session_seconds < SENSOR_WARMUP_S) {
+         long r = SENSOR_WARMUP_S - s->session_seconds;
+         (void)snprintf(val, sizeof val, "WARMUP %d:%02d", (int)(r / 60),
+                        (int)(r % 60));
+      } else if (s->paired > 0 && m->now - s->paired < SENSOR_WARMUP_S) {
+         long wl = (s->paired + SENSOR_WARMUP_S - m->now) / 60;
+         (void)snprintf(val, sizeof val, "WARMUP ~%dM", (int)wl);
+      } else {
+         (void)snprintf(val, sizeof val, "NO DATA");
+      }
+      /* Same layout as the SETTINGS device list: '>' for the current owner,
+       * then a reserved cell showing this device's plot marker (shape,
+       * colour, size), so the choice maps to the trace at a glance. */
+      char name[3 + sizeof s->label];
+      (void)snprintf(name, sizeof name, "%s  %s", s->primary ? ">" : " ",
+                     s->label);
+      menu_row(fb, h, y, sc, lh, name, val,
+               s->primary ? 0xFF33FF88 : 0xFFFFFFFF, MA_PRIM_PICK + i);
+      if (s->marker != MARK_HIDE) {
+         int gr = (2 * sc * s->size) / MARK_SIZE_DEF;
+         if (gr < sc)
+            gr = sc;
+         if (gr > 3 * sc)
+            gr = 3 * sc;
+         plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                           (4 * sc) + (9 * sc), y + (3 * sc), gr, s->marker,
+                           ui_sensor_color(s->color));
+      }
+      /* A BLANK LINE between rows: these are consequential taps made
+       * one-handed at a glance, so each target gets breathing room. */
+      y += 2 * lh;
+   }
+   if (m->pend_type > 0) {
+      /* The ARMED pairing is choosable too: picking it means "the incoming
+       * sensor takes the big number the moment it lands". */
+      char pn[24];
+      (void)snprintf(pn, sizeof pn, "%s  %s PENDING",
+                     m->pend_primary ? ">" : " ",
+                     sensor_type_name(m->pend_type));
+      menu_row(fb, h, y, sc, lh, pn,
+               m->pend_primary ? "PRIMARY ON PAIR" : "WAITING", 0xFF00CCFF,
+               MA_PRIM_PEND);
+      shown++;
+   }
+   if (shown == 0)
+      /* Opening this with no CGM at all is legitimate (the big number is
+       * always tappable); say so rather than showing an empty list. */
+      draw_str(px, fb, x, y, sc, "No CGM. Add one from +.", 0xFF888888);
+}
+
+/* ---- ADD menu: the main-screen '+' lands here ---- */
+
+static void render_addmenu(struct ANativeWindow_Buffer *fb,
+                           const struct screen *m, struct hits *h)
+{
+   (void)m;
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "ADD ...", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   /* This menu opens from the MAIN screen, so its X returns there (MA_CLOSE),
+    * not into SETTINGS. Generous close target across the title band. */
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_CLOSE);
+   y += 3 * lh;
+
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "NEW DEVICE", 0xFFFFFFFF, MA_ADDSENSOR);
+   y += 2 * lh;
+   menu_button(fb, h, x, y, bw, sc, "INSULIN", 0xFFFFFFFF, MA_INS_OPEN);
+}
+
+/* ---- LOG INSULIN: type / units / date / time, then CONFIRM or DISCARD ---- */
+
+/* One "NAME   - value +" row: the value sits right-aligned with a minus and a
+ * plus stepper either side, each a full row-height target two cells wide. */
+static void stepper_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                        int sc, int lh, const char *name, const char *val,
+                        int minus_code, int plus_code)
+{
+   uint32_t *px = fb->bits;
+   int rx       = fb->width - (4 * sc);
+   draw_str(px, fb, 4 * sc, y, sc, name, 0xFFCCCCCC);
+   /* layout from the right edge: "- <val> +", one blank cell between parts */
+   int vw = str_len(val) * 6 * sc;
+   int xp = rx - (6 * sc);      /* '+' cell */
+   int xv = xp - (6 * sc) - vw; /* value */
+   int xm = xv - (2 * 6 * sc);  /* '-' cell */
+   draw_str(px, fb, xm, y, sc, "-", 0xFFCCCCCC);
+   draw_str(px, fb, xv, y, sc, val, 0xFFFFFFFF);
+   draw_str(px, fb, xp, y, sc, "+", 0xFFCCCCCC);
+   /* Steppers are the whole half-row each side of the value's centre, so they
+    * are unmissable on a phone; the value itself is not a target. */
+   int mid = xv + (vw / 2);
+   add_hit(h, xm - (6 * sc), y - (3 * sc), mid - (xm - (6 * sc)), lh, ACT_MENU,
+           minus_code);
+   add_hit(h, mid, y - (3 * sc), (rx - mid) + (4 * sc), lh, ACT_MENU,
+           plus_code);
+}
+
+static void render_insulin(struct ANativeWindow_Buffer *fb,
+                           const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 26);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "LOG INSULIN", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   /* X discards -- nothing is written before an explicit CONFIRM. */
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_INS_DISCARD);
+   y += 2 * lh;
+
+   menu_row(fb, h, y, sc, lh, "TYPE", m->ins_type == 1 ? "FAST" : "SLOW",
+            0xFFFFFFFF, MA_INS_TYPE);
+   y += lh;
+   char val[20];
+   (void)snprintf(val, sizeof val, "%d U", m->ins_units);
+   stepper_row(fb, h, y, sc, lh, "UNITS", val, MA_INS_UMINUS, MA_INS_UPLUS);
+   y += lh;
+   /* fmt_date renders "MM-DD HH:MM"; the form shows the two halves on their
+    * own adjustable lines, both pre-populated by the shell with now. */
+   char dt[20];
+   fmt_date(m->ins_t, m->tz_off, dt, sizeof dt);
+   char datep[8];
+   char timep[8];
+   str_snapshot(datep, sizeof datep, dt);
+   if (str_len(datep) > 5)
+      datep[5] = 0; /* "MM-DD" */
+   str_snapshot(timep, sizeof timep, (str_len(dt) > 6) ? dt + 6 : "");
+   stepper_row(fb, h, y, sc, lh, "DATE", datep, MA_INS_DMINUS, MA_INS_DPLUS);
+   y += lh;
+   stepper_row(fb, h, y, sc, lh, "TIME", timep, MA_INS_TMINUS, MA_INS_TPLUS);
+   y += 2 * lh;
+
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF00FF00, MA_INS_CONFIRM);
+   y += 2 * lh;
+   menu_button(fb, h, x, y, bw, sc, "DISCARD", 0xFFFFFFFF, MA_INS_DISCARD);
+}
+
+/* ---- OLD DEVICES: DISCONNECTED devices. Each keeps its whole slot, so a row
+ * opens the SAME per-device menu as a live one (MA_SENSOR + slot index). The
+ * list PAGINATES: if there are more than fit, a "< PAGE i/n >" row at the
+ * bottom navigates, so any number of old devices is usable. ---- */
+
+static void render_olddev(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "OLD DEVICES", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_OLDDEV_BACK);
+   y += 3 * lh;
+
+   /* Collect the old slots' indices (into m->sensors) in list order. */
+   int idxs[UI_MAX_SLOTS];
+   int nold = 0;
+   for (int i = 0; i < m->nsensors && nold < UI_MAX_SLOTS; i++)
+      if (m->sensors[i].old)
+         idxs[nold++] = i;
+   if (nold <= 0) {
+      draw_str(px, fb, x, y, sc, "None yet. Disconnected", 0xFF888888);
+      y += lh;
+      draw_str(px, fb, x, y, sc, "devices appear here.", 0xFF888888);
+      return;
+   }
+
+   /* Rows that fit between the title and a reserved bottom nav line. Each row
+    * takes 2*lh (a blank line between). At least one, always. */
+   int avail = fb->height - y - (2 * lh); /* reserve the nav line */
+   int per   = avail / (2 * lh);
+   if (per < 1)
+      per = 1;
+   int npages = (nold + per - 1) / per;
+   int page   = m->old_page;
+   if (page < 0)
+      page = 0;
+   if (page >= npages)
+      page = npages - 1;
+   int start = page * per;
+
+   for (int r = start; r < start + per && r < nold; r++) {
+      const struct ui_sensor *s = &m->sensors[idxs[r]];
+      char val[20];
+      long agot = (s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
+      if (agot > 0)
+         fmt_date(agot, m->tz_off, val, sizeof val);
+      else
+         (void)snprintf(val, sizeof val, "--");
+      char name[3 + sizeof s->label];
+      (void)snprintf(name, sizeof name, "  %s", s->label);
+      menu_row(fb, h, y, sc, lh, name, val, 0xFFAAAAAA, MA_SENSOR + idxs[r]);
+      if (s->marker != MARK_HIDE) {
+         int gr = (2 * sc * s->size) / MARK_SIZE_DEF;
+         if (gr < sc)
+            gr = sc;
+         if (gr > 3 * sc)
+            gr = 3 * sc;
+         plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                           (4 * sc) + (3 * sc), y + (3 * sc), gr, s->marker,
+                           ui_sensor_color(s->color));
+      }
+      y += 2 * lh; /* blank line between rows */
+   }
+
+   /* Bottom navigation, only when there is more than one page. "<" and ">"
+    * are generous tap targets on the left and right; the page count is
+    * centred between them. */
+   if (npages > 1) {
+      int navy = fb->height - lh - (4 * sc);
+      if (page > 0) {
+         draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
+         add_hit(h, 0, navy - (3 * sc), fb->width / 3, 2 * lh, ACT_MENU,
+                 MA_OLDPAGE_PREV);
+      }
+      char pg[24];
+      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
+      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
+               0xFF888888);
+      if (page < npages - 1) {
+         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
+         add_hit(h, (2 * fb->width) / 3, navy - (3 * sc), fb->width / 3, 2 * lh,
+                 ACT_MENU, MA_OLDPAGE_NEXT);
+      }
+   }
 }
 
 /* ---- MARKER / COLOR pickers: a full list of options, each with a live glyph,
@@ -1755,14 +2487,17 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
    /* Graphical combined picker: shapes shown as glyphs, colours as full-colour
     * buttons, and a size row previewing the CURRENT shape+colour at each size.
     * All selections update in place; the title-row X returns to the device. */
-   int sc          = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc         = 2 * sc;
-   int lh          = 16 * sc;
-   int x           = 4 * sc;
-   int rx          = fb->width - (4 * sc);
-   int y           = (fb->height / 20) + (8 * sc);
-   int back        = MA_SENSOR + (m->sel >= 0 ? m->sel : 0);
+   int sc  = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int rx  = fb->width - (4 * sc);
+   int y   = (fb->height / 20) + (8 * sc);
+   /* The picker always edits the selected slot -- old devices keep their slot,
+    * so this works for them exactly like a live one (the title X returns to
+    * that device's per-sensor menu). */
    int okk         = (m->sel >= 0 && m->sel < m->nsensors);
+   int back        = MA_SENSOR + (m->sel >= 0 ? m->sel : 0);
    int curm        = okk ? m->sensors[m->sel].marker : MARK_DOT;
    int curc        = okk ? m->sensors[m->sel].color : 0;
    int curs        = okk ? m->sensors[m->sel].size : MARK_SIZE_DEF;
@@ -2062,6 +2797,10 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
       kp_title = "CALIBRATION";
    else if (m->kp_mode == 3)
       kp_title = "RESCALE";
+   else if (m->kp_mode == 4)
+      kp_title = "REMOTE IP";
+   else if (m->kp_mode == 5)
+      kp_title = "REMOTE PORT";
    else /* pairing: name the CGM being added, e.g. "PAIR NEW STELO" */
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->add_type ? m->add_type : "SENSOR");
@@ -2071,18 +2810,26 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
 
    /* Entry field: one underscore per slot, replaced by digits as typed, so the
     * width never shifts. Plot-max shows the unit after the value; pair shows
-    * the 4 code digits. dsc is sized for the widest label so the field -- and
-    * the keypad below -- is identical in both modes. */
-   int nslots     = m->kp_mode ? 3 : 4; /* code = 4 digits, others = 3 */
+    * the 4 code digits; the remote IP gets a full dotted quad's 15 slots and
+    * the remote port a TCP port's 5. dsc is sized for the widest label so the
+    * field -- and the keypad below -- is identical across modes. */
+   static const int slots_for[6] = {4, 3, 3, 3, 15, 5};
+   int nslots = slots_for[(m->kp_mode >= 0 && m->kp_mode < 6) ? m->kp_mode : 0];
+   int has_unit   = m->kp_mode >= 1 && m->kp_mode <= 3; /* glucose entries */
    const char *en = m->entry ? m->entry : "";
-   char shown[16];
+   char shown[24];
    int k = 0;
    for (int i = 0; i < nslots; i++) /* typed digits, then '_' for empty slots */
       shown[k++] = *en ? *en++ : '_';
-   if (m->kp_mode)
+   if (has_unit)
       k += snprintf(shown + k, sizeof shown - k, " %s", UI_LBL(m->units));
    shown[k] = 0;
-   int dsc  = (fb->width - (8 * sc)) / (10 * 6); /* fits "___ MMOL/L" */
+   /* Size the field from what is actually shown ("___ MMOL/L" = 10 cells, the
+    * 15-slot IP is wider still), so no mode overflows the margins. */
+   int fcells = str_len(shown);
+   if (fcells < 10)
+      fcells = 10;
+   int dsc = (fb->width - (8 * sc)) / (fcells * 6);
    if (dsc > 4 * sc)
       dsc = 4 * sc;
    if (dsc < sc)
@@ -2094,27 +2841,40 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    /* Generous close target: the whole area above the keypad closes it. */
    add_hit(h, 0, ty - (3 * sc), fb->width, y - (ty - (3 * sc)), ACT_MENU, 113);
 
-   /* 3x4 grid: digits, then 0 / DEL / OK. The title's X cancels. */
+   /* 3x4 grid: digits, then 0 / DEL / OK. The title's X cancels. The IP mode
+    * needs a 13th key ('.'), so it swaps to a 5-row layout: the dot takes 0's
+    * old cell, 0 and DEL shift right, and OK becomes a full-width bottom row
+    * (which also makes the confirm harder to fat-finger from DEL). */
+   int iprows = (m->kp_mode == 4) ? 5 : 4;
    int gm     = fb->width / 12;
    int gw     = fb->width - (2 * gm);
    int cw     = gw / 3;
    int bottom = fb->height - (fb->height / 20);
-   int ch     = (bottom - y) / 4;
+   int ch     = (bottom - y) / iprows;
    int wfit   = (cw - (4 * sc)) / (3 * 6); /* widest label "DEL" fits width */
    int hfit   = (ch - (4 * sc)) / 7;
    int ksc    = wfit < hfit ? wfit : hfit;
    if (ksc < sc)
       ksc = sc;
-   static const char *keys[12] = {"7", "8", "9", "4", "5", "6",
-                                  "1", "2", "3", "0", "<", "OK"};
-   static const int acts[12]   = {107, 108, 109, 104, 105, 106,
-                                  101, 102, 103, 100, 110, MA_OK};
+   static const char *keys[12]   = {"7", "8", "9", "4", "5", "6",
+                                    "1", "2", "3", "0", "<", "OK"};
+   static const int acts[12]     = {107, 108, 109, 104, 105, 106,
+                                    101, 102, 103, 100, 110, MA_OK};
+   static const char *ipkeys[12] = {"7", "8", "9", "4", "5", "6",
+                                    "1", "2", "3", ".", "0", "<"};
+   static const int ipacts[12]   = {107, 108, 109, 104,    105, 106,
+                                    101, 102, 103, MA_DOT, 100, 110};
+   const char **kk               = (m->kp_mode == 4) ? ipkeys : keys;
+   const int *aa                 = (m->kp_mode == 4) ? ipacts : acts;
    for (int r = 0; r < 4; r++)
       for (int col = 0; col < 3; col++) {
          int idx = (r * 3) + col;
          pad_key(fb, h, gm + (col * cw), y + (r * ch), cw - (2 * sc),
-                 ch - (2 * sc), ksc, keys[idx], acts[idx]);
+                 ch - (2 * sc), ksc, kk[idx], aa[idx]);
       }
+   if (m->kp_mode == 4)
+      pad_key(fb, h, gm, y + (4 * ch), (3 * cw) - (2 * sc), ch - (2 * sc), ksc,
+              "OK", MA_OK);
 }
 
 /* Pairing candidate picker: scanned sensors strongest-first; a tap pairs one
@@ -2273,6 +3033,14 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_SENSTYPE: render_senstype(fb, m, h); break;
       case SCR_METERHELP: render_meterhelp(fb, m, h); break;
       case SCR_FORGET: render_forget(fb, m, h); break;
+      case SCR_RECONF: render_reconf(fb, m, h); break;
+      case SCR_PAIRCONF: render_pairconf(fb, m, h); break;
+      case SCR_ADDMENU: render_addmenu(fb, m, h); break;
+      case SCR_INSULIN: render_insulin(fb, m, h); break;
+      case SCR_PRIMPICK: render_primpick(fb, m, h); break;
+      case SCR_PERMS: render_perms(fb, m, h); break;
+      case SCR_REMOTE: render_remote(fb, m, h); break;
+      case SCR_OLDDEV: render_olddev(fb, m, h); break;
       case SCR_LABEL: render_label(fb, m, h); break;
       case SCR_MARKPICK:
       case SCR_COLORPICK: render_markpick(fb, m, h); break; /* combined menu */

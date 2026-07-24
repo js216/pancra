@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.jk.pancra"
-          android:versionCode="1" android:versionName="1.0">
+          android:versionCode="1" android:versionName="0.1">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
 
   <!-- Android 12+ (API 31+): scanning never used to derive location -->
@@ -24,13 +24,19 @@
   <uses-permission android:name="android.permission.WAKE_LOCK"/>
   <!-- keep the process alive through Doze (user grants via the system dialog) -->
   <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+  <!-- REMOTE push: POST each new datapoint to the user-configured server -->
+  <uses-permission android:name="android.permission.INTERNET"/>
 
   <!-- debuggable is intentionally absent (defaults to false = release-safe).
        Dev builds flip it on via aapt's debug-mode flag so crash.log is
        retrievable on-device; `make release` does not. -->
+  <!-- usesCleartextTraffic: the REMOTE push goes to a user-configured LAN
+       address (glucoserve.py) over plain HTTP; Android 9+ blocks cleartext
+       without this. -->
   <application android:label="Pancra"
                android:icon="@mipmap/ic_launcher"
                android:roundIcon="@mipmap/ic_launcher_round"
+               android:usesCleartextTraffic="true"
                android:allowBackup="false"
                android:theme="@android:style/Theme.NoTitleBar">
     <activity android:name="android.app.NativeActivity" android:exported="true"
