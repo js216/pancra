@@ -972,26 +972,40 @@ int main(void)
 
          /* LOG INSULIN: the one writing control (CONFIRM) appears exactly
           * once, and every field the form promises is actually adjustable --
-          * type toggle, units steppers, date steppers, time steppers. */
+          * units, date and time arrow steppers. (The TYPE toggle is gone:
+          * FAST/SLOW is chosen on the ADD menu and fixed in the title.)
+          * Each field's UP target must sit ABOVE its DOWN target -- that is
+          * the whole promise of the vertical arrow steppers. */
          fm.scr       = SCR_INSULIN;
          fm.ins_t     = now_ts;
          fm.ins_type  = 1;
          fm.ins_units = 12;
          ui_render(&fb2, &fm, &fh);
          {
+            /* The three fields (units/date/time) each carry a keypad-entry
+             * target, and the one writing control (CONFIRM) appears
+             * exactly once -- BELOW discard, the app-wide cancel-on-top
+             * rule. */
             int nconf   = 0;
-            int codes[] = {MA_INS_TYPE,   MA_INS_UMINUS, MA_INS_UPLUS,
-                           MA_INS_DMINUS, MA_INS_DPLUS,  MA_INS_TMINUS,
-                           MA_INS_TPLUS,  MA_INS_DISCARD};
-            int seen[8] = {0};
+            int ndisc   = 0;
+            int seen[3] = {0};
+            int yconf   = -1;
+            int ydisc   = -1;
             for (int i = 0; i < fh.n; i++) {
                if (fh.box[i].kind != ACT_MENU)
                   continue;
-               if (fh.box[i].arg == MA_INS_CONFIRM)
+               if (fh.box[i].arg == MA_INS_CONFIRM) {
                   nconf++;
-               for (int k = 0; k < 8; k++)
-                  if (fh.box[i].arg == codes[k])
-                     seen[k] = 1;
+                  yconf = fh.box[i].y;
+               }
+               if (fh.box[i].arg == MA_INS_DISCARD) {
+                  ndisc++;
+                  if (ydisc < 0 || fh.box[i].y > ydisc)
+                     ydisc = fh.box[i].y; /* the button, not the title X */
+               }
+               int d = fh.box[i].arg - MA_INS_EDIT;
+               if (d >= 0 && d < 3)
+                  seen[d] = 1;
             }
             if (nconf != 1) {
                printf("  FAIL: SCR_INSULIN records %d MA_INS_CONFIRM targets, "
@@ -999,11 +1013,21 @@ int main(void)
                       nconf);
                fail = 1;
             }
-            for (int k = 0; k < 8; k++)
+            if (ndisc < 1) {
+               printf("  FAIL: SCR_INSULIN records no MA_INS_DISCARD\n");
+               fail = 1;
+            }
+            if (yconf >= 0 && ydisc >= 0 && yconf <= ydisc) {
+               printf("  FAIL: SCR_INSULIN CONFIRM (y=%d) is not BELOW "
+                      "DISCARD (y=%d)\n",
+                      yconf, ydisc);
+               fail = 1;
+            }
+            for (int k = 0; k < 3; k++)
                if (!seen[k]) {
-                  printf("  FAIL: SCR_INSULIN is missing control %d "
-                         "(index %d) -- that field cannot be adjusted\n",
-                         codes[k], k);
+                  printf("  FAIL: SCR_INSULIN field %d has no keypad-entry "
+                         "target -- that field cannot be edited\n",
+                         k);
                   fail = 1;
                }
             printf("uitest: insulin form carries every control, one CONFIRM\n");

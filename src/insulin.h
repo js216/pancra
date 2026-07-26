@@ -49,6 +49,15 @@ int insulin_append(long t, int type, int units, long tz);
  * what the LOG INSULIN form pre-populates with. */
 int insulin_last_units(int type);
 
+/* Rewrite the LAST file row matching `orig` (t/type/units) to the new
+ * values, or delete it. Rewrite-and-rename (a crash never truncates the
+ * log), then the tail is reloaded. 0 on success, -1 on failure or when no
+ * row matches. These exist for the EDIT INSULIN form only -- everything
+ * else treats the log as append-only. */
+int insulin_update(const struct ins_rec *orig, long t, int type, int units,
+                   long tz);
+int insulin_delete(const struct ins_rec *orig);
+
 const char *insulin_type_name(int type); /* "SLOW" / "FAST" */
 
 #endif

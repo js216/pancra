@@ -5,6 +5,7 @@
 #ifndef PANCRA_UI_H
 #define PANCRA_UI_H
 
+#include "insulin.h" /* struct ins_rec: the INSULIN LOG table rows */
 #include "ndk.h"
 #include "sensors.h" /* sensor types/kinds the model and renderer share */
 #include <stdint.h>
@@ -46,12 +47,12 @@ void fmt_dur(long seconds, char *out, int n);
  * truncating it, so a cramped screen is a visible error, not a quiet lie. */
 #define UI_MIN_SLOTS 3
 
-/* Rows the settings screen consumes ABOVE (and below) the sensor entries: title
- * (2), DISPLAY (7 -- including the REMOTE summary row), ALARM (5), the
- * PERMISSIONS summary row (2 -- the full section moved to its own screen so
- * the DEVICES list gets the space), the DEVICES header (1), and the two
- * trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA -- each a
- * separator + a ~1-row button (4 total). Keep in step with render_settings.
+/* Rows the settings screen consumes ABOVE (and below) the sensor entries:
+ * title (2), the DISPLAY summary row (1 -- the display settings moved to
+ * their own submenu), REMOTE (1), PERMISSIONS (2), ALARM (5), the DEVICES
+ * header (1), and the two trailing framed buttons -- ADD NEW DEVICE and
+ * EXPORT DATA -- each a separator + a ~1-row button (4 total). Keep in
+ * step with render_settings.
  *
  * Exported deliberately. It used to be private to ui.c while test/uitest.c
  * carried its own literal for the same quantity, so the two could drift
@@ -59,7 +60,7 @@ void fmt_dur(long seconds, char *out, int n);
  * exactly the mistake that leaves sensor rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_SET_ABOVE 22
+#define UI_SET_ABOVE 17
 
 /* How many sensor rows fit in the settings screen at this geometry, given
  * everything above the SENSORS section. The whole UI never scrolls, so this is
@@ -117,9 +118,11 @@ enum ui_screen {
    SCR_INSULIN,    /* LOG INSULIN entry form */
    SCR_PRIMPICK,   /* big-number tap with >1 registered CGM: choose primary */
    SCR_PERMS,      /* permissions + background controls, moved off SETTINGS */
-   SCR_OLDDEV, /* previously-used (forgotten) devices: restyle their trace */
-   SCR_RECONF, /* confirm reconnecting an EXPIRED old device */
-   SCR_REMOTE, /* remote push: enable/disable, server IP and port */
+   SCR_OLDDEV,  /* previously-used (forgotten) devices: restyle their trace */
+   SCR_RECONF,  /* confirm reconnecting an EXPIRED old device */
+   SCR_REMOTE,  /* remote push: enable/disable, server IP and port */
+   SCR_INSLOG,  /* insulin dose log: paginated when/type/units table */
+   SCR_DISPLAY, /* display settings submenu (off SETTINGS) */
    SCR_N
 };
 
@@ -200,6 +203,7 @@ struct screen {
    long now;             /* realtime_s() at frame time */
    long t, tz_off;       /* reading time; local timezone offset (seconds) */
    long session_seconds; /* current session length from the driver */
+   long remote_last_ok;  /* last server-acknowledged push; 0 = never */
    const struct ui_point *hist;     /* plot history, newest-first (borrowed) */
    const struct ui_dev *devs;       /* scanned sensors (borrowed) */
    const struct ui_sensor *sensors; /* configured sensors (borrowed) */
@@ -246,9 +250,18 @@ struct screen {
    int add_kind;         /* KIND_CGM / KIND_BGM of that type */
    /* The picked device awaiting the SCR_PAIRCONF yes/no (borrowed). */
    const char *pair_name, *pair_mac;
-   /* LOG INSULIN form state (ins_t rendered via tz_off). */
+   /* LOG INSULIN form state (ins_t rendered via tz_off). ins_edit means
+    * the form edits an existing dose (title EDIT..., red DELETE button). */
    long ins_t;
-   int ins_type, ins_units;
+   int ins_type, ins_units, ins_edit;
+   /* INSULIN LOG table (borrowed; oldest first, like insulin.h's tail) */
+   const struct ins_rec *ins_log;
+   int ins_nlog, inslog_page;
+   /* insulin plot styling per type (index INS_SLOW / INS_FAST), and which
+    * insulin type the marker picker is editing (-1 = a sensor's) */
+   int ins_marker[2], ins_color[2], ins_size[2], markpick_ins;
+   /* status bar shows the value (vs icon); lock screen shows the notif */
+   int statbar_val, lockscr_val;
    /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none.
     * DEVICES shows it as a tappable PENDING row (MA_PEND_CANCEL); the
     * choose-primary screen offers it too (MA_PRIM_PEND), and pend_primary
@@ -300,11 +313,25 @@ enum ui_menu {
    MA_SCREEN    = 5,
    MA_NEWDATA   = 6,  /* toggle the new-datapoint beep */
    MA_METERSCAN = 7,  /* start scanning from the OneTouch instructions screen */
-   MA_PERM      = 10, /* + permission index (0..2) */
-   MA_BATTERY   = 20,
-   MA_BGEXEC    = 22,
-   MA_PAIR_CODE = 30,
-   MA_PLOTMAX   = 31,
+   MA_INS_FAST  = 21, /* ADD menu: LOG FAST INSULIN (type preset) */
+   MA_INS_SLOW  = 23, /* ADD menu: LOG SLOW INSULIN (type preset) */
+   MA_INSLOG_OPEN   = 25,  /* ADD menu: open the INSULIN LOG table */
+   MA_INSLOG_BACK   = 26,  /* insulin log: back to the ADD menu */
+   MA_INSLOG_PREV   = 27,  /* insulin log: previous page */
+   MA_INSLOG_NEXT   = 28,  /* insulin log: next page */
+   MA_INSMARK_OPEN  = 114, /* + INS_SLOW/INS_FAST: pick that type's marker */
+   MA_INS_DELETE    = 116, /* EDIT INSULIN: delete this dose (red) */
+   MA_INSMARK_BACK  = 117, /* insulin marker picker: back to DISPLAY */
+   MA_DISPLAY_OPEN  = 118, /* settings: open the DISPLAY submenu */
+   MA_DISPLAY_BACK  = 119, /* display submenu: back to settings */
+   MA_STATBAR       = 120, /* toggle status bar: value vs app icon */
+   MA_NOTIF_REOPEN  = 121, /* re-post the (swiped-away) notification */
+   MA_LOCKSCR       = 122, /* toggle lock-screen notification visibility */
+   MA_PERM          = 10,  /* + permission index (0..2) */
+   MA_BATTERY       = 20,
+   MA_BGEXEC        = 22,
+   MA_PAIR_CODE     = 30,
+   MA_PLOTMAX       = 31,
    MA_REMOTE_OPEN   = 32, /* settings: open the REMOTE submenu */
    MA_REMOTE_TOGGLE = 33, /* remote menu: enable/disable the push */
    MA_REMOTE_IP     = 34, /* remote menu: edit the server IP (keypad) */
@@ -378,7 +405,13 @@ enum ui_menu {
    MA_COLOR_PICK = 240, /* + colour index */
    MA_SIZE_PICK  = 250, /* + size 1..MARK_SIZE_MAX */
    MA_PRIM_PICK  = 260, /* + slot index: make that CGM the primary */
-   MA_CHAR       = 300  /* + index into ui_label_chars[] */
+   MA_CHAR       = 300, /* + index into ui_label_chars[] */
+   /* LOG INSULIN fields: + 0 units, + 1 date, + 2 time, + 3 year. Tapping
+    * the value opens the keypad for exact entry (kp_mode 6/7/8/9). */
+   MA_INS_EDIT = 400,
+   /* INSULIN LOG rows: + tail index (0..NINS-1) opens that dose in the
+    * EDIT INSULIN form. Nothing above this range. */
+   MA_INSLOG_EDIT = 500
 };
 
 /* THE RANGES MUST NOT OVERLAP, and the compiler is the only thing that will

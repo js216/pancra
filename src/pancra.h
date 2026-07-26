@@ -57,6 +57,9 @@ jobject dexble_ctx(void); /* app Context global ref; outlives the activity */
  * activity alive -- the service heartbeat drives it so the notification keeps
  * tracking readings after the activity is destroyed. */
 void pancra_notify_refresh(void);
+/* A REMOTE push was acknowledged by the server (HTTP 2xx). Called on
+ * Ble.remotePush's worker thread; just timestamps the last success. */
+void pancra_remote_ok(void);
 void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */
 void dexble_request_devinfo(void);
 void dexble_request_devinfo_link(int link);

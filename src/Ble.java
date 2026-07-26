@@ -119,7 +119,9 @@ public final class Ble {
                     os.write(body);
                     os.close();
                     int code = c.getResponseCode();
-                    if (code / 100 != 2)
+                    if (code / 100 == 2)
+                        onRemoteOk(); /* native timestamps the last success */
+                    else
                         Log.i(TAG, "remote push: HTTP " + code);
                 } catch (Throwable e) {
                     Log.i(TAG, "remote push: " + e);
@@ -210,8 +212,9 @@ public final class Ble {
     /* Push the live glucose + a 3H plot bitmap into the ongoing notification
      * (shown on the lock screen / shade). Called from native each reading. */
     public static void showGlucose(Context ctx, String title, String text,
-                                   int[] px, int w, int h) {
-        PancraService.showGlucose(ctx, title, text, px, w, h);
+                                   String value,
+                                   int[] px, int w, int h, int lockscr) {
+        PancraService.showGlucose(ctx, title, text, value, px, w, h, lockscr);
     }
 
     /* ---- Java -> C callbacks (bound via RegisterNatives in dexble.c) ---- */
@@ -227,6 +230,8 @@ public final class Ble {
     /* Service heartbeat -> native alarm re-evaluation. Not a BLE event: it
      * exists so the stale-data alarm still fires with no activity alive. */
     static native void onTick();
+    /* Push worker -> native: the remote server acknowledged a datapoint. */
+    static native void onRemoteOk();
 
     private static BluetoothLeScanner scanner;
     private static ScanCallback scanCb;

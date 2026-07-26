@@ -6,7 +6,8 @@
  * append-only file the app reloads at every launch, so the properties that
  * matter are: what was confirmed is durably on disk, what loads back is
  * exactly what was written, a corrupt row can never load as a plausible dose,
- * and the form's pre-population (last units per type) follows entry order.
+ * the tail is TIME-SORTED however doses were entered or edited, and the
+ * form's pre-population (last units per type) follows dose time.
  *
  * Built and run by `make insulintest`, which `make check` depends on. */
 #include "insulin.h"
@@ -53,13 +54,15 @@ int main(void)
       "...values intact, oldest first");
    ck(g_ins[1].type == INS_FAST && g_ins[1].units == 4, "...newest last");
 
-   printf("== pre-population: last units PER TYPE, by entry order ==\n");
+   printf("== pre-population: last units PER TYPE, by dose time ==\n");
    ck(insulin_last_units(INS_SLOW) == 12, "SLOW recalls its own last dose");
    ck(insulin_last_units(INS_FAST) == 4, "FAST recalls its own last dose");
    ck(insulin_append(t0 - 999, INS_FAST, 6, -3600) == 0,
       "a BACKDATED dose still appends");
-   ck(insulin_last_units(INS_FAST) == 6,
-      "...and 'last' means last ENTERED, not latest dose time");
+   ck(g_ins[0].t == t0 - 999,
+      "...and files into place: the tail is TIME-sorted, not entry-sorted");
+   ck(insulin_last_units(INS_FAST) == 4,
+      "...so 'last' means latest BY DOSE TIME, unmoved by the backdate");
 
    printf("== out-of-range input is refused, not clamped ==\n");
    int before = g_nins;
@@ -87,6 +90,28 @@ int main(void)
       "only the legitimate foreign row loads; corrupt ones are dropped");
    ck(g_ins[g_nins - 1].units == 7 && g_ins[g_nins - 1].type == INS_SLOW,
       "...and it parsed correctly");
+
+   printf("== edit / delete rewrite exactly one content-matched row ==\n");
+   fresh();
+   (void)insulin_append(t0, INS_SLOW, 10, 0);
+   (void)insulin_append(t0 + 100, INS_FAST, 5, 0);
+   (void)insulin_append(t0 + 200, INS_FAST, 5, 0);
+   {
+      struct ins_rec orig = {t0 + 100, INS_FAST, 5};
+      ck(insulin_update(&orig, t0 + 150, INS_SLOW, 8, 0) == 0,
+         "an edit rewrites the matched row");
+      ck(g_nins == 3, "...row count unchanged");
+      ck(insulin_last_units(INS_SLOW) == 8, "...new values took effect");
+      insulin_load();
+      ck(g_nins == 3 && insulin_last_units(INS_SLOW) == 8,
+         "...and the edit is durable on disk");
+      struct ins_rec gone = {t0 + 150, INS_SLOW, 8};
+      ck(insulin_delete(&gone) == 0, "a delete removes the row");
+      ck(g_nins == 2, "...row count down one");
+      ck(insulin_delete(&gone) < 0, "deleting a missing row refuses");
+      insulin_load();
+      ck(g_nins == 2, "...and the delete is durable on disk");
+   }
 
    printf("== the tail stays bounded; the newest rows win ==\n");
    fresh();

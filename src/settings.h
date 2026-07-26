@@ -19,6 +19,11 @@ extern int
 extern int g_units;    /* 0 mg/dL, 1 mmol/L */
 extern int g_disc;     /* stale-data alarm: index into disc_min */
 extern int g_plot_max; /* plot vertical-scale top, mg/dL */
+extern int g_ins_marker[2];  /* MARK_* per insulin type (INS_SLOW/FAST) */
+extern int g_ins_color[2];   /* ui palette index per insulin type */
+extern int g_ins_size[2];    /* marker size 1..MARK_SIZE_MAX per type */
+extern int g_statbar_val;    /* 1 = status bar shows the value, 0 = icon */
+extern int g_lockscr_val;    /* 1 = notification visible on lock screen */
 extern char g_code_str[16];  /* runtime pairing code (PAIR NEW SENSOR) */
 extern int g_remote_on;      /* 1 = push each new datapoint to the server */
 extern char g_remote_ip[16]; /* dotted-quad server address; "" = not set */

@@ -177,6 +177,12 @@ static jmethodID
  * reading can be marked dirty and cleared by the other consumer without ever
  * being rendered. */
 static volatile int g_notify_dirty;
+/* Wall-clock of the last REMOTE push the server ACKNOWLEDGED (HTTP 2xx),
+ * reported back by Ble.remotePush's worker thread via onRemoteOk. Runtime
+ * state, not a setting: it starts at 0 ("NEVER") on every launch. A plain
+ * long store/load -- worst case the settings row shows an age one frame
+ * stale. */
+static long g_remote_last_ok;
 static char g_status[MAX_COLS + 1] = "STARTING";
 /* Execution checkpoint: set to a static label at the top of each hot code path,
  * so the crash handler can record WHERE we were when a fault hit (debuggerd
@@ -247,6 +253,8 @@ enum {
    MENU_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
    MENU_ADD,        /* main-screen '+': NEW DEVICE / INSULIN */
    MENU_INSULIN,    /* LOG INSULIN entry form */
+   MENU_INSLOG,     /* INSULIN LOG: paginated dose table */
+   MENU_DISPLAY,    /* display settings submenu */
    MENU_PRIMPICK,   /* choose which registered CGM owns the big number */
    MENU_PERMS,      /* permissions + background controls */
    MENU_OLDDEV,     /* previously-used (forgotten) devices */
@@ -254,7 +262,20 @@ enum {
    MENU_REMOTE      /* remote push: enable/disable, server IP and port */
 }; /* g_menu / g_kp_return values */
 
-static int g_old_page; /* which page the OLD DEVICES list is showing */
+static int g_old_page;    /* which page the OLD DEVICES list is showing */
+static int g_inslog_page; /* which page the INSULIN LOG is showing */
+/* EDIT INSULIN: which dose the form edits (-1 = none, logging new), and
+ * the ORIGINAL row -- the rewrite matches on it, so edits of a stale tail
+ * index can never hit the wrong dose. */
+static int g_ins_edit = -1;
+static struct ins_rec g_ins_orig;
+static int g_markpick_ins = -1; /* INS_SLOW/INS_FAST being styled; -1 =
+                                 * the picker edits a sensor's styling */
+/* Where the LOG/EDIT INSULIN form was OPENED from -- every exit (X,
+ * CANCEL, DELETE, CONFIRM) returns exactly there. Recorded at each entry
+ * point, never inferred: inferring the return target is the recurring
+ * menu-navigation bug this app keeps re-growing. */
+static int g_ins_from = MENU_ADD;
 
 /* LOG INSULIN form state. The instant is edited as a whole (date and time
  * steppers both move g_ins_t); units re-populate from the last dose of the
@@ -659,6 +680,10 @@ static int g_add_type = SENSOR_STELO;
  * MENU_SETTINGS when reached via the DEVICES list, MENU_NONE (main screen) when
  * reached via the STATE/STORED info-block shortcut. */
 static int g_sensor_from = MENU_NONE;
+/* Where the PAIRING flow (type tap -> keypad / meter help) was entered
+ * from: the ADD menu or the ADD DEVICE picker. Every abort path returns
+ * exactly there -- recorded, never inferred (the recurring bug). */
+static int g_pair_from = MENU_SENSTYPE;
 
 /* Build "<dir><name>" into a bounded buffer. Six call sites used to open-code
  * this same loop. */
@@ -1390,7 +1415,7 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
  * arrays are static so they outlive the render call. */
 static void build_model(struct screen *m)
 {
-   static struct ui_point pts[NHIST];
+   static struct ui_point pts[NHIST + NINS]; /* glucose + insulin doses */
    static struct ui_dev devs[MAX_DEVS];
    long now = realtime_s();
 
@@ -1431,6 +1456,10 @@ static void build_model(struct screen *m)
       m->scr = SCR_ADDMENU;
    else if (g_menu == MENU_INSULIN)
       m->scr = SCR_INSULIN;
+   else if (g_menu == MENU_INSLOG)
+      m->scr = SCR_INSLOG;
+   else if (g_menu == MENU_DISPLAY)
+      m->scr = SCR_DISPLAY;
    else if (g_menu == MENU_PRIMPICK)
       m->scr = SCR_PRIMPICK;
    else if (g_menu == MENU_PERMS)
@@ -1467,6 +1496,18 @@ static void build_model(struct screen *m)
       pts[i].glu  = g_hist[i].glu;
       pts[i].src  = g_hist[i].src;
       pts[i].kind = g_hist[i].kind;
+   }
+   /* Insulin doses ride along as KIND_INS points (glu = units; ui.c pins
+    * them to the plot's bottom edge and scrubs them as "N UNITS").
+    * plot_render and plot_hit take points in any order, so appending
+    * after the newest-first glucose is fine. They are NEVER in g_hist,
+    * so they cannot leak into stats or the remote push. */
+   for (int i = 0; i < g_nins && nh < NHIST + NINS; i++) {
+      pts[nh].t    = g_ins[i].t;
+      pts[nh].glu  = g_ins[i].units;
+      pts[nh].src  = g_ins[i].type; /* the scrub shows "2U FAST" etc. */
+      pts[nh].kind = KIND_INS;
+      nh++;
    }
    m->hist       = pts;
    m->nhist      = nh;
@@ -1515,19 +1556,20 @@ static void build_model(struct screen *m)
 
    /* settings + device info (globals persist; s.mac lives on our stack, so it
     * is copied into a static the borrowed pointer can safely outlast) */
-   m->sound_on     = g_sound_on;
-   m->vib_on       = g_vib_on;
-   m->orient       = g_orient;
-   m->screen_on    = g_screen_on;
-   m->newdata_beep = g_newdata_beep;
-   m->remote_on    = g_remote_on;
-   m->remote_ip    = g_remote_ip; /* global, so the borrow is stable */
-   m->remote_port  = g_remote_port;
-   m->disc         = g_disc;
-   m->code         = g_code_str;
-   m->model        = g_model;
-   m->fw           = g_fw;
-   m->mfr          = g_mfr;
+   m->sound_on       = g_sound_on;
+   m->vib_on         = g_vib_on;
+   m->orient         = g_orient;
+   m->screen_on      = g_screen_on;
+   m->newdata_beep   = g_newdata_beep;
+   m->remote_on      = g_remote_on;
+   m->remote_ip      = g_remote_ip; /* global, so the borrow is stable */
+   m->remote_port    = g_remote_port;
+   m->remote_last_ok = g_remote_last_ok;
+   m->disc           = g_disc;
+   m->code           = g_code_str;
+   m->model          = g_model;
+   m->fw             = g_fw;
+   m->mfr            = g_mfr;
    static char macbuf[20];
    str_snapshot(macbuf, sizeof macbuf, s.mac);
    m->mac = macbuf;
@@ -1591,9 +1633,21 @@ static void build_model(struct screen *m)
    m->pair_name = g_pend_name;
    m->pair_mac  = g_pend_mac;
    /* LOG INSULIN form state */
-   m->ins_t        = g_ins_t;
-   m->ins_type     = g_ins_type;
-   m->ins_units    = g_ins_units;
+   m->ins_t       = g_ins_t;
+   m->ins_type    = g_ins_type;
+   m->ins_units   = g_ins_units;
+   m->ins_log     = g_ins; /* global tail: the borrow is stable */
+   m->ins_nlog    = g_nins;
+   m->inslog_page = g_inslog_page;
+   m->ins_edit    = (g_ins_edit >= 0);
+   for (int k = 0; k < 2; k++) {
+      m->ins_marker[k] = g_ins_marker[k];
+      m->ins_color[k]  = g_ins_color[k];
+      m->ins_size[k]   = g_ins_size[k];
+   }
+   m->markpick_ins = g_markpick_ins;
+   m->statbar_val  = g_statbar_val;
+   m->lockscr_val  = g_lockscr_val;
    m->pend_type    = g_pend_pairing;
    m->pend_primary = g_pend_primary;
    m->old_page     = g_old_page;
@@ -2659,6 +2713,13 @@ void pancra_status(const char *s)
  * threads with driver_lock held (same rule that keeps the alarm off these
  * threads). dexble_env(), not g_act->env: a JNIEnv is only valid on its own
  * thread, and these calls arrive on binder threads and the service tick. */
+/* Java -> C: Ble.remotePush got a 2xx from the server (called on its push
+ * worker thread, via dexble.c's registered onRemoteOk). */
+void pancra_remote_ok(void)
+{
+   g_remote_last_ok = realtime_s();
+}
+
 static void remote_push(long t, int mg_dl)
 {
    if (!g_remote_on || !g_remote_ip[0] || !g_ble || !m_remote_push)
@@ -3697,6 +3758,147 @@ static void do_reconnect(int idx)
    g_menu = g_sensor_from;
 }
 
+/* Hinnant civil-date conversions (the same algorithm ui.c's fmt_date
+ * uses), for the LOG INSULIN keypad date/time entry: the typed MMDD and
+ * HHMM must recombine with the untouched half on the calendar, so the
+ * date can never leak into the time or vice versa. */
+static long days_from_civil(long y, long m, long d)
+{
+   y -= m <= 2;
+   long era          = (y >= 0 ? y : y - 399) / 400;
+   unsigned long yoe = (unsigned long)(y - (era * 400));
+   unsigned long doy =
+       (((153UL * (unsigned long)(m > 2 ? m - 3 : m + 9)) + 2) / 5) +
+       (unsigned long)d - 1;
+   unsigned long doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy;
+   return (era * 146097) + (long)doe - 719468;
+}
+
+static void civil_from_days(long z, long *y, long *m, long *d)
+{
+   z += 719468;
+   long era          = (z >= 0 ? z : z - 146096) / 146097;
+   unsigned long doe = (unsigned long)(z - (era * 146097));
+   unsigned long yoe =
+       (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365;
+   long yy           = (long)yoe + (era * 400);
+   unsigned long doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100));
+   unsigned long mp  = ((5 * doy) + 2) / 153;
+   *d                = (long)(doy - (((153 * mp) + 2) / 5) + 1);
+   *m                = (long)(mp < 10 ? mp + 3 : mp - 9);
+   *y                = yy + (*m <= 2);
+}
+
+/* Every insulin-related menu action (the LOG/EDIT form, the dose log
+ * table, the marker picker), split out of menu_action so neither function
+ * outgrows the size gate. Returns 1 when `action` was one of ours. */
+static int ins_action(int action)
+{
+   if (action == MA_INS_OPEN || action == MA_INS_FAST ||
+       action == MA_INS_SLOW) {
+      /* The ADD menu picks the type up front (FAST / SLOW buttons); the
+       * legacy MA_INS_OPEN keeps the last-used type. Pre-populate: now
+       * (whole minute) and the type's last entered amount (1 U when none
+       * is known). */
+      if (action == MA_INS_FAST)
+         g_ins_type = INS_FAST;
+      else if (action == MA_INS_SLOW)
+         g_ins_type = INS_SLOW;
+      g_ins_t = realtime_s();
+      g_ins_t -= g_ins_t % 60;
+      int lu      = insulin_last_units(g_ins_type);
+      g_ins_units = (lu > 0) ? lu : 1;
+      g_ins_from  = MENU_ADD; /* these buttons live on the ADD menu */
+      g_menu      = MENU_INSULIN;
+   } else if (action == MA_INS_TYPE) {
+      g_ins_type = (g_ins_type == INS_FAST) ? INS_SLOW : INS_FAST;
+      /* A NEW dose's amount follows the type (each has its own habitual
+       * dose); an EDIT keeps whatever amount is being edited. */
+      if (g_ins_edit < 0) {
+         int lu      = insulin_last_units(g_ins_type);
+         g_ins_units = (lu > 0) ? lu : 1;
+      }
+   } else if (action == MA_INSLOG_OPEN) {
+      g_inslog_page = 0;
+      g_menu        = MENU_INSLOG;
+   } else if (action == MA_INSLOG_PREV) {
+      if (g_inslog_page > 0)
+         g_inslog_page--;
+   } else if (action == MA_INSLOG_NEXT) {
+      g_inslog_page++; /* render clamps to the last page */
+   } else if (action >= MA_INS_EDIT && action < MA_INS_EDIT + 4) {
+      /* Tapping a form value opens the keypad for EXACT entry: units (2
+       * digits), date (MMDD), time (HHMM) or year (YYYY). The keypad's OK
+       * validates and writes back; X returns unchanged. */
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = 6 + (action - MA_INS_EDIT);
+      g_kp_return = MENU_INSULIN;
+      g_entrylen  = 0;
+   } else if (action == MA_INS_CONFIRM) {
+      /* The one write, on the explicit CONFIRM only (the calibration rule).
+       * Editing rewrites the matched original row; logging appends. */
+      if (g_menu == MENU_INSULIN) {
+         int rc = -1;
+         if (g_ins_edit >= 0)
+            rc = insulin_update(&g_ins_orig, g_ins_t, g_ins_type, g_ins_units,
+                                g_tz_off);
+         else
+            rc = insulin_append(g_ins_t, g_ins_type, g_ins_units, g_tz_off);
+         if (rc == 0) {
+            LOGI("insulin %s: %d U %s at %ld",
+                 g_ins_edit >= 0 ? "edited" : "logged", g_ins_units,
+                 insulin_type_name(g_ins_type), g_ins_t);
+            set_status(g_ins_edit >= 0 ? "INSULIN EDITED" : "INSULIN LOGGED");
+         } else {
+            /* Refuse VISIBLY -- a dose the user believes recorded but is not
+             * would corrupt every judgement made on top of the log. */
+            set_status("INSULIN: WRITE FAILED");
+         }
+         g_menu     = g_ins_from;
+         g_ins_edit = -1;
+         g_ui_dirty = 1;
+      }
+   } else if (action == MA_INS_DELETE) {
+      if (g_menu == MENU_INSULIN && g_ins_edit >= 0) {
+         if (insulin_delete(&g_ins_orig) == 0)
+            set_status("INSULIN DELETED");
+         else
+            set_status("INSULIN: DELETE FAILED");
+         g_menu     = g_ins_from;
+         g_ins_edit = -1;
+         g_ui_dirty = 1;
+      }
+   } else if (action >= MA_INSLOG_EDIT && action < MA_INSLOG_EDIT + NINS) {
+      /* Open this dose in the EDIT form, pre-filled; remember the ORIGINAL
+       * row so the eventual rewrite matches content, not a tail index that
+       * may have shifted meanwhile. */
+      int i = action - MA_INSLOG_EDIT;
+      if (g_menu == MENU_INSLOG && i >= 0 && i < g_nins) {
+         g_ins_orig  = g_ins[i];
+         g_ins_edit  = i;
+         g_ins_t     = g_ins[i].t;
+         g_ins_type  = g_ins[i].type;
+         g_ins_units = g_ins[i].units;
+         g_ins_from  = MENU_INSLOG; /* opened from the dose log */
+         g_menu      = MENU_INSULIN;
+      }
+   } else if (action == MA_INS_DISCARD) {
+      if (g_menu == MENU_INSULIN) {
+         g_menu     = g_ins_from;
+         g_ins_edit = -1;
+      }
+   } else if (action >= MA_INSMARK_OPEN && action < MA_INSMARK_OPEN + 2) {
+      g_markpick_ins = action - MA_INSMARK_OPEN; /* INS_SLOW / INS_FAST */
+      g_menu         = MENU_MARKPICK;
+   } else if (action == MA_INSMARK_BACK) {
+      g_markpick_ins = -1;
+      g_menu         = MENU_DISPLAY; /* the row lives on the DISPLAY menu */
+   } else {
+      return 0; /* not an insulin action */
+   }
+   return 1;
+}
+
 static void menu_action(int action)
 {
    if (action == 0) {
@@ -3756,7 +3958,15 @@ static void menu_action(int action)
       sys_export_data(); /* Java builds the combined CSV + opens the share sheet
                           */
    } else if (action >= MA_TYPE && action < MA_TYPE + SENSOR_NTYPES) {
-      g_add_type = action - MA_TYPE;
+      /* The ADD menu's DEVICES section enters here DIRECTLY (no
+       * MA_ADDSENSOR hop records the origin), so record it now: the flow
+       * must fall back to the MAIN screen, not into settings. */
+      if (g_menu == MENU_ADD)
+         g_sensor_from = MENU_ADD;
+      /* Every abort inside the pairing flow (keypad X, device-list
+       * cancel) returns to the EXACT screen the type was tapped on. */
+      g_pair_from = (g_menu == MENU_ADD) ? MENU_ADD : MENU_SENSTYPE;
+      g_add_type  = action - MA_TYPE;
       /* A CGM pairs with a code on the keypad; a meter bonds at the OS level,
        * so it only has to be discovered. */
       /* Where the flow lands when it finishes (or is closed): back into
@@ -3828,9 +4038,9 @@ static void menu_action(int action)
       g_kp_return = MENU_REMOTE;
       g_entrylen  = 0;
    } else if (action == MA_PERMS_BACK || action == MA_OLDDEV_BACK ||
-              action == MA_REMOTE_BACK) {
-      /* All three submenus (permissions, old devices, remote) were opened FROM
-       * settings and their X returns there. */
+              action == MA_REMOTE_BACK || action == MA_DISPLAY_BACK) {
+      /* All four submenus (permissions, old devices, remote, display)
+       * were opened FROM settings and their X returns there. */
       g_menu = MENU_SETTINGS;
    } else if (action == MA_OLDDEV_OPEN) {
       g_old_page = 0; /* always open on the first page */
@@ -3881,11 +4091,17 @@ static void menu_action(int action)
          sensors_unlock();
       }
    } else if (action == MA_MARKER) {
-      if (g_sel >= 0 && g_sel < g_nslot)
-         g_menu = MENU_MARKPICK; /* open the shape picker */
+      if (g_sel >= 0 && g_sel < g_nslot) {
+         g_markpick_ins = -1; /* this picker edits the SENSOR's styling */
+         g_menu         = MENU_MARKPICK;
+      }
    } else if (action >= MA_MARK_PICK && action < MA_MARK_PICK + MARK_N) {
       int mk = action - MA_MARK_PICK;
-      if (g_sel >= 0 && g_sel < g_nslot) {
+      if (g_markpick_ins >= 0) {
+         /* the picker is editing an INSULIN type's marker, not a sensor's */
+         g_ins_marker[g_markpick_ins] = mk;
+         settings_save();
+      } else if (g_sel >= 0 && g_sel < g_nslot) {
          sensors_lock();
          g_slot[g_sel].marker = mk;
          slots_save();
@@ -3896,7 +4112,11 @@ static void menu_action(int action)
    } else if (action >= MA_SIZE_PICK &&
               action <= MA_SIZE_PICK + MARK_SIZE_MAX) {
       int sz = action - MA_SIZE_PICK; /* 1..MARK_SIZE_MAX */
-      if (sz >= 1 && sz <= MARK_SIZE_MAX && g_sel >= 0 && g_sel < g_nslot) {
+      if (sz >= 1 && sz <= MARK_SIZE_MAX && g_markpick_ins >= 0) {
+         g_ins_size[g_markpick_ins] = sz;
+         settings_save();
+      } else if (sz >= 1 && sz <= MARK_SIZE_MAX && g_sel >= 0 &&
+                 g_sel < g_nslot) {
          sensors_lock();
          g_slot[g_sel].size = sz;
          slots_save();
@@ -3935,7 +4155,10 @@ static void menu_action(int action)
          g_menu = MENU_COLORPICK; /* open the colour picker */
    } else if (action >= MA_COLOR_PICK && action < MA_COLOR_PICK + 7) {
       int ci = action - MA_COLOR_PICK;
-      if (g_sel >= 0 && g_sel < g_nslot) {
+      if (g_markpick_ins >= 0) {
+         g_ins_color[g_markpick_ins] = ci;
+         settings_save();
+      } else if (g_sel >= 0 && g_sel < g_nslot) {
          sensors_lock();
          g_slot[g_sel].color = ci;
          slots_save();
@@ -4179,13 +4402,13 @@ static void menu_action(int action)
    } else if (action == 31) {
       g_menu      = MENU_KEYPAD;
       g_kp_mode   = 1;
-      g_kp_return = MENU_SETTINGS;
+      g_kp_return = MENU_DISPLAY; /* PLOT MAX now lives on DISPLAY */
       g_entrylen  = 0;
    } else if (action >= 100 && action <= 109) { /* digit */
       /* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted
        * quad's 15; port = 5. Keep in step with ui.c's slots_for. */
-      static const int caps[6] = {4, 3, 3, 3, 15, 5};
-      int cap = caps[(g_kp_mode >= 0 && g_kp_mode < 6) ? g_kp_mode : 0];
+      static const int caps[10] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4};
+      int cap = caps[(g_kp_mode >= 0 && g_kp_mode < 10) ? g_kp_mode : 0];
       if (g_entrylen < cap)
          g_entry[g_entrylen++] = (char)('0' + (action - 100));
    } else if (action == MA_DOT) {
@@ -4207,13 +4430,13 @@ static void menu_action(int action)
       if (g_smart_pairing)
          pair_cancel(); /* abandon pairing, keep the old bond */
       if (was_pairing)
-         g_menu = MENU_SENSTYPE;
+         g_menu = g_pair_from; /* the screen the type was tapped on */
       else
          keypad_close();
    } /* X -> close */
-   else if (action == 199) { /* device list: cancel -> back to ADD SENSOR */
+   else if (action == 199) { /* device list: cancel -> where pairing began */
       pair_cancel();
-      g_menu = MENU_SENSTYPE;
+      g_menu = g_pair_from;
    } else if (action >= 200 &&
               action < 200 + MAX_DEVS) { /* device list: pick */
       /* Only honour a device-pick while the list is actually open and the index
@@ -4249,52 +4472,27 @@ static void menu_action(int action)
          g_pend_name[0] = 0;
          g_menu = MENU_DEVLIST; /* nothing committed: back to the list */
       }
-   } else if (action == MA_ADD_OPEN) {
+   } else if (action == MA_ADD_OPEN || action == MA_INSLOG_BACK) {
+      /* both land on the ADD menu (the log's X returns where it opened) */
       g_menu = MENU_ADD;
-   } else if (action == MA_INS_OPEN) {
-      /* Pre-populate: now (whole minute), the last-used type, and that type's
-       * last entered amount (1 U when none is known). */
-      g_ins_t = realtime_s();
-      g_ins_t -= g_ins_t % 60;
-      int lu      = insulin_last_units(g_ins_type);
-      g_ins_units = (lu > 0) ? lu : 1;
-      g_menu      = MENU_INSULIN;
-   } else if (action == MA_INS_TYPE) {
-      g_ins_type = (g_ins_type == INS_FAST) ? INS_SLOW : INS_FAST;
-      /* The amount follows the type: each has its own habitual dose. */
-      int lu      = insulin_last_units(g_ins_type);
-      g_ins_units = (lu > 0) ? lu : 1;
-   } else if (action == MA_INS_UMINUS) {
-      if (g_ins_units > INS_UNITS_MIN)
-         g_ins_units--;
-   } else if (action == MA_INS_UPLUS) {
-      if (g_ins_units < INS_UNITS_MAX)
-         g_ins_units++;
-   } else if (action == MA_INS_DMINUS) {
-      g_ins_t -= 86400;
-   } else if (action == MA_INS_DPLUS) {
-      g_ins_t += 86400;
-   } else if (action == MA_INS_TMINUS) {
-      g_ins_t -= 300;
-   } else if (action == MA_INS_TPLUS) {
-      g_ins_t += 300;
-   } else if (action == MA_INS_CONFIRM) {
-      /* The one write, on the explicit CONFIRM only (the calibration rule). */
-      if (g_menu == MENU_INSULIN) {
-         if (insulin_append(g_ins_t, g_ins_type, g_ins_units, g_tz_off) == 0) {
-            LOGI("insulin logged: %d U %s at %ld", g_ins_units,
-                 insulin_type_name(g_ins_type), g_ins_t);
-            set_status("INSULIN LOGGED");
-         } else {
-            /* Refuse VISIBLY -- a dose the user believes recorded but is not
-             * would corrupt every judgement made on top of the log. */
-            set_status("INSULIN: WRITE FAILED");
-         }
-         g_menu = MENU_NONE;
-      }
-   } else if (action == MA_INS_DISCARD) {
-      if (g_menu == MENU_INSULIN)
-         g_menu = MENU_NONE;
+   } else if (action == MA_DISPLAY_OPEN) {
+      g_menu = MENU_DISPLAY; /* its X shares the settings-back branch */
+   } else if (action == MA_STATBAR || action == MA_LOCKSCR ||
+              action == MA_NOTIF_REOPEN) {
+      if (action == MA_STATBAR)
+         g_statbar_val = !g_statbar_val;
+      else if (action == MA_LOCKSCR)
+         g_lockscr_val = !g_lockscr_val;
+      if (action != MA_NOTIF_REOPEN)
+         settings_save();
+      /* All three re-post the notification immediately: the toggles so
+       * the change is visible at once, REOPEN because re-posting IS the
+       * action (a swiped-away notification returns on notify()). */
+      g_notify_dirty = 1;
+      pancra_notify_refresh();
+   } else if (ins_action(action)) {
+      /* handled: LOG/EDIT INSULIN, the dose log table, the insulin marker
+       * picker -- see ins_action above menu_action */
    } else if (action == MA_OK) {
       if (g_menu == MENU_LABEL) {
          if (g_sel >= 0 && g_sel < g_nslot) {
@@ -4420,6 +4618,88 @@ static void menu_action(int action)
             }
             g_remote_port = v;
             remote_save();
+            g_entrylen = 0;
+            keypad_close();
+         }
+      } else if (g_kp_mode == 6) { /* INSULIN UNITS: 1..99 */
+         if (g_entrylen > 0) {
+            int v = 0;
+            for (int i = 0; i < g_entrylen; i++)
+               v = (v * 10) + (g_entry[i] - '0');
+            if (v < INS_UNITS_MIN || v > INS_UNITS_MAX) {
+               g_entrylen = 0;
+               g_ui_dirty = 1;
+               return; /* stay: cleared entry is the refusal */
+            }
+            g_ins_units = v;
+            g_entrylen  = 0;
+            keypad_close();
+         }
+      } else if (g_kp_mode == 9) { /* INSULIN YEAR: 4 digits */
+         if (g_entrylen == 4) {
+            int v = 0;
+            for (int i = 0; i < 4; i++)
+               v = (v * 10) + (g_entry[i] - '0');
+            long local = g_ins_t + g_tz_off;
+            long secs  = local % 86400;
+            long z     = local / 86400;
+            if (secs < 0) {
+               secs += 86400;
+               z--;
+            }
+            long yy = 0;
+            long mm = 0;
+            long dd = 0;
+            civil_from_days(z, &yy, &mm, &dd);
+            /* a dose belongs to a human timescale; refuse typo years */
+            if (v < 2000 || v > 2199) {
+               g_entrylen = 0;
+               g_ui_dirty = 1;
+               return;
+            }
+            /* keep month/day/time; clamp Feb 29 out of non-leap years */
+            int leap = (v % 4 == 0 && v % 100 != 0) || v % 400 == 0;
+            if (mm == 2 && dd == 29 && !leap)
+               dd = 28;
+            g_ins_t    = (days_from_civil(v, mm, dd) * 86400) + secs - g_tz_off;
+            g_entrylen = 0;
+            keypad_close();
+         }
+      } else if (g_kp_mode == 7 || g_kp_mode == 8) { /* INSULIN MMDD/HHMM */
+         if (g_entrylen == 4) {
+            int a = ((g_entry[0] - '0') * 10) + (g_entry[1] - '0');
+            int b = ((g_entry[2] - '0') * 10) + (g_entry[3] - '0');
+            /* split the dose instant into local civil date + seconds */
+            long local = g_ins_t + g_tz_off;
+            long secs  = local % 86400;
+            long z     = local / 86400;
+            if (secs < 0) {
+               secs += 86400;
+               z--;
+            }
+            long yy = 0;
+            long mm = 0;
+            long dd = 0;
+            civil_from_days(z, &yy, &mm, &dd);
+            if (g_kp_mode == 7) { /* MMDD, within the current year */
+               static const int mdl[12] = {31, 28, 31, 30, 31, 30,
+                                           31, 31, 30, 31, 30, 31};
+               int leap = (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0;
+               int md = (a >= 1 && a <= 12) ? mdl[a - 1] + (a == 2 && leap) : 0;
+               if (a < 1 || a > 12 || b < 1 || b > md) {
+                  g_entrylen = 0;
+                  g_ui_dirty = 1;
+                  return; /* invalid date: stay, entry cleared */
+               }
+               g_ins_t = (days_from_civil(yy, a, b) * 86400) + secs - g_tz_off;
+            } else { /* HHMM: keep the civil date, set the time of day */
+               if (a > 23 || b > 59) {
+                  g_entrylen = 0;
+                  g_ui_dirty = 1;
+                  return; /* invalid time: stay, entry cleared */
+               }
+               g_ins_t = (z * 86400) + (a * 3600L) + (b * 60L) - g_tz_off;
+            }
             g_entrylen = 0;
             keypad_close();
          }
@@ -5039,6 +5319,11 @@ static void notify_update(void)
     * line empty so the BigPicture plot below gets that vertical space. */
    int stale = realtime_s() - cur_time > 360;
    text[0]   = 0;
+   /* val is the bare display value for the STATUS-BAR icon; EMPTY on
+    * stale/no data, which is Java's cue to fall back to the app glyph --
+    * the bar must never show a number the app itself would blank. */
+   char val[12];
+   val[0] = 0;
    if (cur_glu < 0 || stale) {
       (void)snprintf(title, sizeof title, "--- %s  no recent reading",
                      UNIT_LBL);
@@ -5052,7 +5337,10 @@ static void notify_update(void)
       hm[5] = 0; /* HH:MM */
       (void)snprintf(title, sizeof title, "%s %s  %s   at %s", gv, UNIT_LBL, tr,
                      hm);
+      (void)snprintf(val, sizeof val, "%s", gv);
    }
+   if (!g_statbar_val)
+      val[0] = 0; /* STATUS BAR: ICON mode -- Java falls back to the glyph */
    for (int i = 0; i < NOTIFY_W * NOTIFY_H; i++)
       g_notify_px[i] = 0xFF181818;
    static struct plot_pt pts[NHIST];
@@ -5120,16 +5408,29 @@ static void notify_update(void)
    hist_unlock();
    plot_render(g_notify_px, NOTIFY_W, NOTIFY_W, NOTIFY_H, 0, 0, NOTIFY_W,
                NOTIFY_H, pts, np, realtime_s(), 3, 3, white_color, -1, 0);
+   /* plot_render writes the SCREEN's pixel convention -- raw u32 on a
+    * little-endian RGBA surface, i.e. 0xAABBGGRR -- but
+    * Bitmap.createBitmap(..., ARGB_8888) reads each int as 0xAARRGGBB.
+    * Swap R and B or every coloured marker is wrong in the notification:
+    * white dots and gray gridlines hide the swap (R == B), a PINK meter
+    * marker turned periwinkle. Same failure ui_sensor_colors documents. */
+   for (int i = 0; i < NOTIFY_W * NOTIFY_H; i++) {
+      uint32_t c = g_notify_px[i];
+      g_notify_px[i] =
+          (c & 0xFF00FF00U) | ((c & 0xFFU) << 16U) | ((c >> 16U) & 0xFFU);
+   }
    jstring jt    = (*e)->NewStringUTF(e, title);
    jstring js    = (*e)->NewStringUTF(e, text);
+   jstring jv    = (*e)->NewStringUTF(e, val);
    jintArray arr = (*e)->NewIntArray(e, NOTIFY_W * NOTIFY_H);
    /* On OOM any of these is NULL with an exception pending; SetIntArrayRegion
     * on a NULL array aborts the VM, so bail and clean up instead. */
-   if (jt && js && arr) {
+   if (jt && js && jv && arr) {
       (*e)->SetIntArrayRegion(e, arr, 0, NOTIFY_W * NOTIFY_H,
                               (const jint *)g_notify_px);
-      (*e)->CallStaticVoidMethod(e, g_ble, m_show_glucose, jctx, jt, js, arr,
-                                 (jint)NOTIFY_W, (jint)NOTIFY_H);
+      (*e)->CallStaticVoidMethod(e, g_ble, m_show_glucose, jctx, jt, js, jv,
+                                 arr, (jint)NOTIFY_W, (jint)NOTIFY_H,
+                                 (jint)(g_lockscr_val ? 1 : 0));
    }
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
@@ -5137,6 +5438,8 @@ static void notify_update(void)
       (*e)->DeleteLocalRef(e, jt);
    if (js)
       (*e)->DeleteLocalRef(e, js);
+   if (jv)
+      (*e)->DeleteLocalRef(e, jv);
    if (arr)
       (*e)->DeleteLocalRef(e, arr);
    __atomic_store_n(&g_notify_busy, 0, __ATOMIC_SEQ_CST);
@@ -5435,7 +5738,7 @@ static int on_input(int fd, int events, void *data)
             }
             int fx = (int)(ax / n);
             int fy = (int)(ay / n);
-            static struct plot_pt pts[NHIST];
+            static struct plot_pt pts[NHIST + NINS];
             static int psrc[NHIST];
             /* Under hist_lock: hist_insert memmoves g_hist from a BLE binder
              * thread, so an unlocked copy here reads a half-shifted array and
@@ -5464,6 +5767,44 @@ static int on_input(int fd, int events, void *data)
                      pts[i].hidden = 1;
                      break;
                   }
+            /* Insulin doses ride along, in the SAME order the model
+             * appends them, so the returned index maps onto m->hist. */
+            int np_glu = np;
+            for (int i = 0; i < g_nins && np < NHIST + NINS; i++) {
+               pts[np].t      = g_ins[i].t;
+               pts[np].glu    = 60; /* the renderer's fixed insulin y */
+               pts[np].marker = 0;
+               pts[np].col    = 0;
+               pts[np].size   = 0;
+               pts[np].hidden =
+                   (g_ins_marker[g_ins[i].type == INS_FAST ? INS_FAST
+                                                           : INS_SLOW] ==
+                    MARK_HIDE);
+               np++;
+            }
+            /* plot_hit picks by TIME alone, which would leave a dose
+             * between two 5-minute CGM points a sliver of reachability.
+             * Aim by finger HEIGHT instead: below the 70-line (where the
+             * insulin row lives) only insulin is selectable, above it
+             * only glucose -- sliding along the plot bottom walks the
+             * doses. */
+            int oy70 = ry + rh;
+            {
+               int oxx            = 0;
+               struct plot_pt ref = {0};
+               ref.t              = realtime_s();
+               ref.glu            = 70;
+               if (!plot_point_xy(rx, ry, rw, rh, ref, realtime_s(),
+                                  g_plot_hours, &oxx, &oy70))
+                  oy70 = ry + rh; /* degenerate window: all glucose */
+            }
+            int aim_ins = (fy >= oy70);
+            for (int i = 0; i < np_glu; i++)
+               if (aim_ins)
+                  pts[i].hidden = 1;
+            for (int i = np_glu; i < np; i++)
+               if (!aim_ins)
+                  pts[i].hidden = 1;
             int idx = plot_hit(rx, ry, rw, rh, pts, np, realtime_s(),
                                g_plot_hours, fx, fy);
             if (idx != g_scrub_idx) {
@@ -5868,7 +6209,8 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       m_show_glucose =
           (*env)->GetStaticMethodID(env, g_ble, "showGlucose",
                                     "(Landroid/content/Context;Ljava/lang/"
-                                    "String;Ljava/lang/String;[III)V");
+                                    "String;Ljava/lang/String;Ljava/lang/"
+                                    "String;[IIII)V");
       m_set_orient = (*env)->GetStaticMethodID(env, g_ble, "setOrientation",
                                                "(Landroid/content/Context;I)V");
       m_export     = (*env)->GetStaticMethodID(env, g_ble, "exportData",

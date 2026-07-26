@@ -20,7 +20,15 @@ int g_newdata_beep;  /* short beep on each new primary-CGM datapoint (OFF/BEEP)
                       */
 int g_units;
 int g_disc;
-int g_plot_max      = PLOT_GLU_MAX;
+int g_plot_max = PLOT_GLU_MAX;
+/* Insulin plot styling, PER TYPE (index INS_SLOW / INS_FAST): marker
+ * shape, ui palette colour, marker size. Defaults: crosses, SLOW white,
+ * FAST blue (matching the log table's blue FAST rows). */
+int g_ins_marker[2] = {1, 1};
+int g_ins_color[2]  = {6, 1};
+int g_ins_size[2]   = {2, 2};
+int g_statbar_val   = 1;      /* status bar shows the VALUE (0 = app icon) */
+int g_lockscr_val   = 1;      /* notification visible on the lock screen */
 char g_code_str[16] = "9973"; /* Stelo applicator default (rebuild to change) */
 int g_remote_on;              /* push each new datapoint; default off */
 char g_remote_ip[16];         /* dotted quad; "" until the user sets one */
@@ -143,11 +151,14 @@ void settings_save(void)
    int fd = open(g_settings_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd < 0)
       return;
-   char b[64];
-   int n = snprintf(b, sizeof b, "%d %d %d %d %d %d %d %d\n", g_sound_on,
-                    g_vib_on, g_orient, g_units, g_disc, g_plot_max,
-                    g_screen_on, g_newdata_beep);
-   n     = clampn(n, sizeof b);
+   char b[96];
+   int n = snprintf(
+       b, sizeof b, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+       g_sound_on, g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
+       g_newdata_beep, g_ins_marker[0], g_ins_color[0], g_ins_size[0],
+       g_ins_marker[1], g_ins_color[1], g_ins_size[1], g_statbar_val,
+       g_lockscr_val);
+   n = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
    close(fd);
@@ -158,16 +169,18 @@ void settings_load(void)
    int fd = open(g_settings_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   char b[64];
+   char b[96];
    int n = (int)read(fd, b, sizeof b - 1);
    close(fd);
    if (n <= 0)
       return;
-   b[n]     = 0;
-   int v[8] = {g_sound_on, g_vib_on,   g_orient,    g_units,
-               g_disc,     g_plot_max, g_screen_on, g_newdata_beep};
-   char *q  = b;
-   for (int i = 0; i < 8; i++) {
+   b[n]      = 0;
+   int v[16] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
+                g_disc,          g_plot_max,     g_screen_on,   g_newdata_beep,
+                g_ins_marker[0], g_ins_color[0], g_ins_size[0], g_ins_marker[1],
+                g_ins_color[1],  g_ins_size[1],  g_statbar_val, g_lockscr_val};
+   char *q   = b;
+   for (int i = 0; i < 16; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -191,6 +204,20 @@ void settings_load(void)
    g_plot_max     = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
    g_screen_on    = v[6] ? 1 : 0;
    g_newdata_beep = v[7] ? 1 : 0;
+   /* Fields 9-14 are newer than some files on disk: out-of-range (or
+    * absent, leaving the default) falls back to the defaults. Bounds:
+    * 9 == MARK_N, 7 colours, 4 == MARK_SIZE_MAX; settings.c stays
+    * decoupled from sensors.h, crosschecked by eye. */
+   for (int k = 0; k < 2; k++) {
+      int base        = 8 + (k * 3);
+      int defc        = k ? 1 : 6; /* SLOW white, FAST blue */
+      g_ins_marker[k] = (v[base] >= 0 && v[base] < 9) ? v[base] : 1;
+      g_ins_color[k] =
+          (v[base + 1] >= 0 && v[base + 1] < 7) ? v[base + 1] : defc;
+      g_ins_size[k] = (v[base + 2] >= 1 && v[base + 2] <= 4) ? v[base + 2] : 2;
+   }
+   g_statbar_val = v[14] ? 1 : 0;
+   g_lockscr_val = v[15] ? 1 : 0;
    plot_set_max(g_plot_max);
 }
 

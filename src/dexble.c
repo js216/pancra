@@ -521,6 +521,14 @@ static void jni_tick(JNIEnv *e, jclass c)
    pancra_reconcile_tick();
 }
 
+/* Ble.remotePush's worker thread: the server acknowledged a push (2xx). */
+static void jni_remote_ok(JNIEnv *e, jclass c)
+{
+   (void)e;
+   (void)c;
+   pancra_remote_ok();
+}
+
 static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
 {
    (void)e;
@@ -592,6 +600,8 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    static char s5[]                 = "(ILjava/lang/String;[B)V";
    static char n6[]                 = "onTick";
    static char s6[]                 = "()V";
+   static char n7[]                 = "onRemoteOk";
+   static char s7[]                 = "()V";
    static const JNINativeMethod m[] = {
        {n0, s0, (void *)jni_connected   },
        {n1, s1, (void *)jni_disconnected},
@@ -600,8 +610,9 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n4, s4, (void *)jni_rssi        },
        {n5, s5, (void *)jni_read        },
        {n6, s6, (void *)jni_tick        },
+       {n7, s7, (void *)jni_remote_ok   },
    };
-   if ((*e)->RegisterNatives(e, ble, m, 7) != 0)
+   if ((*e)->RegisterNatives(e, ble, m, 8) != 0)
       return 0;
    m_connect = (*e)->GetStaticMethodID(
        e, ble, "connect",

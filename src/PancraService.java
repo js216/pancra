@@ -32,7 +32,12 @@ import android.provider.Settings;
 import android.util.Log;
 
 public final class PancraService extends Service {
-    private static final String CH = "pancra";
+    /* Channel id v2: importance is immutable once a channel exists, and the
+     * original "pancra" channel was IMPORTANCE_LOW -- which Android files
+     * under "silent notifications", a class most lock screens HIDE. DEFAULT
+     * importance (with sound and vibration explicitly off, so it stays just
+     * as quiet) is what makes the value show on the lock screen. */
+    private static final String CH = "pancra_glucose";
     private static final String ACTION_WAKE = "com.jk.pancra.WAKE";
     private static final long WAKE_INTERVAL_MS = 5 * 60 * 1000L;   /* ~one sensor cycle */
     private static PowerManager.WakeLock wakelock;
@@ -43,6 +48,8 @@ public final class PancraService extends Service {
      * onStartCommand stamped the plain "Reading glucose" over the live reading,
      * so the shade showed neither number nor plot until the next reading. */
     private static volatile String sTitle, sText;
+    private static volatile String sVal; /* fresh display value, "" = stale */
+    private static volatile boolean sLock = true; /* visible on lock screen */
     private static volatile int[] sPx;
     private static volatile int sW, sH;
 
@@ -100,8 +107,14 @@ public final class PancraService extends Service {
      * placeholder. Before the first reading it shows "Reading glucose". */
     private static Notification buildNotif(Context app) {
         NotificationManager nm = app.getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(
-            new NotificationChannel(CH, "Pancra", NotificationManager.IMPORTANCE_LOW));
+        NotificationChannel ch =
+            new NotificationChannel(CH, "Pancra",
+                                    NotificationManager.IMPORTANCE_DEFAULT);
+        ch.setSound(null, null);   /* DEFAULT importance, but never a peep: */
+        ch.enableVibration(false); /* the alarm has its own loud path */
+        ch.setShowBadge(false);
+        nm.createNotificationChannel(ch);
+        nm.deleteNotificationChannel("pancra"); /* retire the LOW-imp. v1 */
         Intent open = new Intent(app, android.app.NativeActivity.class);
         open.setAction(Intent.ACTION_MAIN);
         open.addCategory(Intent.CATEGORY_LAUNCHER);
@@ -113,10 +126,20 @@ public final class PancraService extends Service {
         Notification.Builder b = new Notification.Builder(app, CH)
             .setContentTitle(title)
             .setContentText(text)
-            .setSmallIcon(notifIcon(app))
             .setContentIntent(pi)
             .setOngoing(true)
             .setOnlyAlertOnce(true);
+        /* Status bar shows the VALUE when fresh; the app glyph otherwise.
+         * The pulldown keeps its identity via the large icon / plot. */
+        String v = sVal;
+        android.graphics.drawable.Icon vi =
+            (v != null && !v.isEmpty()) ? valueIcon(v) : null;
+        if (vi != null) b.setSmallIcon(vi);
+        else b.setSmallIcon(notifIcon(app));
+        /* LOCK SCREEN setting: SHOW = full content on the lock screen,
+         * HIDE = the notification does not appear there at all. */
+        b.setVisibility(sLock ? Notification.VISIBILITY_PUBLIC
+                              : Notification.VISIBILITY_SECRET);
         int[] px = sPx; int w = sW; int h = sH;
         if (px != null && w > 0 && h > 0 && px.length >= w * h) {
             Bitmap bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
@@ -140,16 +163,57 @@ public final class PancraService extends Service {
      * wakes re-post the SAME rich notification (see buildNotif); uses id 1 so it
      * refreshes the FGS notification, setOnlyAlertOnce so refreshes never buzz. */
     public static void showGlucose(Context ctx, String title, String text,
-                                   int[] px, int w, int h) {
+                                   String value, int[] px, int w, int h,
+                                   int lockscr) {
         try {
             Context app = ctx.getApplicationContext();
-            sTitle = title; sText = text;
+            sTitle = title; sText = text; sVal = value; sLock = lockscr != 0;
             if (px != null && w > 0 && h > 0 && px.length >= w * h) {
                 sPx = px; sW = w; sH = h;
             }
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             nm.notify(1, buildNotif(app));
         } catch (Throwable t) { Log.i("pancra", "showGlucose: " + t); }
+    }
+
+    /* The STATUS BAR icon is the value itself: Android renders small icons as
+     * alpha-only silhouettes, so bold white digits on transparency show up as
+     * a legible number in the top row (the xDrip/Juggluco trick). Returns null
+     * on any failure so the caller falls back to the app glyph -- which is
+     * also what a STALE reading gets (value == ""), matching the app's rule
+     * that stale data blanks rather than lies. */
+    private static android.graphics.drawable.Icon valueIcon(String v) {
+        try {
+            final int S = 96;
+            Bitmap b = Bitmap.createBitmap(S, S, Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas c = new android.graphics.Canvas(b);
+            android.graphics.Paint p =
+                new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            p.setColor(0xFFFFFFFF);
+            /* CONDENSED bold: designed-narrow digits look like the clock
+             * where artificially squeezed regular ones look distorted.
+             * The icon SLOT is a fixed ~25px square, so the clock's full
+             * 3-digit width (~39px) is unreachable; the tuning target is
+             * the clock's exact glyph HEIGHT (measured: cap 18px of the
+             * 25px slot = 72% of the canvas). */
+            p.setTypeface(android.graphics.Typeface.create(
+                "sans-serif-condensed",
+                android.graphics.Typeface.BOLD));
+            p.setTextAlign(android.graphics.Paint.Align.CENTER);
+            float ts = 100f; /* cap height ~0.71em -> ~71px = clock's 72% */
+            p.setTextSize(ts);
+            float tw = p.measureText(v);
+            if (tw > S) {
+                float sx = S / tw;
+                if (sx < 0.6f) sx = 0.6f;
+                p.setTextScaleX(sx);
+                tw = p.measureText(v);
+                if (tw > S) p.setTextSize(ts * S / tw);
+            }
+            android.graphics.Paint.FontMetrics fm = p.getFontMetrics();
+            c.drawText(v, S / 2f, (S - fm.ascent - fm.descent) / 2f, p);
+            return android.graphics.drawable.Icon.createWithBitmap(b);
+        } catch (Throwable t) { return null; }
     }
 
     /* Re-arm a periodic wake. Stelo disconnects after every reading, so between

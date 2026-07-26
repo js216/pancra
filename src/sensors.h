@@ -42,7 +42,10 @@ enum sensor_type {
  */
 enum sensor_kind {
    KIND_CGM = 0, /* continuous, 5-min, trend arrow, drawn as a line */
-   KIND_BGM      /* sparse fingersticks, drawn as discrete markers */
+   KIND_BGM,     /* sparse fingersticks, drawn as discrete markers */
+   KIND_INS      /* insulin doses: plotted along the bottom edge, in the
+                  * user-chosen INSULIN MARKER; excluded from stats and
+                  * from the remote push (they are not glucose) */
 };
 
 /* MARK_HIDE is not a plot.c shape: it means "do not draw this device's points"
