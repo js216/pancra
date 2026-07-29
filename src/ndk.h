@@ -67,7 +67,13 @@ float AMotionEvent_getHistoricalX(const struct AInputEvent *ev,
                                   unsigned long idx, unsigned long h);
 float AMotionEvent_getHistoricalY(const struct AInputEvent *ev,
                                   unsigned long idx, unsigned long h);
+int32_t AKeyEvent_getAction(const struct AInputEvent *ev);
+int32_t AKeyEvent_getKeyCode(const struct AInputEvent *ev);
+#define AINPUT_EVENT_TYPE_KEY       1
 #define AINPUT_EVENT_TYPE_MOTION    2
+#define AKEY_EVENT_ACTION_DOWN      0
+#define AKEY_EVENT_ACTION_UP        1
+#define AKEYCODE_BACK               4
 #define AMOTION_EVENT_ACTION_DOWN   0
 #define AMOTION_EVENT_ACTION_UP     1
 #define AMOTION_EVENT_ACTION_MOVE   2

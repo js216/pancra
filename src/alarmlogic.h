@@ -180,6 +180,12 @@ int cal_entry_mgdl(const char *digits, int n, int units);
 #define AL_MIN  40
 #define AL_MAX  400
 #define AL_STEP 5
+/* Keypad-entry bound for BOTH alarm thresholds, and alarm_load's range check
+ * (the two must agree, so it lives here next to AL_*): 0..999 mg/dL. Either
+ * end is a deliberate OFF switch -- LOW 0 sits below any possible reading,
+ * and a HIGH past the sensor's 400 scale above any -- so both are legitimate
+ * user choices, unlike the stepper-era [AL_MIN, AL_MAX] clamp. */
+#define AL_ENTRY_MAX 999
 
 void alarm_step(int which, int *lo, int *hi);
 

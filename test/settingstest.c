@@ -97,11 +97,30 @@ int main(void)
    ck(g_alarm_low == 80 && g_alarm_high == 200,
       "low > high is rejected (it would latch BOTH alarms forever)");
 
-   put(g_alarm_path, "20 200\n");
+   /* Both thresholds accept 0..AL_ENTRY_MAX now -- 0 is LOW's deliberate
+    * OFF switch (below any possible reading), so it must round-trip. */
+   put(g_alarm_path, "0 200\n");
    alarm_load();
-   ck(g_alarm_low == 80, "a LOW below the keypad's own minimum is rejected");
+   ck(g_alarm_low == 0, "LOW 0 (that alarm's OFF switch) is accepted");
+   g_alarm_low  = 80;
+   g_alarm_high = 200;
+   /* With 0 legal, a file that parses to NO digits must be rejected
+    * explicitly: garbage would otherwise read as the valid pair 0/0 and
+    * silently install both alarms OFF. */
+   put(g_alarm_path, "not numbers\n");
+   alarm_load();
+   ck(g_alarm_low == 80 && g_alarm_high == 200,
+      "a digit-free file is rejected, never read as a 0/0 pair");
 
-   put(g_alarm_path, "80 500\n");
+   /* HIGH alone ranges past the 400 glucose scale, up to AL_HIGH_MAX (999)
+    * -- parked up there it effectively disables the high alarm, which is the
+    * user's call to make. 999 must load; 1000 must not. */
+   put(g_alarm_path, "80 999\n");
+   alarm_load();
+   ck(g_alarm_high == 999, "a HIGH up to AL_HIGH_MAX (999) is accepted");
+   g_alarm_low  = 80;
+   g_alarm_high = 200;
+   put(g_alarm_path, "80 1000\n");
    alarm_load();
    ck(g_alarm_high == 200, "a HIGH above the keypad's own maximum is rejected");
 

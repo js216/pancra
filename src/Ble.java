@@ -49,16 +49,26 @@ public final class Ble {
      * and a reader can tell them apart. The content:// URI comes from
      * PancraFiles (see the manifest); FLAG_GRANT_READ_URI_PERMISSION lets the
      * chosen app read it. */
-    public static void exportData(Context ctx) {
+    /* cutoff: rows whose leading epoch field is OLDER are left out (0 =
+     * everything); header lines (no leading digit) are always kept. The
+     * three flags mirror the EXPORT DATA menu's checkboxes; the DEVICES
+     * section is a registry, not a time series, so it never filters. */
+    public static void exportData(Context ctx, long cutoff, boolean glucose,
+                                  boolean devices, boolean insulin) {
         try {
             java.io.File dir = ctx.getFilesDir();
             java.io.File out = new java.io.File(dir, "pancra.csv");
             java.io.FileOutputStream os = new java.io.FileOutputStream(out);
-            copyInto(os, new java.io.File(dir, "sensors.csv"));
-            os.write('\n'); /* blank line between sections */
-            copyInto(os, new java.io.File(dir, "readings.csv"));
-            os.write('\n');
-            copyInto(os, new java.io.File(dir, "insulin.csv"));
+            if (devices) {
+                copyInto(os, new java.io.File(dir, "sensors.csv"));
+                os.write('\n'); /* blank line between sections */
+            }
+            if (glucose) {
+                copyFiltered(os, new java.io.File(dir, "readings.csv"), cutoff);
+                os.write('\n');
+            }
+            if (insulin)
+                copyFiltered(os, new java.io.File(dir, "insulin.csv"), cutoff);
             os.close();
             if (out.length() == 0) return;
             Uri uri = Uri.parse("content://com.jk.pancra.files/pancra.csv");
@@ -82,6 +92,34 @@ public final class Ble {
         is.close();
     }
 
+    /* copyInto, but keeping only rows whose LEADING integer (epoch seconds,
+     * the first CSV field of readings.csv and insulin.csv alike) is >= cutoff.
+     * Lines that do not start with a digit (the column header) are kept, so a
+     * filtered export stays self-describing. */
+    private static void copyFiltered(java.io.OutputStream os, java.io.File f,
+                                     long cutoff)
+            throws java.io.IOException {
+        if (!f.exists()) return;
+        if (cutoff <= 0) { copyInto(os, f); return; }
+        java.io.BufferedReader r =
+            new java.io.BufferedReader(new java.io.FileReader(f));
+        String ln;
+        while ((ln = r.readLine()) != null) {
+            long t = -1;
+            int i = 0;
+            while (i < ln.length() && ln.charAt(i) >= '0'
+                   && ln.charAt(i) <= '9' && i < 12) {
+                t = (t < 0 ? 0 : t) * 10 + (ln.charAt(i) - '0');
+                i++;
+            }
+            if (t < 0 || t >= cutoff) {
+                os.write(ln.getBytes());
+                os.write('\n');
+            }
+        }
+        r.close();
+    }
+
     /* ---- REMOTE push: one datapoint per call to the configured server ---- */
 
     /* One background thread with a small BOUNDED queue. Pushes must never block
@@ -95,42 +133,296 @@ public final class Ble {
             new java.util.concurrent.ArrayBlockingQueue<Runnable>(64),
             new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
 
-    /* Called from native on every newly stored datapoint (CGM, backfill, and
-     * meter fingersticks alike). Enqueue-and-return; the network happens on
-     * pushExec's thread. The body is one line of plain text --
-     * "<epoch seconds> <mg/dL>\n" -- POSTed to http://ip:port/ (glucoserve.py
-     * appends it to data.txt). Failures are logged and dropped: the phone's
-     * readings.csv stays the record of truth, the remote page is a mirror. */
-    public static void remotePush(final String ip, final int port,
-                                  final long t, final int glu) {
+    /* ---- REMOTE sync: cursor-driven, so nothing is lost ----
+     *
+     * The old design pushed each new datapoint once and dropped it on any
+     * failure -- every reading taken while the server was unreachable was
+     * gone for good. Now native asks the server what it already has (the
+     * CURSOR, GET /api/last), then sends everything newer in chronological
+     * batches; a batch that fails for ANY reason is simply retried later
+     * from the cursor, and the server skips what it already stored, so a
+     * reply lost in flight cannot double-write. See glucoserve.c.
+     *
+     * All of it runs on pushExec (never a BLE binder thread, which holds
+     * the driver lock). Native drives one step per tick and reads the
+     * state back through the three getters below -- no callbacks into C
+     * from arbitrary threads beyond the existing onRemoteOk. */
+    private static volatile long sCurGlu = -1; /* server cursors; -1 = not */
+    private static volatile long sCurIns = -1; /* yet asked */
+    /* The tag of the last batch the server CONFIRMED, per set. Native passes
+     * its outbox position as the tag and advances only when it comes back
+     * here -- so a batch that failed, timed out, or whose reply was lost
+     * leaves the position untouched and is simply resent. */
+    private static volatile long sAckGlu = -1;
+    private static volatile long sAckIns = -1;
+    /* What the LAST attempt actually got back. Failures used to be visible
+     * only in logcat, so a server quietly refusing every batch looked
+     * exactly like a working link that had nothing to send. */
+    private static volatile String sStatus = "";
+
+    public static String remoteStatus() { return sStatus; }
+
+    /* ---- the PULL direction ----
+     * The server holds far more history than the phone (months of it), so
+     * after the push is caught up the app walks backwards through it a
+     * window at a time and imports whatever it does not already have.
+     * Reads are not rate limited -- the cap exists to bound what a stranger
+     * can WRITE -- so this is only as slow as the network. */
+    private static volatile String sRange = "";  /* the last window's body */
+    private static volatile long sRangeAck = 0;  /* the window it belongs to */
+
+    public static String remoteRangeBody() { return sRange; }
+    public static long remoteRangeAck() { return sRangeAck; }
+
+    public static synchronized void remoteRange(final String ip, final int port,
+                                                final long from, final long to) {
+        if (sBusy != 0) return;
+        sBusy = 1;
         try {
             pushExec.execute(new Runnable() { @Override public void run() {
                 java.net.HttpURLConnection c = null;
                 try {
-                    c = (java.net.HttpURLConnection)
-                        new java.net.URL("http", ip, port, "/").openConnection();
+                    c = (java.net.HttpURLConnection) new java.net.URL(
+                        "http", ip, port,
+                        "/api/range?from=" + from + "&to=" + to)
+                        .openConnection();
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(15000);
+                    int code = c.getResponseCode();
+                    if (code / 100 != 2) {
+                        status(String.valueOf(code));
+                        backoff();
+                        return;
+                    }
+                    java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(c.getInputStream()));
+                    StringBuilder b = new StringBuilder();
+                    String ln;
+                    /* Bounded: one window is a day of readings, and native
+                     * refuses to parse more than it has room for anyway. */
+                    while ((ln = r.readLine()) != null && b.length() < 65536)
+                        b.append(ln).append('\n');
+                    r.close();
+                    sRange    = b.toString();
+                    sRangeAck = to;
+                    status(String.valueOf(code));
+                    onRemoteOk();
+                } catch (Throwable e) {
+                    Log.i(TAG, "remote range: " + e);
+                    status(shortErr(e));
+                    backoff();
+                } finally {
+                    if (c != null) c.disconnect();
+                    sBusy = 0;
+                }
+            }});
+        } catch (Throwable e) { sBusy = 0; backoff(); }
+    }
+
+    /* Short, uppercase, and only characters the app's 5x7 font can draw. */
+    private static void status(String s) {
+        StringBuilder b = new StringBuilder();
+        String u = s.toUpperCase();
+        for (int i = 0; i < u.length() && b.length() < 20; i++) {
+            char c = u.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == ' ' || c == '-' || c == '.' || c == '/' || c == ':')
+                b.append(c);
+        }
+        sStatus = b.toString();
+    }
+    private static volatile int sBusy;         /* a request is in flight */
+    private static volatile long sReadyAt;     /* elapsedRealtime() gate */
+
+    private static final long BACKOFF_MS = 61000; /* > the server's 60 s
+                                                   * rate window */
+
+    /* 1 while a request is in flight OR we are waiting out a backoff. */
+    public static int remoteBusy() {
+        if (sBusy != 0) return 1;
+        return android.os.SystemClock.elapsedRealtime() < sReadyAt ? 1 : 0;
+    }
+    public static long remoteCursorGlu() { return sCurGlu; }
+    public static long remoteCursorIns() { return sCurIns; }
+    public static long remoteAckGlu() { return sAckGlu; }
+    public static long remoteAckIns() { return sAckIns; }
+    /* Forget the cursors: native calls this when the server address changes,
+     * so points are never measured against another server's history. */
+    public static void remoteForget() {
+        sCurGlu = -1; sCurIns = -1; sAckGlu = -1; sAckIns = -1; sReadyAt = 0;
+    }
+
+    private static void backoff() {
+        sReadyAt = android.os.SystemClock.elapsedRealtime() + BACKOFF_MS;
+    }
+
+    /* GET /api/last -> "glucose <t>\ninsulin <t>". */
+    /* synchronized: the activity timer AND the service tick both drive
+     * this, so the check-then-set of sBusy has to be atomic or two requests
+     * could go out at once. */
+    public static synchronized void remoteCursor(final String ip, final int port) {
+        if (sBusy != 0) return;
+        sBusy = 1;
+        try {
+            pushExec.execute(new Runnable() { @Override public void run() {
+                java.net.HttpURLConnection c = null;
+                try {
+                    c = (java.net.HttpURLConnection) new java.net.URL(
+                        "http", ip, port, "/api/last").openConnection();
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(5000);
+                    int rc = c.getResponseCode();
+                    if (rc / 100 != 2) {
+                        status(String.valueOf(rc));
+                        backoff();
+                        return;
+                    }
+                    java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(c.getInputStream()));
+                    long g = -1, i = -1;
+                    String ln;
+                    while ((ln = r.readLine()) != null) {
+                        String[] f = ln.trim().split("\\s+");
+                        if (f.length != 2) continue;
+                        try {
+                            /* The dose set is called "units" on the wire --
+                             * naming it anything else here silently strands
+                             * the cursor at -1, which stops ALL syncing, not
+                             * just the doses. That is exactly what happened
+                             * when the endpoint was renamed. */
+                            if (f[0].equals("glucose")) g = Long.parseLong(f[1]);
+                            else if (f[0].equals("units")) i = Long.parseLong(f[1]);
+                        } catch (NumberFormatException e) { /* skip the line */ }
+                    }
+                    r.close();
+                    if (g < 0 || i < 0) {
+                        status("BAD REPLY");
+                        /* Loud, because the symptom is silence: no cursor
+                         * means no push, and the only visible sign is
+                         * LAST SYNC never advancing. */
+                        Log.i(TAG, "remote cursor: unparsable reply "
+                                   + "(glucose=" + g + " units=" + i + ")");
+                        backoff();
+                        return;
+                    }
+                    sCurGlu = g;
+                    sCurIns = i;
+                    status("200");
+                    onRemoteOk();
+                } catch (Throwable e) {
+                    Log.i(TAG, "remote cursor: " + e);
+                    status(shortErr(e));
+                    backoff();
+                } finally {
+                    if (c != null) c.disconnect();
+                    sBusy = 0;
+                }
+            }});
+        } catch (Throwable e) { sBusy = 0; backoff(); }
+    }
+
+    /* A word that fits the row, instead of a Java class name. */
+    private static String shortErr(Throwable e) {
+        String n = e.getClass().getSimpleName();
+        if (n.contains("Timeout")) return "TIMEOUT";
+        if (n.contains("UnknownHost")) return "NO HOST";
+        if (n.contains("Connect")) return "REFUSED";
+        if (n.contains("NoRoute")) return "NO ROUTE";
+        return "ERROR";
+    }
+
+    /* POST one batch. `tag` is opaque here and echoed into sAckGlu/sAckIns
+     * ONLY on a 2xx -- that is the whole delivery guarantee: native treats an
+     * unacknowledged batch as unsent. `full` means native filled the batch to
+     * the cap, so more is waiting and the server's per-minute cap would
+     * refuse an immediate follow-up; pace instead of earning a 429. */
+    public static synchronized void remoteBatch(final String ip, final int port,
+                                   final boolean insulin, final String body,
+                                   final long tag, final boolean full) {
+        if (sBusy != 0) return;
+        sBusy = 1;
+        try {
+            pushExec.execute(new Runnable() { @Override public void run() {
+                java.net.HttpURLConnection c = null;
+                try {
+                    c = (java.net.HttpURLConnection) new java.net.URL(
+                        "http", ip, port,
+                        /* "/units", not "/insulin": that is the name the
+                         * server uses. Posting to a route it does not have
+                         * fell through to its single-point handler, which
+                         * answered 400 to every dose batch -- and the 61 s
+                         * backoff after each failure then starved the
+                         * glucose push as well. */
+                        insulin ? "/units" : "/glucose").openConnection();
                     c.setConnectTimeout(5000);
                     c.setReadTimeout(5000);
                     c.setRequestMethod("POST");
                     c.setDoOutput(true);
-                    byte[] body = (t + " " + glu + "\n").getBytes("UTF-8");
-                    c.setFixedLengthStreamingMode(body.length);
+                    byte[] b = body.getBytes("UTF-8");
+                    c.setFixedLengthStreamingMode(b.length);
                     java.io.OutputStream os = c.getOutputStream();
-                    os.write(body);
+                    os.write(b);
                     os.close();
                     int code = c.getResponseCode();
-                    if (code / 100 == 2)
-                        onRemoteOk(); /* native timestamps the last success */
-                    else
-                        Log.i(TAG, "remote push: HTTP " + code);
+                    if (code / 100 == 2) {
+                        if (insulin) sAckIns = tag; else sAckGlu = tag;
+                        onRemoteOk();
+                        /* The reply says "stored N of M". A batch that stored
+                         * NOTHING was all duplicates, so it consumed none of
+                         * the server's per-minute budget and must not cost us
+                         * a minute of waiting either -- that is what lets a
+                         * full re-offer of the whole log run at speed while
+                         * genuinely new data still paces itself. */
+                        int stored = -1;
+                        try {
+                            java.io.BufferedReader rr =
+                                new java.io.BufferedReader(
+                                    new java.io.InputStreamReader(
+                                        c.getInputStream()));
+                            String rl = rr.readLine();
+                            rr.close();
+                            if (rl != null && rl.startsWith("stored "))
+                                stored = Integer.parseInt(
+                                    rl.substring(7).split("\\s+")[0]);
+                            status(String.valueOf(code));
+                        } catch (Throwable ignored) { /* pace conservatively */ }
+                        if (full && stored != 0) backoff();
+                    } else {
+                        /* 429 (rate cap) or anything else: keep the cursor
+                         * where it was and come back -- the same points get
+                         * resent, which is exactly what the contract allows. */
+                        Log.i(TAG, "remote batch: HTTP " + code);
+                        String why = "";
+                        try {
+                            java.io.InputStream es = c.getErrorStream();
+                            if (es != null) {
+                                java.io.BufferedReader er =
+                                    new java.io.BufferedReader(
+                                        new java.io.InputStreamReader(es));
+                                String el = er.readLine();
+                                er.close();
+                                if (el != null) why = " " + el;
+                            }
+                        } catch (Throwable ignored) { /* code alone will do */ }
+                        if (why.length() > 0) Log.i(TAG, "remote:" + why);
+                        status(String.valueOf(code));
+                        backoff();
+                    }
                 } catch (Throwable e) {
-                    Log.i(TAG, "remote push: " + e);
+                    Log.i(TAG, "remote batch: " + e);
+                    status(shortErr(e));
+                    backoff();
                 } finally {
                     if (c != null) c.disconnect();
+                    sBusy = 0;
                 }
             }});
-        } catch (Throwable e) { Log.i(TAG, "remote push enqueue: " + e); }
+        } catch (Throwable e) { sBusy = 0; backoff(); }
     }
+
+    /* (The old one-point-per-reading push is gone: the cursor-driven sync
+     * above replaces it and cannot drop a point. The server keeps its "/"
+     * route for other clients.) */
 
     /* mode: 0 portrait, 1 landscape, 2 gravity (sensor always), 3 system (sensor
      * only if the OS auto-rotate setting allows it) */

@@ -10,6 +10,9 @@ void stat_add(long t, int glu);
 /* time-in-range (%) and average over the rolling last `days`; returns 0
  * (=>"--") until the data reaches back far enough to cover the whole window. */
 int stat_window(int days, int *tir, int *avg);
+/* TEMPORARY DIAGNOSTIC: called when a stats bucket holding real readings is
+ * about to be recycled, which should be impossible inside one ring window.
+ * Implemented in main.c so it reaches the app log. */
 /* seed the buckets from the tail of the readings CSV at `readings_path`. */
 void stat_load(const char *readings_path);
 

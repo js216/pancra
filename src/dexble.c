@@ -517,6 +517,10 @@ static void jni_tick(JNIEnv *e, jclass c)
     * designed to outlive the activity by days -- which is exactly the window
     * in which a stranded link would otherwise never be reconnected. */
    pancra_link_watchdog();
+   /* And push: the sync is driven from here for the SAME reason -- the
+    * activity's timer dies with the activity, so with the app backgrounded
+    * nothing left the phone until it was reopened. */
+   pancra_remote_sync();
    meter_sync_watchdog();
    pancra_reconcile_tick();
 }

@@ -20,6 +20,7 @@
 #include "otble.h"
 #include "pancra.h"
 #include "plot.h"
+#include "plotdata.h" /* long-span plot data, bucketed from the log */
 #include "scanlogic.h"
 #include "sensors.h"
 #include "settings.h"
@@ -170,8 +171,12 @@ static jmethodID m_batt_ok, m_req_batt, m_bucket,
 static jmethodID m_show_glucose; /* push value+plot to the notification */
 static jmethodID
     m_bonded_stelo; /* resolve the bonded Stelo's MAC from bond list */
-static jmethodID
-    m_remote_push; /* REMOTE: send one datapoint to the configured server */
+/* REMOTE sync: cursor read, batch push, and the in-flight/backoff gate. */
+static jmethodID m_remote_cursor, m_remote_batch, m_remote_busy,
+    m_remote_cur_glu, m_remote_cur_ins, m_remote_forget, m_remote_ack_glu,
+    m_remote_ack_ins, m_remote_status, m_remote_range, m_remote_range_body,
+    m_remote_range_ack;
+static char g_remote_status[24]; /* last attempt's reply, for the UI */
 /* Set on a BLE binder thread, consumed by BOTH the activity's 1 Hz timer and
  * the service tick thread -- so the test-and-clear must be atomic, or a
  * reading can be marked dirty and cleared by the other consumer without ever
@@ -259,8 +264,22 @@ enum {
    MENU_PERMS,      /* permissions + background controls */
    MENU_OLDDEV,     /* previously-used (forgotten) devices */
    MENU_RECONF,     /* confirm reconnecting an EXPIRED old device */
-   MENU_REMOTE      /* remote push: enable/disable, server IP and port */
+   MENU_REMOTE,     /* remote push: enable/disable, server IP and port */
+   MENU_INSDEL,     /* confirm deleting an insulin dose */
+   MENU_ALARM,      /* alarm submenu: LOW/HIGH thresholds + outputs */
+   MENU_EXPORT      /* EXPORT DATA: range + section checkboxes */
 }; /* g_menu / g_kp_return values */
+
+/* EXPORT DATA menu state (session-only; the defaults are the whole point:
+ * everything, all time). Range 0 = 30 D, 1 = 1 Y, 2 = ALL. */
+static int g_exp_range = 2;
+static int g_exp_glu   = 1;
+static int g_exp_dev   = 1;
+static int g_exp_ins   = 1;
+
+/* Where the ALARM submenu was opened from -- the settings row, or the main
+ * screen's alarm row -- so its X returns exactly there (the origin rule). */
+static int g_alarm_from = MENU_SETTINGS;
 
 static int g_old_page;    /* which page the OLD DEVICES list is showing */
 static int g_inslog_page; /* which page the INSULIN LOG is showing */
@@ -309,12 +328,23 @@ static int g_pend_pairing;
 static int g_pend_primary;
 
 static int g_menu; /* which modal screen is open */
-/* Eat the remainder of the current touch gesture: set on any menu
- * transition that happens under a still-held finger, cleared on UP/CANCEL,
- * so the screen that just appeared cannot be pressed by the same touch. */
-static int g_touch_swallow;
-static int g_gate;         /* first-run permission-rationale screen */
-static int g_want_battery; /* pop battery-opt prompt after perms */
+
+/* ---- act-on-RELEASE ----
+ * A press only ARMS the control under the finger; the action fires on the
+ * RELEASE, and only if it lands back on that same control -- so sliding the
+ * finger off first is a free cancel, and nothing else can fire until the
+ * next press. While armed and on-target, draw_impl lightens the control's
+ * whole hit rectangle (ui_press_overlay): one consistent pressed visual for
+ * every screen, with no per-renderer work. Exempt BY DESIGN: plot scrubbing
+ * (the drag itself is the interaction), the alarm +- steppers (step on
+ * press + auto-repeat on hold is their whole point), and silencing a
+ * sounding alarm (any press must silence IMMEDIATELY -- see on_input). */
+static int g_arm_kind = ACT_NONE; /* armed action; ACT_NONE = none */
+static int g_arm_arg;
+static int g_arm_in;         /* finger currently on the armed control */
+static int g_arm_x, g_arm_y; /* where it last touched it (finds the box) */
+static int g_gate;           /* first-run permission-rationale screen */
+static int g_want_battery;   /* pop battery-opt prompt after perms */
 static const int disc_min[] = {0, 10, 30, 60}; /* DISCONNECT-alarm minutes */
 static long g_launch_t; /* for the stale-alarm grace period */
 /* Per-CGM-link DIS strings. g_model/g_fw (settings.c) are process-global and
@@ -501,8 +531,6 @@ static void calq_try_locked(void); /* defined after cal_select; used earlier */
 static void calq_tick(void);
 static void calq_load(void);
 static int g_kp_return;    /* keypad close target: 0 = main, 1 = settings */
-static int g_al_held = -1; /* alarm button held for auto-repeat (0:LOW- 1:LOW+
-                            * 2:HIGH- 3:HIGH+); geometry lives in ui.c */
 static int g_timerfd = -1; /* shared repaint / repeat timer */
 static struct ALooper
     *g_looper;       /* main looper, to remove the timer fd on destroy */
@@ -511,6 +539,11 @@ static int g_inited; /* process-wide one-time init done (relaunch guard) */
  * ACT_SCRUB hit box via plot_rect) */
 static int g_scrub_idx = -1; /* highlighted point, -1 = none */
 static int g_scrubbing;      /* a plot drag is in progress */
+static int g_scrub_ins;      /* what that drag scrubs: 1 insulin, 0 glucose.
+                              * Latched at the DOWN and held for the whole
+                              * gesture, so a finger wandering across the
+                              * band boundary (or off the plot) keeps
+                              * scrubbing what it started on. */
 
 /* fmt_glu / fmt_trend / fmt_hms are UI display formatters (declared in ui.h);
  * white_color is the notification plot's dot-colour callback. */
@@ -1413,9 +1446,31 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
 /* Snapshot the shell's mutable state into an immutable frame for the pure UI.
  * Called on the main thread just before ui_render(); the borrowed hist/dev
  * arrays are static so they outlive the render call. */
+/* ---- long plot spans: bucketed from the LOG, not from the RAM window ----
+ *
+ * A plot is about 700 pixels wide, so a 30-day span can show at most one
+ * column per hour however many readings exist. Drawing it from g_hist tied
+ * the plot's DEPTH to a point budget: 5040 points is ten days once four
+ * sources are logging, so the 30D plot ran out of data before it ran out of
+ * axis -- and it would shrink again, silently, the day a user added a third
+ * sensor.
+ *
+ * So for anything past the live window the points come straight out of
+ * readings.csv, bucketed onto the pixel grid as they are read: for each
+ * column, the newest reading of each source. Memory is then a function of
+ * the SCREEN (columns x sources), not of how much history exists or how many
+ * devices write it -- 30D, 90D or a year all cost the same.
+ *
+ * Rebuilt only when the span changes, the log grows, or the window has aged
+ * a minute (on a 30-day plot one pixel is an hour, so a minute of staleness
+ * is invisible). */
+#define PCOL_MAX  768          /* x columns we ever draw into */
+#define PSRC_MAX  8            /* distinct sources kept per column */
+#define PLONG_MIN (24L * 3600) /* spans past this are drawn from the log */
+
 static void build_model(struct screen *m)
 {
-   static struct ui_point pts[NHIST + NINS]; /* glucose + insulin doses */
+   static struct ui_point pts[PLOT_LONG_MAX + NINS]; /* glucose + doses */
    static struct ui_dev devs[MAX_DEVS];
    long now = realtime_s();
 
@@ -1470,6 +1525,12 @@ static void build_model(struct screen *m)
       m->scr = SCR_RECONF;
    else if (g_menu == MENU_REMOTE)
       m->scr = SCR_REMOTE;
+   else if (g_menu == MENU_INSDEL)
+      m->scr = SCR_INSDEL;
+   else if (g_menu == MENU_ALARM)
+      m->scr = SCR_ALARM;
+   else if (g_menu == MENU_EXPORT)
+      m->scr = SCR_EXPORT;
    else
       m->scr = SCR_MAIN;
    m->now    = now;
@@ -1490,19 +1551,30 @@ static void build_model(struct screen *m)
     * SELF-DEADLOCK -- unlike driver_lock and reg_lock, this one is not
     * recursive. An adversarial review flagged the missing lock; acting on it
     * would have wedged the app on the first repaint. */
-   int nh = g_nhist < NHIST ? g_nhist : NHIST;
-   for (int i = 0; i < nh; i++) {
-      pts[i].t    = g_hist[i].t;
-      pts[i].glu  = g_hist[i].glu;
-      pts[i].src  = g_hist[i].src;
-      pts[i].kind = g_hist[i].kind;
+   int nlong = 0;
+   const struct ui_point *plong =
+       plot_source_from(g_store_path, now, g_plot_hours, &nlong);
+   int nh = 0;
+   if (plong) {
+      /* A long span: one column per pixel, straight from the log, so its
+       * depth does not depend on how many points happen to fit in RAM. */
+      for (int i = 0; i < nlong && nh < PLOT_LONG_MAX; i++)
+         pts[nh++] = plong[i];
+   } else {
+      nh = g_nhist < NHIST ? g_nhist : NHIST;
+      for (int i = 0; i < nh; i++) {
+         pts[i].t    = g_hist[i].t;
+         pts[i].glu  = g_hist[i].glu;
+         pts[i].src  = g_hist[i].src;
+         pts[i].kind = g_hist[i].kind;
+      }
    }
    /* Insulin doses ride along as KIND_INS points (glu = units; ui.c pins
     * them to the plot's bottom edge and scrubs them as "N UNITS").
     * plot_render and plot_hit take points in any order, so appending
     * after the newest-first glucose is fine. They are NEVER in g_hist,
     * so they cannot leak into stats or the remote push. */
-   for (int i = 0; i < g_nins && nh < NHIST + NINS; i++) {
+   for (int i = 0; i < g_nins && nh < PLOT_LONG_MAX + NINS; i++) {
       pts[nh].t    = g_ins[i].t;
       pts[nh].glu  = g_ins[i].units;
       pts[nh].src  = g_ins[i].type; /* the scrub shows "2U FAST" etc. */
@@ -1563,6 +1635,7 @@ static void build_model(struct screen *m)
    m->newdata_beep   = g_newdata_beep;
    m->remote_on      = g_remote_on;
    m->remote_ip      = g_remote_ip; /* global, so the borrow is stable */
+   m->remote_status  = g_remote_status;
    m->remote_port    = g_remote_port;
    m->remote_last_ok = g_remote_last_ok;
    m->disc           = g_disc;
@@ -1648,6 +1721,10 @@ static void build_model(struct screen *m)
    m->markpick_ins = g_markpick_ins;
    m->statbar_val  = g_statbar_val;
    m->lockscr_val  = g_lockscr_val;
+   m->exp_range    = g_exp_range;
+   m->exp_glu      = g_exp_glu;
+   m->exp_dev      = g_exp_dev;
+   m->exp_ins      = g_exp_ins;
    m->pend_type    = g_pend_pairing;
    m->pend_primary = g_pend_primary;
    m->old_page     = g_old_page;
@@ -1753,6 +1830,24 @@ static void draw_impl(struct ANativeWindow *win)
    struct screen sm;
    build_model(&sm);
    ui_render(&buf, &sm, &g_hits);
+   /* Resting frames run at 13/16 intensity so the armed full-intensity
+    * highlight below is visible even on white text and the green big
+    * number, which have no headroom at full brightness. */
+   ui_dim(&buf);
+   /* Pressed-but-not-yet-fired: shade the armed control (act-on-release --
+    * see g_arm_*). Re-found in the JUST-rebuilt hit boxes via the finger's
+    * last on-target point, and only shaded while it still resolves to the
+    * same action -- a redraw that moved or removed the control drops the
+    * shade rather than lighting a stranger. */
+   if (g_arm_kind != ACT_NONE && g_arm_in) {
+      int bi = ui_hit_idx(&g_hits, g_arm_x, g_arm_y);
+      if (bi >= 0 && g_hits.box[bi].kind == g_arm_kind &&
+          g_hits.box[bi].arg == g_arm_arg)
+         /* the GLOW rect, not the hit rect: usually the same, narrower for
+          * controls whose hit zone out-sizes their glyph (see add_glow) */
+         ui_press_overlay(&buf, g_hits.box[bi].gx, g_hits.box[bi].gy,
+                          g_hits.box[bi].gw, g_hits.box[bi].gh);
+   }
 
    ANativeWindow_unlockAndPost(win);
 }
@@ -2512,9 +2607,9 @@ static void alarm_reeval(void)
  * left want unchanged, so dexble_alarm() was never called again and the hypo
  * stayed silent for its entire duration, becoming audible only if glucose
  * returned to range and re-crossed. Clearing g_alarm_want forces the next
- * evaluation to treat the level as new. alarm_adjust already accepts that a
- * settings change can change alarm state; this is the same for the audible
- * settings. */
+ * evaluation to treat the level as new. The threshold entry (kp_mode 10/11)
+ * already accepts that a settings change can change alarm state; this is the
+ * same for the audible settings. */
 static void alarm_reactuate(void)
 {
    /* Clear AND re-evaluate under ONE hold. Releasing between them left a
@@ -2720,22 +2815,567 @@ void pancra_remote_ok(void)
    g_remote_last_ok = realtime_s();
 }
 
-static void remote_push(long t, int mg_dl)
+/* ---- REMOTE sync: an OUTBOX over the app's own append-only log ----
+ *
+ * The first design tracked what the SERVER had, as one newest timestamp, and
+ * sent whatever was newer. A scalar cannot express a HOLE, so anything
+ * missing behind that timestamp was invisible and stayed missing forever --
+ * which is exactly how a reading vanished when a manual import overwrote it.
+ *
+ * So track what WE have sent instead. readings.csv is already the perfect
+ * queue: every reading the app accepts is appended to it, in ARRIVAL order,
+ * by all three paths (live, meter, backfill), and it is never rewritten. A
+ * reading backfilled an hour late is appended NOW, at the end, so it takes
+ * its turn like any other.
+ *
+ * One persisted byte offset says how far into that file the server has
+ * CONFIRMED. The next batch is simply the next unsent lines, and the offset
+ * advances only when the server acknowledges that exact batch (the tag
+ * echoed back through Ble.remoteAckGlu). A failure, a timeout, a lost reply,
+ * a killed process -- all leave the offset alone, so those same lines are
+ * the first thing retried. A reading cannot fall through a crack: the crack
+ * would have to be a line in a file the offset has not passed.
+ *
+ * Delivery is at-least-once; the server's dedup makes it exactly-once in
+ * effect. Doses take the simpler road below -- their file IS rewritten (an
+ * edit or delete rewrites it), so a byte offset would be a lie, and the
+ * whole log is small enough to re-offer wholesale. */
+#define REMOTE_BATCH 100 /* the server's per-request cap */
+
+static long g_ob_pos;    /* bytes of readings.csv the server confirmed */
+static long g_ob_flight; /* offset the in-flight batch would advance to */
+/* The LIVE tail, sent ahead of the backlog. The outbox walks the log from
+ * the front for completeness, which can be a long way behind after an
+ * import or an outage -- and a reading taken NOW must not wait for that to
+ * finish. So each pass offers the newest lines first, out of order, and the
+ * sequential walk still delivers everything in its own time. Duplicates
+ * cost nothing (the server skips them), so the overlap is free. */
+static long g_ob_live; /* log size as of the last acknowledged live push */
+static long g_ob_lflight;
+static long g_ins_flight; /* dose index the in-flight chunk would reach */
+static char g_ob_path[256];
+
+/* Atomic: temp file then rename, so a crash cannot leave a half-written
+ * position -- which would either resend a lot or, far worse, skip. */
+static void ob_save(void)
 {
-   if (!g_remote_on || !g_remote_ip[0] || !g_ble || !m_remote_push)
+   char tmp[sizeof g_ob_path + 4];
+   if (snprintf(tmp, sizeof tmp, "%s.t", g_ob_path) >= (int)sizeof tmp)
       return;
+   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (fd < 0)
+      return;
+   char b[32];
+   int n = snprintf(b, sizeof b, "%ld\n", g_ob_pos);
+   if (n > 0 && write(fd, b, (size_t)n) == n) {
+      close(fd);
+      (void)rename(tmp, g_ob_path);
+      return;
+   }
+   close(fd);
+   (void)unlink(tmp);
+}
+
+static void ob_load(void)
+{
+   int fd = open(g_ob_path, O_RDONLY, 0);
+   if (fd < 0)
+      return;
+   char b[32];
+   long n = read(fd, b, sizeof b - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   b[n]   = 0;
+   long v = 0;
+   int nd = 0;
+   for (int i = 0; b[i] >= '0' && b[i] <= '9'; i++)
+      if (nd++ < 18)
+         v = (v * 10) + (b[i] - '0');
+   if (nd > 0)
+      g_ob_pos = v;
+}
+
+static long ob_log_size(void)
+{
+   int fd = open(g_store_path, O_RDONLY, 0);
+   if (fd < 0)
+      return 0;
+   long n = lseek(fd, 0, SEEK_END);
+   close(fd);
+   return n < 0 ? 0 : n;
+}
+
+/* The start of the line containing byte `at`: a batch must never begin
+ * mid-record, or the first line would be a truncation. */
+static long ob_line_start(long at)
+{
+   if (at <= 0)
+      return 0;
+   int fd = open(g_store_path, O_RDONLY, 0);
+   if (fd < 0)
+      return 0;
+   if (lseek(fd, at, SEEK_SET) != at) {
+      close(fd);
+      return 0;
+   }
+   char rd[512];
+   long got = read(fd, rd, sizeof rd);
+   close(fd);
+   for (long i = 0; i < got; i++)
+      if (rd[i] == '\n')
+         return at + i + 1;
+   return at;
+}
+
+/* Fill `buf` with up to REMOTE_BATCH datapoint lines starting at byte `from`
+ * of readings.csv. *end receives the offset just past the last COMPLETE line
+ * consumed -- the tag the server must acknowledge before that ground is
+ * given up. Returns how many lines went into the body.
+ *
+ * Header, malformed and implausible lines are STEPPED OVER (they advance
+ * *end without being sent): they are not data the server wants, and leaving
+ * them in front of the offset would wedge the queue forever. */
+static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
+{
+   *end   = from;
+   *full  = 0;
+   int fd = open(g_store_path, O_RDONLY, 0);
+   if (fd < 0)
+      return 0;
+   if (lseek(fd, from, SEEK_SET) != from) {
+      close(fd);
+      return 0;
+   }
+   size_t used = 0;
+   int n       = 0;
+   long at     = from;
+   char rd[1024];
+   char line[256];
+   int llen = 0;
+   int over = 0; /* over-long line: step past it, never parse a truncation */
+   long got = 0;
+   while (n < REMOTE_BATCH && (got = read(fd, rd, sizeof rd)) > 0) {
+      for (long i = 0; i < got && n < REMOTE_BATCH; i++) {
+         if (rd[i] != '\n') {
+            if (llen < (int)sizeof line - 1)
+               line[llen++] = rd[i];
+            else
+               over = 1;
+            continue;
+         }
+         line[llen]    = '\0';
+         long consumed = llen + 1; /* the line and its newline */
+         long t        = 0;
+         int glu       = 0;
+         int ok        = 0;
+         if (!over && line[0] >= '0' && line[0] <= '9') {
+            /* "<epoch>,<mg/dL>,..." -- the first two fields, nothing else */
+            const char *p = line;
+            while (*p >= '0' && *p <= '9')
+               t = (t * 10) + (*p++ - '0');
+            if (*p == ',') {
+               p++;
+               int v = 0;
+               int d = 0;
+               while (*p >= '0' && *p <= '9') {
+                  v = (v * 10) + (*p++ - '0');
+                  d++;
+               }
+               if (d > 0 && (*p == ',' || *p == '\0'))
+                  ok = t > 0 && v > 0 && v < 2000;
+               glu = v;
+            }
+         }
+         llen = 0;
+         over = 0;
+         if (ok) {
+            int w = snprintf(buf + used, cap - used, "%ld %d\n", t, glu);
+            if (w <= 0 || (size_t)w >= cap - used) {
+               *full = 1;
+               close(fd);
+               return n; /* body full: the rest rides the next batch */
+            }
+            used += (size_t)w;
+            n++;
+         }
+         at += consumed;
+         *end = at;
+      }
+   }
+   close(fd);
+   if (n >= REMOTE_BATCH)
+      *full = 1;
+   return n;
+}
+
+/* Doses: the file is REWRITTEN on an edit or a delete, so a byte offset
+ * would describe a file that no longer exists. The log is tiny (a hundred
+ * records over months), so offer it whole, in chunks, and start a fresh
+ * cycle whenever the file changes. Complete by construction, no
+ * bookkeeping to get wrong. */
+static int g_ins_send_i;    /* next dose index to offer */
+static long g_ins_sent_len; /* insulin.csv size when the last cycle ended */
+
+static long ins_file_size(void)
+{
+   int fd = open(g_ins_path, O_RDONLY, 0);
+   if (fd < 0)
+      return 0;
+   long n = lseek(fd, 0, SEEK_END);
+   close(fd);
+   return n < 0 ? 0 : n;
+}
+
+static int ob_fill_ins(char *buf, size_t cap, int from, int *nsent)
+{
+   size_t used = 0;
+   int n       = 0;
+   int i       = from;
+   for (; i < g_nins && n < REMOTE_BATCH; i++) {
+      long t = g_ins[i].t;
+      int u  = g_ins[i].units;
+      int ty = (g_ins[i].type == INS_FAST) ? 1 : 0;
+      if (t <= 0 || u <= 0 || u > 300)
+         continue;
+      int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, ty, u);
+      if (w <= 0 || (size_t)w >= cap - used)
+         break;
+      used += (size_t)w;
+      n++;
+   }
+   *nsent = i;
+   return n;
+}
+
+/* ---- the PULL direction: import what the server has and we do not ----
+ *
+ * The server keeps months; the phone keeps NHIST readings. After the push is
+ * caught up, walk BACKWARDS through the server a day at a time and import
+ * anything missing, so the rolling stats (30D, 90D) can be filled from
+ * history the phone never saw -- a fresh install, or a phone that joined
+ * after the log did.
+ *
+ * Imported readings carry no provenance: data.txt stores a time and a value,
+ * nothing about which sensor produced it. Attributing them to a live device
+ * would be a lie, so they get their own synthetic one -- UNKNOWN -- which is
+ * registered as an OLD (disconnected) device: it appears in OLD DEVICES with
+ * its fields blank, it can be styled and hidden like any other, and it can
+ * never be picked as primary or reconnected. */
+#define PULL_WINDOW (24L * 3600)  /* server history fetched per request */
+#define PULL_DEPTH  (95L * 86400) /* how far back to go: past the 90D stat */
+
+static long g_pull_from;   /* oldest instant imported so far; 0 = not begun */
+static long g_pull_flight; /* window end awaiting its reply */
+static int g_pull_done;    /* reached PULL_DEPTH: nothing left to fetch */
+static char g_pull_path[256];
+static int g_unknown_id = -1; /* the synthetic device, minted on first use */
+
+static void pull_save(void)
+{
+   int fd = open(g_pull_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (fd < 0)
+      return;
+   char b[32];
+   int n = snprintf(b, sizeof b, "%ld\n", g_pull_from);
+   if (n > 0)
+      (void)!write(fd, b, (size_t)n);
+   close(fd);
+}
+
+static void pull_load(void)
+{
+   int fd = open(g_pull_path, O_RDONLY, 0);
+   if (fd < 0)
+      return;
+   char b[32];
+   long n = read(fd, b, sizeof b - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   b[n]   = 0;
+   long v = 0;
+   int nd = 0;
+   for (int i = 0; b[i] >= '0' && b[i] <= '9'; i++)
+      if (nd++ < 18)
+         v = (v * 10) + (b[i] - '0');
+   if (nd > 0)
+      g_pull_from = v;
+}
+
+/* The UNKNOWN device: minted once, kept as an OLD slot forever. */
+static int unknown_id(void)
+{
+   if (g_unknown_id >= 0)
+      return g_unknown_id;
+   sensors_lock();
+   /* "identity" is the reuse key, so a fixed string means one row for life
+    * however many times this is called. */
+   int id = sensor_mint(SENSOR_STELO, "IMPORTED", "", "", "", 0);
+   if (id >= 0) {
+      struct sensor_slot *sl = sensor_slot_by_id(id);
+      if (!sl) {
+         int si = sensor_claim_slot(id, SENSOR_STELO, "IMPORTED");
+         if (si >= 0)
+            sl = &g_slot[si];
+      }
+      if (sl) {
+         (void)snprintf(sl->label, sizeof sl->label, "UNKNOWN");
+         sl->old     = 1; /* never live: it is history, not a sensor */
+         sl->primary = 0;
+         slots_save();
+      }
+   }
+   sensors_unlock();
+   g_unknown_id = id;
+   return id;
+}
+
+/* Import one window's worth of "<epoch> <mg/dL>" lines. Returns how many
+ * were new. hist_insert dedups, so re-importing costs nothing. */
+static int pull_import(const char *body)
+{
+   int src   = unknown_id();
+   int added = 0;
+   if (src < 0)
+      return 0;
+   const char *p = body;
+   while (*p) {
+      long t  = 0;
+      int glu = 0;
+      while (*p == ' ' || *p == '\n' || *p == '\r')
+         p++;
+      if (!*p)
+         break;
+      if (*p < '0' || *p > '9') { /* skip a line we cannot read */
+         while (*p && *p != '\n')
+            p++;
+         continue;
+      }
+      while (*p >= '0' && *p <= '9')
+         t = (t * 10) + (*p++ - '0');
+      while (*p == ' ')
+         p++;
+      while (*p >= '0' && *p <= '9')
+         glu = (glu * 10) + (*p++ - '0');
+      while (*p && *p != '\n')
+         p++;
+      if (t <= 0 || glu <= 0 || glu >= 2000)
+         continue;
+      int prime = sensor_primary_id();
+      hist_lock();
+      /* ONLY what we do not already hold, from ANY source. Imported data
+       * has no provenance, so adding a point the phone already recorded
+       * under its real sensor would not "restate" it -- hist_insert dedups
+       * per-source, so it would sit BESIDE it as a second reading, double
+       * counting the stats and drawing a synthetic dot over a real one.
+       * The identity is the (timestamp, value) PAIR. */
+      int isnew = 0;
+      if (!hist_have_point(t, glu))
+         isnew = hist_insert(t, glu, 127, src, KIND_CGM);
+      if (isnew)
+         stat_add(t, glu);
+      hist_refresh_current(prime);
+      hist_unlock();
+      if (isnew) {
+         /* Durable, so the stats survive a restart -- stat_load rebuilds
+          * them from this very file. */
+         store_append(t, glu, 127, 0, 0, src, t, g_tz_off, KIND_CGM, 1000);
+         added++;
+      }
+   }
+   return added;
+}
+
+/* When to even TRY. A datapoint arrives every few minutes, so polling the
+ * server on every tick was pointless traffic -- and during a catch-up it
+ * became a request per second, which is no way to treat a server you own.
+ * Fire on a NEW DATAPOINT (the log grew); otherwise only often enough to
+ * work through a backlog, and not at all when there is nothing to do. */
+#define REMOTE_GAP 10L /* seconds between attempts while catching up */
+
+static long g_rem_next; /* earliest next attempt */
+static long g_rem_seen; /* log size when we last looked */
+
+void pancra_remote_sync(void)
+{
+   if (!g_remote_on || !g_remote_ip[0] || !g_ble || !m_remote_busy)
+      return;
+   {
+      long now   = realtime_s();
+      long sz    = ob_log_size();
+      int fresh  = (sz != g_rem_seen); /* a datapoint just landed */
+      g_rem_seen = sz;
+      if (!fresh && now < g_rem_next)
+         return;
+      g_rem_next = now + REMOTE_GAP;
+   }
    JNIEnv *e = dexble_env();
    if (!e)
       return;
+   /* A request in flight, or a backoff after a failure/rate cap. */
+   if ((*e)->CallStaticIntMethod(e, g_ble, m_remote_busy) != 0)
+      return;
+   if ((*e)->ExceptionCheck(e)) {
+      (*e)->ExceptionClear(e);
+      return;
+   }
+
+   /* Commit ground the server has confirmed. ONLY here does the offset
+    * move, and only to a tag the server itself echoed back. */
+   long ack = (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_ack_glu);
+   if (g_ob_flight > g_ob_pos && ack == g_ob_flight) {
+      g_ob_pos    = g_ob_flight;
+      g_ob_flight = 0;
+      ob_save();
+   }
+   /* A live push acknowledges with a NEGATIVE tag, so it can never be
+    * mistaken for outbox ground and advance the offset past unsent lines. */
+   if (g_ob_lflight > 0 && ack == -g_ob_lflight) {
+      g_ob_live    = g_ob_lflight;
+      g_ob_lflight = 0;
+   }
+   long acki = (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_ack_ins);
+   if (g_ins_flight > 0 && acki == g_ins_flight) {
+      g_ins_send_i = (int)g_ins_flight;
+      g_ins_flight = 0;
+      if (g_ins_send_i >= g_nins) { /* a full cycle: every dose offered */
+         g_ins_send_i   = 0;
+         g_ins_sent_len = ins_file_size();
+      }
+   }
+
    jstring ip = (*e)->NewStringUTF(e, g_remote_ip);
    if (!ip)
       return;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_remote_push, ip, (jint)g_remote_port,
-                              (jlong)t, (jint)mg_dl);
+
+   static char body[REMOTE_BATCH * 24];
+   long end = 0;
+   int full = 0;
+   int n    = 0;
+   int ins  = 0;
+   long tag = 0;
+
+   /* FRESHNESS FIRST: anything appended since the last live push. Starting
+    * a little before the file end keeps this to one small batch even if
+    * several readings landed at once. */
+   long fsz = ob_log_size();
+   if (fsz > g_ob_live && fsz > g_ob_pos) {
+      long from = g_ob_live;
+      if (from < fsz - 4096)
+         from = ob_line_start(fsz - 4096);
+      if (from < g_ob_pos)
+         from = g_ob_pos;
+      long lend = 0;
+      n         = ob_fill(body, sizeof body, from, &lend, &full);
+      if (n > 0) {
+         tag  = -fsz; /* negative: a live push, not outbox ground */
+         full = 0;    /* a couple of readings: no need to pace */
+      }
+   }
+   if (n == 0)
+      n = ob_fill(body, sizeof body, g_ob_pos, &end, &full);
+   if (n > 0 && tag == 0)
+      tag = end;
+   if (n == 0) {
+      /* Glucose is caught up. Offer doses: a chunk of the log, and a new
+       * cycle whenever the file has changed since the last one finished. */
+      if (g_ins_send_i > 0 || ins_file_size() != g_ins_sent_len) {
+         int upto = 0;
+         n        = ob_fill_ins(body, sizeof body, g_ins_send_i, &upto);
+         ins      = 1;
+         tag      = upto;
+         full     = (n >= REMOTE_BATCH);
+         if (n == 0) { /* nothing sendable left in this cycle */
+            g_ins_send_i   = 0;
+            g_ins_sent_len = ins_file_size();
+         }
+      }
+   }
+   if (n == 0 && !g_pull_done) {
+      /* Nothing to send: spend the pass PULLING instead. First collect a
+       * window that arrived, then ask for the next one further back. */
+      long rack =
+          (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_range_ack);
+      if (g_pull_flight > 0 && rack == g_pull_flight) {
+         jstring rb =
+             (*e)->CallStaticObjectMethod(e, g_ble, m_remote_range_body);
+         if (rb) {
+            const char *cs = (*e)->GetStringUTFChars(e, rb, NULL);
+            if (cs) {
+               int got = pull_import(cs);
+               (*e)->ReleaseStringUTFChars(e, rb, cs);
+               LOGI("remote pull: %ld..%ld imported %d",
+                    g_pull_flight - PULL_WINDOW, g_pull_flight, got);
+            }
+            (*e)->DeleteLocalRef(e, rb);
+         }
+         g_pull_from   = g_pull_flight - PULL_WINDOW;
+         g_pull_flight = 0;
+         pull_save();
+         g_ui_dirty = 1;
+      }
+      if (g_pull_flight == 0) {
+         long to = g_pull_from > 0 ? g_pull_from : realtime_s();
+         if (to <= realtime_s() - PULL_DEPTH) {
+            g_pull_done = 1; /* the whole stats horizon is in */
+         } else {
+            g_pull_flight = to;
+            (*e)->CallStaticVoidMethod(e, g_ble, m_remote_range, ip,
+                                       (jint)g_remote_port,
+                                       (jlong)(to - PULL_WINDOW), (jlong)to);
+         }
+      }
+   }
+   if (n > 0) {
+      jstring b = (*e)->NewStringUTF(e, body);
+      if (b) {
+         if (ins)
+            g_ins_flight = tag;
+         else if (tag < 0)
+            g_ob_lflight = -tag;
+         else
+            g_ob_flight = tag;
+         (*e)->CallStaticVoidMethod(e, g_ble, m_remote_batch, ip,
+                                    (jint)g_remote_port, (jboolean)ins, b,
+                                    (jlong)tag, (jboolean)full);
+         (*e)->DeleteLocalRef(e, b);
+      }
+   }
+   /* Cache what the last attempt reported, for the REMOTE screen. */
+   if (m_remote_status) {
+      jstring st = (*e)->CallStaticObjectMethod(e, g_ble, m_remote_status);
+      if (st) {
+         const char *cs = (*e)->GetStringUTFChars(e, st, NULL);
+         if (cs) {
+            str_snapshot(g_remote_status, sizeof g_remote_status, cs);
+            (*e)->ReleaseStringUTFChars(e, st, cs);
+         }
+         (*e)->DeleteLocalRef(e, st);
+      }
+   }
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e); /* a push must never take the reading down */
    (*e)->DeleteLocalRef(e, ip);
 }
+
+/* The configured server changed: the cursors describe the OLD one, so drop
+ * them rather than measure this server's history against another's. */
+static void remote_forget_cursor(void)
+{
+   if (!g_ble || !m_remote_forget)
+      return;
+   JNIEnv *e = dexble_env();
+   if (!e)
+      return;
+   (*e)->CallStaticVoidMethod(e, g_ble, m_remote_forget);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+}
+
+/* (The per-datapoint remote_push is gone: every point now leaves through
+ * remote_sync_step's cursor-driven batches, which cannot silently drop one.
+ * The server keeps its single-point "/" route for older clients.) */
 
 /* Is this a usable glucose value?
  *
@@ -2881,7 +3521,9 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    if (isnew) {
       store_append(t, mg_dl, trend, g_conn_rssi, has, src, t, g_tz_off,
                    KIND_CGM, rpm);
-      remote_push(t, mg_dl); /* every NEW datapoint, same gate as the log */
+      /* No per-datapoint push any more: remote_sync_step() on the tick
+       * delivers this point (and anything a previous outage lost) from the
+       * server's own cursor. */
    }
    LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
@@ -3180,7 +3822,18 @@ static void sys_export_data(void)
    if (!g_act || !m_export)
       return;
    JNIEnv *e = g_act->env;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_export, g_act->clazz);
+   /* Cutoff epoch: rows OLDER than this are left out (0 = keep all).
+    * Sections per the EXPORT DATA checkboxes; Java filters by each row's
+    * leading epoch field and keeps header lines. */
+   long cutoff = 0;
+   if (g_exp_range == 0)
+      cutoff = realtime_s() - (30L * 86400);
+   else if (g_exp_range == 1)
+      cutoff = realtime_s() - (365L * 86400);
+   (*e)->CallStaticVoidMethod(e, g_ble, m_export, g_act->clazz, (jlong)cutoff,
+                              (jboolean)(g_exp_glu != 0),
+                              (jboolean)(g_exp_dev != 0),
+                              (jboolean)(g_exp_ins != 0));
 }
 
 static int sys_perm_granted(const char *perm)
@@ -3854,12 +4507,23 @@ static int ins_action(int action)
              * would corrupt every judgement made on top of the log. */
             set_status("INSULIN: WRITE FAILED");
          }
-         g_menu     = g_ins_from;
+         /* CONFIRM on a NEW dose lands on the MAIN screen -- logging a dose
+          * is a completed task, not a detour to return from, and the status
+          * banner + plot marker there ARE the confirmation. An EDIT still
+          * returns to the log it was opened from (g_ins_from). */
+         g_menu     = (g_ins_edit >= 0) ? g_ins_from : MENU_NONE;
          g_ins_edit = -1;
          g_ui_dirty = 1;
       }
    } else if (action == MA_INS_DELETE) {
-      if (g_menu == MENU_INSULIN && g_ins_edit >= 0) {
+      /* Confirm first; this action deletes nothing (the SCR_FORGET rule --
+       * DELETE sat right between CANCEL and CONFIRM, one mis-tap from
+       * silently losing a logged dose). */
+      if (g_menu == MENU_INSULIN && g_ins_edit >= 0)
+         g_menu = MENU_INSDEL;
+   } else if (action == MA_INSDEL_YES) {
+      /* The one deleting control, on the confirmation screen only. */
+      if (g_menu == MENU_INSDEL && g_ins_edit >= 0) {
          if (insulin_delete(&g_ins_orig) == 0)
             set_status("INSULIN DELETED");
          else
@@ -3868,6 +4532,9 @@ static int ins_action(int action)
          g_ins_edit = -1;
          g_ui_dirty = 1;
       }
+   } else if (action == MA_INSDEL_NO) {
+      if (g_menu == MENU_INSDEL)
+         g_menu = MENU_INSULIN; /* back to the EDIT form, state intact */
    } else if (action >= MA_INSLOG_EDIT && action < MA_INSLOG_EDIT + NINS) {
       /* Open this dose in the EDIT form, pre-filled; remember the ORIGINAL
        * row so the eventual rewrite matches content, not a tail index that
@@ -3899,6 +4566,83 @@ static int ins_action(int action)
    return 1;
 }
 
+/* Every SUBMENU navigation/config action -- ALARM (and its two threshold-
+ * keypad openers), EXPORT DATA, REMOTE, PERMISSIONS, DISPLAY, OLD DEVICES --
+ * split out of menu_action so it stays under the size gate (the ins_action
+ * pattern). Returns 1 when `action` was one of ours. */
+static int submenu_action(int action)
+{
+   if (action == MA_ALARM_LOW || action == MA_ALARM_HIGH) {
+      /* "LOW <value>" / "HIGH <value>" (main-screen row or ALARM submenu):
+       * type the threshold on the keypad (display units). The keypad
+       * returns to WHERE this was tapped -- the origin rule. */
+      g_kp_return = (g_menu == MENU_ALARM) ? MENU_ALARM : MENU_NONE;
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = (action == MA_ALARM_LOW) ? 10 : 11;
+      g_entrylen  = 0;
+   } else if (action == MA_ALARM_OPEN) {
+      /* Entered from the settings row or the main alarm row; record the
+       * origin so MA_ALARM_BACK returns exactly there. */
+      g_alarm_from = (g_menu == MENU_SETTINGS) ? MENU_SETTINGS : MENU_NONE;
+      g_menu       = MENU_ALARM;
+   } else if (action == MA_ALARM_BACK) {
+      g_menu = g_alarm_from;
+   } else if (action == MA_EXPORT) {
+      g_menu = MENU_EXPORT; /* configure first; MA_EXP_GO does the work */
+   } else if (action == MA_EXP_RANGE) {
+      g_exp_range = (g_exp_range + 1) % 3; /* 30 D -> 1 Y -> ALL -> ... */
+   } else if (action == MA_EXP_GLU) {
+      g_exp_glu = !g_exp_glu;
+   } else if (action == MA_EXP_DEV) {
+      g_exp_dev = !g_exp_dev;
+   } else if (action == MA_EXP_INS) {
+      g_exp_ins = !g_exp_ins;
+   } else if (action == MA_EXP_GO) {
+      if (g_menu == MENU_EXPORT && (g_exp_glu || g_exp_dev || g_exp_ins))
+         sys_export_data(); /* Java builds the CSV per the checkboxes/range
+                             * and opens the share sheet; the menu stays,
+                             * its X returns to settings */
+   } else if (action == MA_DISPLAY_OPEN) {
+      g_menu = MENU_DISPLAY;
+   } else if (action == MA_PERMS_OPEN) {
+      sys_refresh(); /* fresh snapshot for the screen being opened */
+      g_menu = MENU_PERMS;
+   } else if (action == MA_REMOTE_OPEN) {
+      g_menu = MENU_REMOTE;
+   } else if (action == MA_REMOTE_TOGGLE) {
+      g_remote_on = !g_remote_on;
+      remote_save();
+   } else if (action == MA_REMOTE_IP) {
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = 4;
+      g_kp_return = MENU_REMOTE;
+      g_entrylen  = 0;
+   } else if (action == MA_REMOTE_PORT) {
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = 5;
+      g_kp_return = MENU_REMOTE;
+      g_entrylen  = 0;
+   } else if (action == MA_OLDDEV_OPEN) {
+      g_old_page = 0; /* always open on the first page */
+      g_menu     = MENU_OLDDEV;
+   } else if (action == MA_OLDPAGE_PREV) {
+      if (g_old_page > 0)
+         g_old_page--;
+   } else if (action == MA_OLDPAGE_NEXT) {
+      g_old_page++; /* render clamps to the last page */
+   } else if (action == MA_PERMS_BACK || action == MA_OLDDEV_BACK ||
+              action == MA_REMOTE_BACK || action == MA_DISPLAY_BACK ||
+              action == MA_EXP_BACK) {
+      /* All five submenus were opened FROM settings; their X returns
+       * there. (The ALARM submenu is the exception -- also reachable from
+       * the main screen, so its back goes through g_alarm_from above.) */
+      g_menu = MENU_SETTINGS;
+   } else {
+      return 0; /* not ours */
+   }
+   return 1;
+}
+
 static void menu_action(int action)
 {
    if (action == 0) {
@@ -3917,6 +4661,13 @@ static void menu_action(int action)
    } else if (action == 3) {
       g_units = !g_units;
       settings_save();
+      /* The notification renders the value in DISPLAY units (title AND the
+       * status-bar icon) but is only rebuilt on a new datapoint -- without
+       * an explicit refresh the bar keeps showing the OLD units' rendering
+       * (e.g. "9.4" beside a big number reading 169) for up to a full CGM
+       * cadence after the toggle. */
+      g_notify_dirty = 1;
+      pancra_notify_refresh();
    } else if (action == 4) {
       g_disc = (int)(((unsigned)g_disc + 1U) & 3U);
       settings_save();
@@ -3954,9 +4705,6 @@ static void menu_action(int action)
       if (g_menu == MENU_NONE || g_menu == MENU_SETTINGS || g_menu == MENU_ADD)
          g_sensor_from = g_menu;
       g_menu = MENU_SENSTYPE;
-   } else if (action == MA_EXPORT) {
-      sys_export_data(); /* Java builds the combined CSV + opens the share sheet
-                          */
    } else if (action >= MA_TYPE && action < MA_TYPE + SENSOR_NTYPES) {
       /* The ADD menu's DEVICES section enters here DIRECTLY (no
        * MA_ADDSENSOR hop records the origin), so record it now: the flow
@@ -4019,37 +4767,6 @@ static void menu_action(int action)
          g_notify_dirty = 1;
          g_menu         = MENU_NONE;
       }
-   } else if (action == MA_PERMS_OPEN) {
-      sys_refresh(); /* fresh snapshot for the screen being opened */
-      g_menu = MENU_PERMS;
-   } else if (action == MA_REMOTE_OPEN) {
-      g_menu = MENU_REMOTE;
-   } else if (action == MA_REMOTE_TOGGLE) {
-      g_remote_on = !g_remote_on;
-      remote_save();
-   } else if (action == MA_REMOTE_IP) {
-      g_menu      = MENU_KEYPAD;
-      g_kp_mode   = 4;
-      g_kp_return = MENU_REMOTE;
-      g_entrylen  = 0;
-   } else if (action == MA_REMOTE_PORT) {
-      g_menu      = MENU_KEYPAD;
-      g_kp_mode   = 5;
-      g_kp_return = MENU_REMOTE;
-      g_entrylen  = 0;
-   } else if (action == MA_PERMS_BACK || action == MA_OLDDEV_BACK ||
-              action == MA_REMOTE_BACK || action == MA_DISPLAY_BACK) {
-      /* All four submenus (permissions, old devices, remote, display)
-       * were opened FROM settings and their X returns there. */
-      g_menu = MENU_SETTINGS;
-   } else if (action == MA_OLDDEV_OPEN) {
-      g_old_page = 0; /* always open on the first page */
-      g_menu     = MENU_OLDDEV;
-   } else if (action == MA_OLDPAGE_PREV) {
-      if (g_old_page > 0)
-         g_old_page--;
-   } else if (action == MA_OLDPAGE_NEXT) {
-      g_old_page++; /* render clamps to the last page */
    } else if (action == MA_RECONNECT) {
       /* Direct revive if the sensor was pulled BEFORE expiry; otherwise a
        * confirmation, since reconnecting a dead sensor just waits forever. */
@@ -4407,15 +5124,26 @@ static void menu_action(int action)
    } else if (action >= 100 && action <= 109) { /* digit */
       /* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted
        * quad's 15; port = 5. Keep in step with ui.c's slots_for. */
-      static const int caps[10] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4};
-      int cap = caps[(g_kp_mode >= 0 && g_kp_mode < 10) ? g_kp_mode : 0];
+      static const int caps[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
+      int cap = caps[(g_kp_mode >= 0 && g_kp_mode < 12) ? g_kp_mode : 0];
       if (g_entrylen < cap)
          g_entry[g_entrylen++] = (char)('0' + (action - 100));
    } else if (action == MA_DOT) {
-      /* Only the remote-IP keypad has a '.' key; the guard keeps a stale tap
-       * (racing a repaint) from injecting one into a numeric entry. */
-      if (g_menu == MENU_KEYPAD && g_kp_mode == 4 && g_entrylen < 15)
+      /* '.' exists on the remote-IP keypad and, in mmol/L mode only, on the
+       * two alarm-threshold keypads (one dot, one decimal digit -- "5.5").
+       * The guard keeps a stale tap (racing a repaint) from injecting one
+       * into any other numeric entry. */
+      if (g_menu == MENU_KEYPAD && g_kp_mode == 4 && g_entrylen < 15) {
          g_entry[g_entrylen++] = '.';
+      } else if (g_menu == MENU_KEYPAD && g_units &&
+                 (g_kp_mode == 10 || g_kp_mode == 11) && g_entrylen < 4) {
+         int seen = 0;
+         for (int i = 0; i < g_entrylen; i++)
+            if (g_entry[i] == '.')
+               seen = 1;
+         if (!seen)
+            g_entry[g_entrylen++] = '.';
+      }
    } else if (action == 110) {
       if (g_entrylen > 0)
          g_entrylen--;
@@ -4475,8 +5203,6 @@ static void menu_action(int action)
    } else if (action == MA_ADD_OPEN || action == MA_INSLOG_BACK) {
       /* both land on the ADD menu (the log's X returns where it opened) */
       g_menu = MENU_ADD;
-   } else if (action == MA_DISPLAY_OPEN) {
-      g_menu = MENU_DISPLAY; /* its X shares the settings-back branch */
    } else if (action == MA_STATBAR || action == MA_LOCKSCR ||
               action == MA_NOTIF_REOPEN) {
       if (action == MA_STATBAR)
@@ -4490,9 +5216,11 @@ static void menu_action(int action)
        * action (a swiped-away notification returns on notify()). */
       g_notify_dirty = 1;
       pancra_notify_refresh();
-   } else if (ins_action(action)) {
-      /* handled: LOG/EDIT INSULIN, the dose log table, the insulin marker
-       * picker -- see ins_action above menu_action */
+   } else if (ins_action(action) || submenu_action(action)) {
+      /* handled by a split-out family (see them above menu_action):
+       * LOG/EDIT INSULIN + dose log + marker picker (ins_action), or the
+       * ALARM / EXPORT DATA / REMOTE / PERMISSIONS / DISPLAY / OLD DEVICES
+       * submenus (submenu_action) */
    } else if (action == MA_OK) {
       if (g_menu == MENU_LABEL) {
          if (g_sel >= 0 && g_sel < g_nslot) {
@@ -4557,6 +5285,65 @@ static void menu_action(int action)
             keypad_close();
             g_menu = MENU_RESCALE;
          }
+      } else if (g_kp_mode == 10 || g_kp_mode == 11) {
+         /* ALARM LOW / HIGH: entry in DISPLAY units. mg/dL is a plain
+          * integer; mmol/L is LITERAL mmol with an optional '.' and one
+          * decimal digit ("5.5") -- its keypad shows a dot key (ui.c).
+          * Both thresholds accept 0..AL_ENTRY_MAX: 0 parks LOW below any
+          * possible reading and a past-the-scale HIGH above any, each that
+          * alarm's deliberate OFF switch. Refuse VISIBLY (stay on the
+          * keypad, entry cleared) a malformed entry, an out-of-range value,
+          * or one that would invert the pair -- a silent clamp would move a
+          * threshold the user never typed. Equal is allowed. */
+         if (g_entrylen > 0) {
+            int ip  = 0;
+            int fd  = 0;
+            int dot = 0; /* 0 none, 1 seen, 2 decimal digit consumed */
+            int bad = 0;
+            for (int i = 0; i < g_entrylen; i++) {
+               char ch = g_entry[i];
+               if (ch == '.') {
+                  if (dot || !g_units)
+                     bad = 1; /* one dot, and only in mmol/L mode */
+                  else
+                     dot = 1;
+               } else if (dot == 0) {
+                  ip = (ip * 10) + (ch - '0');
+               } else if (dot == 1) {
+                  fd  = ch - '0';
+                  dot = 2;
+               } else {
+                  bad = 1; /* a second decimal digit: not representable */
+               }
+            }
+            int mgdl = g_units ? (((ip * 10) + fd) * 18) / 10 : ip;
+            alarm_lock();
+            int lo = g_alarm_low;
+            int hi = g_alarm_high;
+            alarm_unlock();
+            if (bad || mgdl > AL_ENTRY_MAX ||
+                (g_kp_mode == 10 ? mgdl > hi : mgdl < lo)) {
+               LOGI("alarm %s %d mg/dL refused (0..%d, low<=high)",
+                    g_kp_mode == 10 ? "low" : "high", mgdl, AL_ENTRY_MAX);
+               g_entrylen = 0;
+               g_ui_dirty = 1;
+               return; /* cleared entry is the feedback; retype it */
+            }
+            /* Under alarm_lock: the pair is READ under it by the alarm
+             * evaluators, and a mixed old/new pair can invert the range for
+             * one tick (see the old alarm_adjust's rationale). */
+            alarm_lock();
+            if (g_kp_mode == 10)
+               g_alarm_low = mgdl;
+            else
+               g_alarm_high = mgdl;
+            alarm_unlock();
+            alarm_save();
+            alarm_reeval(); /* a threshold move can itself enter/leave the
+                             * alarmed state */
+            g_entrylen = 0;
+            keypad_close();
+         }
       } else if (g_kp_mode == 1) { /* PLOT MAX: entry is in the display unit */
          if (g_entrylen > 0) {
             int v = 0;
@@ -4578,6 +5365,10 @@ static void menu_action(int action)
             plot_set_max(mgdl);
             settings_save();
             keypad_close();
+            /* the notification plot shares this vertical scale; without a
+             * refresh it keeps the old one until the next datapoint */
+            g_notify_dirty = 1;
+            pancra_notify_refresh();
          }
       } else if (g_kp_mode == 4) { /* REMOTE IP: a dotted quad */
          if (g_entrylen > 0) {
@@ -4602,6 +5393,8 @@ static void menu_action(int action)
                   break;
             }
             remote_save();
+            remote_forget_cursor(); /* a DIFFERENT server: its history is
+                                     * not this one's -- re-ask the cursor */
             g_entrylen = 0;
             keypad_close();
          }
@@ -4618,6 +5411,7 @@ static void menu_action(int action)
             }
             g_remote_port = v;
             remote_save();
+            remote_forget_cursor(); /* possibly a different server */
             g_entrylen = 0;
             keypad_close();
          }
@@ -4749,6 +5543,109 @@ static void menu_action(int action)
       draw(g_win);
 }
 
+/* The menu_action code this screen's own title-row X emits -- the system back
+ * gesture is a second finger on the SAME target, so navigation stays
+ * single-sourced in menu_action and every recorded g_*_from origin keeps
+ * working. Returns -1 when there is nothing to close (the main screen: back
+ * deliberately does nothing there). KEEP IN STEP with the add_hit(...,
+ * ACT_MENU, code) each render_* records on its title row. */
+static int menu_back_code(void)
+{
+   switch (g_menu) {
+      case MENU_SETTINGS:
+      case MENU_ADD:
+      case MENU_PRIMPICK: return MA_CLOSE;
+      case MENU_KEYPAD: /* menu_action gates on kp_mode, exactly like the X */
+      case MENU_LABEL: return MA_KP_CLOSE;
+      case MENU_DEVLIST: return MA_DEV_CANCEL;
+      case MENU_SENSOR:
+      case MENU_SENSTYPE: return MA_SENSOR_BACK;
+      case MENU_CAL:
+      case MENU_CALPEND: return MA_CAL_BACK;
+      case MENU_RESCALE:
+      case MENU_RESCALEACT: return MA_RESCALE_BACK;
+      case MENU_FORGET: return MA_FORGET_NO;
+      case MENU_MARKPICK:
+      case MENU_COLORPICK:
+         /* the combined picker's X: DISPLAY for an insulin type's styling,
+          * the owning sensor's screen otherwise (same as render_markpick) */
+         return (g_markpick_ins >= 0) ? MA_INSMARK_BACK
+                                      : MA_SENSOR + (g_sel >= 0 ? g_sel : 0);
+      case MENU_METERHELP: return MA_ADDSENSOR;
+      case MENU_PAIRCONF: return MA_PAIR_NO;
+      case MENU_INSULIN: return MA_INS_DISCARD;
+      case MENU_INSDEL: return MA_INSDEL_NO;
+      case MENU_ALARM: return MA_ALARM_BACK;
+      case MENU_EXPORT: return MA_EXP_BACK;
+      case MENU_INSLOG: return MA_INSLOG_BACK;
+      case MENU_DISPLAY: return MA_DISPLAY_BACK;
+      case MENU_PERMS: return MA_PERMS_BACK;
+      case MENU_OLDDEV: return MA_OLDDEV_BACK;
+      case MENU_RECONF: return MA_RECON_NO;
+      case MENU_REMOTE: return MA_REMOTE_BACK;
+      default: return -1; /* MENU_NONE */
+   }
+}
+
+/* ---- act-on-release helpers (state at g_arm_*; policy comment there) ---- */
+
+/* DOWN on a control: arm it and repaint so the pressed shade shows. */
+static void press_arm(int kind, int arg, int x, int y)
+{
+   g_arm_kind = kind;
+   g_arm_arg  = arg;
+   g_arm_in   = 1;
+   g_arm_x    = x;
+   g_arm_y    = y;
+   if (g_win)
+      draw(g_win);
+}
+
+/* Drop any armed press without firing (a stale arm must never shade or fire
+ * on a later screen -- called when a DOWN lands on nothing, and by the back
+ * key, which can change the screen under a held finger). */
+static void press_cancel(void)
+{
+   g_arm_kind = ACT_NONE;
+   g_arm_in   = 0;
+}
+
+/* MOVE: is the finger still on the armed control? Repaint only when the
+ * answer changes, so a drag can't saturate the main thread with draws. */
+static void press_track(int x, int y)
+{
+   if (g_arm_kind == ACT_NONE)
+      return;
+   struct action a = ui_hit(&g_hits, x, y);
+   int in          = (a.kind == g_arm_kind && a.arg == g_arm_arg);
+   if (in != g_arm_in) {
+      g_arm_in = in;
+      if (in) {
+         g_arm_x = x;
+         g_arm_y = y;
+      }
+      if (g_win)
+         draw(g_win);
+   }
+}
+
+/* UP/CANCEL: disarm, and say whether the action should fire -- an UP that
+ * lands back on the armed control. A miss repaints to clear the shade (a
+ * fired action repaints through its own path). Read g_arm_kind/g_arm_arg
+ * BEFORE calling: this clears them. */
+static int press_release(int up, int x, int y)
+{
+   if (g_arm_kind == ACT_NONE)
+      return 0;
+   struct action a = ui_hit(&g_hits, x, y);
+   int fire        = up && a.kind == g_arm_kind && a.arg == g_arm_arg;
+   g_arm_kind      = ACT_NONE;
+   g_arm_in        = 0;
+   if (!fire && g_win)
+      draw(g_win);
+   return fire;
+}
+
 /* Plot rectangle recorded by the last render (the ACT_SCRUB target), so a drag
  * can resolve to a datapoint even after the finger leaves the plot. */
 static int plot_rect(int *x, int *y, int *w, int *h)
@@ -4764,24 +5661,11 @@ static int plot_rect(int *x, int *y, int *w, int *h)
    return 0;
 }
 
-/* adjust the threshold for button i by +/-5, clamped and kept low<=high; saves
- */
-static void alarm_adjust(int i)
-{
-   /* Clamp logic lives in alarmlogic.c so `make check` can fail on it.
-    *
-    * Under alarm_lock because the thresholds are READ under it by
-    * pancra_alarm_check (alarm_zone and alarm_stranded both take them), from a
-    * binder thread and the service tick. Writing them unlocked let an
-    * evaluation observe a mixed pair -- a new low against an old high -- which
-    * for one tick can invert the range and report the wrong zone. */
-   alarm_lock();
-   alarm_step(i, &g_alarm_low, &g_alarm_high);
-   alarm_unlock();
-   alarm_save();
-   alarm_reeval(); /* a threshold move can itself enter/leave the alarmed state
-                    */
-}
+/* (The +- stepper's alarm_adjust is gone: thresholds are now typed on the
+ * keypad -- see the kp_mode 10/11 branch in the MA_OK handler, which keeps
+ * the same lock discipline: the pair is written under alarm_lock because the
+ * evaluators read it under alarm_lock, and a mixed old/new pair can invert
+ * the range for one tick.) */
 
 /* an older reading recovered via backfill: store it, place it in history, but
  * don't disturb the current value unless it turns out to be the newest */
@@ -5070,7 +5954,7 @@ int ot_drv_reading(long naive, int mg_dl)
    hist_unlock();
    if (isnew) { /* meters are never rescaled: factor 1000 */
       store_append(t, mg_dl, 127, 0, 0, g_meter_src, naive, tz, KIND_BGM, 1000);
-      remote_push(t, mg_dl); /* fingersticks are datapoints too */
+      /* fingersticks ride the same cursor-driven sync (see above) */
    }
    LOGI("meter reading %d mg/dL at %ld (raw %ld)%s", mg_dl, t, naive,
         isnew ? "" : " (already stored)");
@@ -5149,7 +6033,7 @@ void pancra_backfill(int mg_dl, int trend, int age_s)
    if (isnew) {
       store_append(t, mg_dl, trend, 0, 0, src, t, g_tz_off, KIND_CGM,
                    rpm); /* no RSSI for backfilled points */
-      remote_push(t, mg_dl);
+      /* delivered by remote_sync_step() on the tick */
    }
    LOGI("backfill reading %d mg/dL age %d -> t=%ld", mg_dl, age_s, t);
    /* A gap recovered by backfill can be the newest reading (a missed live
@@ -5342,7 +6226,7 @@ static void notify_update(void)
    if (!g_statbar_val)
       val[0] = 0; /* STATUS BAR: ICON mode -- Java falls back to the glyph */
    for (int i = 0; i < NOTIFY_W * NOTIFY_H; i++)
-      g_notify_px[i] = 0xFF181818;
+      g_notify_px[i] = 0xFF000000; /* true black, matching the app screen */
    static struct plot_pt pts[NHIST];
 
    /* Per-device styling, SNAPSHOTTED before hist_lock: the plot must colour
@@ -5459,8 +6343,7 @@ void pancra_notify_refresh(void)
    notify_update();
 }
 
-/* timer tick: repaint so AGE / stale state stay live; while a +/- button is
- * held (fast cadence) also step the threshold, for hold-to-repeat */
+/* timer tick: repaint so AGE / stale state stay live */
 static int on_timer(int fd, int events, void *data)
 {
    g_where = "on_timer";
@@ -5473,13 +6356,16 @@ static int on_timer(int fd, int events, void *data)
    g_main_tid     = gettid();
    uint64_t ticks = 0;
    read(fd, &ticks, sizeof ticks); /* single read clears the expiration count */
-   if (g_al_held >= 0)
-      alarm_adjust(g_al_held);
    /* Covers both the stale-data alarm (which depends on elapsed time) and any
     * glucose alarm a reading raised on a binder thread: the zone is
     * recomputed here, so this single main-thread caller owns every transition.
     */
    disc_reeval();
+   /* One REMOTE step per tick: read the server's cursor, or send the next
+    * chronological batch of points newer than it. Self-throttling (Java
+    * reports busy while a request is in flight or a backoff is running),
+    * so a backlog drains at the server's own pace instead of being lost. */
+   pancra_remote_sync();
    calq_tick(); /* retry / expire any durably-queued calibration */
    /* Expire a pending rescale that no reading answered within the window, even
     * if no datapoint arrives at all (a disconnected CGM). Surfaced, never
@@ -5629,23 +6515,10 @@ static int on_input(int fd, int events, void *data)
           * is a no-op and the alarm stays acknowledged. Clearing it would make
           * the very next reading re-chime what the user just dismissed; a
           * genuine change of level still re-fires. */
-         /* A menu transition mid-gesture armed the swallow (see the modal
-          * dispatch below): eat the REST of that gesture, so the screen that
-          * appeared under a still-held touch cannot be pressed by it. But a
-          * fresh DOWN is always a NEW, deliberate tap -- it clears the swallow
-          * and is handled normally. This is deliberately clear-on-DOWN rather
-          * than clear-on-UP: a missed or non-standard UP (multi-touch
-          * POINTER_UP, a cancelled gesture) must NEVER be able to leave the
-          * whole app swallowing every touch. */
-         if (g_touch_swallow) {
-            if (action == AMOTION_EVENT_ACTION_DOWN) {
-               g_touch_swallow =
-                   0; /* new gesture: fall through and handle it */
-            } else {
-               AInputQueue_finishEvent(q, ev, 1);
-               continue;
-            }
-         }
+         /* (The old mid-gesture "touch swallow" is gone: actions now fire on
+          * the RELEASE, so a menu can no longer change under a still-held
+          * finger -- and the back key, the one remaining way it can, cancels
+          * any armed press explicitly.) */
          int was_sounding = 0;
          if (action == AMOTION_EVENT_ACTION_DOWN) {
             alarm_lock();
@@ -5668,28 +6541,49 @@ static int on_input(int fd, int events, void *data)
             AInputQueue_finishEvent(q, ev, 1);
             continue;
          }
-         /* the first-run rationale screen is modal: a tap on CONTINUE fires the
-          * permission request; anything else is ignored */
+         /* the first-run rationale screen is modal: CONTINUE arms on the
+          * press and fires the permission request on the release (the
+          * app-wide act-on-release rule); anything else is ignored */
          if (g_gate) {
-            if (action == AMOTION_EVENT_ACTION_DOWN &&
-                ui_hit(&g_hits, tx, ty).kind == ACT_GATE_CONTINUE) {
-               g_gate = 0;
-               if (g_act)
-                  request_ble_permissions(g_act);
-               if (g_win)
-                  draw(g_win);
+            if (action == AMOTION_EVENT_ACTION_DOWN) {
+               struct action a = ui_hit(&g_hits, tx, ty);
+               if (a.kind == ACT_GATE_CONTINUE)
+                  press_arm(a.kind, a.arg, tx, ty);
+               else
+                  press_cancel();
+            } else if (action == AMOTION_EVENT_ACTION_MOVE) {
+               press_track(tx, ty);
+            } else if (action == AMOTION_EVENT_ACTION_UP ||
+                       action == AMOTION_EVENT_ACTION_CANCEL) {
+               if (press_release(action == AMOTION_EVENT_ACTION_UP, tx, ty)) {
+                  g_gate = 0;
+                  if (g_act)
+                     request_ble_permissions(g_act);
+                  if (g_win)
+                     draw(g_win);
+               }
             }
             AInputQueue_finishEvent(q, ev, 1);
             continue;
          }
          /* All modal menus (settings / keypad / device list) are pure now: a
-          * tap maps via the recorded ACT_MENU targets to a menu_action code. */
+          * press ARMS the recorded ACT_MENU target under it, and the release
+          * -- back on the same target -- dispatches its menu_action code.
+          * Sliding off first cancels without firing anything. */
          if (g_menu) {
             if (action == AMOTION_EVENT_ACTION_DOWN) {
                struct action a = ui_hit(&g_hits, tx, ty);
-               if (a.kind == ACT_MENU) {
-                  int prev_menu = g_menu;
-                  menu_action(a.arg);
+               if (a.kind == ACT_MENU)
+                  press_arm(a.kind, a.arg, tx, ty);
+               else
+                  press_cancel();
+            } else if (action == AMOTION_EVENT_ACTION_MOVE) {
+               press_track(tx, ty);
+            } else if (action == AMOTION_EVENT_ACTION_UP ||
+                       action == AMOTION_EVENT_ACTION_CANCEL) {
+               int aarg = g_arm_arg; /* press_release clears it */
+               if (press_release(action == AMOTION_EVENT_ACTION_UP, tx, ty)) {
+                  menu_action(aarg);
                   /* GENERAL rule (so no menu needs special-casing): the moment
                    * a menu action lands back on the MAIN screen, restore its
                    * chosen orientation -- menus render portrait, main follows
@@ -5697,14 +6591,6 @@ static int on_input(int fd, int events, void *data)
                    * stuck in the portrait the menu-open had forced. */
                   if (g_menu == MENU_NONE)
                      sys_set_orientation(g_orient);
-                  /* A menu TRANSITION consumes the REST of this gesture: the
-                   * screen under the finger just changed, so the still-held
-                   * touch would land on whatever the new screen put there --
-                   * picking a primary CGM closed the picker and the same
-                   * finger immediately pressed a plot tab. Nothing fires
-                   * again until the user actually lifts. */
-                  if (g_menu != prev_menu)
-                     g_touch_swallow = 1;
                }
             }
             AInputQueue_finishEvent(q, ev, 1);
@@ -5725,6 +6611,7 @@ static int on_input(int fd, int events, void *data)
          int rh   = 0;
          if ((begin || cont) && plot_rect(&rx, &ry, &rw, &rh)) {
             g_scrubbing = 1;
+            press_cancel(); /* scrubbing is exempt; no arm may linger */
             /* Average the current sample with the batched historical ones so
              * the pick tracks the centre of the contact, not a jittery edge. */
             unsigned long hs = AMotionEvent_getHistorySize(ev);
@@ -5738,23 +6625,48 @@ static int on_input(int fd, int events, void *data)
             }
             int fx = (int)(ax / n);
             int fy = (int)(ay / n);
-            static struct plot_pt pts[NHIST + NINS];
-            static int psrc[NHIST];
+            static struct plot_pt pts[PLOT_LONG_MAX + NINS];
+            /* SIZED FOR THE SAME LOOP AS pts, not for the live window.
+             * This was left at NHIST when pts grew to hold a long span, so
+             * scrubbing 7D or 30D wrote up to PLOT_LONG_MAX ints into a
+             * 5040-int array -- 176 kB straight through the statics that
+             * follow it, which is what silently emptied the stats ring
+             * minutes after every restart. */
+            static int psrc[PLOT_LONG_MAX + NINS];
             /* Under hist_lock: hist_insert memmoves g_hist from a BLE binder
              * thread, so an unlocked copy here reads a half-shifted array and
              * the scrub lands on a datapoint that was never there. Every other
              * reader takes the lock; this one was missed. */
-            hist_lock();
-            int np = g_nhist < NHIST ? g_nhist : NHIST;
-            for (int i = 0; i < np; i++) {
-               pts[i].t      = g_hist[i].t;
-               pts[i].glu    = g_hist[i].glu;
-               pts[i].marker = 0;
-               pts[i].col    = 0;
-               pts[i].hidden = 0;
-               psrc[i]       = g_hist[i].src;
+            int nlong2                    = 0;
+            const struct ui_point *plong2 = plot_source_from(
+                g_store_path, realtime_s(), g_plot_hours, &nlong2);
+            int np = 0;
+            if (plong2) {
+               /* Hit-test what was DRAWN: on a long span that is the
+                * bucketed set, not the RAM window, or the scrub would
+                * select points the plot never showed. */
+               for (int i = 0; i < nlong2 && np < PLOT_LONG_MAX; i++) {
+                  pts[np].t      = plong2[i].t;
+                  pts[np].glu    = plong2[i].glu;
+                  pts[np].marker = 0;
+                  pts[np].col    = 0;
+                  pts[np].hidden = 0;
+                  psrc[np]       = plong2[i].src;
+                  np++;
+               }
+            } else {
+               hist_lock();
+               np = g_nhist < NHIST ? g_nhist : NHIST;
+               for (int i = 0; i < np; i++) {
+                  pts[i].t      = g_hist[i].t;
+                  pts[i].glu    = g_hist[i].glu;
+                  pts[i].marker = 0;
+                  pts[i].col    = 0;
+                  pts[i].hidden = 0;
+                  psrc[i]       = g_hist[i].src;
+               }
+               hist_unlock();
             }
-            hist_unlock();
             /* A HIDDEN device (marker OFF) is off the plot, so its points must
              * not be scrub-selectable either. plot_hit skips pts[].hidden. Pull
              * the (few) hidden-marker device ids in ONE locked call, then flag
@@ -5770,7 +6682,7 @@ static int on_input(int fd, int events, void *data)
             /* Insulin doses ride along, in the SAME order the model
              * appends them, so the returned index maps onto m->hist. */
             int np_glu = np;
-            for (int i = 0; i < g_nins && np < NHIST + NINS; i++) {
+            for (int i = 0; i < g_nins && np < PLOT_LONG_MAX + NINS; i++) {
                pts[np].t      = g_ins[i].t;
                pts[np].glu    = 60; /* the renderer's fixed insulin y */
                pts[np].marker = 0;
@@ -5784,21 +6696,51 @@ static int on_input(int fd, int events, void *data)
             }
             /* plot_hit picks by TIME alone, which would leave a dose
              * between two 5-minute CGM points a sliver of reachability.
-             * Aim by finger HEIGHT instead: below the 70-line (where the
-             * insulin row lives) only insulin is selectable, above it
+             * Aim by finger HEIGHT instead: in the insulin band (twice the
+             * below-70 strip, so the row is reachable without covering it
+             * with the fingertip) only insulin is selectable, above it
              * only glucose -- sliding along the plot bottom walks the
-             * doses. */
-            int oy70 = ry + rh;
-            {
-               int oxx            = 0;
-               struct plot_pt ref = {0};
-               ref.t              = realtime_s();
-               ref.glu            = 70;
-               if (!plot_point_xy(rx, ry, rw, rh, ref, realtime_s(),
-                                  g_plot_hours, &oxx, &oy70))
-                  oy70 = ry + rh; /* degenerate window: all glucose */
+             * doses. Decided ONCE, at the DOWN: the rest of the gesture
+             * keeps scrubbing whichever series it began on, wherever the
+             * finger wanders. With no dose in the visible window the whole
+             * plot aims at glucose -- no dead band over nothing. */
+            if (begin) {
+               int oy70 = ry + rh;
+               {
+                  int oxx            = 0;
+                  struct plot_pt ref = {0};
+                  ref.t              = realtime_s();
+                  ref.glu            = 70;
+                  if (!plot_point_xy(rx, ry, rw, rh, ref, realtime_s(),
+                                     g_plot_hours, &oxx, &oy70))
+                     oy70 = ry + rh; /* degenerate window: all glucose */
+               }
+               /* A dose only claims the touch if one is actually NEAR the
+                * finger. Asking merely "is there a dose in this window"
+                * meant that on a 30-day span a single marker at one edge
+                * captured a press at the far edge, and the scrub then
+                * jumped to a dose an inch away instead of reading the
+                * glucose under the fingertip. About half an inch of x
+                * either side -- an eighth of the plot -- is roughly a
+                * fingertip's own width. */
+               int near_x   = rw / 8;
+               int have_ins = 0;
+               for (int i = np_glu; i < np && !have_ins; i++) {
+                  int oxx = 0;
+                  int oyy = 0;
+                  if (pts[i].hidden ||
+                      !plot_point_xy(rx, ry, rw, rh, pts[i], realtime_s(),
+                                     g_plot_hours, &oxx, &oyy))
+                     continue;
+                  int dx = oxx - fx;
+                  if (dx < 0)
+                     dx = -dx;
+                  if (dx <= near_x)
+                     have_ins = 1;
+               }
+               g_scrub_ins = have_ins && (fy >= (2 * oy70) - (ry + rh));
             }
-            int aim_ins = (fy >= oy70);
+            int aim_ins = g_scrub_ins;
             for (int i = 0; i < np_glu; i++)
                if (aim_ins)
                   pts[i].hidden = 1;
@@ -5813,68 +6755,94 @@ static int on_input(int fd, int events, void *data)
             }
             handled = 1;
          } else if (action == AMOTION_EVENT_ACTION_DOWN) {
-            if (act.kind == ACT_OPEN_SETTINGS) {
-               sys_refresh(); /* snapshot system state before draw (main
-                                 thread)*/
-               g_menu = MENU_SETTINGS;
-               sys_set_orientation(0);
-               if (g_win)
-                  draw(g_win);
+            if (act.kind == ACT_OPEN_SETTINGS || act.kind == ACT_PICK_PRIMARY ||
+                act.kind == ACT_MENU || act.kind == ACT_PLOT_TAB) {
+               /* Every real main-screen action arms here and fires on the
+                * release back on the same control (press_release below). */
+               press_arm(act.kind, act.arg, tx, ty);
                handled = 1;
-            } else if (act.kind == ACT_PICK_PRIMARY) {
-               /* Tapping the big number ALWAYS opens the CHOOSE PRIMARY
-                * screen -- with several CGMs to pick between, with one (to
-                * see/confirm which owns the number), or with none (the
-                * screen states there is no CGM and offers the pending one if
-                * a pairing is armed). A consistent affordance beats a tap
-                * that silently does nothing. */
-               sys_refresh();
-               g_menu = MENU_PRIMPICK;
-               sys_set_orientation(0);
-               if (g_win)
-                  draw(g_win);
-               handled = 1;
-            } else if (act.kind == ACT_MENU) {
-               /* Main-screen shortcut into a menu action (the info/stats block
-                * taps straight to the primary CGM's device screen). */
-               sys_refresh();
-               sys_set_orientation(0);
-               int prev_menu = g_menu;
-               menu_action(act.arg);
-               if (g_menu != prev_menu)
-                  g_touch_swallow = 1; /* a menu opened under a held finger */
-               if (g_win)
-                  draw(g_win);
-               handled = 1;
-            } else if (act.kind == ACT_ALARM_LOW ||
-                       act.kind == ACT_ALARM_HIGH) {
-               /* step once now; repeat only after a 400 ms hold, then 120 ms.
-                * button index: 0 LOW- 1 LOW+ 2 HIGH- 3 HIGH+ */
-               int btn =
-                   (act.kind == ACT_ALARM_HIGH ? 2 : 0) + (act.arg > 0 ? 1 : 0);
-               g_al_held = btn;
-               alarm_adjust(btn);
-               timer_set(400, 120);
-               draw(g_win);
+            } else {
+               press_cancel(); /* a stale arm must not survive a dead tap */
+            }
+         } else if (action == AMOTION_EVENT_ACTION_MOVE) {
+            if (g_arm_kind != ACT_NONE) {
+               press_track(tx, ty);
                handled = 1;
             }
          } else if (action == AMOTION_EVENT_ACTION_UP ||
                     action == AMOTION_EVENT_ACTION_CANCEL) {
             g_scrubbing = 0;
-            if (g_al_held >= 0) { /* release stops the auto-repeat */
-               g_al_held = -1;
-               timer_set(1000, 1000);
-               handled = 1;
-            } else if (g_scrub_idx >= 0) { /* release clears the highlight */
+            int akind   = g_arm_kind; /* press_release clears these */
+            int aarg    = g_arm_arg;
+            int fire = press_release(action == AMOTION_EVENT_ACTION_UP, tx, ty);
+            if (g_scrub_idx >= 0) { /* release clears the highlight */
                g_scrub_idx = -1;
                draw(g_win);
                handled = 1;
-            } else if (act.kind == ACT_PLOT_TAB) { /* a tab tap (arg = hours) */
-               g_plot_hours = act.arg;
-               draw(g_win);
+            } else if (fire) {
+               if (akind == ACT_OPEN_SETTINGS) {
+                  sys_refresh(); /* snapshot system state before draw (main
+                                    thread)*/
+                  g_menu = MENU_SETTINGS;
+                  sys_set_orientation(0);
+                  if (g_win)
+                     draw(g_win);
+               } else if (akind == ACT_PICK_PRIMARY) {
+                  /* Releasing on the big number ALWAYS opens the CHOOSE
+                   * PRIMARY screen -- with several CGMs to pick between,
+                   * with one (to see/confirm which owns the number), or
+                   * with none (the screen states there is no CGM and offers
+                   * the pending one if a pairing is armed). A consistent
+                   * affordance beats a tap that silently does nothing. */
+                  sys_refresh();
+                  g_menu = MENU_PRIMPICK;
+                  sys_set_orientation(0);
+                  if (g_win)
+                     draw(g_win);
+               } else if (akind == ACT_MENU) {
+                  /* Main-screen shortcut into a menu action (the info/stats
+                   * block taps straight to the primary CGM's device menu). */
+                  sys_refresh();
+                  sys_set_orientation(0);
+                  menu_action(aarg);
+                  if (g_win)
+                     draw(g_win);
+               } else if (akind == ACT_PLOT_TAB) { /* tab (arg = hours) */
+                  g_plot_hours = aarg;
+                  draw(g_win);
+               }
                handled = 1;
             }
          }
+      } else if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY &&
+                 AKeyEvent_getKeyCode(ev) == AKEYCODE_BACK) {
+         /* The system back gesture/button, acting exactly like a tap on the
+          * current screen's title-row X. ALWAYS claimed (handled = 1), even
+          * when it does nothing: unhandled it falls through to NativeActivity,
+          * which finishes the activity -- so on the main screen and the gate
+          * "no effect" still has to eat the event. Act on UP, the OS's own
+          * back-on-release semantics; the DOWN is claimed silently. */
+         if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP && !g_gate) {
+            /* Same contract as a touch: a sounding alarm is silenced by ANY
+             * press, and that press does nothing else (see the DOWN handler
+             * above for why the test and the silence share the lock). */
+            int was_sounding = 0;
+            alarm_lock();
+            was_sounding = g_alarm_sounding;
+            if (was_sounding && dexble_alarm_silence()) {
+               g_alarm_sounding = 0;
+               g_alarm_acked    = 1;
+            }
+            alarm_unlock();
+            int code = was_sounding ? -1 : menu_back_code();
+            if (code >= 0) {
+               press_cancel();    /* the screen changes under any held finger */
+               menu_action(code); /* redraws via its trailing draw() */
+               if (g_menu == MENU_NONE)
+                  sys_set_orientation(g_orient); /* see the menu rule above */
+            }
+         }
+         handled = 1;
       }
       AInputQueue_finishEvent(q, ev, handled);
    }
@@ -5940,14 +6908,6 @@ static void on_resume(struct ANativeActivity *a)
 static void on_pause(struct ANativeActivity *a)
 {
    g_paused = 1; /* set BEFORE the stop, or on_timer could race it back up */
-   /* END ANY AUTO-REPEAT. g_al_held is cleared only by an UP or CANCEL event,
-    * and the looper keeps running while the activity is paused -- so a hold
-    * that loses focus without a CANCEL leaves on_timer calling alarm_adjust at
-    * the fast cadence indefinitely, each call writing the settings file and
-    * slewing the threshold until it pins at its clamp. A low alarm parked at
-    * AL_MIN is a hypo alarm that cannot fire. Android normally does deliver
-    * CANCEL; nothing in this code required it to. */
-   g_al_held = -1;
    timer_set(1000, 1000); /* back to the 1 Hz cadence */
    stop_scan(a);
 }
@@ -6213,8 +7173,8 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                                     "String;[IIII)V");
       m_set_orient = (*env)->GetStaticMethodID(env, g_ble, "setOrientation",
                                                "(Landroid/content/Context;I)V");
-      m_export     = (*env)->GetStaticMethodID(env, g_ble, "exportData",
-                                               "(Landroid/content/Context;)V");
+      m_export = (*env)->GetStaticMethodID(env, g_ble, "exportData",
+                                           "(Landroid/content/Context;JZZZ)V");
       m_perm_granted = (*env)->GetStaticMethodID(
           env, g_ble, "permGranted",
           "(Landroid/content/Context;Ljava/lang/String;)Z");
@@ -6234,8 +7194,31 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       m_bonded_stelo = (*env)->GetStaticMethodID(
           env, g_ble, "bondedSensor",
           "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
-      m_remote_push = (*env)->GetStaticMethodID(env, g_ble, "remotePush",
-                                                "(Ljava/lang/String;IJI)V");
+      m_remote_cursor = (*env)->GetStaticMethodID(env, g_ble, "remoteCursor",
+                                                  "(Ljava/lang/String;I)V");
+      m_remote_batch  = (*env)->GetStaticMethodID(
+          env, g_ble, "remoteBatch",
+          "(Ljava/lang/String;IZLjava/lang/String;JZ)V");
+      m_remote_busy =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteBusy", "()I");
+      m_remote_cur_glu =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteCursorGlu", "()J");
+      m_remote_cur_ins =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteCursorIns", "()J");
+      m_remote_forget =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteForget", "()V");
+      m_remote_ack_glu =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteAckGlu", "()J");
+      m_remote_ack_ins =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteAckIns", "()J");
+      m_remote_status = (*env)->GetStaticMethodID(env, g_ble, "remoteStatus",
+                                                  "()Ljava/lang/String;");
+      m_remote_range  = (*env)->GetStaticMethodID(env, g_ble, "remoteRange",
+                                                  "(Ljava/lang/String;IJJ)V");
+      m_remote_range_body = (*env)->GetStaticMethodID(
+          env, g_ble, "remoteRangeBody", "()Ljava/lang/String;");
+      m_remote_range_ack =
+          (*env)->GetStaticMethodID(env, g_ble, "remoteRangeAck", "()J");
 
       /* wire up the BLE protocol driver (registers its own Ble callbacks) */
       dexble_init(activity->internalDataPath ? activity->internalDataPath
@@ -6265,6 +7248,9 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                                ? activity->internalDataPath
                                : "/data/local/tmp";
          data_path(g_store_path, sizeof g_store_path, dir, "/readings.csv");
+         /* The outbox position lives beside the log it indexes. */
+         data_path(g_ob_path, sizeof g_ob_path, dir, "/remote.pos");
+         data_path(g_pull_path, sizeof g_pull_path, dir, "/remote.pull");
          data_path(g_info_path, sizeof g_info_path, dir, "/stelo.info");
          data_path(g_alarm_path, sizeof g_alarm_path, dir, "/alarm.cfg");
          data_path(g_settings_path, sizeof g_settings_path, dir,
@@ -6390,6 +7376,8 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
             }
          }
          stat_load(g_store_path);
+         ob_load();   /* how far the server has confirmed our log */
+         pull_load(); /* how far back we have imported ITS history */
          info_load();
          alarm_load();
          settings_load();

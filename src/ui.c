@@ -9,12 +9,14 @@
  * and runs on the host against a malloc'd buffer (see test/uitest.c, which
  * renders each screen to a PPM and checks its hit-targets with no phone). */
 #include "ui.h"
+#include "alarmlogic.h" /* AL_ENTRY_MAX: the alarm keypads' ceiling */
 #include "font.h"
 #include "insulin.h" /* struct ins_rec + INS_* for the INSULIN LOG table */
 #include "ndk.h"
 #include "plot.h"
-#include "sensors.h" /* sensor types, kinds, marker enum */
-#include "util.h"    /* str_snapshot */
+#include "plotdata.h" /* PLOT_LONG_MAX: the long-span point ceiling */
+#include "sensors.h"  /* sensor types, kinds, marker enum */
+#include "util.h"     /* str_snapshot */
 #include <stdint.h>
 #include <stdio.h> /* snprintf */
 
@@ -27,7 +29,9 @@
  * that is plot.c's x-tick colour, and an orphan marker drawn in it reads as
  * part of the axis. */
 #define UI_ORPHAN 0xFF8A8AA0
-static const int ui_tab_hours[UI_TABS] = {3, 6, 12, 24, 72, 168};
+/* 720h = 30D on the right. 6H went: it sat between 3H and 12H without
+ * showing anything either of them didn't. */
+static const int ui_tab_hours[UI_TABS] = {3, 12, 24, 72, 168, 720};
 
 /* plot.c takes the marker as a plain shape index (0 dot, 1 cross, 2 square,
  * 3 triangle) and deliberately does not borrow sensors.h's enum, so the two
@@ -186,7 +190,25 @@ static void add_hit(struct hits *h, int x, int y, int w, int hgt, int kind,
    h->box[h->n].h    = hgt;
    h->box[h->n].kind = kind;
    h->box[h->n].arg  = arg;
+   /* glow (pressed-highlight) rect defaults to the hit rect itself */
+   h->box[h->n].gx = x;
+   h->box[h->n].gy = y;
+   h->box[h->n].gw = w;
+   h->box[h->n].gh = hgt;
    h->n++;
+}
+
+/* Narrow the LAST recorded hit box's glow rect to (x,y,w,h) -- for a control
+ * whose hit zone is deliberately larger than its visible glyph, so arming it
+ * lights the glyph alone, not every stranger caught in the zone. */
+static void add_glow(struct hits *h, int x, int y, int w, int hgt)
+{
+   if (h->n <= 0)
+      return;
+   h->box[h->n - 1].gx = x;
+   h->box[h->n - 1].gy = y;
+   h->box[h->n - 1].gw = w;
+   h->box[h->n - 1].gh = hgt;
 }
 
 /* big-number colour by fixed medical range (0xAABBGGRR) */
@@ -207,18 +229,9 @@ static uint32_t white_color(int g)
    return 0xFFFFFFFF; /* plot dots */
 }
 
-/* 5x7 icons, stored exactly like font glyphs (7 rows, MSB = leftmost of the
- * low 5 bits), for states a letter cannot say. Speaker: driver box left,
- * cone opening right. Vibrate: a phone outline with a shake line each side. */
-static const uint8_t icon_speaker[7] = {0x01, 0x03, 0x1F, 0x1F,
-                                        0x1F, 0x03, 0x01};
-static const uint8_t icon_vibrate[7] = {0x0E, 0x0A, 0x1B, 0x1B,
-                                        0x1B, 0x0A, 0x0E};
-/* A pencil, tip lower-left: the universally read "edit this row" mark. */
-static const uint8_t icon_pencil[7] = {0x03, 0x07, 0x0E, 0x1C,
-                                       0x18, 0x10, 0x00};
-/* A small filled disc: the NEW DATAPOINT beep indicator. */
-static const uint8_t icon_dot[7] = {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00};
+/* The 5x7 icon BITMAPS live in font.c with the glyph tables (all the pixel
+ * art in one file); this blitter stays here with draw_cell and its clipping
+ * counter. */
 
 /* Draw one 5x7 icon at (ox,oy), scale sc -- the icon equivalent of one
  * draw_str glyph cell. */
@@ -605,6 +618,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int hx0 = bx3 + (17 * bigsc3) + sc;
    add_hit(h, hx0, y, fb->width - hx0, (units_y + (7 * sc)) - y,
            ACT_OPEN_SETTINGS, 0);
+   /* ...but the pressed highlight lights the hamburger GLYPH alone (plus a
+    * little breathing room) -- the zone also contains the units label, and
+    * a lit MG/DL would read as if the units were about to change. */
+   add_glow(h, ham_x - (2 * sc), ham_y - (2 * sc), ham_w + (4 * sc),
+            ham_h + (4 * sc));
    y += (8 * bigsc3) + pad;
 
    /* plot-window tabs (or the scrub readout while dragging) */
@@ -632,26 +650,51 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          (void)snprintf(gv, sizeof gv, "%d U", m->hist[m->scrub].glu);
       else
          fmt_glu(m->hist[m->scrub].glu, m->units, gv, sizeof gv);
-      /* On the multi-day spans (3D / 7D) a bare HH:MM is ambiguous across days,
-       * so prefix the weekday (SUN..SAT). 1970-01-01 was a Thursday. */
+      /* On the multi-day spans a bare HH:MM is ambiguous across days, so
+       * prefix the DATE as M/DD ("7/21"). A weekday name told you it was a
+       * Thursday but not WHICH one, which is useless once the span passes a
+       * week -- and at 30D it is useless immediately. */
       const char *unit = UI_LBL(m->units);
       if (ins)
          unit = (m->hist[m->scrub].src == INS_FAST) ? "FAST" : "SLOW";
-      if (m->plot_hours >= 72) {
+      if (m->plot_hours >= 720) {
+         /* A MONTH-long span: a weekday name is ambiguous four times over,
+          * so name the actual date. */
+         char dt[20];
+         /* 12, not 8: gcc cannot prove the month is two digits, and this
+          * build treats a possibly-truncating snprintf as an error. */
+         char md[12];
+         fmt_date(m->hist[m->scrub].t, m->tz_off, dt, sizeof dt);
+         /* fmt_date gives "YYYY-MM-DD HH:MM"; take the month without its
+          * leading zero, and the day as written. */
+         int mon = ((dt[5] - '0') * 10) + (dt[6] - '0');
+         (void)snprintf(md, sizeof md, "%d/%c%c", mon, dt[8], dt[9]);
+         (void)snprintf(line, sizeof line, "%s %s %s %s", gv, unit, md, ts);
+      } else if (m->plot_hours >= 72) {
+         /* Within a week, the weekday IS the clearer label -- "TUE 08:15"
+          * places a reading the way you actually remember it, and there is
+          * only one Tuesday to confuse it with. 1970-01-01 was a Thursday. */
          static const char *const wd[7] = {"SUN", "MON", "TUE", "WED",
                                            "THU", "FRI", "SAT"};
          long z = (m->hist[m->scrub].t + m->tz_off) / 86400;
-         int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0=Sun; 1970-01-01 = Thu */
-         (void)snprintf(line, sizeof line, "%s %s  %s %s", gv, unit, wd[wi],
-                        ts);
+         int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0 = Sunday */
+         (void)snprintf(line, sizeof line, "%s %s %s %s", gv, unit, wd[wi], ts);
       } else {
          (void)snprintf(line, sizeof line, "%s %s  %s", gv, unit, ts);
       }
-      int lw = str_len(line) * 6 * 2 * sc;
+      /* The unit is always shown -- it is what makes the number a
+       * measurement -- so the DATED spans need a little more room than
+       * double scale gives. Step the scale down only as far as the line
+       * actually needs, rather than dropping to a fixed smaller size:
+       * usually one notch, which reads as the same text, not a glitch. */
+      int tsc2 = 2 * sc;
+      while (tsc2 > sc && str_len(line) * 6 * tsc2 > cw - (4 * sc))
+         tsc2--;
+      int lw = str_len(line) * 6 * tsc2;
       int lx = cx + ((cw - lw) / 2);
       if (lx < cx + (2 * sc))
          lx = cx + (2 * sc);
-      draw_str(px, fb, lx, y, 2 * sc, line, 0xFFFFFFFF);
+      draw_str(px, fb, lx, y, tsc2, line, 0xFFFFFFFF);
    } else {
       int laby = y + ((rowh - (7 * sc)) / 2);
       for (int i = 0; i < UI_TABS; i++) {
@@ -685,7 +728,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * does not jump when an alarm appears (the space is always held).
     *
     * The reserve is the info block's own vertical budget (render_info's needv:
-    * 5 info rows + gap + 4 stat rows + the banner's advance and 7*5 glyph) plus
+    * 4 info rows + gap + 4 stat rows + the banner's advance and 7*5 glyph) plus
     * one blank line (16) for the gap BELOW the alarm. render_info fits itself
     * into whatever is left, so reserving at least this much can only leave it
     * room to spare -- never clip. */
@@ -693,13 +736,13 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * screen bottom AT FULL FONT:
     *   34 = what render_glucose itself adds after the plot (the ALARM LOW/HIGH
     *        config row: 9 gap + 7 row + 18 portrait pad),
-    *  202 = render_info's own budget (needv: 5 info rows + gap + 4 stat rows +
+    *  186 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
     *        the banner's advance and glyph),
     *   16 = one blank line BELOW the alarm's large letters.
     * Reserving render_info's full budget keeps its font at sc (it only
     * downscales when squeezed), which is the point -- the plot grows into the
     * dead space, the text below it does NOT shrink. */
-   int reserve = (34 + 202 + 16) * sc;
+   int reserve = (34 + 186 + 16) * sc;
    int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
    int ph   = 0;
    if (landscape)
@@ -720,7 +763,20 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * full 7 days -- the same shrinking-7D bug NHIST's sizing fixes. ui.c is
     * intentionally decoupled from store.h, so the Makefile `crosscheck` target
     * greps both and fails the build if they ever drift apart. */
-#define UI_PLOT_MAX 5040
+#define UI_PLOT_GLU 5040
+   /* ...PLUS the insulin doses, which the shell appends AFTER the glucose
+    * points in the SAME m->hist array (build_model sizes it NHIST + NINS).
+    * Capping at the glucose figure alone silently dropped every dose whose
+    * index landed past it: with the history full -- the steady state after
+    * a fortnight -- that is ALL of them, and before that the NEWEST ones,
+    * so a dose logged minutes ago was missing from the plot while older
+    * ones still showed. NINS comes from insulin.h (already included by
+    * ui.h); only the glucose half is a literal, so the Makefile's
+    * crosscheck can keep it in step with store.h's NHIST. */
+/* A LONG span returns up to PLOT_LONG_MAX points (plotdata.h), which is
+ * far more than the live window holds -- size for the larger of the two or
+ * the old half of a 30-day plot is silently cut off. */
+#define UI_PLOT_MAX (PLOT_LONG_MAX + NINS)
    static struct plot_pt pts[UI_PLOT_MAX];
    int np = m->nhist < UI_PLOT_MAX ? m->nhist : UI_PLOT_MAX;
    for (int i = 0; i < np; i++) {
@@ -788,11 +844,19 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          pts[i].col    = UI_ORPHAN;
       }
    }
+   /* The longer the span, the denser the points and the less a fat marker
+    * says: at 30D thousands of readings share the width, so half the 7D
+    * radius keeps the shape of the trace readable instead of smearing it
+    * into a band. */
    int prad = 3 * sc / 2;
-   if (m->plot_hours >= 168)
+   if (m->plot_hours >= 720)
+      prad = prad / 4;
+   else if (m->plot_hours >= 168)
       prad = prad / 2;
    else if (m->plot_hours >= 72)
       prad = prad * 3 / 4;
+   if (prad < 1)
+      prad = 1;
    plot_render(px, fb->stride, fb->width, fb->height, plot_x, plot_y, plot_w,
                ph, pts, np, m->now, m->plot_hours, prad, white_color,
                scrub ? m->scrub : -1, UI_HILITE);
@@ -801,7 +865,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    add_hit(h, plot_x, plot_y, plot_w, ph, ACT_SCRUB, 0);
    y += ph + (9 * sc);
 
-   /* alarm config row: "ALARM  LOW - 110 +  HIGH - 300 +", full-column */
+   /* alarm config row: "ALARM  LOW 110  HIGH 300", full-column. The old
+    * per-step +- buttons were fiddly sub-fingertip targets; tapping
+    * "LOW <value>" or "HIGH <value>" opens the keypad on that threshold
+    * instead (entry in DISPLAY units, exactly like calibration). */
    const uint32_t gy = 0xFF888888;
    const uint32_t wt = 0xFFFFFFFF;
    int cwid          = 6 * sc;
@@ -809,43 +876,51 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    char hi[8];
    fmt_glu(m->alarm_low, m->units, lo, sizeof lo);
    fmt_glu(m->alarm_high, m->units, hi, sizeof hi);
-   const char *tok[9] = {"ALARM", "LOW", "-", lo, "+", "HIGH", "-", hi, "+"};
-   uint32_t tcol[9]   = {gy, gy, gy, wt, gy, gy, gy, wt, gy};
-   /* Two icon cells (5 wide + 1 gap + 5) LEFT of "ALARM" show the alarm's
-    * outputs at a glance: speaker = sound enabled, phone = vibration
-    * enabled; an off output simply leaves its cell empty. The space is
-    * always reserved, so toggling never shifts the row. */
-   int icon_w = 11 * sc;
+   const char *tok[5] = {"ALARM", "LOW", lo, "HIGH", hi};
+   uint32_t tcol[5]   = {gy, gy, wt, gy, wt};
+   /* Four icon cells LEFT of "ALARM" -- speaker (sound), phone (vibration),
+    * slashed circle (DISCONNECT alarm), dot (NEW DATAPOINT beep) -- so with
+    * the LOW/HIGH values every alarm is represented on the main screen.
+    * FIXED cells at an equal 6*sc pitch: each symbol always appears in the
+    * same place regardless of which others are enabled; an off state just
+    * leaves its cell empty, so toggling never shifts anything. */
+   int icon_w = 23 * sc;
    int total  = icon_w;
-   for (int i = 0; i < 9; i++)
+   for (int i = 0; i < 5; i++)
       total += str_len(tok[i]) * cwid;
-   int g = (cw - total) / 11;
+   int g = (cw - total) / 7;
    if (g < cwid)
       g = cwid;
    int ax = cx + g;
-   /* NEW DATAPOINT beep: a small dot, left-aligned with the info-block
-    * text below (cx + 2*sc), so the alarm row itself stays put. */
-   if (m->newdata_beep)
-      draw_icon(px, fb, cx + (2 * sc), y, sc, icon_dot, gy);
    if (m->sound_on)
       draw_icon(px, fb, ax, y, sc, icon_speaker, gy);
    if (m->vib_on)
       draw_icon(px, fb, ax + (6 * sc), y, sc, icon_vibrate, gy);
+   if (m->disc)
+      draw_icon(px, fb, ax + (12 * sc), y, sc, icon_nolink, gy);
+   if (m->newdata_beep)
+      draw_icon(px, fb, ax + (18 * sc), y, sc, icon_dot, gy);
    ax += icon_w + g;
    int al_y = y - (3 * sc);
    int al_h = (3 * sc) + (7 * sc) + pad;
-   /* the four +/- buttons in draw order: LOW-, LOW+, HIGH-, HIGH+ */
-   int alact[4] = {ACT_ALARM_LOW, ACT_ALARM_LOW, ACT_ALARM_HIGH,
-                   ACT_ALARM_HIGH};
-   int alarg[4] = {-1, +1, -1, +1};
-   int btn      = 0;
-   for (int i = 0; i < 9; i++) {
+   /* Three targets on the row: everything LEFT of "LOW" (the icons and the
+    * ALARM label, from the screen's leftmost pixel) opens the ALARM
+    * submenu; "LOW <value>" and "HIGH <value>" are each ONE target (label +
+    * value + surrounding gap, full row height) opening that threshold's
+    * keypad. The three are DISJOINT -- the pressed highlight lights the
+    * armed control's whole rectangle, so they must not contain each other's
+    * pixels. */
+   int pair_x = 0;
+   for (int i = 0; i < 5; i++) {
+      if (i == 1 || i == 3)
+         pair_x = ax; /* start of the LOW / HIGH pair */
+      if (i == 1)
+         add_hit(h, 0, al_y, ax - (g / 2), al_h, ACT_MENU, MA_ALARM_OPEN);
       draw_str(px, fb, ax, y, sc, tok[i], tcol[i]);
       int tw = str_len(tok[i]) * cwid;
-      if (tok[i][0] == '-' || tok[i][0] == '+') {
-         add_hit(h, ax - (g / 2), al_y, tw + g, al_h, alact[btn], alarg[btn]);
-         btn++;
-      }
+      if (i == 2 || i == 4)
+         add_hit(h, pair_x - (g / 2), al_y, (ax + tw) - pair_x + g, al_h,
+                 ACT_MENU, (i == 2) ? MA_ALARM_LOW : MA_ALARM_HIGH);
       ax += tw + g;
    }
    y += (7 * sc) + pad;
@@ -854,6 +929,17 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
 
 /* Right/bottom column: sensor+session panel, rolling-stats table and the
  * alarm banner. */
+/* Draw one info-table row and return the rightmost pixel column it used (or
+ * `r` if that is further right already) -- the '+' hit zone starts exactly
+ * where the widest row ends, so every drawn row must report through here. */
+static int info_row(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
+                    int y, int sc, const char *s, uint32_t c, int r)
+{
+   draw_str(px, fb, x, y, sc, s, c);
+   int re = x + (str_len(s) * 6 * sc);
+   return re > r ? re : r;
+}
+
 static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                         struct hits *h, int cx, int cw, int y, int sc)
 {
@@ -885,7 +971,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * budget. On a normal-width phone this yields the same `sc` as everywhere
     * else; on a narrow or split-screen window it still steps down gracefully.
     */
-   int needv  = (5 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
+   int needv  = (4 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
    int availv = fb->height - y;
    int vsc    = availv > 0 ? availv / needv : 1;
    int hsc    = cw / (2 + (35 * 6)); /* 35 = the stats table's fixed width */
@@ -899,6 +985,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int lh             = 16 * sc; /* row pitch: matches the settings leading */
    const uint32_t col = 0xFFCCCCCC;
    int info_y0        = y; /* top of the STATE..PRED block (a tap-shortcut) */
+   int info_r         = x; /* rightmost pixel any info row used so far */
 
    /* Widest row is the unbonded STATE line (8 + UI_COLS status + advert count)
     * and the stats rows (4 + 5*6 + a 6-char unit, with each cell up to 15 now
@@ -925,9 +1012,10 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
             plot_marker_glyph(px, fb->stride, fb->width, fb->height,
                               gx + (3 * sc), y + (3 * sc), 2 * sc, ps->marker,
                               ui_sensor_color(ps->color));
-         draw_str(px, fb, gx + (2 * 6 * sc), y, sc, ps->label, col);
+         info_r =
+             info_row(px, fb, gx + (2 * 6 * sc), y, sc, ps->label, col, info_r);
       } else {
-         draw_str(px, fb, x, y, sc, "PRIMARY --", col);
+         info_r = info_row(px, fb, x, y, sc, "PRIMARY --", col, info_r);
       }
       y += lh;
    }
@@ -962,15 +1050,14 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
          st[budget] = '\0';
       (void)snprintf(row, sizeof row, "STATE   %s  %s ADV", st, advs);
    }
-   draw_str(px, fb, x, y, sc, row, col);
+   info_r = info_row(px, fb, x, y, sc, row, col, info_r);
    y += lh;
-   (void)snprintf(row, sizeof row, "STORED  %d readings", m->stored);
-   draw_str(px, fb, x, y, sc, row, col);
-   y += lh;
+   /* (No STORED row: a raw reading count earns no place on the main
+    * screen.) */
    if (!m->has_cgm) {
       /* CGM-only row, blanked when no CGM exists (see STATE above). The PRED
        * row is blanked on the same flag further down. */
-      draw_str(px, fb, x, y, sc, "SESSION --", col);
+      info_r = info_row(px, fb, x, y, sc, "SESSION --", col, info_r);
    } else if (m->have_reading) {
       long ss = m->session_seconds;
       /* The PRIMARY CGM's own wear budget (per-device: user override, DIS
@@ -998,7 +1085,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
             r = 0;
          (void)snprintf(row, sizeof row, "SESSION WARMUP %ld:%02ld LEFT",
                         r / 60, r % 60);
-         draw_str(px, fb, x, y, sc, row, 0xFF00CCFF);
+         info_r = info_row(px, fb, x, y, sc, row, 0xFF00CCFF, info_r);
       } else {
          long left = len - ss;
          (void)snprintf(row, sizeof row, "SESSION %ldD %ldH   ", ss / 86400,
@@ -1042,7 +1129,8 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
             (void)snprintf(lrow, sizeof lrow, "LEFT %ldD %ldH", left / 86400,
                            (left % 86400) / 3600);
          }
-         draw_str(px, fb, x + (str_len(row) * 6 * sc), y, sc, lrow, lcol);
+         info_r = info_row(px, fb, x + (str_len(row) * 6 * sc), y, sc, lrow,
+                           lcol, info_r);
       }
    } else {
       /* No reading yet: if the primary is in its warmup window, SAY so with
@@ -1059,10 +1147,10 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (wpair > 0 && m->now - wpair < SENSOR_WARMUP_S) {
          (void)snprintf(row, sizeof row, "SESSION WARMUP ~%ldM LEFT",
                         (wpair + SENSOR_WARMUP_S - m->now) / 60);
-         draw_str(px, fb, x, y, sc, row, 0xFF00CCFF);
+         info_r = info_row(px, fb, x, y, sc, row, 0xFF00CCFF, info_r);
       } else {
          (void)snprintf(row, sizeof row, "SESSION --");
-         draw_str(px, fb, x, y, sc, row, col);
+         info_r = info_row(px, fb, x, y, sc, row, col, info_r);
       }
    }
    y += lh;
@@ -1083,27 +1171,39 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    } else {
       (void)snprintf(row, sizeof row, "PRED    --      SEQ --");
    }
-   draw_str(px, fb, x, y, sc, row, col);
+   info_r = info_row(px, fb, x, y, sc, row, col, info_r);
    y += lh;
    /* The STATE..PRED block describes the PRIMARY CGM, so a tap anywhere in it
     * is a shortcut straight to that device's menu (via ACT_MENU -> MA_SENSOR).
     */
-   for (int k = 0; k < m->nsensors; k++)
-      if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
-         add_hit(h, cx, info_y0, cw, y - info_y0, ACT_MENU, MA_SENSOR + k);
-         break;
-      }
    /* A big '+' in the empty space right of the table: the ADD entry point
-    * (new device / log insulin) reachable without a trip through SETTINGS.
-    * Recorded AFTER the block shortcut above -- ui_hit takes the LAST box, so
-    * the '+' wins inside its own square and the shortcut keeps the rest. */
+    * (new device / log insulin) reachable without a trip through SETTINGS. */
    {
       int psc = 3 * sc;
       int pw  = 6 * psc;
       int pxx = cx + cw - pw - (2 * sc);
       int pyy = info_y0 + (((y - info_y0) - (7 * psc)) / 2);
       draw_str(px, fb, pxx, pyy, psc, "+", 0xFFCCCCCC);
-      add_hit(h, pxx - (3 * sc), info_y0, pw + (5 * sc), y - info_y0, ACT_MENU,
+      /* '+' hit zone: ALL the dead space right of the table -- from the last
+       * pixel the widest info row used (info_r) to the right edge, over the
+       * block's full height -- not just the glyph's own padded square. A
+       * very wide row must still not squeeze the target smaller than that
+       * square, so the start is capped at the glyph's old left margin. */
+      int hx0 = info_r;
+      if (hx0 > pxx - (3 * sc))
+         hx0 = pxx - (3 * sc);
+      /* The block shortcut (tap the PRIMARY..PRED table -> that device's
+       * menu) ends EXACTLY where the '+' zone begins -- disjoint targets,
+       * because the pressed highlight lights the armed control's whole
+       * rectangle: a full-width shortcut box also contained the '+' glyph,
+       * so arming the table visibly lit the '+' as if it would fire. */
+      for (int k = 0; k < m->nsensors; k++)
+         if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
+            add_hit(h, cx, info_y0, hx0 - cx, y - info_y0, ACT_MENU,
+                    MA_SENSOR + k);
+            break;
+         }
+      add_hit(h, hx0, info_y0, cx + cw - hx0, y - info_y0, ACT_MENU,
               MA_ADD_OPEN);
    }
 
@@ -1357,15 +1457,43 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    add_hit(h, 0, y - (3 * sc), fb->width, 3 * lh, ACT_MENU, MA_CLOSE);
    y += 2 * lh;
 
-   /* One row instead of the old six: the display settings live on their
-    * own submenu (render_display), so the settings screen keeps its
-    * height for the DEVICES list. */
-   menu_row(fb, h, y, sc, lh, "DISPLAY", "...", 0xFFFFFFFF, MA_DISPLAY_OPEN);
-   y += lh;
-   /* REMOTE: one summary row opening the submenu, like PERMISSIONS below. The
-    * value is the push state -- and, when ON, the age of the last push the
-    * server actually acknowledged (2xx) -- so whether datapoints are leaving
-    * the phone AND arriving is visible without opening the submenu. */
+   /* Four submenu rows -- DISPLAY ... / ALARM / PERMISSIONS / REMOTE --
+    * with a blank line between each, so the four doors read as one calm
+    * block and the settings screen keeps its height for the DEVICES list.
+    * (The ellipsis is part of the DISPLAY row's NAME, not a value; the
+    * alarm settings live on their own submenu now, render_alarm.) */
+   menu_row(fb, h, y, sc, lh, "DISPLAY ...", "", 0xFFFFFFFF, MA_DISPLAY_OPEN);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "ALARM", "", 0xFFFFFFFF, MA_ALARM_OPEN);
+   /* The row's "value" is the SAME icon language the main alarm row uses --
+    * speaker / phone / slashed circle / dot -- in the SAME fixed, equally
+    * spaced cells (6*sc pitch, right-aligned), each symbol always in its
+    * own place with an empty cell when that alarm is off. */
+   {
+      int iax = rx - (23 * sc);
+      if (m->sound_on)
+         draw_icon(px, fb, iax, y, sc, icon_speaker, 0xFF888888);
+      if (m->vib_on)
+         draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
+      if (m->disc)
+         draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, 0xFF888888);
+      if (m->newdata_beep)
+         draw_icon(px, fb, iax + (18 * sc), y, sc, icon_dot, 0xFF888888);
+   }
+   y += 2 * lh;
+   /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
+    * is granted, red CHECK otherwise -- opening the full submenu. */
+   {
+      int ok = m->perm[0] && m->perm[1] && m->perm[2] && m->batt_ok &&
+               !m->bg_restricted;
+      menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
+               ok ? 0xFF33FF88 : 0xFF4466FF, MA_PERMS_OPEN);
+      y += 2 * lh;
+   }
+   /* REMOTE: the value is the push state -- and, when ON, the age of the
+    * last push the server actually acknowledged (2xx) -- so whether
+    * datapoints are leaving the phone AND arriving is visible without
+    * opening the submenu. */
    char rmv[16] = "OFF";
    if (m->remote_on) {
       if (m->remote_last_ok > 0) {
@@ -1380,32 +1508,6 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    }
    menu_row(fb, h, y, sc, lh, "REMOTE", rmv,
             m->remote_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_REMOTE_OPEN);
-   y += lh;
-   /* PERMISSIONS lives at the END of DISPLAY, as one summary row -- green OK
-    * when everything a CGM needs is granted, red CHECK otherwise -- opening
-    * the full submenu. The eight raw permission rows moved off this
-    * unscrollable screen so the DEVICES list gets the space. */
-   {
-      int ok = m->perm[0] && m->perm[1] && m->perm[2] && m->batt_ok &&
-               !m->bg_restricted;
-      menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
-               ok ? 0xFF33FF88 : 0xFF4466FF, MA_PERMS_OPEN);
-      y += 2 * lh;
-   }
-
-   draw_str(px, fb, x, y, sc, "ALARM", 0xFF888888);
-   y += lh;
-   menu_row(fb, h, y, sc, lh, "SOUND", m->sound_on ? "ON" : "OFF", 0xFFFFFFFF,
-            MA_SOUND);
-   y += lh;
-   menu_row(fb, h, y, sc, lh, "VIBRATION", m->vib_on ? "ON" : "OFF", 0xFFFFFFFF,
-            MA_VIB);
-   y += lh;
-   menu_row(fb, h, y, sc, lh, "DISCONNECT", ui_disc_lbl[(unsigned)m->disc & 3U],
-            0xFFFFFFFF, MA_DISC);
-   y += lh;
-   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT", m->newdata_beep ? "BEEP" : "OFF",
-            0xFFFFFFFF, MA_NEWDATA);
    y += 2 * lh;
 
    /* SENSORS: one row per configured sensor, then the add action. The old
@@ -1569,6 +1671,108 @@ static void render_perms(struct ANativeWindow_Buffer *fb,
             m->bg_restricted ? 0xFF4466FF : 0xFF33FF88, MA_BGEXEC);
 }
 
+/* ---- ALARM submenu (opened from SETTINGS, or straight from the main
+ * screen's alarm row left of "LOW") ---- */
+
+static void render_alarm(struct ANativeWindow_Buffer *fb,
+                         const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 16);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "ALARM", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_ALARM_BACK);
+   y += 3 * lh;
+
+   /* The two thresholds FIRST, in display units; a tap opens the keypad on
+    * that threshold (the same MA codes the main-screen row uses). */
+   char lo[8];
+   char hi[8];
+   char lv[16];
+   char hv[16];
+   fmt_glu(m->alarm_low, m->units, lo, sizeof lo);
+   fmt_glu(m->alarm_high, m->units, hi, sizeof hi);
+   (void)snprintf(lv, sizeof lv, "%s %s", lo, UI_LBL(m->units));
+   (void)snprintf(hv, sizeof hv, "%s %s", hi, UI_LBL(m->units));
+   menu_row(fb, h, y, sc, lh, "LOW", lv, 0xFFFFFFFF, MA_ALARM_LOW);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "HIGH", hv, 0xFFFFFFFF, MA_ALARM_HIGH);
+   y += 2 * lh;
+   /* An enabled state reads GREEN, off stays white -- on/off is visible
+    * from the colour alone, before reading a word. */
+   menu_row(fb, h, y, sc, lh, "SOUND", m->sound_on ? "ON" : "OFF",
+            m->sound_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_SOUND);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "VIBRATION", m->vib_on ? "ON" : "OFF",
+            m->vib_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_VIB);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "DISCONNECT", ui_disc_lbl[(unsigned)m->disc & 3U],
+            m->disc ? 0xFF33FF88 : 0xFFFFFFFF, MA_DISC);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT", m->newdata_beep ? "BEEP" : "OFF",
+            m->newdata_beep ? 0xFF33FF88 : 0xFFFFFFFF, MA_NEWDATA);
+}
+
+/* ---- EXPORT DATA menu (opened from SETTINGS' EXPORT DATA button) ---- */
+
+/* One checkbox row: name left, the checkbox ICON right (font.c: icon_box /
+ * icon_boxck -- the same glyph language as every other symbol), green when
+ * checked. The whole row toggles (generous target, like every menu_row). */
+static void chk_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                    int sc, int lh, const char *name, int on, int code)
+{
+   uint32_t *px = fb->bits;
+   int rx       = fb->width - (4 * sc);
+   draw_str(px, fb, 4 * sc, y, sc, name, 0xFFCCCCCC);
+   draw_icon(px, fb, rx - (5 * sc), y, sc, on ? icon_boxck : icon_box,
+             on ? 0xFF33FF88 : 0xFF888888);
+   add_hit(h, 0, y - (3 * sc), fb->width, lh, ACT_MENU, code);
+}
+
+static void render_export(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 16);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "EXPORT DATA", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_EXP_BACK);
+   y += 3 * lh;
+
+   static const char *const rng[3] = {"30 D", "1 Y", "ALL"};
+   menu_row(fb, h, y, sc, lh, "RANGE",
+            rng[(m->exp_range >= 0 && m->exp_range < 3) ? m->exp_range : 2],
+            0xFFFFFFFF, MA_EXP_RANGE);
+   y += 2 * lh;
+   chk_row(fb, h, y, sc, lh, "GLUCOSE", m->exp_glu, MA_EXP_GLU);
+   y += 2 * lh;
+   chk_row(fb, h, y, sc, lh, "DEVICES", m->exp_dev, MA_EXP_DEV);
+   y += 2 * lh;
+   chk_row(fb, h, y, sc, lh, "INSULIN", m->exp_ins, MA_EXP_INS);
+   y += 3 * lh;
+
+   /* The one acting control. With every section unticked there is nothing
+    * to build, so the button greys out and records no target. */
+   int any = m->exp_glu || m->exp_dev || m->exp_ins;
+   int bw  = fb->width - (2 * x);
+   if (any)
+      menu_button(fb, h, x, y, bw, sc, "EXPORT", 0xFF33FF88, MA_EXP_GO);
+   else
+      draw_str(px, fb, x, y, sc, "NOTHING SELECTED", 0xFF888888);
+}
+
 /* ---- DISPLAY submenu (opened from SETTINGS) ---- */
 
 static void render_display(struct ANativeWindow_Buffer *fb,
@@ -1648,9 +1852,13 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
                           const struct screen *m, struct hits *h)
 {
    uint32_t *px = fb->bits;
-   /* 24 rows: title (2) + three double-pitch setting rows (6) + a gap (2) +
-    * the transport note (3) + a gap (1) + the API reference (9) + margin. */
-   int sc  = ui_fit_scale(fb->width, fb->height, 24);
+   /* 25 rows: title (2) + three double-pitch setting rows (6) + the two
+    * report rows (3) + the transport note (4) + the API reference (9) +
+    * margin. This number only sizes the FONT (ui_fit_scale divides the
+    * height by it), and it falls off a cliff -- 31 rows still renders at
+    * scale 3 on a 720x1600 phone, 32 drops to 2 and the whole screen goes
+    * tiny. Claim what the content actually needs, not more. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 25);
    int tsc = 2 * sc;
    int lh  = 16 * sc;
    int x   = 4 * sc;
@@ -1686,26 +1894,62 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
    (void)snprintf(pt, sizeof pt, "%d", m->remote_port);
    menu_row(fb, h, y, sc, lh, "PORT", pt, 0xFFFFFFFF, MA_REMOTE_PORT);
    y += 2 * lh;
+   /* STATUS: when the server last ACKNOWLEDGED something. With push on,
+    * this is the one row that says whether the link actually works --
+    * "ON" above only means the app intends to send. Not tappable (code
+    * -1): it reports, it does not act. */
+   {
+      char sv[16];
+      uint32_t scol = 0xFFAAAAAA;
+      if (!m->remote_on) {
+         (void)snprintf(sv, sizeof sv, "--");
+      } else if (m->remote_last_ok > 0) {
+         char ago[12];
+         fmt_ago(m->now, m->remote_last_ok, ago, sizeof ago);
+         (void)snprintf(sv, sizeof sv, "%s AGO", ago);
+         /* Fresh is green; a link that has not been acknowledged in over
+          * ten minutes is amber, because that is a backlog building up. */
+         scol = (m->now - m->remote_last_ok <= 600) ? 0xFF33FF88 : 0xFFAA8844;
+      } else {
+         (void)snprintf(sv, sizeof sv, "NEVER");
+         scol = 0xFFAA8844;
+      }
+      menu_row(fb, h, y, sc, lh, "LAST SYNC", sv, scol, -1);
+      y += lh;
+      /* ...and WHAT the server said. A refusal used to be invisible here:
+       * the screen showed a happy PUSH ON while every batch was bouncing. */
+      const char *rs =
+          (m->remote_status && m->remote_status[0]) ? m->remote_status : "--";
+      menu_row(fb, h, y, sc, lh, "LAST STATUS", rs,
+               (rs[0] == '2') ? 0xFF33FF88 : 0xFFAAAAAA, -1);
+      y += 2 * lh;
+   }
 
-   draw_str(px, fb, x, y, sc, "Each new datapoint is sent", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "Datapoints are sent to this", 0xFF888888);
    y += lh;
-   draw_str(px, fb, x, y, sc, "to this server as plain,", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "server as plain, unencrypted", 0xFF888888);
    y += lh;
-   draw_str(px, fb, x, y, sc, "unencrypted HTTP.", 0xFF888888);
+   /* The resume behaviour is the thing worth knowing: an unreachable
+    * server costs nothing, because the next sync starts from ITS cursor. */
+   draw_str(px, fb, x, y, sc, "HTTP, resuming after outages.", 0xFF888888);
    y += 2 * lh;
 
    /* The exact wire protocol, for anyone pointing their own server here
     * (kept in step with glucoserve.c). Only glyphs the 5x7 font has:
     * A-Z 0-9 - : . / ( ) , -- no quotes, and no < > (those glyphs are
     * the backspace/marker arrows). */
-   static const char *const api[5] = {
+   static const char *const api[9] = {
        "REST API:",
        "",
-       "POST /  BODY: (EPOCH) (MGDL)",
-       "  200 OK / 400 BAD / 429",
-       "  RATE CAP 100 PER MINUTE",
+       "GET /API/LAST  - THE CURSOR:",
+       "  NEWEST STORED TIME, PER SET",
+       "POST /GLUCOSE  - PER LINE:",
+       "  (EPOCH) (MGDL)",
+       "POST /UNITS  - PER LINE:",
+       "  (EPOCH) (0 SLOW/1 FAST) (U)",
+       "  100 LINES PER MINUTE, MAX",
    };
-   for (int i = 0; i < 5; i++) {
+   for (int i = 0; i < 9; i++) {
       draw_str(px, fb, x, y, sc, api[i], 0xFF888888);
       y += lh;
    }
@@ -2432,11 +2676,14 @@ static void render_primpick(struct ANativeWindow_Buffer *fb,
    int shown = 0;
    for (int i = 0; i < m->nsensors && i < UI_MAX_SLOTS; i++) {
       const struct ui_sensor *s = &m->sensors[i];
-      /* EVERY registered CGM is offered -- including one just paired that
-       * has no session and no datapoint yet: making it primary is precisely
-       * how the user pre-arms the display for the sensor they are switching
-       * to. Only a meter never qualifies. Rows without data say so. */
-      if (s->kind != KIND_CGM)
+      /* EVERY LIVE registered CGM is offered -- including one just paired
+       * that has no session and no datapoint yet: making it primary is
+       * precisely how the user pre-arms the display for the sensor they are
+       * switching to. A meter never qualifies, and neither does an OLD
+       * (disconnected) device: it lives in OLD DEVICES and nowhere else --
+       * it is not streaming, so it can never own the big number
+       * (sensor_set_primary refuses it too). */
+      if (s->kind != KIND_CGM || s->old)
          continue;
       shown++;
       char val[28];
@@ -2645,6 +2892,56 @@ static void render_insulin(struct ANativeWindow_Buffer *fb,
       y += 2 * lh;
    }
    menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF00FF00, MA_INS_CONFIRM);
+}
+
+/* ---- delete-dose confirmation ----
+ * The EDIT form's DELETE button lands here first; only the red DELETE on
+ * this screen (MA_INSDEL_YES) actually removes the dose from the log. ---- */
+static void render_insdel(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "DELETE DOSE?", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X",
+            0xFFFFFFFF); /* close = cancel */
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_INSDEL_NO);
+   y += 2 * lh;
+
+   /* the dose about to be deleted, so a mis-tap from the log is caught */
+   char dt[20];
+   fmt_date(m->ins_t, m->tz_off, dt, sizeof dt);
+   char line[40];
+   (void)snprintf(line, sizeof line, "%d U %s", m->ins_units,
+                  m->ins_type == 1 ? "FAST" : "SLOW");
+   draw_str(px, fb, x, y, sc, line, 0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, dt, 0xFFFFFFFF);
+   y += 2 * lh;
+   static const char *const note[] = {
+       "REMOVES THIS DOSE FROM THE",
+       "INSULIN LOG. THIS CANNOT",
+       "BE UNDONE.",
+   };
+   for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
+      draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
+      y += lh;
+   }
+   y += 2 * lh;
+
+   /* CANCEL (safe, white) on top, DELETE (RED) well below -- the same
+    * discipline as SCR_FORGET, so reach-and-tap muscle memory can never
+    * delete by accident. */
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_INSDEL_NO);
+   y += 3 * lh; /* wide gap so DELETE is not tapped by accident */
+   menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF0000FF, MA_INSDEL_YES);
 }
 
 /* ---- INSULIN LOG: the dose tail as a when/type/units table, newest
@@ -3106,17 +3403,20 @@ static void render_senstype(struct ANativeWindow_Buffer *fb,
    }
 }
 
-/* One keypad key: framed cell, centred label, full-cell ACT_MENU target. */
+/* One keypad key: framed cell, centred label (in `col`), full-cell ACT_MENU
+ * target. code < 0 = a DISABLED key: drawn but recording no target, so it
+ * cannot fire (the grayed-out OK of an over-limit entry). */
 static void pad_key(struct ANativeWindow_Buffer *fb, struct hits *h, int cx,
-                    int cy, int cw, int ch, int ksc, const char *lab, int code)
+                    int cy, int cw, int ch, int ksc, const char *lab, int code,
+                    uint32_t col)
 {
    uint32_t *px = fb->bits;
    draw_frame(px, fb, cx, cy, cw, ch, 0xFF555555);
    int lw  = str_len(lab) * 6 * ksc;
    int lhh = 7 * ksc;
-   draw_str(px, fb, cx + ((cw - lw) / 2), cy + ((ch - lhh) / 2), ksc, lab,
-            0xFFFFFFFF);
-   add_hit(h, cx, cy, cw, ch, ACT_MENU, code);
+   draw_str(px, fb, cx + ((cw - lw) / 2), cy + ((ch - lhh) / 2), ksc, lab, col);
+   if (code >= 0)
+      add_hit(h, cx, cy, cw, ch, ACT_MENU, code);
 }
 
 /* Pairing / plot-max keypad: a title, a fixed-width entry field, and a 3x4
@@ -3160,22 +3460,39 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
       kp_title = "TIME (HHMM)";
    else if (m->kp_mode == 9)
       kp_title = "YEAR";
+   else if (m->kp_mode == 10)
+      kp_title = "ALARM LOW";
+   else if (m->kp_mode == 11)
+      kp_title = "ALARM HIGH";
    else /* pairing: name the CGM being added, e.g. "PAIR NEW STELO" */
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->add_type ? m->add_type : "SENSOR");
    draw_str(px, fb, x, y, tsc, kp_title, 0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
    y += 2 * lh;
+   if (m->kp_mode == 10 || m->kp_mode == 11) {
+      /* the accepted ceiling, in the entry's own units, then a blank row;
+       * the key grid below sizes itself into whatever height remains */
+      char mv[8];
+      char mx[24];
+      fmt_glu(AL_ENTRY_MAX, m->units, mv, sizeof mv);
+      (void)snprintf(mx, sizeof mx, "MAX: %s %s", mv, UI_LBL(m->units));
+      draw_str(px, fb, x, y, sc, mx, 0xFF888888);
+      y += 2 * lh;
+   }
 
    /* Entry field: one underscore per slot, replaced by digits as typed, so the
     * width never shifts. Plot-max shows the unit after the value; pair shows
     * the 4 code digits; the remote IP gets a full dotted quad's 15 slots and
     * the remote port a TCP port's 5. dsc is sized for the widest label so the
     * field -- and the keypad below -- is identical across modes. */
-   static const int slots_for[10] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4};
+   static const int slots_for[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
    int nslots =
-       slots_for[(m->kp_mode >= 0 && m->kp_mode < 10) ? m->kp_mode : 0];
-   int has_unit   = m->kp_mode >= 1 && m->kp_mode <= 3; /* glucose entries */
+       slots_for[(m->kp_mode >= 0 && m->kp_mode < 12) ? m->kp_mode : 0];
+   /* glucose entries carry the unit label: plot max / cal / rescale and the
+    * two alarm thresholds */
+   int has_unit   = (m->kp_mode >= 1 && m->kp_mode <= 3) || m->kp_mode == 10 ||
+                    m->kp_mode == 11;
    const char *en = m->entry ? m->entry : "";
    char shown[24];
    int k = 0;
@@ -3202,10 +3519,14 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    add_hit(h, 0, ty - (3 * sc), fb->width, y - (ty - (3 * sc)), ACT_MENU, 113);
 
    /* 3x4 grid: digits, then 0 / DEL / OK. The title's X cancels. The IP mode
-    * needs a 13th key ('.'), so it swaps to a 5-row layout: the dot takes 0's
-    * old cell, 0 and DEL shift right, and OK becomes a full-width bottom row
-    * (which also makes the confirm harder to fat-finger from DEL). */
-   int iprows = (m->kp_mode == 4) ? 5 : 4;
+    * -- and the two alarm-threshold modes in mmol/L, where the value carries
+    * a decimal ("5.5") -- need a 13th key ('.'), so they swap to a 5-row
+    * layout: the dot takes 0's old cell, 0 and DEL shift right, and OK
+    * becomes a full-width bottom row (which also makes the confirm harder to
+    * fat-finger from DEL). */
+   int dotkey = (m->kp_mode == 4) ||
+                ((m->kp_mode == 10 || m->kp_mode == 11) && m->units);
+   int iprows = dotkey ? 5 : 4;
    int gm     = fb->width / 12;
    int gw     = fb->width - (2 * gm);
    int cw     = gw / 3;
@@ -3224,17 +3545,59 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
                                     "1", "2", "3", ".", "0", "<"};
    static const int ipacts[12]   = {107, 108, 109, 104,    105, 106,
                                     101, 102, 103, MA_DOT, 100, 110};
-   const char **kk               = (m->kp_mode == 4) ? ipkeys : keys;
-   const int *aa                 = (m->kp_mode == 4) ? ipacts : acts;
+   const char **kk               = dotkey ? ipkeys : keys;
+   const int *aa                 = dotkey ? ipacts : acts;
+   /* A value too LARGE for this mode's field DISABLES OK -- drawn gray,
+    * recording no target, so an over-limit entry cannot even be submitted;
+    * deleting digits re-enables it. Only modes with a numeric ceiling
+    * participate (glucose entries 400, the alarm thresholds AL_ENTRY_MAX,
+    * the TCP port 65535); a code/IP/date entry never disables here. */
+   long okmax = 0; /* this mode's ceiling in comparable units; 0 = none */
+   long okval = 0;
+   {
+      long ipart = 0;
+      int frac   = -1;
+      int sdot   = 0;
+      /* NOT `en` -- the entry-field loop above consumed that pointer */
+      for (const char *p = m->entry ? m->entry : ""; *p; p++) {
+         if (*p == '.') {
+            sdot = 1;
+         } else if (*p >= '0' && *p <= '9') {
+            if (!sdot)
+               ipart = (ipart * 10) + (*p - '0');
+            else if (frac < 0)
+               frac = *p - '0';
+         }
+      }
+      if (m->kp_mode >= 1 && m->kp_mode <= 3) {
+         /* display units, mmol as TENTHS (no dot key in these modes) */
+         okval = m->units ? (ipart * 18) / 10 : ipart;
+         okmax = 400;
+      } else if (m->kp_mode == 10 || m->kp_mode == 11) {
+         long tenths = (ipart * 10) + (frac > 0 ? frac : 0);
+         okval       = m->units ? (tenths * 18) / 10 : ipart;
+         okmax       = AL_ENTRY_MAX;
+      } else if (m->kp_mode == 5) {
+         okval = ipart;
+         okmax = 65535;
+      }
+   }
+   int ok_dead = okmax > 0 && okval > okmax;
    for (int r = 0; r < 4; r++)
       for (int col = 0; col < 3; col++) {
-         int idx = (r * 3) + col;
+         int idx      = (r * 3) + col;
+         int code     = aa[idx];
+         uint32_t kcl = 0xFFFFFFFF;
+         if (code == MA_OK && ok_dead) {
+            code = -1;
+            kcl  = 0xFF555555;
+         }
          pad_key(fb, h, gm + (col * cw), y + (r * ch), cw - (2 * sc),
-                 ch - (2 * sc), ksc, kk[idx], aa[idx]);
+                 ch - (2 * sc), ksc, kk[idx], code, kcl);
       }
-   if (m->kp_mode == 4)
+   if (dotkey)
       pad_key(fb, h, gm, y + (4 * ch), (3 * cw) - (2 * sc), ch - (2 * sc), ksc,
-              "OK", MA_OK);
+              "OK", ok_dead ? -1 : MA_OK, ok_dead ? 0xFF555555 : 0xFFFFFFFF);
 }
 
 /* Pairing candidate picker: scanned sensors strongest-first; a tap pairs one
@@ -3382,7 +3745,8 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h)
 {
    h->n = 0;
-   clear_fb(fb, 0xFF181818);
+   /* TRUE black, zero photons on an OLED -- not the old 0xFF181818 wash. */
+   clear_fb(fb, 0xFF000000);
    switch (m->scr) {
       case SCR_SETTINGS: render_settings(fb, m, h); break;
       case SCR_KEYPAD: render_keypad(fb, m, h); break;
@@ -3404,6 +3768,9 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_PERMS: render_perms(fb, m, h); break;
       case SCR_REMOTE: render_remote(fb, m, h); break;
       case SCR_INSLOG: render_inslog(fb, m, h); break;
+      case SCR_INSDEL: render_insdel(fb, m, h); break;
+      case SCR_ALARM: render_alarm(fb, m, h); break;
+      case SCR_EXPORT: render_export(fb, m, h); break;
       case SCR_DISPLAY: render_display(fb, m, h); break;
       case SCR_OLDDEV: render_olddev(fb, m, h); break;
       case SCR_LABEL: render_label(fb, m, h); break;
@@ -3414,14 +3781,72 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
    }
 }
 
-struct action ui_hit(const struct hits *h, int x, int y)
+int ui_hit_idx(const struct hits *h, int x, int y)
 {
    /* last box wins, matching draw order (later-drawn overlays are on top) */
    for (int i = h->n - 1; i >= 0; i--) {
       int bx = h->box[i].x;
       int by = h->box[i].y;
       if (x >= bx && x < bx + h->box[i].w && y >= by && y < by + h->box[i].h)
-         return (struct action){h->box[i].kind, h->box[i].arg};
+         return i;
    }
-   return (struct action){ACT_NONE, 0};
+   return -1;
+}
+
+struct action ui_hit(const struct hits *h, int x, int y)
+{
+   int i = ui_hit_idx(h, x, y);
+   if (i < 0)
+      return (struct action){ACT_NONE, 0};
+   return (struct action){h->box[i].kind, h->box[i].arg};
+}
+
+void ui_dim(struct ANativeWindow_Buffer *fb)
+{
+   uint32_t *px = fb->bits;
+   for (int j = 0; j < fb->height; j++)
+      for (int i = 0; i < fb->width; i++) {
+         uint32_t c = px[(j * fb->stride) + i];
+         /* Two channels per multiply: red+blue share one 13/16 scaling,
+          * green the other. Each 8-bit field times 13 stays under 16 bits,
+          * so the fields cannot bleed into each other before the mask. */
+         uint32_t rb = ((c & 0x00FF00FFU) * 13U >> 4U) & 0x00FF00FFU;
+         uint32_t g  = ((c & 0x0000FF00U) * 13U >> 4U) & 0x0000FF00U;
+         px[(j * fb->stride) + i] = (c & 0xFF000000U) | rb | g;
+      }
+}
+
+void ui_press_overlay(struct ANativeWindow_Buffer *fb, int x, int y, int w,
+                      int h)
+{
+   uint32_t *px = fb->bits;
+   int x0       = x < 0 ? 0 : x;
+   int y0       = y < 0 ? 0 : y;
+   int x1       = (x + w > fb->width) ? fb->width : x + w;
+   int y1       = (y + h > fb->height) ? fb->height : y + h;
+   for (int j = y0; j < y1; j++)
+      for (int i = x0; i < x1; i++) {
+         uint32_t c = px[(j * fb->stride) + i];
+         uint32_t r = (c >> 16U) & 0xFFU;
+         uint32_t g = (c >> 8U) & 0xFFU;
+         uint32_t b = c & 0xFFU;
+         uint32_t m = r > g ? r : g;
+         if (b > m)
+            m = b;
+         /* FOREGROUND only -- the text/graphics drawn IN the control, by
+          * brightness, NOT merely "not zero": that test once scaled the
+          * (then not-quite-black) background to full white. Content starts
+          * at the 0x555555 frame gray; anything dimmer (the black clear,
+          * faint fills) is background and must not change. */
+         if (m < 0x40U)
+            continue;
+         /* Scale so the brightest channel saturates: the same hue at full
+          * intensity. Gray text goes white; green/red buttons stay green/
+          * red (their 0x555555 frames go white, so every control shows). */
+         r = (r * 0xFFU) / m;
+         g = (g * 0xFFU) / m;
+         b = (b * 0xFFU) / m;
+         px[(j * fb->stride) + i] =
+             (c & 0xFF000000U) | (r << 16U) | (g << 8U) | b;
+      }
 }

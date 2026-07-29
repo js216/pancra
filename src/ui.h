@@ -7,7 +7,8 @@
 
 #include "insulin.h" /* struct ins_rec: the INSULIN LOG table rows */
 #include "ndk.h"
-#include "sensors.h" /* sensor types/kinds the model and renderer share */
+#include "plotdata.h" /* PLOT_LONG_MAX: how many points a long span yields */
+#include "sensors.h"  /* sensor types/kinds the model and renderer share */
 #include <stdint.h>
 
 /* ---- pixel/text primitives (font-based, no shared state) ----
@@ -48,11 +49,11 @@ void fmt_dur(long seconds, char *out, int n);
 #define UI_MIN_SLOTS 3
 
 /* Rows the settings screen consumes ABOVE (and below) the sensor entries:
- * title (2), the DISPLAY summary row (1 -- the display settings moved to
- * their own submenu), REMOTE (1), PERMISSIONS (2), ALARM (5), the DEVICES
- * header (1), and the two trailing framed buttons -- ADD NEW DEVICE and
- * EXPORT DATA -- each a separator + a ~1-row button (4 total). Keep in
- * step with render_settings.
+ * title (2), the four submenu rows -- DISPLAY ... / ALARM / PERMISSIONS /
+ * REMOTE -- each with a blank line after it (8), the DEVICES header (1),
+ * and the two trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA --
+ * each a separator + a ~1-row button (4 total). Keep in step with
+ * render_settings.
  *
  * Exported deliberately. It used to be private to ui.c while test/uitest.c
  * carried its own literal for the same quantity, so the two could drift
@@ -60,7 +61,7 @@ void fmt_dur(long seconds, char *out, int n);
  * exactly the mistake that leaves sensor rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_SET_ABOVE 17
+#define UI_SET_ABOVE 16
 
 /* How many sensor rows fit in the settings screen at this geometry, given
  * everything above the SENSORS section. The whole UI never scrolls, so this is
@@ -123,6 +124,9 @@ enum ui_screen {
    SCR_REMOTE,  /* remote push: enable/disable, server IP and port */
    SCR_INSLOG,  /* insulin dose log: paginated when/type/units table */
    SCR_DISPLAY, /* display settings submenu (off SETTINGS) */
+   SCR_INSDEL,  /* confirm deleting an insulin dose: DELETE / CANCEL */
+   SCR_ALARM,   /* alarm submenu: LOW/HIGH thresholds + outputs */
+   SCR_EXPORT,  /* EXPORT DATA: range + section checkboxes + the button */
    SCR_N
 };
 
@@ -211,6 +215,10 @@ struct screen {
    const char *mac, *model, *fw, *mfr, *code; /* device-info strings */
    const char *entry;                         /* keypad digits typed so far */
    const char *remote_ip; /* remote-push server address; "" = not set */
+   /* What the last sync attempt actually got back ("200 STORED 3 OF 3",
+    * "409 TOO FAR BEHIND", "TIMEOUT"...). Empty = nothing attempted yet.
+    * Failures were previously invisible outside logcat. */
+   const char *remote_status;
 
    /* --- int members --- */
    enum ui_screen scr;
@@ -262,6 +270,9 @@ struct screen {
    int ins_marker[2], ins_color[2], ins_size[2], markpick_ins;
    /* status bar shows the value (vs icon); lock screen shows the notif */
    int statbar_val, lockscr_val;
+   /* EXPORT DATA menu state: range 0 = 30 D, 1 = 1 Y, 2 = ALL; the three
+    * section checkboxes (1 = included) */
+   int exp_range, exp_glu, exp_dev, exp_ins;
    /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none.
     * DEVICES shows it as a tappable PENDING row (MA_PEND_CANCEL); the
     * choose-primary screen offers it too (MA_PRIM_PEND), and pend_primary
@@ -287,8 +298,6 @@ enum {
    ACT_NONE = 0,
    ACT_OPEN_SETTINGS,
    ACT_PLOT_TAB,      /* arg = plot span in hours */
-   ACT_ALARM_LOW,     /* arg = +-1 (minus/plus) */
-   ACT_ALARM_HIGH,    /* arg = +-1 */
    ACT_SCRUB,         /* a press inside the plot; shell resolves the point */
    ACT_GATE_CONTINUE, /* first-run rationale: request permissions */
    ACT_PICK_PRIMARY,  /* big-number tap: choose the primary (shell decides
@@ -315,18 +324,34 @@ enum ui_menu {
    MA_METERSCAN = 7,  /* start scanning from the OneTouch instructions screen */
    MA_INS_FAST  = 21, /* ADD menu: LOG FAST INSULIN (type preset) */
    MA_INS_SLOW  = 23, /* ADD menu: LOG SLOW INSULIN (type preset) */
-   MA_INSLOG_OPEN   = 25,  /* ADD menu: open the INSULIN LOG table */
-   MA_INSLOG_BACK   = 26,  /* insulin log: back to the ADD menu */
-   MA_INSLOG_PREV   = 27,  /* insulin log: previous page */
-   MA_INSLOG_NEXT   = 28,  /* insulin log: next page */
-   MA_INSMARK_OPEN  = 114, /* + INS_SLOW/INS_FAST: pick that type's marker */
-   MA_INS_DELETE    = 116, /* EDIT INSULIN: delete this dose (red) */
-   MA_INSMARK_BACK  = 117, /* insulin marker picker: back to DISPLAY */
-   MA_DISPLAY_OPEN  = 118, /* settings: open the DISPLAY submenu */
-   MA_DISPLAY_BACK  = 119, /* display submenu: back to settings */
-   MA_STATBAR       = 120, /* toggle status bar: value vs app icon */
-   MA_NOTIF_REOPEN  = 121, /* re-post the (swiped-away) notification */
-   MA_LOCKSCR       = 122, /* toggle lock-screen notification visibility */
+   MA_INSLOG_OPEN  = 25,  /* ADD menu: open the INSULIN LOG table */
+   MA_INSLOG_BACK  = 26,  /* insulin log: back to the ADD menu */
+   MA_INSLOG_PREV  = 27,  /* insulin log: previous page */
+   MA_INSLOG_NEXT  = 28,  /* insulin log: next page */
+   MA_INSMARK_OPEN = 114, /* + INS_SLOW/INS_FAST: pick that type's marker */
+   MA_INS_DELETE   = 116, /* EDIT INSULIN: delete this dose (red) */
+   MA_INSMARK_BACK = 117, /* insulin marker picker: back to DISPLAY */
+   MA_DISPLAY_OPEN = 118, /* settings: open the DISPLAY submenu */
+   MA_DISPLAY_BACK = 119, /* display submenu: back to settings */
+   MA_STATBAR      = 120, /* toggle status bar: value vs app icon */
+   MA_NOTIF_REOPEN = 121, /* re-post the (swiped-away) notification */
+   MA_LOCKSCR      = 122, /* toggle lock-screen notification visibility */
+   MA_INSDEL_YES   = 123, /* delete-dose confirmation: really delete */
+   MA_INSDEL_NO    = 124, /* delete-dose confirmation: back to the form */
+   MA_ALARM_LOW    = 125, /* LOW <value> (main row / ALARM menu): keypad 10 */
+   MA_ALARM_HIGH   = 126, /* HIGH <value> (main row / ALARM menu): keypad 11 */
+   MA_ALARM_OPEN   = 127, /* open the ALARM submenu (settings row, or the
+                           * main alarm row LEFT of "LOW") */
+   MA_ALARM_BACK = 128,   /* ALARM submenu: back to where it was opened */
+   /* EXPORT DATA menu: parked in the free band ABOVE MA_PRIM_PICK's range
+    * end (260 + MAX_SLOTS = 270) and below MA_CHAR (300); the existing
+    * MA_PRIM_PICK assert covers the lower neighbour. */
+   MA_EXP_RANGE     = 271, /* cycle the range: 30 D / 1 Y / ALL */
+   MA_EXP_GLU       = 272, /* toggle the GLUCOSE (readings) section */
+   MA_EXP_DEV       = 273, /* toggle the DEVICES (sensors) section */
+   MA_EXP_INS       = 274, /* toggle the INSULIN (doses) section */
+   MA_EXP_GO        = 275, /* build the CSV and open the share sheet */
+   MA_EXP_BACK      = 276, /* back to settings, nothing exported */
    MA_PERM          = 10,  /* + permission index (0..2) */
    MA_BATTERY       = 20,
    MA_BGEXEC        = 22,
@@ -439,6 +464,8 @@ _Static_assert(MA_DIGIT + 10 <= MA_BACKSPACE,
                "MA_DIGIT range hits MA_BACKSPACE");
 _Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_CHAR,
                "MA_PRIM_PICK range hits MA_CHAR");
+_Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_EXP_RANGE,
+               "MA_PRIM_PICK range hits the EXPORT DATA codes");
 
 /* Up to this many touch targets per frame. */
 #define UI_MAX_HITS 48
@@ -446,6 +473,12 @@ _Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_CHAR,
 struct hits {
    struct {
       int x, y, w, h, kind, arg;
+      /* Pressed-highlight (glow) rect: what ui_press_overlay lights while
+       * this control is armed. add_hit defaults it to the hit rect; a
+       * control with a deliberately oversized hit zone (the settings
+       * hamburger) narrows it to its visible glyph via add_glow, so
+       * pressing it never lights unrelated pixels caught in the zone. */
+      int gx, gy, gw, gh;
    } box[UI_MAX_HITS];
 
    int n;
@@ -456,5 +489,20 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h);
 /* Map a tap at (x,y) against the targets from the last render. Pure. */
 struct action ui_hit(const struct hits *h, int x, int y);
+/* As ui_hit, but returns the index of the winning box (-1 = none), so the
+ * shell can shade the pressed control's own rectangle. Pure. */
+int ui_hit_idx(const struct hits *h, int x, int y);
+/* Pressed-but-not-yet-fired highlight: every drawn (non-black) pixel in the
+ * rectangle brightens to the same hue at full intensity; the background
+ * stays black. Drawn by the shell over the armed control after ui_render --
+ * actions fire on RELEASE, and this is the one consistent "armed" visual. */
+void ui_press_overlay(struct ANativeWindow_Buffer *fb, int x, int y, int w,
+                      int h);
+/* Whole-frame dim to 13/16 intensity, applied by the shell AFTER ui_render
+ * (so the offline harness still sees exact colours). This is what makes the
+ * pressed highlight visible on already-saturated foregrounds -- white text
+ * and the green big number have no headroom at full intensity, so the
+ * resting frame gives some up. */
+void ui_dim(struct ANativeWindow_Buffer *fb);
 
 #endif

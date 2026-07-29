@@ -43,6 +43,12 @@ void pancra_alarm_check(void);
  * with no activity alive -- the service heartbeat drives it so a stranded link
  * is repaired even after the activity is destroyed. */
 void pancra_link_watchdog(void);
+/* One step of the REMOTE sync (cursor read, or the next batch). Called from
+ * the SERVICE tick as well as the activity's timer: the activity's looper
+ * dies with the activity, and a phone with the app backgrounded must still
+ * deliver its readings -- that is precisely the window in which points used
+ * to pile up unsent. */
+void pancra_remote_sync(void);
 /* Time out a wedged meter sync. Safe on any thread and with no activity
  * alive; the service heartbeat drives it so a sync interrupted by the
  * activity's teardown cannot latch g_meter_busy forever. */

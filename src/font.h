@@ -19,4 +19,14 @@ const uint8_t *glyph_for(char c);
 /* strlen for the ASCII strings we render (no libc dependency). */
 int str_len(const char *s);
 
+/* 5x7 status icons, same bitmap format as the glyphs, for states a letter
+ * cannot say. Pure data like the font tables; ui.c's draw_icon blits them. */
+extern const uint8_t icon_speaker[7]; /* alarm output: sound enabled */
+extern const uint8_t icon_vibrate[7]; /* alarm output: vibration enabled */
+extern const uint8_t icon_pencil[7];  /* "edit this row" mark */
+extern const uint8_t icon_dot[7];     /* NEW DATAPOINT beep indicator */
+extern const uint8_t icon_nolink[7];  /* DISCONNECT (stale-data) alarm */
+extern const uint8_t icon_box[7];     /* checkbox, empty */
+extern const uint8_t icon_boxck[7];   /* checkbox, checked */
+
 #endif

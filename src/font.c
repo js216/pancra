@@ -118,3 +118,21 @@ int str_len(const char *s)
       n++;
    return n;
 }
+
+/* ---- 5x7 status icons: same format as the glyphs (7 rows, MSB = leftmost
+ * of the low 5 bits), kept here so all the bitmap art lives in one file.
+ * ui.c's draw_icon blits them. ---- */
+
+/* Speaker: driver box left, cone opening right. */
+const uint8_t icon_speaker[7] = {0x01, 0x03, 0x1F, 0x1F, 0x1F, 0x03, 0x01};
+/* A phone outline with a shake line each side. */
+const uint8_t icon_vibrate[7] = {0x0E, 0x0A, 0x1B, 0x1B, 0x1B, 0x0A, 0x0E};
+/* A pencil, tip lower-left: the universally read "edit this row" mark. */
+const uint8_t icon_pencil[7] = {0x03, 0x07, 0x0E, 0x1C, 0x18, 0x10, 0x00};
+/* A small filled disc: the NEW DATAPOINT beep indicator. */
+const uint8_t icon_dot[7] = {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00};
+/* A slashed circle -- "no data": the DISCONNECT (stale-data) alarm. */
+const uint8_t icon_nolink[7] = {0x00, 0x0E, 0x13, 0x15, 0x19, 0x0E, 0x00};
+/* Checkbox, empty and checked (an X filling the interior). */
+const uint8_t icon_box[7]   = {0x00, 0x1F, 0x11, 0x11, 0x11, 0x1F, 0x00};
+const uint8_t icon_boxck[7] = {0x00, 0x1F, 0x1B, 0x15, 0x1B, 0x1F, 0x00};

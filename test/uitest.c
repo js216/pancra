@@ -8,6 +8,7 @@
  * right action. As each screen is ported this harness grows a case per screen.
  * Built and run by `make uitest`. */
 #include "ui.h"
+#include "insulin.h" /* INS_FAST: the dose the full-history plot test logs */
 #include "ndk.h"
 #include "plot.h" /* the capping case asserts plot_render's own mapping */
 #include "sensors.h"
@@ -186,7 +187,8 @@ int main(void)
          fail = 1;
       }
    }
-   /* the tab row, the plot, and the alarm buttons must each be reachable */
+   /* the tab row, the plot, and the two alarm-threshold targets (LOW/HIGH
+    * value -> keypad; the old +- steppers are gone) must each be reachable */
    int saw_tab   = 0;
    int saw_scrub = 0;
    int saw_low   = 0;
@@ -195,8 +197,8 @@ int main(void)
       int k     = h.box[i].kind;
       saw_tab   = saw_tab || (k == ACT_PLOT_TAB);
       saw_scrub = saw_scrub || (k == ACT_SCRUB);
-      saw_low   = saw_low || (k == ACT_ALARM_LOW);
-      saw_high  = saw_high || (k == ACT_ALARM_HIGH);
+      saw_low   = saw_low || (k == ACT_MENU && h.box[i].arg == MA_ALARM_LOW);
+      saw_high  = saw_high || (k == ACT_MENU && h.box[i].arg == MA_ALARM_HIGH);
    }
    if (!(saw_tab && saw_scrub && saw_low && saw_high)) {
       printf("  FAIL: missing targets tab=%d scrub=%d low=%d high=%d\n",
@@ -852,15 +854,24 @@ int main(void)
             dm.scr           = allscr[si];
             dm.sel           = 0;
             ui_render(&db, &dm, &dh);
-            for (int i = 0; i < dh.n; i++)
-               if (dh.box[i].kind == ACT_MENU &&
-                   dh.box[i].arg == MA_FORGET_YES) {
+            for (int i = 0; i < dh.n; i++) {
+               if (dh.box[i].kind != ACT_MENU)
+                  continue;
+               if (dh.box[i].arg == MA_FORGET_YES) {
                   printf("  FAIL: screen %d carries MA_FORGET_YES -- only "
                          "SCR_FORGET may, and tapping it destroys the bond\n",
                          allscr[si]);
                   fail = 1;
                   break;
                }
+               if (dh.box[i].arg == MA_INSDEL_YES) {
+                  printf("  FAIL: screen %d carries MA_INSDEL_YES -- only "
+                         "SCR_INSDEL may, and tapping it deletes the dose\n",
+                         allscr[si]);
+                  fail = 1;
+                  break;
+               }
+            }
          }
          printf("uitest: destructive code confined to its own screen\n");
       }
@@ -921,6 +932,50 @@ int main(void)
             fail = 1;
          }
          printf("uitest: destructive code appears once, below cancel\n");
+
+         /* The delete-dose confirmation follows SCR_FORGET's discipline:
+          * the deleting code (MA_INSDEL_YES reaches insulin_delete) appears
+          * exactly once, with the safe CANCEL above it. */
+         fm.scr       = SCR_INSDEL;
+         fm.ins_t     = now_ts;
+         fm.ins_type  = 1;
+         fm.ins_units = 12;
+         ui_render(&fb2, &fm, &fh);
+         nyes     = 0;
+         nno      = 0;
+         ymin_yes = 1073741824;
+         ymax_no  = -1;
+         for (int i = 0; i < fh.n; i++) {
+            if (fh.box[i].kind != ACT_MENU)
+               continue;
+            if (fh.box[i].arg == MA_INSDEL_YES) {
+               nyes++;
+               if (fh.box[i].y < ymin_yes)
+                  ymin_yes = fh.box[i].y;
+            }
+            if (fh.box[i].arg == MA_INSDEL_NO) {
+               nno++;
+               if (fh.box[i].y > ymax_no)
+                  ymax_no = fh.box[i].y;
+            }
+         }
+         if (nyes != 1) {
+            printf("  FAIL: SCR_INSDEL records %d MA_INSDEL_YES targets, want "
+                   "exactly 1\n",
+                   nyes);
+            fail = 1;
+         }
+         if (nno < 1) {
+            printf("  FAIL: SCR_INSDEL records no MA_INSDEL_NO target\n");
+            fail = 1;
+         }
+         if (nyes == 1 && ymax_no > ymin_yes) {
+            printf("  FAIL: SCR_INSDEL has a CANCEL target BELOW the deleting "
+                   "one (no=%d yes=%d)\n",
+                   ymax_no, ymin_yes);
+            fail = 1;
+         }
+         printf("uitest: insdel deletes once, below cancel\n");
 
          /* The pairing confirmation follows the same discipline: the code
           * that commits (MA_PAIR_YES reaches commit_pair, which registers the
@@ -1040,21 +1095,26 @@ int main(void)
           * sensor MODEL (MA_PRIM_PICK + slot), the same discipline as the
           * device pick. */
          {
-            struct ui_sensor ps[3] = {sens[0], sens[1], sens[2]};
+            struct ui_sensor ps[4] = {sens[0], sens[1], sens[2], sens[0]};
             ps[0].session_seconds  = 3L * 86400; /* live session */
             ps[1].session_seconds  = 0;          /* just paired: no session,
                                                     no data */
             ps[1].last            = 0;
             ps[2].session_seconds = 5; /* BGM: never eligible */
             ps[2].last            = now_ts - 60;
-            struct screen pm      = set;
-            pm.scr                = SCR_PRIMPICK;
-            pm.now                = now_ts;
-            pm.sensors            = ps;
-            pm.nsensors           = 3;
+            /* An OLD (disconnected) CGM lives in OLD DEVICES and nowhere
+             * else -- however live its session looks, it is not streaming
+             * and must never be offered the big number. */
+            ps[3].old        = 1;
+            struct screen pm = set;
+            pm.scr           = SCR_PRIMPICK;
+            pm.now           = now_ts;
+            pm.sensors       = ps;
+            pm.nsensors      = 4;
             ui_render(&fb2, &pm, &fh);
             int rows    = 0;
             int saw_bgm = 0;
+            int saw_old = 0;
             for (int i = 0; i < fh.n; i++)
                if (fh.box[i].kind == ACT_MENU &&
                    fh.box[i].arg >= MA_PRIM_PICK &&
@@ -1062,14 +1122,18 @@ int main(void)
                   rows++;
                   if (fh.box[i].arg == MA_PRIM_PICK + 2)
                      saw_bgm = 1;
+                  if (fh.box[i].arg == MA_PRIM_PICK + 3)
+                     saw_old = 1;
                }
-            if (rows != 2 || saw_bgm) {
-               printf("  FAIL: PRIMPICK offers %d rows (bgm=%d); want both "
-                      "CGMs (even the dataless one) and never the meter\n",
-                      rows, saw_bgm);
+            if (rows != 2 || saw_bgm || saw_old) {
+               printf("  FAIL: PRIMPICK offers %d rows (bgm=%d old=%d); want "
+                      "both LIVE CGMs (even the dataless one) and never the "
+                      "meter or an old device\n",
+                      rows, saw_bgm, saw_old);
                fail = 1;
             }
-            printf("uitest: choose-primary lists every CGM, never a meter\n");
+            printf("uitest: choose-primary lists live CGMs only -- never a "
+                   "meter, never an old device\n");
          }
 
          /* An ARMED (pending) pairing must be visible in DEVICES and
@@ -1364,6 +1428,9 @@ int main(void)
              {SCR_PAIRCONF, MA_PAIR_NO,     "PAIRCONF"},
              {SCR_ADDMENU,  MA_CLOSE,       "ADDMENU" },
              {SCR_INSULIN,  MA_INS_DISCARD, "INSULIN" },
+             {SCR_INSDEL,   MA_INSDEL_NO,   "INSDEL"  },
+             {SCR_ALARM,    MA_ALARM_BACK,  "ALARM"   },
+             {SCR_EXPORT,   MA_EXP_BACK,    "EXPORT"  },
              {SCR_PRIMPICK, MA_CLOSE,       "PRIMPICK"},
              {SCR_PERMS,    MA_PERMS_BACK,  "PERMS"   },
              {SCR_OLDDEV,   MA_OLDDEV_BACK, "OLDDEV"  },
@@ -1535,6 +1602,58 @@ int main(void)
       if (with_pt != without_pt) {
          printf("  FAIL: legacy (src 0) point styled as the current primary\n");
          fail = 1;
+      }
+
+      /* AN INSULIN DOSE MUST STILL DRAW WITH THE GLUCOSE HISTORY FULL.
+       *
+       * The shell appends the doses AFTER the glucose points in the SAME
+       * m->hist array (sized NHIST + NINS), but ui.c capped its plot loop at
+       * the GLUCOSE figure alone -- so once the history filled, every dose's
+       * index sat past the cap and no dose was drawn at all; before that the
+       * NEWEST were dropped first, which is how a dose logged minutes ago
+       * went missing while older ones still showed. Nothing caught it: every
+       * other plot test uses a handful of points, and a full history is the
+       * steady state on a real phone, not an edge case.
+       *
+       * Render a FULL glucose history plus one dose, and require the
+       * insulin marker's colour to appear. */
+      {
+         enum { NG = 5040 };
+         static struct ui_point big[NG + 1];
+         for (int i = 0; i < NG; i++) {
+            long back   = (long)i * 300; /* one CGM cadence per step */
+            big[i].t    = now_ts - back;
+            big[i].glu  = 120;
+            big[i].src  = 0;
+            big[i].kind = KIND_CGM;
+         }
+         /* the dose: newest-first ordering puts it last, like the shell */
+         big[NG].t    = now_ts - 600;
+         big[NG].glu  = 8; /* units; the renderer pins the y itself */
+         big[NG].src  = INS_FAST;
+         big[NG].kind = KIND_INS;
+
+         struct screen is = m;
+         is.now           = now_ts;
+         is.t             = now_ts - 100;
+         is.hist          = big;
+         is.nhist         = NG + 1;
+         is.sensors       = 0;
+         is.nsensors      = 0;
+         is.plot_hours    = 24;
+         /* a distinctive, drawable insulin styling */
+         is.ins_marker[INS_FAST] = MARK_SQUARE_F;
+         is.ins_color[INS_FAST]  = 3;
+         is.ins_size[INS_FAST]   = MARK_SIZE_DEF;
+         ui_render(&tall, &is, &h);
+         long ins_px = count_color(&tall, ui_sensor_color(3));
+         printf("uitest: insulin px with a FULL history = %ld\n", ins_px);
+         if (ins_px <= 0) {
+            printf("  FAIL: an insulin dose vanishes once the glucose "
+                   "history fills -- the plot cap must cover the doses the "
+                   "shell appends after the readings\n");
+            fail = 1;
+         }
       }
    }
 

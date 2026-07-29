@@ -140,13 +140,18 @@ public final class PancraService extends Service {
          * HIDE = the notification does not appear there at all. */
         b.setVisibility(sLock ? Notification.VISIBILITY_PUBLIC
                               : Notification.VISIBILITY_SECRET);
+        /* The COLLAPSED row's large icon is the APP'S OWN badge -- the one
+         * small-icon slot serves both the status bar and the shade header,
+         * so with the value as the small icon this is where the drop
+         * identity lives. The plot moved to the EXPANDED view only. */
+        int li = app.getResources().getIdentifier(
+            "ic_launcher", "mipmap", app.getPackageName());
+        if (li != 0)
+            b.setLargeIcon(android.graphics.drawable.Icon
+                .createWithResource(app, li));
         int[] px = sPx; int w = sW; int h = sH;
         if (px != null && w > 0 && h > 0 && px.length >= w * h) {
             Bitmap bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
-            /* Large icon shows the plot in the COLLAPSED view; BigPicture shows
-             * the full plot when expanded (bigLargeIcon(null) hides the small
-             * duplicate there). So the plot is visible either way. */
-            b.setLargeIcon(bmp);
             b.setStyle(new Notification.BigPictureStyle()
                 .bigPicture(bmp).bigLargeIcon((Bitmap) null));
         }

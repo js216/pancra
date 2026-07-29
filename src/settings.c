@@ -6,6 +6,7 @@
  * display/settings-menu prefs, and the pairing code. The UI (main.c) owns when
  * to save/load; this module owns the state and the on-disk format. */
 #include "settings.h"
+#include "alarmlogic.h" /* AL_HIGH_MAX: alarm_load's bound = the keypad's */
 #include "dexlibc.h"
 #include "plot.h"
 #include "util.h"
@@ -120,6 +121,7 @@ void alarm_load(void)
       }
       q++;
    }
+   int got_lo = nd > 0;
    while (*q == ' ')
       q++;
    nd = 0;
@@ -130,17 +132,25 @@ void alarm_load(void)
       }
       q++;
    }
+   int got_hi = nd > 0;
    /* Range-check, do not merely test for non-zero. A corrupt or hand-edited
     * file with lo=99999 silently DISABLES the low alarm (nothing is ever below
     * it) and lo>hi leaves both alarms permanently latched -- the two ways this
     * file can fail dangerously. Bounds match the keypad's own limits, so a
-    * value that could not be typed cannot be loaded either. */
-   /* lo <= hi, not lo < hi: alarm_adjust() clamps a crossing by setting the
-    * two EQUAL (main.c), so 300/300 is a state the UI can produce and save.
-    * Rejecting it silently reverted the user's thresholds to the compiled
-    * defaults on the next launch -- values they never chose. The predicate
-    * must accept everything the writer can emit. */
-   if (lo >= 40 && lo <= 400 && hi >= 40 && hi <= 400 && lo <= hi) {
+    * value that could not be typed cannot be loaded either: both thresholds
+    * 0..AL_ENTRY_MAX (each end is that alarm's deliberate OFF switch -- see
+    * alarmlogic.h). */
+   /* got_lo/got_hi: with 0 now LEGAL, a file that parses to no digits at all
+    * must be rejected explicitly -- otherwise any garbage reads as the valid
+    * pair 0/0 and silently installs both alarms OFF, thresholds the user
+    * never chose. */
+   /* lo <= hi, not lo < hi: a threshold entry refuses a crossing, but the
+    * old steppers could set the two EQUAL, and equal pairs exist in saved
+    * files. Rejecting one silently reverted the user's thresholds to the
+    * compiled defaults on the next launch -- values they never chose. The
+    * predicate must accept everything the writer can emit. */
+   if (got_lo && got_hi && lo <= AL_ENTRY_MAX && hi <= AL_ENTRY_MAX &&
+       lo <= hi) {
       g_alarm_low  = lo;
       g_alarm_high = hi;
    }

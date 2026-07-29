@@ -19,9 +19,12 @@
  * ui.c is decoupled from this header, so a smaller UI cap would re-truncate the
  * plot even with a large NHIST). */
 #define NHIST 5040
-/* Bytes of readings.csv read back at startup. Sized so NHIST rows of schema v2
- * (~50 B each with the rescale column and two sensors logging) still fit. */
-#define STORE_TAIL 524288
+/* Read BUFFER size for the startup replay -- not a limit on how much of the
+ * log is read. store_load streams the WHOLE file through this in chunks,
+ * because the log is in arrival order: after importing months of history the
+ * newest readings are NOT at the end, and a tail-limited read came back with
+ * an empty plot from an intact log. */
+#define STORE_TAIL 262144
 
 /* One reading in the display history.
  *
@@ -73,6 +76,15 @@ enum { HIST_DUP = 0, HIST_NEW = 1, HIST_OLD = 2 };
  * fingerstick never dedups against a CGM sample either -- a meter reading in
  * the same minute is precisely the divergence worth seeing. */
 int hist_insert(long t, int glu, int trend, int src, int kind);
+/* Is this exact (timestamp, value) already held, from ANY source?
+ * hist_insert dedups per-source by design (two sensors legitimately report
+ * the same minute), which makes it the wrong question for IMPORTED data:
+ * that carries no provenance, so a datapoint the phone already recorded
+ * under its real sensor must not be added again under a synthetic one. The
+ * PAIR is the identity -- same instant, same value -- so two sensors that
+ * genuinely disagree at the same second still both survive. Call under
+ * hist_lock(). */
+int hist_have_point(long t, int glu);
 /* Append one row of schema v2:
  *   epoch,glucose,trend10,rssi,recv_lag,source_id,raw_time,tz_off,kind
  * `raw` is the sensor's own uncorrected time and `tz` the offset assumed when

@@ -44,7 +44,7 @@ build/stub/lib%.so: src/stub_%.c
 
 # native sources: UI/JNI core, BLE transport, protocol driver, self-contained crypto
 SRC := src/main.c src/font.c src/plot.c src/util.c src/stats.c src/store.c src/settings.c src/ui.c \
-       src/alarmlogic.c src/scanlogic.c src/insulin.c \
+       src/alarmlogic.c src/scanlogic.c src/insulin.c src/plotdata.c \
        src/sensors.c src/otble.c \
        src/dexble.c src/dexdriver.c \
        src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
@@ -158,7 +158,7 @@ TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 # one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
 # whole alarm actuation end (Alarm.java, PancraService.java, Ble.java)
 # unchecked by anything.
-check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest done
+check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest done
 
 format:
 	grep -rlP '\r' --exclude='.*' src test res Makefile AndroidManifest.xml \
@@ -189,19 +189,21 @@ crosscheck:
 	 fi; \
 	 printf '\033[1;32mcrosscheck\033[0m: LINK_MAX == MAX_LINKS (%s)\n' "$$c"; \
 	 n=$$(grep -oP '#define NHIST\s+\K[0-9]+' src/store.h); \
-	 u=$$(grep -oP '#define UI_PLOT_MAX\s+\K[0-9]+' src/ui.c); \
+	 u=$$(grep -oP '#define UI_PLOT_GLU\s+\K[0-9]+' src/ui.c); \
 	 if [ -z "$$n" ] || [ -z "$$u" ]; then \
-	   echo "crosscheck: could not read NHIST ('$$n') or UI_PLOT_MAX ('$$u')"; \
+	   echo "crosscheck: could not read NHIST ('$$n') or UI_PLOT_GLU ('$$u')"; \
 	   exit 1; \
 	 fi; \
 	 if [ "$$n" != "$$u" ]; then \
-	   echo "NHIST ($$n in store.h) != UI_PLOT_MAX ($$u in ui.c):"; \
+	   echo "NHIST ($$n in store.h) != UI_PLOT_GLU ($$u in ui.c):"; \
 	   echo "  the shell sends up to NHIST plot points but ui.c draws at most"; \
-	   echo "  UI_PLOT_MAX of them -- a smaller UI cap silently truncates the"; \
+	   echo "  UI_PLOT_GLU of them -- a smaller UI cap silently truncates the"; \
 	   echo "  oldest in-window points, shrinking the 7D plot below a week."; \
+	   echo "  (ui.c's own cap is UI_PLOT_GLU + NINS: the shell appends the"; \
+	   echo "  insulin doses after the glucose points in the same array.)"; \
 	   exit 1; \
 	 fi; \
-	 printf '\033[1;32mcrosscheck\033[0m: NHIST == UI_PLOT_MAX (%s)\n' "$$n"
+	 printf '\033[1;32mcrosscheck\033[0m: NHIST == UI_PLOT_GLU (%s)\n' "$$n"
 
 # A STOPGAP, and labelled as one. There is no Java test binary -- Ble, Alarm and
 # PancraService are almost entirely Android API calls, so exercising them needs
@@ -276,6 +278,21 @@ uitest:
 	cc -iquote src $(JVM_INC) $(TESTWARN) test/uitest.c src/ui.c src/font.c \
 	    src/plot.c src/sensors.c src/util.c -o tmp/uitest/uitest
 	./tmp/uitest/uitest
+
+# Behavioural gate for the LONG-SPAN plot data. The 30D plot is downsampled
+# from the log, and downsampling is where a plot lies quietly: this asserts
+# that every reading which would occupy its own pixel survives, that the span
+# is filled end to end, and that ten times the history does not cost ten
+# times the memory. The bug it pins: plot depth was tied to a point budget,
+# so a 30-day plot showed ten days once four sources were logging.
+plottest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(JVM_INC) $(TESTWARN) -DPLOTDATA_HOST test/plottest.c \
+	    src/plotdata.c src/sensors.c src/util.c -o tmp/uitest/plottest
+	@./tmp/uitest/plottest > tmp/uitest/plottest.log 2>&1 \
+	    && grep -q "ALL PLOT TESTS PASSED" tmp/uitest/plottest.log \
+	    && printf '\033[1;32mplottest\033[0m: long-span plot data OK\n' \
+	    || { cat tmp/uitest/plottest.log; exit 1; }
 
 # Behavioural gate for the alarm decision logic. Until this existed, NOTHING in
 # main.c was covered by any test binary -- an adversarial review deleted the
@@ -399,4 +416,4 @@ drivertest:
 	    && printf '\033[1;32mdrivertest\033[0m: pairing + auth + EGV decode OK\n' \
 	    || { tail -20 tmp/uitest/drivertest.log; exit 1; }
 
-.PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest
+.PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest

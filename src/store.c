@@ -13,6 +13,7 @@
 #include "util.h"
 #include <limits.h> /* LONG_MAX: saturate over-long numeric fields */
 #include <stdio.h>  /* snprintf, SEEK_SET / SEEK_END */
+#include <string.h> /* memcpy: the chunked replay carries partial lines */
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #define LOGW(...) __android_log_print(5, "pancra", __VA_ARGS__)
@@ -107,6 +108,14 @@ void hist_refresh_current(int prime)
    g_cur_glu   = -1;
    g_cur_trend = 0;
    g_cur_time  = 0;
+}
+
+int hist_have_point(long t, int glu)
+{
+   for (int i = 0; i < g_nhist; i++)
+      if (g_hist[i].t == t && g_hist[i].glu == glu)
+         return 1;
+   return 0;
 }
 
 int hist_insert(long t, int glu, int trend, int src, int kind)
@@ -250,34 +259,65 @@ int store_count(void)
    return c;
 }
 
+static void store_load_chunk(char *buf);
+
 void store_load(void)
 {
    int fd = open(g_store_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   long sz = lseek(fd, 0, SEEK_END);
-   /* Keep ~7 days on screen. A schema-v2 row is ~46 B (v1 was ~25 B) and two
-    * sensors can be logging at once, so the tail has to be far larger than it
-    * was or history silently vanishes from the plot after a restart. */
-   long off = sz > STORE_TAIL ? sz - STORE_TAIL : 0;
-   lseek(fd, off, SEEK_SET);
+   /* THE WHOLE FILE, not a tail.
+    *
+    * The log is in ARRIVAL order, which is not time order, so "the last N
+    * bytes" is not "the newest N readings". Importing months of server
+    * history appends thousands of OLD rows at the end -- after which the
+    * tail held April while July sat further up the file, and a restart came
+    * back with an empty plot and empty 1D/3D/7D statistics from a log that
+    * was completely intact.
+    *
+    * hist_insert keeps the newest NHIST BY TIMESTAMP whatever order they
+    * arrive in, so one pass over everything is both correct and simple. It
+    * costs a parse of a file measured in megabytes, once, at startup. */
    static char buf[STORE_TAIL + 1];
-   long n = read(fd, buf, STORE_TAIL);
+   long cap   = (long)sizeof buf - 1;
+   long carry = 0; /* bytes of a partial line held over */
+   long n     = 0;
+   while ((n = read(fd, buf + carry, cap - carry)) > 0 || carry > 0) {
+      long have = carry + (n > 0 ? n : 0);
+      buf[have] = 0;
+      long last = have;
+      if (n > 0) { /* trim to the last complete line */
+         while (last > 0 && buf[last - 1] != '\n')
+            last--;
+         if (last == 0)
+            last = have; /* one absurd line: process it anyway */
+      }
+      char keep[512];
+      long nkeep = have - last;
+      if (nkeep > (long)sizeof keep)
+         nkeep = 0;
+      if (nkeep > 0)
+         memcpy(keep, buf + last, (size_t)nkeep);
+      buf[last] = 0;
+      store_load_chunk(buf);
+      if (n <= 0)
+         break;
+      carry = nkeep;
+      if (carry > 0)
+         memcpy(buf, keep, (size_t)carry);
+   }
    close(fd);
-   if (n <= 0)
-      return;
-   buf[n]        = 0;
+}
+
+/* Parse one chunk of WHOLE lines from the log (see store_load). Chunks are
+ * line-aligned by the caller, so there is no partial first line to skip. */
+static void store_load_chunk(char *buf)
+{
    char *p       = buf;
    long now      = realtime_s();
    long best_t   = 0;
    int best_rssi = 0;
    int best_ok   = 0; /* rssi of the newest row */
-   if (off > 0) {
-      while (*p && *p != '\n')
-         p++;
-      if (*p == '\n')
-         p++;
-   } /* skip partial line */
    while (*p) {
       if (*p == '#') { /* header / comment line */
          while (*p && *p != '\n')

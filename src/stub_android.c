@@ -83,6 +83,18 @@ int AMotionEvent_getAction(const void *ev)
    return 0;
 }
 
+int AKeyEvent_getAction(const void *ev)
+{
+   (void)ev;
+   return 0;
+}
+
+int AKeyEvent_getKeyCode(const void *ev)
+{
+   (void)ev;
+   return 0;
+}
+
 float AMotionEvent_getX(const void *ev, unsigned long i)
 {
    (void)ev;

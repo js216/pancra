@@ -13,6 +13,7 @@
 #include <limits.h> /* LONG_MAX: saturate over-long numeric fields */
 #include <stdio.h>  /* SEEK_SET / SEEK_END */
 #include <stdlib.h>
+#include <string.h> /* memcpy: the chunked replay carries partial lines */
 
 struct hourbucket {
    int hour, count, in_range, sum;
@@ -161,30 +162,60 @@ static char *skip_line(char *p)
 
 /* Seed the stats from the last ~90 days of the log -- a bounded tail read, so
  * it stays O(90 days) regardless of how large the file has grown. */
+static void stat_load_chunk(char *buf);
+
 void stat_load(const char *readings_path)
 {
    int fd = open(readings_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   long sz   = lseek(fd, 0, SEEK_END);
-   long want = 1024L * 1024; /* ~90 days of rows */
-   long off  = sz > want ? sz - want : 0;
-   lseek(fd, off, SEEK_SET);
+   /* THE WHOLE FILE, streamed. Reading only a tail assumed the newest rows
+    * sit at the end -- true of a pure arrival log, FALSE once months of
+    * older history are imported and appended. When that happened the last
+    * megabyte held April, so the 1D/3D/7D columns came back empty from a
+    * log that contained every reading. Buckets are keyed by age, not by
+    * position, so order does not matter; completeness does. */
+   long want = 256L * 1024; /* read buffer, not a limit */
    char *buf = malloc((unsigned long)want + 1);
    if (!buf) {
       close(fd);
       return;
    }
-   long n = read(fd, buf, want);
-   close(fd);
-   if (n <= 0) {
-      free(buf);
-      return;
+   lseek(fd, 0, SEEK_SET);
+   long carry = 0;
+   long n     = 0;
+   while ((n = read(fd, buf + carry, want - carry)) > 0 || carry > 0) {
+      long have = carry + (n > 0 ? n : 0);
+      buf[have] = 0;
+      long last = have;
+      if (n > 0) { /* keep only whole lines; hold the remainder over */
+         while (last > 0 && buf[last - 1] != '\n')
+            last--;
+         if (last == 0)
+            last = have;
+      }
+      long nkeep = have - last;
+      char keep[512];
+      if (nkeep > (long)sizeof keep)
+         nkeep = 0;
+      if (nkeep > 0)
+         memcpy(keep, buf + last, (unsigned long)nkeep);
+      buf[last] = 0;
+      stat_load_chunk(buf);
+      if (n <= 0)
+         break;
+      carry = nkeep;
+      if (carry > 0)
+         memcpy(buf, keep, (unsigned long)carry);
    }
-   buf[n]  = 0;
+   close(fd);
+   free(buf);
+}
+
+/* Parse one chunk of WHOLE lines (see stat_load). */
+static void stat_load_chunk(char *buf)
+{
    char *p = buf;
-   if (off > 0)
-      p = skip_line(p);
    while (*p) {
       if (*p == '#') { /* header / comment line */
          p = skip_line(p);
@@ -247,5 +278,4 @@ void stat_load(const char *readings_path)
          stat_add(t, glu);
       p = skip_line(p);
    }
-   free(buf);
 }

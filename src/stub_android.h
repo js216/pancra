@@ -19,6 +19,8 @@ int AInputQueue_preDispatchEvent(void *q, void *ev);
 void AInputQueue_finishEvent(void *q, void *ev, int handled);
 int AInputEvent_getType(const void *ev);
 int AMotionEvent_getAction(const void *ev);
+int AKeyEvent_getAction(const void *ev);
+int AKeyEvent_getKeyCode(const void *ev);
 float AMotionEvent_getX(const void *ev, unsigned long i);
 float AMotionEvent_getY(const void *ev, unsigned long i);
 unsigned long AMotionEvent_getHistorySize(const void *ev);
