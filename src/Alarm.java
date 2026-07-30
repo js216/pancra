@@ -64,6 +64,87 @@ public final class Alarm {
         } catch (Throwable t) { Log.i("pancra", "beep: " + t); }
     }
 
+    /* CHIRP: the beep's duration and starting pitch, bent by st10 TENTHS of a
+     * semitone over the tone (up for a rise, down for a fall). ToneGenerator
+     * cannot bend pitch, so the waveform is synthesised and handed to a
+     * one-shot AudioTrack.
+     *
+     * The phase is integrated rather than computed per sample from a single
+     * frequency: sin(2*pi*f(t)*t) with a moving f is NOT a glide, it sweeps at
+     * twice the intended rate and lands on the wrong note. Accumulating
+     * phase += 2*pi*f(t)/rate is the actual definition of an instantaneous
+     * frequency, so the tone ends exactly CHIRP_MAX_ST semitones away at the
+     * cap. A short raised-cosine fade on each end keeps the start and stop
+     * from clicking. Called on a BLE binder thread, so nothing here blocks:
+     * AudioTrack.write on a static buffer just copies. */
+    private static final int CHIRP_MS = 200;      /* == the beep's duration */
+    private static final double CHIRP_HZ = 1200;  /* == TONE_PROP_BEEP's pitch */
+    /* Trailing digital silence, and the reason it exists: the marker fires
+     * when the frame has been handed to the mixer, NOT when the speaker has
+     * finished with it, so releasing the track there chopped the last few
+     * milliseconds off mid-render -- an abrupt truncation, which is audible
+     * as a click at the end of every chirp. The fade already takes the
+     * waveform to near-zero, so the click was never the waveform; it was the
+     * cut. Padding means whatever the release truncates is silence. */
+    private static final int CHIRP_PAD_MS = 40;
+
+    public static synchronized void chirp(Context ctx, int st10) {
+        try {
+            final int rate = 22050;
+            final int tone = (rate * CHIRP_MS) / 1000;      /* the audible part */
+            final int n = tone + ((rate * CHIRP_PAD_MS) / 1000); /* + silence */
+            double f1 = CHIRP_HZ * Math.pow(2.0, st10 / 120.0);
+            short[] pcm = new short[n];   /* the tail stays zero: silence */
+            double phase = 0;
+            int fade = rate / 200;                /* 5 ms of ramp each end */
+            for (int i = 0; i < tone; i++) {
+                double u = (double) i / (double) tone;
+                double f = CHIRP_HZ + ((f1 - CHIRP_HZ) * u);
+                phase += (2.0 * Math.PI * f) / rate;
+                double a = 1.0;
+                if (i < fade) a = 0.5 - (0.5 * Math.cos((Math.PI * i) / fade));
+                else if (i > tone - fade)
+                    a = 0.5 - (0.5 * Math.cos((Math.PI * (tone - i)) / fade));
+                pcm[i] = (short) (Math.sin(phase) * a * 26000);
+            }
+            /* USAGE_MEDIA, i.e. STREAM_MUSIC -- the SAME stream the beep's
+             * ToneGenerator uses, and the reason the beep is audible when
+             * this was not. USAGE_ASSISTANCE_SONIFICATION routes to
+             * STREAM_SYSTEM, which is aliased to STREAM_RING and therefore
+             * muted outright whenever the phone is on silent or vibrate: the
+             * chirp was being synthesised and played correctly into a stream
+             * at volume zero. The NEW DATAPOINT alert is an ambient
+             * companion to the reading, not a ringer event, so it belongs on
+             * the media stream with the beep it replaces. (The glucose alarm
+             * is different and stays on USAGE_ALARM, which silent mode does
+             * not touch.) */
+            android.media.AudioTrack tr = new android.media.AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                .setAudioFormat(new android.media.AudioFormat.Builder()
+                    .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).build())
+                .setBufferSizeInBytes(n * 2)
+                .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                .build();
+            tr.write(pcm, 0, n);
+            tr.setNotificationMarkerPosition(n);
+            /* Release when the tone has actually finished. Releasing inline
+             * would cut it off mid-note; leaking it would burn one of the
+             * device's finite AudioTrack slots on every datapoint. */
+            tr.setPlaybackPositionUpdateListener(
+                new android.media.AudioTrack.OnPlaybackPositionUpdateListener() {
+                    @Override public void onMarkerReached(android.media.AudioTrack t) {
+                        try { t.release(); } catch (Throwable x) {}
+                    }
+                    @Override public void onPeriodicNotification(android.media.AudioTrack t) {}
+                });
+            tr.play();
+        } catch (Throwable t) { Log.i("pancra", "chirp: " + t); }
+    }
+
     private static void ensureChannel(NotificationManager nm) {
         if (nm.getNotificationChannel(CH) != null) return;
         NotificationChannel c = new NotificationChannel(CH, "Glucose alarm",

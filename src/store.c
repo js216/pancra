@@ -175,6 +175,22 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
    return HIST_NEW;
 }
 
+int hist_prev_glu(long t, int src)
+{
+   /* g_hist is newest-first, so the first match older than `t` is the one
+    * wanted. KIND_BGM is skipped: a fingerstick is a different instrument
+    * with its own offset, and the chirp describes the CGM's own movement. */
+   for (int i = 0; i < g_nhist; i++) {
+      if (g_hist[i].src != (unsigned short)src)
+         continue;
+      if (g_hist[i].kind == KIND_BGM)
+         continue;
+      if (g_hist[i].t < t)
+         return g_hist[i].glu;
+   }
+   return -1;
+}
+
 void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                   long raw, long tz, int kind, int rescale_pm)
 {

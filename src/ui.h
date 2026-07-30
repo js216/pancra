@@ -85,6 +85,11 @@ int ui_sensor_capacity(int w, int h);
 extern const char ui_label_chars[];
 int ui_label_nchars(void);
 
+/* Digit slots a keypad mode accepts. The renderer draws exactly this many
+ * cells and the input path accepts exactly this many digits, so the two
+ * cannot drift into disagreeing about how long an entry may be. */
+int ui_kp_slots(int mode);
+
 const char *ui_marker_name(int marker);
 const char *ui_color_name(int color);
 uint32_t ui_sensor_color(int color);
@@ -237,7 +242,7 @@ struct screen {
    /* settings (values, not the module's globals) */
    int units, alarm_low, alarm_high, sound_on, vib_on, orient, disc;
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
-   int newdata_beep;           /* 1 = beep on each new primary-CGM datapoint */
+   int newdata_mode;           /* 1 = beep on each new primary-CGM datapoint */
    int remote_on, remote_port; /* remote push enabled; server TCP port */
    /* sensor registry: the list in settings, and which one a detail screen is
     * showing (sel indexes `sensors`; -1 when no detail screen is open) */

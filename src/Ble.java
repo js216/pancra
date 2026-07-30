@@ -281,7 +281,17 @@ public final class Ble {
                         new java.io.InputStreamReader(c.getInputStream()));
                     long g = -1, i = -1;
                     String ln;
-                    while ((ln = r.readLine()) != null) {
+                    /* BOUNDED, like remoteRange's body read. The cursor reply
+                     * is two lines; an endpoint that answers HTTP and then
+                     * never closes the body -- a wrong address landing on an
+                     * event stream or a log tail -- used to hold this loop
+                     * forever, and sBusy with it. remoteBusy() then returned 1
+                     * for the life of the process, so no cursor, no batches and
+                     * no pull ever ran again; nothing cleared it, not even
+                     * toggling REMOTE off and on. setReadTimeout is no help,
+                     * being per-read rather than per-response. */
+                    int nl = 0;
+                    while (nl++ < 64 && (ln = r.readLine()) != null) {
                         String[] f = ln.trim().split("\\s+");
                         if (f.length != 2) continue;
                         try {

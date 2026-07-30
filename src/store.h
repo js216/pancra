@@ -76,6 +76,13 @@ enum { HIST_DUP = 0, HIST_NEW = 1, HIST_OLD = 2 };
  * fingerstick never dedups against a CGM sample either -- a meter reading in
  * the same minute is precisely the divergence worth seeing. */
 int hist_insert(long t, int glu, int trend, int src, int kind);
+/* Glucose of the newest CGM sample from `src` STRICTLY OLDER than `t`, or -1
+ * if that source has none. Per-source by design: the NEW DATAPOINT chirp
+ * pitches on the change since this sensor's own previous reading, and with two
+ * CGMs worn at once a cross-sensor difference is a calibration offset between
+ * two devices, not a trend -- pitching on it would sound like a swing the
+ * wearer never had. Call under hist_lock(). */
+int hist_prev_glu(long t, int src);
 /* Is this exact (timestamp, value) already held, from ANY source?
  * hist_insert dedups per-source by design (two sensors legitimately report
  * the same minute), which makes it the wrong question for IMPORTED data:

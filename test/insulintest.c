@@ -12,6 +12,7 @@
  * Built and run by `make insulintest`, which `make check` depends on. */
 #include "insulin.h"
 #include <stdio.h>
+#include <string.h> /* memset: the over-long-row regression builds one */
 #include <unistd.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...)
@@ -111,6 +112,35 @@ int main(void)
       ck(insulin_delete(&gone) < 0, "deleting a missing row refuses");
       insulin_load();
       ck(g_nins == 2, "...and the delete is durable on disk");
+   }
+
+   printf("== an over-long row cannot overflow the rewrite buffer ==\n");
+   {
+      /* ins_rewrite's pass-2 line buffer is 256 bytes and appends its newline
+       * UNCONDITIONALLY, so a row of exactly 256 characters used to write one
+       * byte past the array (ASan: stack-buffer-overflow at insulin.c:254) and
+       * hand write() a 257-byte length. The row is unparseable either way; the
+       * contract is that the rewrite REFUSES rather than corrupting the stack.
+       * Run this under ASan to see the regression, not just the return code. */
+      fresh();
+      ck(insulin_append(t0, INS_SLOW, 10, 0) == 0, "a normal dose to edit");
+      FILE *f = fopen(g_ins_path, "ab");
+      ck(f != NULL, "the log opens for the hostile row");
+      if (f) {
+         char pad[257];
+         memset(pad, '9', sizeof pad);
+         /* 16 characters of plausible row, padded to exactly 256 */
+         fprintf(f, "1700001200,0,7,0");
+         fwrite(pad, 1, 256 - 16, f);
+         fputc('\n', f);
+         fclose(f);
+      }
+      struct ins_rec orig = {t0, INS_SLOW, 10};
+      ck(insulin_update(&orig, t0, INS_SLOW, 11, 0) < 0,
+         "an edit past a 256-char row refuses instead of overflowing");
+      insulin_load();
+      ck(insulin_last_units(INS_SLOW) == 10,
+         "...and the refused edit changed nothing");
    }
 
    printf("== the tail stays bounded; the newest rows win ==\n");

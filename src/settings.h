@@ -12,13 +12,13 @@ extern char g_model[24], g_fw[24],
     g_mfr[24];                        /* DIS: model / fw / manufacturer */
 extern int g_alarm_low, g_alarm_high; /* thresholds, mg/dL */
 extern int g_sound_on, g_vib_on;      /* alarm sound / vibration */
-extern int g_orient;    /* 0 portrait 1 landscape 2 gravity 3 system */
-extern int g_screen_on; /* 1 keep screen on while open, 0 follow the OS */
-extern int
-    g_newdata_beep;    /* 1 = short beep on each new primary-CGM datapoint */
-extern int g_units;    /* 0 mg/dL, 1 mmol/L */
-extern int g_disc;     /* stale-data alarm: index into disc_min */
-extern int g_plot_max; /* plot vertical-scale top, mg/dL */
+extern int g_orient;         /* 0 portrait 1 landscape 2 gravity 3 system */
+extern int g_screen_on;      /* 1 keep screen on while open, 0 follow the OS */
+extern int g_newdata_mode;   /* ND_OFF / ND_BEEP / ND_CHIRP (alarmlogic.h):
+                              * what a new primary-CGM datapoint sounds like */
+extern int g_units;          /* 0 mg/dL, 1 mmol/L */
+extern int g_disc;           /* stale-data alarm: index into disc_min */
+extern int g_plot_max;       /* plot vertical-scale top, mg/dL */
 extern int g_ins_marker[2];  /* MARK_* per insulin type (INS_SLOW/FAST) */
 extern int g_ins_color[2];   /* ui palette index per insulin type */
 extern int g_ins_size[2];    /* marker size 1..MARK_SIZE_MAX per type */

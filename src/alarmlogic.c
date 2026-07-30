@@ -10,11 +10,27 @@ int alarm_zone(int glu, long glu_t, long now, int lo, int hi)
    int fresh = (glu >= 0 && now - glu_t <= AL_FRESH_S);
    if (!fresh)
       return 0;
-   if (glu < lo)
+   /* AT the limit counts: the limit is the last acceptable value's neighbour,
+    * so 70 with low=70 already rings -- waiting for 69 gives away 5 minutes
+    * of a drop the user asked to be told about. Same at the top. */
+   if (glu <= lo)
       return 1;
-   if (glu > hi)
+   if (glu >= hi)
       return 2;
    return 0;
+}
+
+int chirp_semitone10(int delta_mgdl)
+{
+   /* Tenths, so the 2 mg/dL-per-semitone rule survives integer division at
+    * odd deltas: 1 mg/dL is half a semitone (5 tenths), not 0. */
+   int st10 = (delta_mgdl * 10) / CHIRP_MGDL_PER_ST;
+   int cap  = CHIRP_MAX_ST * 10;
+   if (st10 > cap)
+      st10 = cap;
+   if (st10 < -cap)
+      st10 = -cap;
+   return st10;
 }
 
 int alarm_stale(int glu, long glu_t, long now, long launch_t, long disc_s)
@@ -44,8 +60,8 @@ int alarm_stranded(int glu, long glu_t, long now, int lo, int hi)
    if (glu < 0)
       return 0; /* never had a reading */
    if (now - glu_t <= AL_FRESH_S)
-      return 0; /* still fresh: the zone rules apply */
-   return glu < lo || glu > hi;
+      return 0;                   /* still fresh: the zone rules apply */
+   return glu <= lo || glu >= hi; /* inclusive, matching alarm_zone */
 }
 
 int alarm_want(int zone, int stale)

@@ -235,7 +235,13 @@ static int ins_rewrite(const struct ins_rec *orig, int del, long t, int type,
    while (ok && (n = read(fd, buf, sizeof buf)) > 0)
       for (long i = 0; ok && i < n; i++) {
          if (buf[i] != '\n') {
-            if (llen < (int)sizeof line)
+            /* -1: the newline below is appended UNCONDITIONALLY, so the last
+             * byte of `line` belongs to it. Filling to sizeof line here let a
+             * row of exactly 256 characters run llen to 256 and then write
+             * line[256] -- one byte past the array, with the following write()
+             * shipping 257 bytes out of it. Pass 1 and the trailing-line
+             * branch below both already reserve that byte. */
+            if (llen < (int)sizeof line - 1)
                line[llen++] = buf[i];
             else
                ok = 0; /* over-long row: refuse to rewrite blind */

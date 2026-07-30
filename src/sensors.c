@@ -505,23 +505,43 @@ void sensors_load(void)
 
 void slots_save(void)
 {
+   /* Build the WHOLE file, then rename it into place.
+    *
+    * This used to truncate the live file and then write one line per slot, so
+    * anything that stopped the process mid-loop -- an OOM kill, a crash, the
+    * battery -- left a registry holding some of the sensors and not the rest.
+    * These are not "preferences": a lost slot is a G7 the user has to pair
+    * again, key and all. The temp-then-rename here is the same shape
+    * insulin.c already uses for its own rewrite; rename is atomic, so the
+    * file on disk is always either the old registry or the new one. */
    reg_lock();
-   int fd = open(g_slots_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   char tmp[sizeof g_slots_path + 4];
+   int tn = snprintf(tmp, sizeof tmp, "%s.t", g_slots_path);
+   if (tn <= 0 || tn >= (int)sizeof tmp) {
+      reg_unlock();
+      return;
+   }
+   char all[(MAX_SLOTS * 96) + 1];
+   int used = 0;
+   for (int i = 0; i < g_nslot && used < (int)sizeof all; i++) {
+      int n =
+          snprintf(all + used, sizeof all - (size_t)used,
+                   "%d,%s,%d,%d,%d,%d,%d,%d\n", g_slot[i].id, g_slot[i].label,
+                   g_slot[i].marker, g_slot[i].color, g_slot[i].primary,
+                   g_slot[i].size, g_slot[i].wear_days, g_slot[i].old);
+      if (n <= 0 || n >= (int)sizeof all - used)
+         break; /* cannot describe the rest: keep the file we already have */
+      used += n;
+   }
+   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd < 0) {
       reg_unlock();
       return;
    }
-   for (int i = 0; i < g_nslot; i++) {
-      char b[96];
-      int n = snprintf(b, sizeof b, "%d,%s,%d,%d,%d,%d,%d,%d\n", g_slot[i].id,
-                       g_slot[i].label, g_slot[i].marker, g_slot[i].color,
-                       g_slot[i].primary, g_slot[i].size, g_slot[i].wear_days,
-                       g_slot[i].old);
-      n     = clampn(n, sizeof b);
-      if (write(fd, b, n) != n) { /* best effort: preferences, not data */
-      }
-   }
+   int ok = (used == 0) || (write(fd, all, used) == used);
    close(fd);
+   if (!ok || rename(tmp, g_slots_path) != 0)
+      (void)unlink(tmp);
    reg_unlock();
 }
 

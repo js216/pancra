@@ -51,7 +51,7 @@ static const char *link_path(char *out, int cap, const char *base, int link)
 
 static JavaVM *g_vm;       /* for a JNIEnv on any thread */
 static jclass g_alarm_cls; /* com.jk.pancra.Alarm */
-static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep;
+static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep, m_alarm_chirp;
 
 /* a JNIEnv valid on the calling thread (main-loop touches and binder callbacks
  * both drive the alarm), attaching if necessary */
@@ -130,6 +130,23 @@ void dexble_beep(void)
       (*e)->ExceptionClear(e);
 }
 
+/* One pitch-bent chirp (NEW DATAPOINT alert in CHIRP mode). `st10` is tenths
+ * of a semitone, signed; 0 sounds exactly like the beep. Best-effort, same as
+ * dexble_beep. */
+void dexble_chirp(int st10)
+{
+   JNIEnv *e = any_env();
+   if (!e || !g_alarm_cls || !m_alarm_chirp) {
+      LOGI("chirp: not wired (e=%p cls=%p m=%p)", (void *)e,
+           (void *)g_alarm_cls, (void *)m_alarm_chirp);
+      return;
+   }
+   LOGI("chirp: fire st10=%d", st10);
+   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_chirp, g_ctx, (jint)st10);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+}
+
 /* Returns 1 only if Java was reached. Symmetric with dexble_alarm, and for the
  * same reason: the callers commit the "silent" state BEFORE calling, so a
  * silent no-op here leaves a looping USAGE_ALARM MediaPlayer running with
@@ -200,6 +217,14 @@ void dexble_subscribe(int link, const char *uuid, int indicate)
    }
    (*e)->CallStaticVoidMethod(e, g_ble, m_subscribe, (jint)link, u,
                               (jboolean)indicate);
+   /* Clear before returning, for the reason dexble_write spells out: this is
+    * reached from jni_connected, which goes on to make further JNI calls with
+    * the exception still pending (illegal -- CheckJNI aborts) and then returns
+    * into onServicesDiscovered, which has no catch of its own. That is an
+    * uncaught throw on a Bluetooth binder thread, i.e. the death of the
+    * process holding the CGM link and the alarm. */
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
    (*e)->DeleteLocalRef(e, u);
 }
 
@@ -272,6 +297,8 @@ static void ble_read_rssi(void)
       return;
    (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi,
                               (jint)driver_link()); /* result -> onRssi */
+   if ((*e)->ExceptionCheck(e)) /* never return to Java with one pending */
+      (*e)->ExceptionClear(e);
 }
 
 /* One-shot read of the Device Information Service (0x180A) strings the Stelo
@@ -311,6 +338,10 @@ void dexble_request_devinfo(void)
       }
       (*e)->CallStaticVoidMethod(e, g_ble, m_read, (jint)driver_link(),
                                  u); /* result -> onRead */
+      /* Per iteration: a pending exception makes the NEXT NewStringUTF
+       * illegal, so this cannot wait until the loop ends. */
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
       (*e)->DeleteLocalRef(e, u);
    }
 }
@@ -414,8 +445,11 @@ static void jni_connected(JNIEnv *e, jclass c, jint link)
        * so this brief window is the one chance. Read LINK_METER explicitly
        * (ble_read_rssi() targets driver_link(), which is not the meter here);
        * the result returns via onRssi -> jni_rssi -> pancra_meter_rssi. */
-      if (e && m_readrssi)
+      if (e && m_readrssi) {
          (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, (jint)LINK_METER);
+         if ((*e)->ExceptionCheck(e)) /* we return into Java from here */
+            (*e)->ExceptionClear(e);
+      }
    } else {
       driver_select(link);
       driver_on_connected();
@@ -664,6 +698,8 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
                                              "(Landroid/content/Context;)V");
    m_alarm_beep    = (*e)->GetStaticMethodID(e, alarm_cls, "beep",
                                              "(Landroid/content/Context;)V");
+   m_alarm_chirp   = (*e)->GetStaticMethodID(e, alarm_cls, "chirp",
+                                             "(Landroid/content/Context;I)V");
    LOGI("alarm class wired (trigger=%p silence=%p)", (void *)m_alarm_trigger,
         (void *)m_alarm_silence);
 }

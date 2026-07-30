@@ -30,6 +30,31 @@
 /* How old a reading may be and still count as current, in seconds. */
 #define AL_FRESH_S 360
 
+/* ---- NEW DATAPOINT alert modes (g_newdata_mode, persisted) ----
+ *   ND_OFF    silent
+ *   ND_BEEP   one fixed tone per new primary-CGM sample
+ *   ND_CHIRP  the same tone, pitch-bent by the change since that sensor's
+ *             own previous sample
+ * Values are PERSISTED (settings field 7, historically a 0/1 flag), so they
+ * must not be renumbered. */
+#define ND_OFF   0
+#define ND_BEEP  1
+#define ND_CHIRP 2
+
+/* CHIRP pitch mapping. The chirp is the beep's duration and starting pitch,
+ * then bends by one semitone per CHIRP_MGDL_PER_ST mg/dL of change, up for a
+ * rise and down for a fall, clamped at CHIRP_MAX_ST semitones either way --
+ * so the ear reads direction and rate without a glance, and a wild jump
+ * cannot produce a wild noise. */
+#define CHIRP_MGDL_PER_ST 2
+#define CHIRP_MAX_ST      5
+
+/* Semitones of bend for a delta in mg/dL, in TENTHS of a semitone (the app
+ * has no floating point; Java turns tenths into a frequency ratio). A delta
+ * of 0 -- or the first sample of a session, which has nothing to compare
+ * against -- gives 0, i.e. exactly the BEEP tone. Pure, so it is tested. */
+int chirp_semitone10(int delta_mgdl);
+
 /* Glucose zone RIGHT NOW: 0 in range, 1 low, 2 high. Derived, never latched.
  *
  * `glu < 0` means "no reading". Staleness returns 0 rather than the last

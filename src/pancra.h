@@ -80,6 +80,9 @@ void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
 void dexble_meter_connect(const char *mac);
 int dexble_alarm(int kind, int sound, int vibrate); /* 0 low, 1 high, 2 stale */
 void dexble_beep(void); /* one short NEW DATAPOINT beep */
+/* One NEW DATAPOINT chirp, pitch-bent by `st10` tenths of a semitone
+ * (chirp_semitone10); 0 is the beep's own pitch. */
+void dexble_chirp(int st10);
 int dexble_alarm_silence(void);
 
 #endif

@@ -1632,7 +1632,7 @@ static void build_model(struct screen *m)
    m->vib_on         = g_vib_on;
    m->orient         = g_orient;
    m->screen_on      = g_screen_on;
-   m->newdata_beep   = g_newdata_beep;
+   m->newdata_mode   = g_newdata_mode;
    m->remote_on      = g_remote_on;
    m->remote_ip      = g_remote_ip; /* global, so the borrow is stable */
    m->remote_status  = g_remote_status;
@@ -2925,7 +2925,14 @@ static long ob_line_start(long at)
    for (long i = 0; i < got; i++)
       if (rd[i] == '\n')
          return at + i + 1;
-   return at;
+   /* No newline in 512 bytes, or the read failed: `at` is NOT known to be a
+    * line start, and returning it would have the caller parse from the
+    * middle of a record -- the tail of one line reads as a plausible
+    * "<epoch>,<mg/dL>" and gets PUSHED to the server as a reading that was
+    * never taken. 0 is the safe answer: the caller floors it at g_ob_pos,
+    * which is always a line boundary, so the live shortcut is skipped and
+    * the outbox sends the same data correctly a moment later. */
+   return 0;
 }
 
 /* Fill `buf` with up to REMOTE_BATCH datapoint lines starting at byte `from`
@@ -2953,11 +2960,19 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
    char rd[1024];
    char line[256];
    int llen = 0;
-   int over = 0; /* over-long line: step past it, never parse a truncation */
-   long got = 0;
+   /* Bytes this line REALLY occupies, which is not llen once a line overruns
+    * `line`: llen stops at 255 while the file keeps going. The offset we hand
+    * back is a byte position in the file, so counting the truncation instead
+    * of the line would leave every later offset short by the difference --
+    * the next batch would resume mid-line and the queue would mis-parse or
+    * skip exactly the records this offset exists to protect. */
+   long rawlen = 0;
+   int over    = 0; /* over-long line: step past it, never parse a truncation */
+   long got    = 0;
    while (n < REMOTE_BATCH && (got = read(fd, rd, sizeof rd)) > 0) {
       for (long i = 0; i < got && n < REMOTE_BATCH; i++) {
          if (rd[i] != '\n') {
+            rawlen++;
             if (llen < (int)sizeof line - 1)
                line[llen++] = rd[i];
             else
@@ -2965,12 +2980,14 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
             continue;
          }
          line[llen]    = '\0';
-         long consumed = llen + 1; /* the line and its newline */
+         long consumed = rawlen + 1; /* the line and its newline */
          long t        = 0;
          int glu       = 0;
+         int ty        = 0; /* wire type: 0 = CGM, 1 = fingerstick */
          int ok        = 0;
          if (!over && line[0] >= '0' && line[0] <= '9') {
-            /* "<epoch>,<mg/dL>,..." -- the first two fields, nothing else */
+            /* "<epoch>,<mg/dL>,..." -- the first two fields, plus the kind
+             * column further along (see g_store_hdr in store.c) */
             const char *p = line;
             while (*p >= '0' && *p <= '9')
                t = (t * 10) + (*p++ - '0');
@@ -2985,12 +3002,22 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
                if (d > 0 && (*p == ',' || *p == '\0'))
                   ok = t > 0 && v > 0 && v < 2000;
                glu = v;
+               /* Field 9 is `kind` (KIND_CGM/KIND_BGM): 7 commas further on.
+                * A shorter (v1) row simply has none, and defaults to CGM --
+                * exactly what every v1 row was. */
+               int nc = 0;
+               while (*p && nc < 7)
+                  if (*p++ == ',')
+                     nc++;
+               if (nc == 7 && *p >= '0' && *p <= '9')
+                  ty = ((*p - '0') == KIND_BGM) ? 1 : 0;
             }
          }
-         llen = 0;
-         over = 0;
+         llen   = 0;
+         rawlen = 0;
+         over   = 0;
          if (ok) {
-            int w = snprintf(buf + used, cap - used, "%ld %d\n", t, glu);
+            int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, glu, ty);
             if (w <= 0 || (size_t)w >= cap - used) {
                *full = 1;
                close(fd);
@@ -3131,8 +3158,13 @@ static int unknown_id(void)
    return id;
 }
 
-/* Import one window's worth of "<epoch> <mg/dL>" lines. Returns how many
- * were new. hist_insert dedups, so re-importing costs nothing. */
+/* The value rule every ingestion path shares (defined with the live-reading
+ * handler below; declared here because the import must not invent its own). */
+static int glucose_plausible(int mg_dl);
+
+/* Import one window's worth of "<epoch> <mg/dL> [<type>]" lines (type 1 =
+ * fingerstick, absent or 0 = CGM). Returns how many were new. hist_insert
+ * dedups, so re-importing costs nothing. */
 static int pull_import(const char *body)
 {
    int src   = unknown_id();
@@ -3152,15 +3184,62 @@ static int pull_import(const char *body)
             p++;
          continue;
       }
-      while (*p >= '0' && *p <= '9')
-         t = (t * 10) + (*p++ - '0');
+      /* CAP THE DIGITS, exactly as rdfield/stat_load_chunk/ob_load/pull_load
+       * do. Signed overflow is undefined behaviour and it happens HERE, during
+       * parsing, before any range check below can reject the value -- and this
+       * is the one parser in the app fed bytes from off the device, so a
+       * 10-digit field like 4294967396 wrapped to a perfectly plausible 100
+       * and was written to the log as a reading that was never taken. */
+      int nd = 0;
+      while (*p >= '0' && *p <= '9') {
+         if (nd++ < 18) {
+            t = (t * 10) + (*p++ - '0');
+         } else {
+            t = 4102444800L; /* 2100-01-01: fails the future bound below */
+            p++;
+         }
+      }
       while (*p == ' ')
          p++;
-      while (*p >= '0' && *p <= '9')
-         glu = (glu * 10) + (*p++ - '0');
+      nd = 0;
+      while (*p >= '0' && *p <= '9') {
+         if (nd++ < 6) {
+            glu = (glu * 10) + (*p++ - '0');
+         } else {
+            glu = 1000000; /* ditto: fails glucose_plausible below */
+            p++;
+         }
+      }
+      /* The optional third field is the wire type: 1 = fingerstick. A
+       * 2-field line (the old server) reads as CGM, as it always did. */
+      int kind = KIND_CGM;
+      while (*p == ' ')
+         p++;
+      if (*p == '1' &&
+          (p[1] == '\n' || p[1] == '\r' || p[1] == ' ' || p[1] == '\0'))
+         kind = KIND_BGM;
       while (*p && *p != '\n')
          p++;
-      if (t <= 0 || glu <= 0 || glu >= 2000)
+      /* BOUND THE TIMESTAMP AT BOTH ENDS, and judge the value by the same
+       * rule every other ingestion path uses.
+       *
+       * This accepted any t > 0, and a FUTURE-dated point is not merely a
+       * wrong dot on the plot: hist_insert has no time bound either, so future
+       * points sort to the head of g_hist and evict the oldest entry on every
+       * insert. Once NHIST of them are in, g_hist[NHIST-1].t is itself in the
+       * future, so every genuine live reading fails hist_insert's
+       * `t <= g_hist[NHIST-1].t` test and returns HIST_OLD -- logged, but
+       * never re-entered into memory. alarm_gather then finds no sample for
+       * any live CGM (the synthetic IMPORTED source is flagged old and is not
+       * in its id set), ns stays 0, and zone stays 0: a real hypo can no
+       * longer raise AL_LOW for the rest of the process lifetime. A remote
+       * server whose clock ran ahead is enough to do it -- no hostility
+       * required. store_load_chunk already bounds its replay this way.
+       *
+       * glucose_plausible is the 20..600 rule pancra_glucose, pancra_backfill
+       * and both loaders enforce; this path used its own 1..1999, which let
+       * values no sensor can produce into the log and the statistics. */
+      if (t <= 0 || t > realtime_s() + 3600 || !glucose_plausible(glu))
          continue;
       int prime = sensor_primary_id();
       hist_lock();
@@ -3172,7 +3251,7 @@ static int pull_import(const char *body)
        * The identity is the (timestamp, value) PAIR. */
       int isnew = 0;
       if (!hist_have_point(t, glu))
-         isnew = hist_insert(t, glu, 127, src, KIND_CGM);
+         isnew = hist_insert(t, glu, 127, src, kind);
       if (isnew)
          stat_add(t, glu);
       hist_refresh_current(prime);
@@ -3180,7 +3259,7 @@ static int pull_import(const char *body)
       if (isnew) {
          /* Durable, so the stats survive a restart -- stat_load rebuilds
           * them from this very file. */
-         store_append(t, glu, 127, 0, 0, src, t, g_tz_off, KIND_CGM, 1000);
+         store_append(t, glu, 127, 0, 0, src, t, g_tz_off, kind, 1000);
          added++;
       }
    }
@@ -3197,7 +3276,34 @@ static int pull_import(const char *body)
 static long g_rem_next; /* earliest next attempt */
 static long g_rem_seen; /* log size when we last looked */
 
+static int g_sync_busy; /* single-flight guard; see pancra_remote_sync */
+static void remote_sync_locked(void);
+
+/* SINGLE-FLIGHT, because this runs on TWO threads.
+ *
+ * The activity's 1 Hz on_timer and the service's tick thread both drive the
+ * sync, and the Java-side sBusy flag does not serialise them: remoteBusy() is
+ * polled at the top while sBusy is not set until remoteBatch/remoteRange is
+ * actually entered, and the whole batch build -- three open/lseek/read cycles
+ * into one SHARED static body[] -- sits in between. Two threads inside that
+ * window fill the same buffer from different file offsets, so the POST can
+ * carry a spliced line: a fabricated <epoch> <mg/dL> pair stored as a real
+ * reading, after which the acknowledged offset advances past data that was
+ * never correctly sent. Every other function reachable from both callers
+ * already has such a guard (g_notify_busy, g_reconcile_busy, alarm_lock, the
+ * atomic on last_kick); this one was the exception.
+ *
+ * Skipping rather than waiting is right: the loser has nothing to contribute,
+ * and the next tick is at most REMOTE_GAP away. */
 void pancra_remote_sync(void)
+{
+   if (__atomic_exchange_n(&g_sync_busy, 1, __ATOMIC_SEQ_CST))
+      return;
+   remote_sync_locked();
+   __atomic_store_n(&g_sync_busy, 0, __ATOMIC_SEQ_CST);
+}
+
+static void remote_sync_locked(void)
 {
    if (!g_remote_on || !g_remote_ip[0] || !g_ble || !m_remote_busy)
       return;
@@ -3482,7 +3588,12 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
       mg_dl = rescale_apply(mg_dl, rpm);
    int prime = sensor_primary_id();
    hist_lock();
-   int isnew = hist_insert(t, mg_dl, trend, src, KIND_CGM);
+   /* THIS sensor's previous value, captured BEFORE the insert (afterwards the
+    * newest sample from src is the one being added) and under the same lock
+    * that protects g_hist. Feeds the CHIRP pitch below; -1 means this source
+    * has no earlier sample, which chirps at the plain BEEP pitch. */
+   int prev_glu = hist_prev_glu(t, src);
+   int isnew    = hist_insert(t, mg_dl, trend, src, KIND_CGM);
    if (isnew) {
       /* Any non-zero result, matching what store_append persists below -- see
        * store.h. Gating on HIST_NEW alone made TIR and the average change
@@ -3527,10 +3638,21 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    }
    LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
-   /* NEW DATAPOINT beep: a genuinely new sample from the PRIMARY CGM only, so a
-    * secondary sensor or a backfilled/duplicate reading does not chirp. */
-   if (isnew && g_newdata_beep && src == prime)
-      dexble_beep();
+   /* NEW DATAPOINT alert: a genuinely new sample from the PRIMARY CGM only, so
+    * a secondary sensor or a backfilled/duplicate reading stays silent.
+    *
+    * CHIRP pitches on the change since THIS sensor's own previous sample.
+    * Never against another CGM's: with two sensors worn at once their
+    * difference is the calibration offset between two devices, and pitching
+    * on it would announce swings the wearer never had. With no previous
+    * sample of its own (a fresh session) the delta is 0, which is exactly the
+    * BEEP tone -- the honest sound for "no change known yet". */
+   if (isnew && src == prime) {
+      if (g_newdata_mode == ND_BEEP)
+         dexble_beep();
+      else if (g_newdata_mode == ND_CHIRP)
+         dexble_chirp(chirp_semitone10(prev_glu >= 0 ? mg_dl - prev_glu : 0));
+   }
 
    /* Alarm evaluation is deliberately NOT done here.
     *
@@ -4676,7 +4798,9 @@ static void menu_action(int action)
       settings_save();
       apply_screen_on(); /* takes effect immediately, not on menu close */
    } else if (action == MA_NEWDATA) {
-      g_newdata_beep = !g_newdata_beep;
+      /* OFF -> BEEP -> CHIRP -> OFF. A cycle, not a toggle, since CHIRP
+       * joined: the row shows which of the three is active. */
+      g_newdata_mode = (g_newdata_mode + 1) % 3;
       settings_save();
    }
    /* --- sensor registry --- */
@@ -5122,10 +5246,7 @@ static void menu_action(int action)
       g_kp_return = MENU_DISPLAY; /* PLOT MAX now lives on DISPLAY */
       g_entrylen  = 0;
    } else if (action >= 100 && action <= 109) { /* digit */
-      /* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted
-       * quad's 15; port = 5. Keep in step with ui.c's slots_for. */
-      static const int caps[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
-      int cap = caps[(g_kp_mode >= 0 && g_kp_mode < 12) ? g_kp_mode : 0];
+      int cap = ui_kp_slots(g_kp_mode);
       if (g_entrylen < cap)
          g_entry[g_entrylen++] = (char)('0' + (action - 100));
    } else if (action == MA_DOT) {

@@ -334,7 +334,11 @@ void fmt_dur(long seconds, char *out, int n)
  * standard 0xAARRGGBB, which swaps red and blue: BLUE rendered orange, AMBER
  * rendered blue, etc. Encoded correctly (R and B swapped) they now match their
  * names. */
-static const uint32_t ui_sensor_colors[7] = {
+/* One constant, so the two tables and the two guards below cannot drift:
+ * a colour index comes from a settings file the user can hand-edit, and a
+ * table that outgrew its guard would read past its end. */
+#define UI_NCOLORS 7
+static const uint32_t ui_sensor_colors[UI_NCOLORS] = {
     0xFF88FF33 /* GREEN */,
     0xFFFFAA44 /* BLUE */,
     0xFF44CCFF /* AMBER */,
@@ -342,7 +346,7 @@ static const uint32_t ui_sensor_colors[7] = {
     0xFFEEFF66 /* CYAN */,
     0xFFFF88BB /* VIOLET */,
     0xFFFFFFFF /* WHITE -- the default primary-trace colour */};
-static const char *const ui_color_names[7] = {
+static const char *const ui_color_names[UI_NCOLORS] = {
     "GREEN", "BLUE", "AMBER", "PINK", "CYAN", "VIOLET", "WHITE"};
 /* Indexed by the (frozen) enum value. */
 static const char *const ui_marker_names[MARK_N] = {
@@ -357,14 +361,14 @@ static const int ui_marker_order[UI_NMARKERS] = {
 
 uint32_t ui_sensor_color(int color)
 {
-   if (color < 0 || color > 6)
+   if (color < 0 || color >= UI_NCOLORS)
       color = 0;
    return ui_sensor_colors[color];
 }
 
 const char *ui_color_name(int color)
 {
-   if (color < 0 || color > 6)
+   if (color < 0 || color >= UI_NCOLORS)
       color = 0;
    return ui_color_names[color];
 }
@@ -898,7 +902,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       draw_icon(px, fb, ax + (6 * sc), y, sc, icon_vibrate, gy);
    if (m->disc)
       draw_icon(px, fb, ax + (12 * sc), y, sc, icon_nolink, gy);
-   if (m->newdata_beep)
+   if (m->newdata_mode)
       draw_icon(px, fb, ax + (18 * sc), y, sc, icon_dot, gy);
    ax += icon_w + g;
    int al_y = y - (3 * sc);
@@ -1384,7 +1388,10 @@ static void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
 static const char *ui_orient_lbl[] = {"PORTRAIT", "LANDSCAPE", "GRAVITY",
                                       "SYSTEM"};
 static const char *ui_disc_lbl[]   = {"OFF", "10 MIN", "30 MIN", "60 MIN"};
-static const char *ui_perm_lbl[]   = {"BT SCAN", "BT CONNECT", "NOTIFY"};
+/* Indexed by ND_OFF / ND_BEEP / ND_CHIRP. */
+static const char *ui_newdata_lbl[] = {"OFF", "BEEP", "CHIRP"};
+
+static const char *ui_perm_lbl[] = {"BT SCAN", "BT CONNECT", "NOTIFY"};
 
 /* App-Standby bucket -> short label. */
 static const char *ui_bucket_label(int b)
@@ -1477,7 +1484,7 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
          draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
       if (m->disc)
          draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, 0xFF888888);
-      if (m->newdata_beep)
+      if (m->newdata_mode)
          draw_icon(px, fb, iax + (18 * sc), y, sc, icon_dot, 0xFF888888);
    }
    y += 2 * lh;
@@ -1715,8 +1722,9 @@ static void render_alarm(struct ANativeWindow_Buffer *fb,
    menu_row(fb, h, y, sc, lh, "DISCONNECT", ui_disc_lbl[(unsigned)m->disc & 3U],
             m->disc ? 0xFF33FF88 : 0xFFFFFFFF, MA_DISC);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT", m->newdata_beep ? "BEEP" : "OFF",
-            m->newdata_beep ? 0xFF33FF88 : 0xFFFFFFFF, MA_NEWDATA);
+   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
+            ui_newdata_lbl[(unsigned)m->newdata_mode % 3U],
+            m->newdata_mode ? 0xFF33FF88 : 0xFFFFFFFF, MA_NEWDATA);
 }
 
 /* ---- EXPORT DATA menu (opened from SETTINGS' EXPORT DATA button) ---- */
@@ -1852,13 +1860,13 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
                           const struct screen *m, struct hits *h)
 {
    uint32_t *px = fb->bits;
-   /* 25 rows: title (2) + three double-pitch setting rows (6) + the two
-    * report rows (3) + the transport note (4) + the API reference (9) +
+   /* 26 rows: title (2) + three double-pitch setting rows (6) + the two
+    * report rows (3) + the transport note (4) + the API reference (10) +
     * margin. This number only sizes the FONT (ui_fit_scale divides the
     * height by it), and it falls off a cliff -- 31 rows still renders at
     * scale 3 on a 720x1600 phone, 32 drops to 2 and the whole screen goes
     * tiny. Claim what the content actually needs, not more. */
-   int sc  = ui_fit_scale(fb->width, fb->height, 25);
+   int sc  = ui_fit_scale(fb->width, fb->height, 26);
    int tsc = 2 * sc;
    int lh  = 16 * sc;
    int x   = 4 * sc;
@@ -1935,21 +1943,22 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
 
    /* The exact wire protocol, for anyone pointing their own server here
-    * (kept in step with glucoserve.c). Only glyphs the 5x7 font has:
-    * A-Z 0-9 - : . / ( ) , -- no quotes, and no < > (those glyphs are
-    * the backspace/marker arrows). */
-   static const char *const api[9] = {
+    * (kept in step with glucoserve's store). Only glyphs the 5x7 font
+    * has: A-Z 0-9 - : . / ( ) , -- no quotes, and no < > (those glyphs
+    * are the backspace/marker arrows). */
+   static const char *const api[10] = {
        "REST API:",
        "",
        "GET /API/LAST  - THE CURSOR:",
        "  NEWEST STORED TIME, PER SET",
        "POST /GLUCOSE  - PER LINE:",
-       "  (EPOCH) (MGDL)",
+       "  (EPOCH) (MGDL) (TYPE)",
+       "  TYPE: 0 CGM, 1 FINGERSTICK",
        "POST /UNITS  - PER LINE:",
        "  (EPOCH) (0 SLOW/1 FAST) (U)",
        "  100 LINES PER MINUTE, MAX",
    };
-   for (int i = 0; i < 9; i++) {
+   for (int i = 0; i < 10; i++) {
       draw_str(px, fb, x, y, sc, api[i], 0xFF888888);
       y += lh;
    }
@@ -3125,8 +3134,6 @@ static void render_olddev(struct ANativeWindow_Buffer *fb,
 /* ---- MARKER / COLOR pickers: a full list of options, each with a live glyph,
  * so the user sees every choice before selecting. The title row returns to the
  * device's own menu (MA_SENSOR + its slot). ---- */
-#define UI_NCOLORS 7 /* ui_sensor_colors[] entries */
-
 static void render_markpick(struct ANativeWindow_Buffer *fb,
                             const struct screen *m, struct hits *h)
 {
@@ -3247,6 +3254,14 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
 
 const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
 #define UI_LABEL_COLS 6
+
+/* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted quad's
+ * 15; port = 5. Index is struct screen's kp_mode. */
+int ui_kp_slots(int mode)
+{
+   static const int slots_for[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
+   return slots_for[(mode >= 0 && mode < 12) ? mode : 0];
+}
 
 int ui_label_nchars(void)
 {
@@ -3486,9 +3501,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
     * the 4 code digits; the remote IP gets a full dotted quad's 15 slots and
     * the remote port a TCP port's 5. dsc is sized for the widest label so the
     * field -- and the keypad below -- is identical across modes. */
-   static const int slots_for[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
-   int nslots =
-       slots_for[(m->kp_mode >= 0 && m->kp_mode < 12) ? m->kp_mode : 0];
+   int nslots = ui_kp_slots(m->kp_mode);
    /* glucose entries carry the unit label: plot max / cal / rescale and the
     * two alarm thresholds */
    int has_unit   = (m->kp_mode >= 1 && m->kp_mode <= 3) || m->kp_mode == 10 ||
@@ -3496,10 +3509,17 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    const char *en = m->entry ? m->entry : "";
    char shown[24];
    int k = 0;
-   for (int i = 0; i < nslots; i++) /* typed digits, then '_' for empty slots */
-      shown[k++] = *en ? *en++ : '_';
-   if (has_unit)
-      k += snprintf(shown + k, sizeof shown - k, " %s", UI_LBL(m->units));
+   /* Both bounds are belt-and-braces: the widest mode is 15 slots plus
+    * " MMOL/L". snprintf returns what it WOULD have written, so an unclamped
+    * k would index past `shown` the moment a longer unit or a wider keypad
+    * appeared -- a silent stack overrun for a one-character change. */
+   for (int i = 0; i < nslots && k < (int)sizeof shown - 1; i++)
+      shown[k++] = *en ? *en++ : '_'; /* typed digits, then '_' for the rest */
+   if (has_unit) {
+      int w = snprintf(shown + k, sizeof shown - k, " %s", UI_LBL(m->units));
+      if (w > 0)
+         k += (w < (int)sizeof shown - k) ? w : (int)sizeof shown - k - 1;
+   }
    shown[k] = 0;
    /* Size the field from what is actually shown ("___ MMOL/L" = 10 cells, the
     * 15-slot IP is wider still), so no mode overflows the margins. */

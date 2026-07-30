@@ -289,11 +289,42 @@ public final class PancraService extends Service {
              * Looper dispatch -> uncaught handler -> the PROCESS IS KILLED.
              * That process holds the CGM connection and the alarm, so a service
              * teardown could take the alarm down with it. */
+            /* The reschedule is in a FINALLY, not merely inside the try.
+             *
+             * Inside the try it was skipped whenever Ble.onTick() threw, and
+             * one throw was permanent: startTicking() returns early while
+             * `tick` is non-null, so nothing ever re-armed the heartbeat. The
+             * service then kept its notification and wakelock while no longer
+             * evaluating the alarm at all -- with the activity gone, that is
+             * the exact hypo-decoded-but-never-sounded case this heartbeat
+             * exists to prevent. UnsatisfiedLinkError from a native-less
+             * process (see onStartCommand) is the realistic first throw.
+             *
+             * `tick` is still read ONCE, which is what keeps onDestroy's null
+             * from escaping run() as an NPE and killing the process. */
+            boolean noNative = false;
             try {
                 Ble.onTick();
-                android.os.Handler h = tick;   /* read once */
-                if (h != null) h.postDelayed(this, TICK_MS);
-            } catch (Throwable t) { Log.i("pancra", "tick: " + t); }
+            } catch (UnsatisfiedLinkError e) {
+                /* libpancra is loaded by the NativeActivity's android.app.lib_name
+                 * and by nothing else, so in a process started WITHOUT the
+                 * activity there is no native code to tick. Such a service can
+                 * never raise or silence an alarm; the honest move is the same
+                 * one the i == null branch makes -- stop, rather than sit there
+                 * showing a "Reading glucose" notification and holding a
+                 * wakelock while monitoring nothing. */
+                noNative = true;
+                Log.i("pancra", "tick: no native in this process, stopping");
+            } catch (Throwable t) {
+                Log.i("pancra", "tick: " + t);
+            } finally {
+                if (noNative) {
+                    stopSelf();
+                } else {
+                    android.os.Handler h = tick;   /* read once */
+                    if (h != null) h.postDelayed(this, TICK_MS);
+                }
+            }
         }
     };
 

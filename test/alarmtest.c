@@ -55,11 +55,32 @@ int main(void)
    ck(alarm_java_kind(alarm_want(0, 1)) == 2, "STALE-> java kind 2");
    ck(alarm_java_kind(AL_NONE) < 0, "silence never actuates a kind");
 
-   printf("== zone: thresholds are exclusive at the boundary ==\n");
+   printf("== zone: thresholds are inclusive at the boundary ==\n");
    ck(alarm_zone(69, now, now, lo, hi) == 1, "69 with low=70 is LOW");
-   ck(alarm_zone(70, now, now, lo, hi) == 0, "70 with low=70 is in range");
-   ck(alarm_zone(180, now, now, lo, hi) == 0, "180 with high=180 is in range");
+   ck(alarm_zone(70, now, now, lo, hi) == 1, "70 AT low=70 is already LOW");
+   ck(alarm_zone(71, now, now, lo, hi) == 0, "71 with low=70 is in range");
+   ck(alarm_zone(179, now, now, lo, hi) == 0, "179 with high=180 is in range");
+   ck(alarm_zone(180, now, now, lo, hi) == 2,
+      "180 AT high=180 is already HIGH");
    ck(alarm_zone(181, now, now, lo, hi) == 2, "181 with high=180 is HIGH");
+
+   printf("== CHIRP pitch: direction, rate, and a hard cap ==\n");
+   /* The audible contract: no change sounds exactly like BEEP, a rise bends
+    * up and a fall bends down, and no excursion however violent can bend
+    * further than CHIRP_MAX_ST -- the alert has to stay a recognisable tone. */
+   ck(chirp_semitone10(0) == 0, "no change is the plain BEEP pitch");
+   ck(chirp_semitone10(2) == 10, "+2 mg/dL is one semitone up");
+   ck(chirp_semitone10(-2) == -10, "-2 mg/dL is one semitone down");
+   ck(chirp_semitone10(1) == 5, "an odd delta keeps its half semitone");
+   ck(chirp_semitone10(-1) == -5, "...in both directions");
+   ck(chirp_semitone10(10) == CHIRP_MAX_ST * 10, "+10 mg/dL reaches the cap");
+   ck(chirp_semitone10(-10) == -CHIRP_MAX_ST * 10, "-10 reaches it too");
+   ck(chirp_semitone10(400) == CHIRP_MAX_ST * 10, "a wild rise stays capped");
+   ck(chirp_semitone10(-400) == -CHIRP_MAX_ST * 10, "a wild fall likewise");
+   ck(chirp_semitone10(11) == chirp_semitone10(10),
+      "past the cap the pitch stops moving");
+   ck(chirp_semitone10(-3) < 0 && chirp_semitone10(3) > 0,
+      "sign follows the direction of travel");
 
    printf("== zone DECAYS with staleness (it must never latch) ==\n");
    /* A sensor dropping out while low used to leave the zone latched at LOW.
