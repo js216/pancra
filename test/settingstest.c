@@ -73,6 +73,30 @@ static void put(const char *path, const char *text)
 
 int main(void)
 {
+   /* FIRST, before paths() and before anything below mutates a global: these
+    * are the compiled defaults, i.e. exactly what a fresh install gets, and
+    * they are only observable here while they are still untouched. */
+   printf("== fresh-install defaults: two NESTED bands ==\n");
+   ck(g_alarm_low == 70 && g_alarm_high == 300,
+      "the alarm defaults to 70/300 -- the conservative 'act now' band");
+   ck(g_nudge_low == 85 && g_nudge_high == 250,
+      "the nudge defaults to 85/250 -- the early 'have a look' band");
+   /* THE INVARIANT, and the reason the feature exists. The nudge must sit
+    * OUTSIDE the alarm: a nudge inside the alarm band can never fire first,
+    * because nudge_fire suppresses it whenever an alarm is sounding, so the
+    * user would be back to editing the alarm threshold day to day -- the habit
+    * whose failure mode is an alarm left parked where it can no longer help.
+    * Stated as a relation, not as four literals, so it keeps meaning something
+    * if the numbers are ever retuned. */
+   ck(g_nudge_low >= g_alarm_low,
+      "the nudge LOW is at or above the alarm's, so it warns FIRST on the way "
+      "down");
+   ck(g_nudge_high <= g_alarm_high, "...and its HIGH at or below, likewise");
+   ck(g_nudge_low <= g_nudge_high && g_alarm_low <= g_alarm_high,
+      "and neither pair is inverted (an inverted pair latches both ends)");
+   ck(g_nudge_sound && g_nudge_vib,
+      "both nudge outputs are on, or the armed band would be silent");
+
    paths();
 
    printf("== alarm thresholds round-trip ==\n");
@@ -166,6 +190,60 @@ int main(void)
    alarm_load();
    ck(g_alarm_low == 88 && g_alarm_high == 199, "non-numeric changes nothing");
 
+   printf("== nudge thresholds share the alarm file ==\n");
+   g_alarm_low  = 75;
+   g_alarm_high = 210;
+   g_nudge_low  = 100;
+   g_nudge_high = 190;
+   alarm_save();
+   g_alarm_low = g_alarm_high = g_nudge_low = g_nudge_high = 0;
+   alarm_load();
+   ck(g_alarm_low == 75 && g_alarm_high == 210 && g_nudge_low == 100 &&
+          g_nudge_high == 190,
+      "all four thresholds round-trip");
+
+   /* THE BACK-COMPAT CASE, and it is not hypothetical: every alarm file on
+    * every phone running a build before this one has exactly two fields. If a
+    * missing nudge pair rejected the whole file, the user's ALARM thresholds
+    * would silently revert to the compiled defaults on the first launch after
+    * the update -- the precise failure the lo<=hi comment above describes. */
+   g_alarm_low  = 88;
+   g_alarm_high = 199;
+   g_nudge_low  = 111;
+   g_nudge_high = 222;
+   put(g_alarm_path, "80 250\n");
+   alarm_load();
+   ck(g_alarm_low == 80 && g_alarm_high == 250,
+      "a two-field (pre-nudge) file still loads its alarm pair");
+   ck(g_nudge_low == 111 && g_nudge_high == 222,
+      "...and leaves the nudge pair untouched");
+
+   /* The nudge pair is checked by the SAME rules, and independently: a bad
+    * nudge must not take a good alarm down with it, or vice versa. */
+   g_nudge_low  = 111;
+   g_nudge_high = 222;
+   put(g_alarm_path, "80 250 190 100\n");
+   alarm_load();
+   ck(g_alarm_low == 80 && g_alarm_high == 250,
+      "an inverted nudge pair does not reject the alarm pair");
+   ck(g_nudge_low == 111 && g_nudge_high == 222, "...but is itself refused");
+   put(g_alarm_path, "80 250 100 1000\n");
+   alarm_load();
+   ck(g_nudge_low == 111 && g_nudge_high == 222,
+      "an over-range nudge is refused, like the alarm's own bound");
+   put(g_alarm_path, "80 250 0 999\n");
+   alarm_load();
+   ck(g_nudge_low == 0 && g_nudge_high == 999,
+      "0 / AL_ENTRY_MAX -- the nudge's OFF switch -- IS accepted");
+   /* A nudge INSIDE the alarm band is pointless (the alarm suppresses it) but
+    * must still load: refusing it would silently revert a threshold the user
+    * chose, and would block the legitimate order of operations when moving
+    * both. */
+   put(g_alarm_path, "100 200 40 400\n");
+   alarm_load();
+   ck(g_nudge_low == 40 && g_nudge_high == 400,
+      "a nudge inside the alarm band loads unchanged");
+
    printf("== settings round-trip and clamping ==\n");
    g_sound_on  = 1;
    g_vib_on    = 0;
@@ -188,6 +266,34 @@ int main(void)
    ck(g_disc >= 0 && g_disc < 4, "a corrupt DISCONNECT index is clamped");
    ck(g_plot_max >= 100 && g_plot_max <= 400,
       "a corrupt plot maximum falls back into range");
+
+   printf("== the nudge's own outputs round-trip, and survive old files ==\n");
+   /* They are the LAST two fields, which is exactly where a save buffer too
+    * small for the format silently drops them: clampn writes the prefix, the
+    * loader parses what it finds and stops, and the tail reverts to its
+    * default on every launch with nothing to show for it. Round-tripping the
+    * last field is what proves the line was written whole. */
+   g_nudge_sound = 0;
+   g_nudge_vib   = 1;
+   g_sound_on    = 1;
+   g_vib_on      = 1;
+   settings_save();
+   g_nudge_sound = g_nudge_vib = 9;
+   settings_load();
+   ck(g_nudge_sound == 0 && g_nudge_vib == 1,
+      "the nudge's sound and vibration round-trip independently");
+   ck(g_sound_on == 1 && g_vib_on == 1,
+      "...without disturbing the ALARM's own pair");
+   /* Every settings.cfg already on a phone stops at field 16. Those files must
+    * keep loading, leaving the two new fields at their ON defaults -- the same
+    * append rule the format has always documented. */
+   g_nudge_sound = 1;
+   g_nudge_vib   = 1;
+   put(g_settings_path, "1 1 0 0 0 300 1 2 1 6 2 1 1 2 1 1\n");
+   settings_load();
+   ck(g_nudge_sound == 1 && g_nudge_vib == 1,
+      "a 16-field (pre-nudge) file leaves both at their defaults");
+   ck(g_newdata_mode == 2, "...while still loading every field it does have");
 
    printf("== the pairing code accepts only digits ==\n");
    put(g_code_path, "12ab34\n");

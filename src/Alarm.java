@@ -87,6 +87,55 @@ public final class Alarm {
      * waveform to near-zero, so the click was never the waveform; it was the
      * cut. Padding means whatever the release truncates is silence. */
     private static final int CHIRP_PAD_MS = 40;
+    /* The chirp currently playing (or the last one). Strongly held so the GC
+     * cannot finalize a track mid-note; released when the next chirp starts. */
+    private static android.media.AudioTrack chirpTrack;
+
+    /* Build a one-shot AudioTrack over `pcm`, start it, and return it so the
+     * caller can park it in a static field.
+     *
+     * Shared by chirp() and nudge() because it carries two lessons that cost
+     * real debugging and must not be re-learned per call site:
+     *
+     * (1) THE CALLER MUST HOLD THE RETURNED TRACK IN A STATIC FIELD. The
+     *     framework keeps only a WeakReference, so a local is not enough: a GC
+     *     during playback can finalize the track mid-note.
+     * (2) NOTHING IS RELEASED HERE. Releasing at a write/marker boundary cuts
+     *     the tail by the output latency -- a few ms on the speaker, but
+     *     150-250 ms over A2DP, enough to swallow a whole short motif. Each
+     *     caller releases its PREVIOUS track when the next one starts, so
+     *     playback is never interrupted and at most one track is alive.
+     *
+     * USAGE_MEDIA, i.e. STREAM_MUSIC -- the SAME stream the beep's
+     * ToneGenerator uses, and the reason the beep was audible when the first
+     * chirp was not. USAGE_ASSISTANCE_SONIFICATION routes to STREAM_SYSTEM,
+     * which is aliased to STREAM_RING and therefore muted outright whenever
+     * the phone is on silent or vibrate. These alerts are ambient companions
+     * to the reading, not ringer events. (The glucose alarm is different and
+     * stays on USAGE_ALARM, which silent mode does not touch.) */
+    private static android.media.AudioTrack playPcm(short[] pcm, int rate, String what) {
+        android.media.AudioTrack tr = new android.media.AudioTrack.Builder()
+            .setAudioAttributes(new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+            .setAudioFormat(new android.media.AudioFormat.Builder()
+                .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(rate)
+                .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).build())
+            .setBufferSizeInBytes(pcm.length * 2)
+            .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+            .build();
+        int wrote = tr.write(pcm, 0, pcm.length);
+        if (wrote < pcm.length) {
+            /* A short or failed load would play silence (or a fragment) while
+             * still holding a mixer track. Say so and drop it. */
+            Log.i("pancra", what + ": short write " + wrote + " of " + pcm.length);
+            tr.release();
+            return null;
+        }
+        tr.play();
+        return tr;
+    }
 
     public static synchronized void chirp(Context ctx, int st10) {
         try {
@@ -107,42 +156,106 @@ public final class Alarm {
                     a = 0.5 - (0.5 * Math.cos((Math.PI * (tone - i)) / fade));
                 pcm[i] = (short) (Math.sin(phase) * a * 26000);
             }
-            /* USAGE_MEDIA, i.e. STREAM_MUSIC -- the SAME stream the beep's
-             * ToneGenerator uses, and the reason the beep is audible when
-             * this was not. USAGE_ASSISTANCE_SONIFICATION routes to
-             * STREAM_SYSTEM, which is aliased to STREAM_RING and therefore
-             * muted outright whenever the phone is on silent or vibrate: the
-             * chirp was being synthesised and played correctly into a stream
-             * at volume zero. The NEW DATAPOINT alert is an ambient
-             * companion to the reading, not a ringer event, so it belongs on
-             * the media stream with the beep it replaces. (The glucose alarm
-             * is different and stays on USAGE_ALARM, which silent mode does
-             * not touch.) */
-            android.media.AudioTrack tr = new android.media.AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
-                .setAudioFormat(new android.media.AudioFormat.Builder()
-                    .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(rate)
-                    .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).build())
-                .setBufferSizeInBytes(n * 2)
-                .setTransferMode(android.media.AudioTrack.MODE_STATIC)
-                .build();
-            tr.write(pcm, 0, n);
-            tr.setNotificationMarkerPosition(n);
-            /* Release when the tone has actually finished. Releasing inline
-             * would cut it off mid-note; leaking it would burn one of the
-             * device's finite AudioTrack slots on every datapoint. */
-            tr.setPlaybackPositionUpdateListener(
-                new android.media.AudioTrack.OnPlaybackPositionUpdateListener() {
-                    @Override public void onMarkerReached(android.media.AudioTrack t) {
-                        try { t.release(); } catch (Throwable x) {}
-                    }
-                    @Override public void onPeriodicNotification(android.media.AudioTrack t) {}
-                });
-            tr.play();
+            android.media.AudioTrack tr = playPcm(pcm, rate, "chirp");
+            if (tr == null) return;
+            /* Release the PREVIOUS track, never this one -- see playPcm. At
+             * most one track is alive at a time (datapoints are ~5 minutes
+             * apart), so nothing accumulates. */
+            if (chirpTrack != null) {
+                try { chirpTrack.release(); } catch (Throwable x) {}
+            }
+            chirpTrack = tr;
         } catch (Throwable t) { Log.i("pancra", "chirp: " + t); }
+    }
+
+    /* NUDGE: the one-time heads-up on the wider threshold band (alarmlogic.h).
+     *
+     * It has to be unmistakably NOT the other two sounds, and unmistakably not
+     * the alarm, because the whole point is that the user can hear it and
+     * decide it does not matter:
+     *
+     *   vs BEEP/CHIRP -- those are ONE 200 ms note at 1200 Hz. This is TWO
+     *     notes, an octave lower, with a gap between them and half again the
+     *     duration. Different pitch, different rhythm, different length: no
+     *     amount of distance or pocket muffling makes them the same event.
+     *   vs the ALARM -- that is the system alarm ringtone, looping at full
+     *     USAGE_ALARM volume until it is dismissed. This is one soft motif at
+     *     roughly two thirds the chirp's amplitude and then silence. It asks
+     *     for a glance, not for action.
+     *
+     * The two notes FALL for a low crossing and RISE for a high one, the same
+     * direction convention CHIRP uses, so which threshold was crossed is
+     * audible without looking.
+     *
+     * The vibration is a single short double-buzz, NOT the alarm's repeating
+     * 600/400 waveform, and it is not cancelled afterwards because it never
+     * repeats -- a one-shot cannot be left running. It deliberately does not
+     * cancel any alarm vibration either: nudge_fire suppresses the nudge while
+     * an alarm is active, so the two cannot overlap.
+     *
+     * `sound` and `vibrate` are the NUDGE's own settings, not the alarm's --
+     * see settings.h. They are honoured independently and each in its own try
+     * block, for the same reason trigger() is staged: a throw from one must
+     * not be able to suppress the other.
+     *
+     * kind: 0 = crossed the nudge LOW, 1 = crossed the nudge HIGH. */
+    private static final int NUDGE_NOTE_MS = 150;
+    private static final int NUDGE_GAP_MS = 70;
+    private static final int NUDGE_PAD_MS = 40;   /* see CHIRP_PAD_MS */
+    private static final double NUDGE_HI_HZ = 740.0;
+    private static final double NUDGE_LO_HZ = 554.0;
+    private static final int NUDGE_AMP = 17000;   /* softer than the chirp */
+    private static android.media.AudioTrack nudgeTrack;
+
+    /* One enveloped sine note written into pcm[off..off+n). The raised-cosine
+     * fade on each end is what keeps the note from clicking; the chirp learned
+     * that the same way. */
+    private static void note(short[] pcm, int off, int n, double hz, int rate) {
+        int fade = rate / 125;                    /* 8 ms of ramp each end */
+        double phase = 0;
+        for (int i = 0; i < n; i++) {
+            phase += (2.0 * Math.PI * hz) / rate;
+            double a = 1.0;
+            if (i < fade) a = 0.5 - (0.5 * Math.cos((Math.PI * i) / fade));
+            else if (i > n - fade)
+                a = 0.5 - (0.5 * Math.cos((Math.PI * (n - i)) / fade));
+            pcm[off + i] = (short) (Math.sin(phase) * a * NUDGE_AMP);
+        }
+    }
+
+    public static synchronized void nudge(Context ctx, int kind,
+                                          boolean sound, boolean vibrate) {
+        try {
+            if (sound) {
+                final int rate = 22050;
+                int nn = (rate * NUDGE_NOTE_MS) / 1000;
+                int ng = (rate * NUDGE_GAP_MS) / 1000;
+                int pad = (rate * NUDGE_PAD_MS) / 1000;
+                short[] pcm = new short[(2 * nn) + ng + pad]; /* gap+tail stay 0 */
+                double first = (kind == 0) ? NUDGE_HI_HZ : NUDGE_LO_HZ;
+                double second = (kind == 0) ? NUDGE_LO_HZ : NUDGE_HI_HZ;
+                note(pcm, 0, nn, first, rate);
+                note(pcm, nn + ng, nn, second, rate);
+                android.media.AudioTrack tr = playPcm(pcm, rate, "nudge");
+                if (tr != null) {
+                    if (nudgeTrack != null) {
+                        try { nudgeTrack.release(); } catch (Throwable x) {}
+                    }
+                    nudgeTrack = tr;
+                }
+            }
+        } catch (Throwable t) { Log.i("pancra", "nudge (sound): " + t); }
+
+        try {
+            Context app = ctx.getApplicationContext();
+            Vibrator v = app.getSystemService(Vibrator.class);
+            /* -1 = play once. NOT 0, which repeats forever: this method has no
+             * counterpart to cancel it, so a repeating waveform here would
+             * buzz until the process died. */
+            if (vibrate && v != null && v.hasVibrator())
+                v.vibrate(VibrationEffect.createWaveform(
+                    new long[]{0, 90, 110, 90}, -1));
+        } catch (Throwable t) { Log.i("pancra", "nudge (vibrate): " + t); }
     }
 
     private static void ensureChannel(NotificationManager nm) {

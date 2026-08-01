@@ -83,6 +83,10 @@ void dexble_beep(void); /* one short NEW DATAPOINT beep */
 /* One NEW DATAPOINT chirp, pitch-bent by `st10` tenths of a semitone
  * (chirp_semitone10); 0 is the beep's own pitch. */
 void dexble_chirp(int st10);
+/* One NUDGE: a single two-note motif plus a short buzz, descending for a low
+ * crossing and rising for a high one. `kind` is 0 low, 1 high; `sound` and
+ * `vibrate` are the nudge's own outputs, independent of the alarm's. */
+void dexble_nudge(int kind, int sound, int vibrate);
 int dexble_alarm_silence(void);
 
 #endif

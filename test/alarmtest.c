@@ -357,6 +357,94 @@ int main(void)
       ck(alarm_zone_merge(2, 1) == 1, "...in either order");
    }
 
+   printf("== nudge: the one-time heads-up on the wider band ==\n");
+   {
+      const long t = 1000;
+      /* Thresholds chosen the way the feature is meant to be used: the nudge
+       * OUTSIDE the alarm. Alarm 70/300, nudge 100/200. */
+      ck(nudge_zone(120, t, t, 100, 200) == NG_NONE, "in the middle: nothing");
+      ck(nudge_zone(100, t, t, 100, 200) == NG_LOW,
+         "AT the low threshold counts, exactly as the alarm does");
+      ck(nudge_zone(200, t, t, 100, 200) == NG_HIGH, "...and at the high one");
+      ck(nudge_zone(99, t, t, 100, 200) == NG_LOW, "below is low");
+      ck(nudge_zone(201, t, t, 100, 200) == NG_HIGH, "above is high");
+      ck(nudge_zone(-1, t, t, 100, 200) == -1, "no reading is UNKNOWN, not 0");
+      ck(nudge_zone(120, t, t + AL_FRESH_S, 100, 200) == NG_NONE,
+         "a reading right at the freshness edge still counts");
+      ck(nudge_zone(120, t, t + AL_FRESH_S + 1, 100, 200) == -1,
+         "one second past it is UNKNOWN, not in-range");
+      /* THE DROPOUT RULE, and why it is -1 rather than 0. If staleness read as
+       * "in range" the latch would clear, and the next reading back would
+       * re-announce a crossing the user already heard -- once per dropout, all
+       * day, on a flaky link. */
+      ck(nudge_next(-1, NG_LOW) == NG_LOW, "a dropout HOLDS the latch");
+      ck(nudge_next(NG_NONE, NG_LOW) == NG_NONE,
+         "a genuine return to range clears it");
+      ck(nudge_next(NG_HIGH, NG_LOW) == NG_HIGH, "a new band replaces it");
+
+      /* Edge-triggered: the crossing sounds, the state does not. */
+      ck(nudge_fire(NG_LOW, 0, NG_NONE) == NG_LOW, "crossing in fires");
+      ck(nudge_fire(NG_LOW, 0, NG_LOW) == NG_NONE,
+         "staying below does NOT fire again -- the whole point of a nudge is "
+         "that it can be ignored, and an ignorable sound that repeats is worse "
+         "than none");
+      ck(nudge_fire(NG_NONE, 0, NG_LOW) == NG_NONE,
+         "returning to range is silent");
+      ck(nudge_fire(-1, 0, NG_NONE) == NG_NONE,
+         "an unknown reading never fires");
+      ck(nudge_fire(NG_HIGH, 0, NG_LOW) == NG_HIGH,
+         "crossing straight from low to high fires the new direction");
+
+      /* Suppression under the alarm. The second argument is "the alarm is
+       * announcing SOMETHING", not this tick's zone -- see nudge_fire. The
+       * caller folds in the imminent-hypo override and the committed level,
+       * which is how a nudge is kept off the back of an unsilenceable
+       * predicted hypo, a DISCONNECT alarm, or a stranded sustain, none of
+       * which appear in the excursion zone at all. */
+      ck(nudge_fire(NG_LOW, 1, NG_NONE) == NG_NONE,
+         "a ringing LOW alarm suppresses the nudge");
+      ck(nudge_fire(NG_HIGH, 2, NG_NONE) == NG_NONE, "...and a HIGH one");
+      ck(nudge_fire(NG_LOW, 2, NG_NONE) == NG_NONE,
+         "ANY alarm suppresses it, not just the matching direction");
+      ck(nudge_fire(NG_LOW, AL_STALE, NG_NONE) == NG_NONE,
+         "a non-zone alarm (stale / forced hypo) suppresses it too");
+      ck(nudge_fire(NG_LOW, 0, NG_NONE) == NG_LOW,
+         "and with nothing sounding it still fires");
+
+      /* The sequence that made nudge_next a separate function: a plunge past
+       * BOTH thresholds between two samples. The nudge is suppressed, but the
+       * latch must still commit -- otherwise, when glucose climbs back out of
+       * the alarm band and is merely nudge-low, prev is still NONE and the
+       * nudge fires at the user who is already staring at the alarm. */
+      int prev  = NG_NONE;
+      int azone = 0;
+      int nz    = nudge_zone(120, t, t, 100, 200); /* fine */
+      ck(nudge_fire(nz, azone, prev) == NG_NONE, "in range: silent");
+      prev = nudge_next(nz, prev);
+
+      nz    = nudge_zone(65, t, t, 100, 200); /* plunged past both */
+      azone = alarm_zone(65, t, t, 70, 300);
+      ck(azone == 1 && nz == NG_LOW, "one sample, both bands crossed");
+      ck(nudge_fire(nz, azone, prev) == NG_NONE,
+         "the alarm has it; stay quiet");
+      prev = nudge_next(nz, prev);
+      ck(prev == NG_LOW, "but the latch MUST record the crossing");
+
+      nz    = nudge_zone(85, t, t, 100, 200); /* recovering: out of the alarm */
+      azone = alarm_zone(85, t, t, 70, 300);
+      ck(azone == 0 && nz == NG_LOW, "back above the alarm, still nudge-low");
+      ck(nudge_fire(nz, azone, prev) == NG_NONE,
+         "and it does NOT fire on the way back up");
+      prev = nudge_next(nz, prev);
+
+      nz   = nudge_zone(140, t, t, 100, 200); /* fully recovered */
+      prev = nudge_next(nz, prev);
+      ck(prev == NG_NONE, "a real recovery re-arms it");
+      nz = nudge_zone(95, t, t, 100, 200);
+      ck(nudge_fire(nz, 0, prev) == NG_LOW,
+         "so the NEXT crossing sounds again");
+   }
+
    printf("\n%s\n", all ? "ALL ALARM TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

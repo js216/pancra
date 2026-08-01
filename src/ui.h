@@ -61,7 +61,18 @@ void fmt_dur(long seconds, char *out, int n);
  * exactly the mistake that leaves sensor rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_SET_ABOVE 16
+/* 19, not 16. Three rows render_settings can draw were never in this count,
+ * because each is optional: the armed-pairing "PENDING..." row, the
+ * "N MORE NOT SHOWN" row when the list is longer than fits, and the
+ * "OLD DEVICES (n)" row once a device has been retired. A user with a full
+ * list, a retired device and a pairing in flight draws all three, and the
+ * budget then under-counts by three rows -- which put EXPORT DATA's frame and
+ * its tap target past the bottom edge (measured: 130 px over at 1440x2560,
+ * and worse once the shared button padding grew). The count must be the WORST
+ * case the renderer can produce, not the common one; being pessimistic here
+ * costs a little font size on a crowded screen, while being optimistic costs
+ * the button entirely, with no scrolling to recover it. */
+#define UI_SET_ABOVE 19
 
 /* How many sensor rows fit in the settings screen at this geometry, given
  * everything above the SENSORS section. The whole UI never scrolls, so this is
@@ -171,6 +182,15 @@ struct ui_sensor {
    int color, marker, primary, size;
    int old; /* 1 = DISCONNECTED: shown under OLD DEVICES, state EXPIRED, but
              * the SAME full per-device menu; excluded from the live list */
+   /* 1 = wear_len was RESOLVED from the model/type, 0 = the user pinned it.
+    *
+    * The WEAR row must show which, because the two behave differently over
+    * time: a resolved length improves when a new model is recognised, a
+    * pinned one never does. A G7 paired before the SW14758 (15 Day) model was
+    * known, then pinned to 10 by one tap of what used to be a two-state
+    * toggle, went on reporting a 10-day budget for a 15-day sensor with
+    * nothing on screen to say the model rule had been overruled. */
+   int wear_auto;
    int glu, trend, predicted, sequence;
    int rssi, rssi_ok, connected;
    /* Calibration state for this CGM's LAST CAL row. cal_pending!=0 means a
@@ -241,8 +261,11 @@ struct screen {
    int has_cgm;
    /* settings (values, not the module's globals) */
    int units, alarm_low, alarm_high, sound_on, vib_on, orient, disc;
+   int nudge_low, nudge_high;  /* the one-time heads-up band (alarmlogic.h) */
+   int nudge_sound, nudge_vib; /* the nudge's OWN outputs, not the alarm's */
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
-   int newdata_mode;           /* 1 = beep on each new primary-CGM datapoint */
+   int newdata_mode;           /* ND_OFF / ND_BEEP / ND_CHIRP: what a new
+                                * primary-CGM datapoint sounds like */
    int remote_on, remote_port; /* remote push enabled; server TCP port */
    /* sensor registry: the list in settings, and which one a detail screen is
     * showing (sel indexes `sensors`; -1 when no detail screen is open) */
@@ -325,7 +348,7 @@ enum ui_menu {
    MA_UNITS     = 3,
    MA_DISC      = 4,
    MA_SCREEN    = 5,
-   MA_NEWDATA   = 6,  /* toggle the new-datapoint beep */
+   MA_NEWDATA   = 6,  /* cycle the new-datapoint alert: OFF/BEEP/CHIRP */
    MA_METERSCAN = 7,  /* start scanning from the OneTouch instructions screen */
    MA_INS_FAST  = 21, /* ADD menu: LOG FAST INSULIN (type preset) */
    MA_INS_SLOW  = 23, /* ADD menu: LOG SLOW INSULIN (type preset) */
@@ -351,12 +374,19 @@ enum ui_menu {
    /* EXPORT DATA menu: parked in the free band ABOVE MA_PRIM_PICK's range
     * end (260 + MAX_SLOTS = 270) and below MA_CHAR (300); the existing
     * MA_PRIM_PICK assert covers the lower neighbour. */
-   MA_EXP_RANGE     = 271, /* cycle the range: 30 D / 1 Y / ALL */
-   MA_EXP_GLU       = 272, /* toggle the GLUCOSE (readings) section */
-   MA_EXP_DEV       = 273, /* toggle the DEVICES (sensors) section */
-   MA_EXP_INS       = 274, /* toggle the INSULIN (doses) section */
-   MA_EXP_GO        = 275, /* build the CSV and open the share sheet */
-   MA_EXP_BACK      = 276, /* back to settings, nothing exported */
+   MA_EXP_RANGE = 271, /* cycle the range: 30 D / 1 Y / ALL */
+   MA_EXP_GLU   = 272, /* toggle the GLUCOSE (readings) section */
+   MA_EXP_DEV   = 273, /* toggle the DEVICES (sensors) section */
+   MA_EXP_INS   = 274, /* toggle the INSULIN (doses) section */
+   MA_EXP_GO    = 275, /* build the CSV and open the share sheet */
+   MA_EXP_BACK  = 276, /* back to settings, nothing exported */
+   /* NUDGE thresholds (main-screen row / ALARM menu): keypad 12 / 13. Parked
+    * in the same free band, above MA_EXP_BACK and below MA_CHAR (300); 129 is
+    * the only gap left next to the MA_ALARM_* codes and one is not enough. */
+   MA_NUDGE_LOW     = 277,
+   MA_NUDGE_HIGH    = 278,
+   MA_NUDGE_SOUND   = 279, /* nudge section: toggle its sound */
+   MA_NUDGE_VIB     = 280, /* nudge section: toggle its vibration */
    MA_PERM          = 10,  /* + permission index (0..2) */
    MA_BATTERY       = 20,
    MA_BGEXEC        = 22,

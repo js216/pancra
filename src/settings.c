@@ -13,8 +13,29 @@
 #include <stdio.h> /* snprintf */
 
 char g_model[24], g_fw[24], g_mfr[24];
-int g_alarm_low = 110, g_alarm_high = 300;
+/* THE TWO BANDS, NESTED, AND THE NUDGE IS THE OUTER ONE. Chosen by the user,
+ * not derived: alarm 70/300 is the conservative "act now" band that should be
+ * set once and left alone, and nudge 85/250 sits outside it as the early
+ * "have a look" that fires first and can be ignored.
+ *
+ * That nesting is the whole feature. Editing the ALARM threshold day to day --
+ * down after a meal, back up when unaware -- is the habit the nudge exists to
+ * retire, because its failure mode is the dangerous one: the alarm gets left
+ * parked somewhere it can no longer help while the user goes on believing a
+ * reminder is armed. Anything that changes these numbers must preserve
+ * nudge_low >= alarm_low and nudge_high <= alarm_high, or the nudge is inside
+ * the alarm and can never fire first (nudge_fire suppresses it under a
+ * sounding alarm).
+ *
+ * Defaults only. A fresh install has no alarm.cfg; every existing file
+ * overrides all four on load. */
+int g_alarm_low = 70, g_alarm_high = 300;
+int g_nudge_low = 85, g_nudge_high = 250;
 int g_sound_on = 1, g_vib_on = 1;
+/* Both ON by default: with the nudge band armed out of the box, an alert the
+ * user has to go and switch on in a second place would just be a way for it
+ * to be silently missing. */
+int g_nudge_sound = 1, g_nudge_vib = 1;
 int g_orient;
 int g_screen_on = 1; /* default: hold the screen on, as the app always has */
 int g_newdata_mode;  /* ND_OFF / ND_BEEP / ND_CHIRP; default silent */
@@ -81,12 +102,46 @@ void alarm_save(void)
    int fd = open(g_alarm_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd < 0)
       return;
-   char b[32];
-   int n = snprintf(b, sizeof b, "%d %d\n", g_alarm_low, g_alarm_high);
+   char b[48];
+   int n = snprintf(b, sizeof b, "%d %d %d %d\n", g_alarm_low, g_alarm_high,
+                    g_nudge_low, g_nudge_high);
    n     = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
    close(fd);
+}
+
+/* One unsigned decimal field at *q, skipping leading spaces and advancing past
+ * the digits. Returns 1 iff at least one digit was consumed.
+ *
+ * DIGIT-CAPPED. Unbounded accumulation is undefined behaviour, and it happens
+ * during parsing -- before any range check can reject anything. A wrapped
+ * value can land back inside a plausible range and silently install thresholds
+ * the user never chose, on the numbers that decide whether a hypo alarm can
+ * fire at all. store.c, stats.c and sensors.c all received this hardening.
+ *
+ * The advance is OUTSIDE the cap, deliberately: putting it inside is what
+ * turned the same fix in sensors.c into an infinite loop.
+ *
+ * Extracted when the nudge pair was appended: four hand-inlined copies of this
+ * loop is four places for the cap to be dropped from. */
+static int parse_field(char **q, int *out)
+{
+   char *p = *q;
+   while (*p == ' ')
+      p++;
+   int v  = 0;
+   int nd = 0;
+   while (*p >= '0' && *p <= '9') {
+      if (nd < 9) {
+         v = (v * 10) + (*p - '0');
+         nd++;
+      }
+      p++;
+   }
+   *q   = p;
+   *out = v;
+   return nd > 0;
 }
 
 void alarm_load(void)
@@ -94,44 +149,26 @@ void alarm_load(void)
    int fd = open(g_alarm_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   char b[32];
+   char b[48];
    int n = (int)read(fd, b, sizeof b - 1);
    close(fd);
    if (n <= 0)
       return;
-   b[n]    = 0;
-   int lo  = 0;
-   int hi  = 0;
-   char *q = b;
-   /* DIGIT-CAPPED. Unbounded accumulation is undefined behaviour, and it
-    * happens during parsing -- before the range check below can reject
-    * anything. A wrapped value can land back inside [40,400] and silently
-    * install alarm thresholds the user never chose, on the two numbers that
-    * decide whether a hypo alarm can fire at all. store.c, stats.c and
-    * sensors.c all received this hardening; these two were missed.
-    *
-    * The advance is OUTSIDE the cap, deliberately: putting it inside is what
-    * turned the same fix in sensors.c into an infinite loop. */
-   int nd = 0;
-   while (*q >= '0' && *q <= '9') {
-      if (nd < 9) {
-         lo = (lo * 10) + (*q - '0');
-         nd++;
-      }
-      q++;
-   }
-   int got_lo = nd > 0;
-   while (*q == ' ')
-      q++;
-   nd = 0;
-   while (*q >= '0' && *q <= '9') {
-      if (nd < 9) {
-         hi = (hi * 10) + (*q - '0');
-         nd++;
-      }
-      q++;
-   }
-   int got_hi = nd > 0;
+   b[n]       = 0;
+   int lo     = 0;
+   int hi     = 0;
+   int nlo    = 0;
+   int nhi    = 0;
+   char *q    = b;
+   int got_lo = parse_field(&q, &lo);
+   int got_hi = parse_field(&q, &hi);
+   /* Fields 3 and 4 are NEWER than files already on disk: an alarm file
+    * written before the nudge existed has two fields, and must keep loading
+    * its alarm pair rather than being rejected wholesale. Absent => the nudge
+    * keeps its OFF defaults, which is the safe direction (no sound the user
+    * did not ask for). */
+   int got_nlo = parse_field(&q, &nlo);
+   int got_nhi = parse_field(&q, &nhi);
    /* Range-check, do not merely test for non-zero. A corrupt or hand-edited
     * file with lo=99999 silently DISABLES the low alarm (nothing is ever below
     * it) and lo>hi leaves both alarms permanently latched -- the two ways this
@@ -153,6 +190,17 @@ void alarm_load(void)
       g_alarm_low  = lo;
       g_alarm_high = hi;
    }
+   /* The nudge pair is committed SEPARATELY and by the same rules, never
+    * cross-checked against the alarm pair. A nudge inside the alarm band is
+    * pointless but harmless (the alarm suppresses it), while refusing to load
+    * it would silently revert a threshold the user chose -- and this file's
+    * whole reason for existing is that a threshold the user believes is armed
+    * must actually be armed. */
+   if (got_nlo && got_nhi && nlo <= AL_ENTRY_MAX && nhi <= AL_ENTRY_MAX &&
+       nlo <= nhi) {
+      g_nudge_low  = nlo;
+      g_nudge_high = nhi;
+   }
 }
 
 void settings_save(void)
@@ -160,13 +208,17 @@ void settings_save(void)
    int fd = open(g_settings_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd < 0)
       return;
-   char b[96];
+   /* 128, matching settings_load's reader. At 96 the two disagreed the moment
+    * the field count grew, and a truncated line does not fail loudly: clampn
+    * writes the prefix, the loader parses what it finds and stops, and the
+    * tail fields silently revert to their defaults on every launch. */
+   char b[128];
    int n = snprintf(
-       b, sizeof b, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+       b, sizeof b, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
        g_sound_on, g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
        g_newdata_mode, g_ins_marker[0], g_ins_color[0], g_ins_size[0],
        g_ins_marker[1], g_ins_color[1], g_ins_size[1], g_statbar_val,
-       g_lockscr_val);
+       g_lockscr_val, g_nudge_sound, g_nudge_vib);
    n = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
@@ -178,18 +230,19 @@ void settings_load(void)
    int fd = open(g_settings_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   char b[96];
+   char b[128];
    int n = (int)read(fd, b, sizeof b - 1);
    close(fd);
    if (n <= 0)
       return;
    b[n]      = 0;
-   int v[16] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
+   int v[18] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
                 g_disc,          g_plot_max,     g_screen_on,   g_newdata_mode,
                 g_ins_marker[0], g_ins_color[0], g_ins_size[0], g_ins_marker[1],
-                g_ins_color[1],  g_ins_size[1],  g_statbar_val, g_lockscr_val};
+                g_ins_color[1],  g_ins_size[1],  g_statbar_val, g_lockscr_val,
+                g_nudge_sound,   g_nudge_vib};
    char *q   = b;
-   for (int i = 0; i < 16; i++) {
+   for (int i = 0; i < 18; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -230,6 +283,11 @@ void settings_load(void)
    }
    g_statbar_val = v[14] ? 1 : 0;
    g_lockscr_val = v[15] ? 1 : 0;
+   /* Fields 17-18, newer than files already on disk. The loop above stops at
+    * the first field the file does not have, so an older file leaves these at
+    * their (ON) defaults -- see the header comment on the format. */
+   g_nudge_sound = v[16] ? 1 : 0;
+   g_nudge_vib   = v[17] ? 1 : 0;
    plot_set_max(g_plot_max);
 }
 

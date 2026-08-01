@@ -151,8 +151,16 @@ int main(void)
        .units           = 0,
        .alarm_low       = 100,
        .alarm_high      = 300,
-       .status          = "CONNECTED",
-       .stat            = {s, s, s, s, s},
+       /* Set, not left zero: a zero pair renders as "OFF"/"OFF", the SHORTEST
+        * the nudge row can be, so the sweep would measure the easy case of a
+        * row whose whole reason for existing is to carry two more numbers.
+        * Widest realistic values instead. */
+       .nudge_low   = 130,
+       .nudge_high  = 220,
+       .nudge_sound = 1,
+       .nudge_vib   = 1,
+       .status      = "CONNECTED",
+       .stat        = {s, s, s, s, s},
    };
 
    int fail = 0;
@@ -505,11 +513,23 @@ int main(void)
                                            .bits   = g_px};
          /* Sweep EVERY screen, not just three -- the excluded ones were
           * exactly where the un-converted width-only scaling survived. */
-         static const int scrs[] = {SCR_MAIN,     SCR_SETTINGS, SCR_SENSOR,
-                                    SCR_CAL,      SCR_FORGET,   SCR_LABEL,
-                                    SCR_KEYPAD,   SCR_DEVLIST,  SCR_GATE,
-                                    SCR_SENSTYPE, SCR_REMOTE};
-         nscr                    = (int)(sizeof scrs / sizeof scrs[0]);
+         /* Every screen built from framed BUTTONS belongs here, not just the
+          * ones that existed when the sweep was written. The button height is
+          * shared by all of them (menu_button), so a change to its padding
+          * moves every one of these at once -- and the screens that were
+          * missing were exactly the ones nothing measured: ADDMENU is nothing
+          * BUT stacked buttons, and ALARM grew a row. A screen absent from
+          * this list is a screen where a control can sit below the bottom
+          * edge, draw nothing, and still record a hit box the gate accepts. */
+         static const int scrs[] = {
+             SCR_MAIN,       SCR_SETTINGS, SCR_SENSOR,   SCR_CAL,
+             SCR_FORGET,     SCR_LABEL,    SCR_KEYPAD,   SCR_DEVLIST,
+             SCR_GATE,       SCR_SENSTYPE, SCR_REMOTE,   SCR_ADDMENU,
+             SCR_ALARM,      SCR_EXPORT,   SCR_INSDEL,   SCR_RECONF,
+             SCR_METERHELP,  SCR_PAIRCONF, SCR_CALPEND,  SCR_RESCALE,
+             SCR_RESCALEACT, SCR_DISPLAY,  SCR_PRIMPICK, SCR_OLDDEV,
+             SCR_MARKPICK,   SCR_COLORPICK};
+         nscr = (int)(sizeof scrs / sizeof scrs[0]);
          for (int c = 0; c < (int)(sizeof scrs / sizeof scrs[0]); c++) {
             struct screen rr = set;
             rr.scr           = scrs[c];
@@ -534,14 +554,51 @@ int main(void)
              * scrolling those rows and their tap targets are permanently
              * unreachable. The list is capped to what the geometry claims it
              * can show, so this asserts the screen honours its OWN promise. */
+            /* ...and the list must be as long as the geometry CLAIMS it can
+             * show, plus the optional rows. `min(cap, 3)` left every screen
+             * with cap > 3 short of its own worst case, and none of the three
+             * conditional rows was ever drawn, so UI_SET_ABOVE could
+             * under-count by three and the gate still passed while EXPORT
+             * DATA sat 130 px below the bottom edge. The worst case is: the
+             * full list, one device RETIRED (the "OLD DEVICES (n)" row), more
+             * live devices than fit (the "N MORE NOT SHOWN" row), and a
+             * pairing armed (the "PENDING..." row). */
             int cap_here = ui_sensor_capacity(sw, sh);
-            int nshow    = cap_here < 3 ? cap_here : 3;
-            rr.sensors   = sens;
-            rr.nsensors  = nshow;
-            rr.sel       = 0;
-            rr.devs      = devs;
-            rr.ndev      = 2;
-            rr.entry     = "1234";
+            static struct ui_sensor full[UI_MAX_SLOTS];
+            int nfull = cap_here + 2; /* > what fits: forces "MORE NOT SHOWN" */
+            if (nfull > UI_MAX_SLOTS)
+               nfull = UI_MAX_SLOTS;
+            for (int q = 0; q < nfull; q++) {
+               full[q]     = sens[q % 3];
+               full[q].id  = q + 1;
+               full[q].old = 0;
+               /* EVERY optional attribute present -- which is the ordinary
+                * state of a CGM once DIS has answered and a pairing code is
+                * stored. Without these, render_sensor was swept with a stub
+                * that skips the ENDS / REMAINING / PRED / SN / CODE rows, so
+                * its row budget could be three rows short and the gate still
+                * passed while DISCONNECT -- the one destructive action --
+                * was laid out entirely below the buffer. */
+               full[q].wear_len        = 10L * 86400;
+               full[q].session_seconds = 7L * 86400;
+               full[q].predicted       = 150;
+               full[q].sequence        = 2029;
+               full[q].connected       = 1;
+               full[q].glu             = 140;
+               full[q].cal_t           = now_ts - 3600;
+               full[q].cal_mgdl        = 120;
+               full[q].cal_state       = CAL_ST_APPLIED;
+               snprintf(full[q].serial, sizeof full[q].serial, "SN1234567");
+               snprintf(full[q].code, sizeof full[q].code, "7381");
+            }
+            full[nfull - 1].old = 1; /* the OLD DEVICES row */
+            rr.sensors          = full;
+            rr.nsensors         = nfull;
+            rr.pend_type        = 1; /* the PENDING... row */
+            rr.sel              = 0;
+            rr.devs             = devs;
+            rr.ndev             = 2;
+            rr.entry            = "1234";
             ui_clip_reset();
             ui_render(&rb, &rr, &h);
             /* Nothing may be laid out past an edge. This is the check that
@@ -743,6 +800,138 @@ int main(void)
        * gets dropped from the sweep without anyone noticing. */
       printf("uitest: reachability+visibility on %d shapes x %d screens\n",
              nshape, nscr);
+   }
+
+   /* --- an AUTO wear budget must not look like a pinned one ---
+    *
+    * Both states printed the same bare "10 DAYS", so a G7 whose model says
+    * 15 days and whose stored pin says 10 was pixel-identical to one
+    * correctly resolved to 10 -- the countdown ran five days short and the
+    * screen offered nothing to explain why. Compared as PIXELS, not as a
+    * string, so the check survives any rewording of the row. */
+   {
+      int w                          = 720;
+      int hgt                        = 1600;
+      uint32_t *shot                 = malloc((size_t)w * hgt * 4);
+      struct ANativeWindow_Buffer wb = {
+          .width = w, .height = hgt, .stride = w, .format = 1, .bits = g_px};
+      struct hits wh;
+      struct ui_sensor ws = sens[0];
+      ws.kind             = KIND_CGM;
+      ws.wear_len         = 10L * 86400; /* IDENTICAL budget in both renders */
+      struct screen wm    = set;
+      wm.scr              = SCR_SENSOR;
+      wm.sensors          = &ws;
+      wm.nsensors         = 1;
+      wm.sel              = 0;
+      long npx            = (long)w * hgt;
+      ws.wear_auto        = 1;
+      for (long q = 0; q < npx; q++)
+         g_px[q] = 0;
+      ui_render(&wb, &wm, &wh);
+      for (long q = 0; q < npx; q++)
+         shot[q] = g_px[q];
+      ws.wear_auto = 0;
+      for (long q = 0; q < npx; q++)
+         g_px[q] = 0;
+      ui_render(&wb, &wm, &wh);
+      long diff = 0;
+      for (long q = 0; q < npx; q++)
+         if (shot[q] != g_px[q])
+            diff++;
+      if (diff == 0) {
+         printf("  FAIL: a pinned wear budget renders identically to AUTO\n");
+         fail = 1;
+      } else {
+         printf("uitest: AUTO vs pinned wear budget differ in %ld pixels\n",
+                diff);
+      }
+      free(shot);
+   }
+
+   /* --- the ALARM and NUDGE rows must not share a single pixel ---
+    *
+    * ui_hit_idx scans BACKWARDS ("last box wins"), which is what makes the
+    * app's deliberate overlaps safe: a specific control drawn later beats the
+    * generous title-bar close target that contains it. These two rows are the
+    * case where that rule bites instead, because neither contains the other --
+    * they are siblings, drawn one after the other, carrying DIFFERENT actions
+    * in the same screen columns. Any vertical overlap means the bottom edge of
+    * "ALARM HIGH" silently opens the NUDGE HIGH keypad.
+    *
+    * It happened: the row's hit box was 3*sc taller than the row's own
+    * advance, harmless while ALARM was the only such row and a 9 px
+    * mis-actuation band (at 1080x1920) the moment NUDGE appeared under it.
+    * Checked at every swept geometry, not one, because the band scales with
+    * sc and vanishes at sc == 1. */
+   {
+      static const int thr[] = {MA_ALARM_LOW, MA_ALARM_HIGH, MA_NUDGE_LOW,
+                                MA_NUDGE_HIGH};
+      /* Its own list, wider than the reachability sweep's: the mis-actuation
+       * band scales with sc, so both the smallest sc (where it vanishes) and
+       * the largest (where it is widest) have to be covered, plus landscape,
+       * where the row padding differs. */
+      static const int tg[][2] = {
+          {320,  480 },
+          {480,  760 },
+          {540,  960 },
+          {720,  1280},
+          {1080, 1920},
+          {1080, 2400},
+          {1440, 2560},
+          {1440, 3200},
+          {800,  480 },
+          {1280, 720 },
+          {1600, 720 },
+          {1920, 1080},
+          {2560, 1440},
+          {1200, 1200},
+      };
+      int shapes = 0;
+      int bad    = 0;
+      for (unsigned s = 0; s < sizeof tg / sizeof tg[0]; s++) {
+         int sw                         = tg[s][0];
+         int sh                         = tg[s][1];
+         struct ANativeWindow_Buffer tb = {.width  = sw,
+                                           .height = sh,
+                                           .stride = sw,
+                                           .format = 1,
+                                           .bits   = g_px};
+         struct hits th;
+         struct screen tm = set;
+         tm.scr           = SCR_MAIN;
+         ui_render(&tb, &tm, &th);
+         shapes++;
+         for (int i = 0; i < th.n; i++)
+            for (int j = i + 1; j < th.n; j++) {
+               int ai = -1;
+               int aj = -1;
+               for (int k = 0; k < 4; k++) {
+                  if (th.box[i].arg == thr[k])
+                     ai = k;
+                  if (th.box[j].arg == thr[k])
+                     aj = k;
+               }
+               if (ai < 0 || aj < 0 || th.box[i].w <= 0 || th.box[j].w <= 0)
+                  continue;
+               int ax2 = th.box[i].x + th.box[i].w;
+               int ay2 = th.box[i].y + th.box[i].h;
+               int bx2 = th.box[j].x + th.box[j].w;
+               int by2 = th.box[j].y + th.box[j].h;
+               if ((th.box[i].x < bx2) && (th.box[j].x < ax2) &&
+                   (th.box[i].y < by2) && (th.box[j].y < ay2)) {
+                  printf("  FAIL: %dx%d: threshold targets %d and %d overlap "
+                         "(y %d..%d vs %d..%d)\n",
+                         sw, sh, th.box[i].arg, th.box[j].arg, th.box[i].y, ay2,
+                         th.box[j].y, by2);
+                  bad  = 1;
+                  fail = 1;
+               }
+            }
+      }
+      if (!bad)
+         printf("uitest: ALARM/NUDGE threshold targets disjoint on %d shapes\n",
+                shapes);
    }
 
    /* --- no screen may be a dead end ---

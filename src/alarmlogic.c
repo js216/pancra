@@ -33,6 +33,34 @@ int chirp_semitone10(int delta_mgdl)
    return st10;
 }
 
+int nudge_zone(int glu, long glu_t, long now, int lo, int hi)
+{
+   /* -1, not 0. See alarmlogic.h: a dropout must HOLD the latch, and a caller
+    * that cannot tell "in range" from "no idea" would clear it instead --
+    * re-arming the nudge to fire again every time a flaky link comes back. */
+   if (glu < 0 || now - glu_t > AL_FRESH_S)
+      return -1;
+   if (glu <= lo) /* inclusive, matching alarm_zone */
+      return NG_LOW;
+   if (glu >= hi)
+      return NG_HIGH;
+   return NG_NONE;
+}
+
+int nudge_next(int nzone, int prev)
+{
+   return (nzone < 0) ? prev : nzone;
+}
+
+int nudge_fire(int nzone, int alarming, int prev)
+{
+   if (nzone <= 0 || nzone == prev)
+      return NG_NONE; /* in range, unknown, or already announced */
+   if (alarming)
+      return NG_NONE; /* the alarm has it; the nudge adds nothing */
+   return nzone;
+}
+
 int alarm_stale(int glu, long glu_t, long now, long launch_t, long disc_s)
 {
    if (disc_s <= 0)

@@ -289,6 +289,38 @@ int main(void)
       ck(collides == 1, "...and its id is unique across every loaded row");
    }
 
+   printf("== wear budget: the model rule, and the pin that overrules it ==\n");
+   {
+      /* THE REGRESSION. Dexcom's 10-day and 15-day G7s are indistinguishable
+       * on the air; only the DIS model tells them apart. A device paired
+       * before that model was recognised carried a PIN of 10 from that era,
+       * and a pin wins outright -- so once the rule landed the app kept
+       * counting a 10-day budget for a sensor it could now positively
+       * identify as 15-day, declaring it nearly over with five days to run.
+       *
+       * The rule below is what makes AUTO correct; the WEAR row's third
+       * state (main.c) is what makes AUTO reachable again. Both are needed:
+       * either alone leaves the sensor short. */
+      ck(sensor_wear_seconds(SENSOR_G7, 0, "SW14758") == 15L * 86400,
+         "AUTO on a G7 15 Day (SW14758) resolves to 15 days");
+      ck(sensor_wear_seconds(SENSOR_G7, 0, "") == 10L * 86400,
+         "AUTO on a G7 of unknown model falls back to 10 -- under-promising "
+         "is the safe direction for a wear countdown");
+      /* A pin beats the rule, in BOTH directions. That is the point of a pin
+       * and also exactly how the wrong answer survived, so pin both ways. */
+      ck(sensor_wear_seconds(SENSOR_G7, 10, "SW14758") == 10L * 86400,
+         "a pin of 10 overrules even a model that says 15");
+      ck(sensor_wear_seconds(SENSOR_G7, 15, "") == 15L * 86400,
+         "...and a pin of 15 overrules a type default of 10");
+      /* Anything that is not a valid pin must RESOLVE, not be trusted as a
+       * literal. slots_load already normalises junk to 0; this is the second
+       * line of defence, and it is what build_model's wear_auto mirrors. */
+      ck(sensor_wear_seconds(SENSOR_G7, 12, "SW14758") == 15L * 86400,
+         "a nonsense pin resolves rather than becoming a 12-day budget");
+      ck(sensor_wear_seconds(SENSOR_G7, -1, "SW14758") == 15L * 86400,
+         "...including a negative one");
+   }
+
    printf("\n%s\n", all ? "ALL REGISTRY TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

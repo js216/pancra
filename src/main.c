@@ -352,6 +352,15 @@ static long g_launch_t; /* for the stale-alarm grace period */
  * provenance -- see pancra_devinfo. Minting uses these. */
 static char g_model_l[LINK_MAX][24], g_fw_l[LINK_MAX][24];
 static int g_disc_alarmed; /* stale alarm currently latched */
+/* NUDGE latch: which nudge band the last KNOWN reading was in (NG_*).
+ *
+ * State, not a derived value, because the nudge announces a CROSSING and a
+ * crossing cannot be read off a single sample. Guarded by alarm_lock like
+ * every other alarm state, and deliberately NOT persisted: after a restart the
+ * app has no idea whether the user already heard this crossing, and the honest
+ * default is "not announced yet" -- a nudge too many is a blip, a nudge too
+ * few is the reminder that never arrives. */
+static int g_nudge_state;
 
 static const char *perms[] = {"android.permission.BLUETOOTH_SCAN",
                               "android.permission.BLUETOOTH_CONNECT",
@@ -1330,7 +1339,10 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
       str_snapshot(u->fw, sizeof u->fw, sl->fw);
    }
    /* This DEVICE's wear budget: override / model / type default. */
-   u->wear_len   = sensor_wear_seconds(u->type, sl->wear_days, sl->model);
+   u->wear_len = sensor_wear_seconds(u->type, sl->wear_days, sl->model);
+   /* Mirrors sensor_wear_seconds' own test for "the user pinned this", and
+    * must stay in step with it: anything that is not a valid pin resolves. */
+   u->wear_auto  = (sl->wear_days != 10 && sl->wear_days != 15);
    u->paired     = sl->paired;
    u->activation = sl->activation;
    /* newest reading from this source, for the "last seen" column */
@@ -1622,9 +1634,13 @@ static void build_model(struct screen *m)
          break;
       }
 
-   m->units      = g_units;
-   m->alarm_low  = g_alarm_low;
-   m->alarm_high = g_alarm_high;
+   m->units       = g_units;
+   m->alarm_low   = g_alarm_low;
+   m->alarm_high  = g_alarm_high;
+   m->nudge_low   = g_nudge_low;
+   m->nudge_high  = g_nudge_high;
+   m->nudge_sound = g_nudge_sound;
+   m->nudge_vib   = g_nudge_vib;
 
    /* settings + device info (globals persist; s.mac lives on our stack, so it
     * is copied into a static the borrowed pointer can safely outlast) */
@@ -2540,7 +2556,45 @@ static struct alarm_reading current_reading(void)
  * must complete before alarm_lock is taken: hist is non-recursive and is
  * the same flag as g_draw_busy, so nesting it inside alarm is the one edge
  * that could still close a lock cycle. */
-static void alarm_gather(long now, int *zone, int *stranded)
+/* Is the ALARM announcing anything right now? The input nudge_fire needs, and
+ * broader than this tick's excursion zone on purpose: g_alarm_want carries the
+ * DISCONNECT alarm and the stranded sustain, neither of which shows up in the
+ * zone, and `pred` is the imminent-hypo override, which forces AL_LOW at any
+ * current reading. Called under alarm_lock (g_alarm_want is read there), and
+ * it reads the level committed by the PREVIOUS evaluation -- which is exactly
+ * the alarm the user can hear right now. */
+static int alarming(int zone, int pred)
+{
+   return zone || pred || g_alarm_want != AL_NONE;
+}
+
+/* Emit the one-time nudge. NG_NONE is the answer on all but a handful of the
+ * ~86400 ticks in a day, so this is a no-op almost always. Best-effort, like
+ * the NEW DATAPOINT beep: a missed nudge is a missed hint, not a missed alarm,
+ * and it must never be able to delay or throw into the alarm path. */
+static void nudge_emit(int ng)
+{
+   if (ng == NG_NONE)
+      return;
+   /* Its OWN outputs, not the alarm's: one alert means "act now" and the
+    * other "have a look", so muting either must not mute the other. With both
+    * off there is nothing to emit and no reason to cross into Java at all --
+    * the latch has already been committed by the caller either way, so the
+    * crossing stays announced and will not fire again on the next tick. */
+   if (!g_nudge_sound && !g_nudge_vib)
+      return;
+   LOGI("nudge %s (sound=%d vib=%d)", ng == NG_LOW ? "low" : "high",
+        g_nudge_sound, g_nudge_vib);
+   dexble_nudge(ng == NG_LOW ? 0 : 1, g_nudge_sound, g_nudge_vib);
+}
+
+/* Gather the alarm zone, the stranded flag and the NUDGE zone across every
+ * live CGM from ONE snapshot of the history. The nudge rides along rather than
+ * gathering again: two passes could see different samples, and a nudge
+ * evaluated against a reading the alarm never saw is a nudge that can fire
+ * underneath its own alarm -- exactly what nudge_fire exists to prevent.
+ * `*nzone` comes back -1 when no live CGM has a current reading. */
+static void alarm_gather(long now, int *zone, int *stranded, int *nzone)
 {
    struct {
       int glu;
@@ -2577,11 +2631,19 @@ static void alarm_gather(long now, int *zone, int *stranded)
    hist_unlock();
    *zone     = 0;
    *stranded = 0;
+   *nzone    = -1;
    for (int i = 0; i < ns; i++) {
       *zone = alarm_zone_merge(*zone, alarm_zone(smp[i].glu, smp[i].t, now,
                                                  g_alarm_low, g_alarm_high));
       if (alarm_stranded(smp[i].glu, smp[i].t, now, g_alarm_low, g_alarm_high))
          *stranded = 1;
+      /* Merged the same way the alarm zone is -- the worst band on ANY worn
+       * CGM wins, and a LOW outranks a HIGH. A sensor with no current reading
+       * contributes nothing rather than voting "in range", which would clear
+       * the latch on a dropout and re-arm the nudge to fire again. */
+      int nz = nudge_zone(smp[i].glu, smp[i].t, now, g_nudge_low, g_nudge_high);
+      if (nz >= 0)
+         *nzone = (*nzone < 0) ? nz : alarm_zone_merge(*nzone, nz);
    }
 }
 
@@ -2590,11 +2652,16 @@ static void alarm_reeval(void)
    long now     = realtime_s();
    int zone     = 0;
    int stranded = 0;
-   alarm_gather(now, &zone, &stranded); /* BEFORE alarm_lock -- see above */
+   int nzone    = -1;
+   alarm_gather(now, &zone, &stranded, &nzone); /* BEFORE alarm_lock */
    alarm_lock();
    g_alarm_state = zone;
-   alarm_apply_ex(g_alarm_state, g_disc_alarmed, stranded, any_pred_low());
+   int pred      = any_pred_low();
+   int ng        = nudge_fire(nzone, alarming(zone, pred), g_nudge_state);
+   g_nudge_state = nudge_next(nzone, g_nudge_state);
+   alarm_apply_ex(g_alarm_state, g_disc_alarmed, stranded, pred);
    alarm_unlock();
+   nudge_emit(ng);
 }
 
 /* Re-issue the CURRENT alarm level to Java, even though the level has not
@@ -2607,7 +2674,7 @@ static void alarm_reeval(void)
  * left want unchanged, so dexble_alarm() was never called again and the hypo
  * stayed silent for its entire duration, becoming audible only if glucose
  * returned to range and re-crossed. Clearing g_alarm_want forces the next
- * evaluation to treat the level as new. The threshold entry (kp_mode 10/11)
+ * evaluation to treat the level as new. The threshold entry (kp_mode 10-13)
  * already accepts that a settings change can change alarm state; this is the
  * same for the audible settings. */
 static void alarm_reactuate(void)
@@ -2769,9 +2836,20 @@ void pancra_alarm_check(void)
    long now                 = realtime_s();
    int zone                 = 0;
    int stranded             = 0;
-   alarm_gather(now, &zone, &stranded);
+   int nzone                = -1;
+   alarm_gather(now, &zone, &stranded, &nzone);
    alarm_lock();
    g_alarm_state = zone;
+   /* The nudge is decided under the SAME hold as the alarm, so the two see one
+    * consistent zone pair and only one thread can claim a given crossing --
+    * pancra_alarm_check runs on the main looper, the service tick AND a GATT
+    * binder thread. The SOUND is emitted after the unlock: it is a JNI call
+    * that synthesises and plays audio, and alarm_lock is a spin lock the main
+    * looper takes. Nothing depends on when it lands, unlike the glucose alarm
+    * whose actuation must stay inside the lock (see alarm_apply_ex). */
+   int pred      = any_pred_low();
+   int ng        = nudge_fire(nzone, alarming(zone, pred), g_nudge_state);
+   g_nudge_state = nudge_next(nzone, g_nudge_state);
    /* Either the user's configured DISCONNECT threshold, or -- regardless of
     * that setting -- data going stale while the last reading was out of range.
     * Without the second term a ringing hypo alarm was silenced after 6 minutes
@@ -2783,8 +2861,9 @@ void pancra_alarm_check(void)
     * never relabel it. See alarm_want_sustained. Folding it in made a stale
     * low mint a fresh "Sensor disconnected" -- including one second after a
     * cold start, off a reading store_load had just restored from the log. */
-   alarm_apply_ex(g_alarm_state, g_disc_alarmed, stranded, any_pred_low());
+   alarm_apply_ex(g_alarm_state, g_disc_alarmed, stranded, pred);
    alarm_unlock();
+   nudge_emit(ng);
 }
 
 static void disc_reeval(void)
@@ -3171,6 +3250,10 @@ static int pull_import(const char *body)
    int added = 0;
    if (src < 0)
       return 0;
+   /* One cutoff for the whole batch, sampled once: a per-line clock read would
+    * let the acceptance boundary drift mid-import, so two identical lines could
+    * be judged differently in the same response. */
+   long horizon  = realtime_s() + 3600;
    const char *p = body;
    while (*p) {
       long t  = 0;
@@ -3239,7 +3322,7 @@ static int pull_import(const char *body)
        * glucose_plausible is the 20..600 rule pancra_glucose, pancra_backfill
        * and both loaders enforce; this path used its own 1..1999, which let
        * values no sensor can produce into the log and the statistics. */
-      if (t <= 0 || t > realtime_s() + 3600 || !glucose_plausible(glu))
+      if (t <= 0 || t > horizon || !glucose_plausible(glu))
          continue;
       int prime = sensor_primary_id();
       hist_lock();
@@ -3252,7 +3335,15 @@ static int pull_import(const char *body)
       int isnew = 0;
       if (!hist_have_point(t, glu))
          isnew = hist_insert(t, glu, 127, src, kind);
-      if (isnew)
+      /* NOT fingersticks -- the same rule stat_load_chunk enforces on replay
+       * (stats.c: `kind != KIND_BGM`). Since this import learned to carry a
+       * type, an imported meter reading would otherwise be counted in the live
+       * hour buckets now and skipped when the log is replayed at next launch,
+       * so TIR, AVG and A1C would show one set of numbers today and different
+       * ones after a restart from the identical log -- the exact drift the
+       * comment in stats.c records having been fixed twice already. The live
+       * meter path (ot_drv_reading) does not call stat_add either. */
+      if (isnew && kind != KIND_BGM)
          stat_add(t, glu);
       hist_refresh_current(prime);
       hist_unlock();
@@ -3569,6 +3660,11 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
     * (visibly) rather than applying it to a much-later reading. Otherwise
     * activate from THIS raw, effective from THIS timestamp, so the reference
     * reading itself shows the entered value. */
+   /* Set when a rescale takes effect ON this reading: from here on mg_dl is
+    * rescaled while the history is not, so any change computed against the
+    * history is the calibration step, not the wearer's glucose moving. The
+    * CHIRP below is the only consumer. */
+   int rescale_started = 0;
    if (g_rescale_pend_mgdl > 0 && g_rescale_pend_id == src) {
       if (t - g_rescale_pend_t > RESCALE_PEND_WINDOW_S) {
          LOGI("pending rescale %d mg/dL EXPIRED (reading %ld s after request)",
@@ -3577,6 +3673,7 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
          g_rescale_expired_id = src;
       } else {
          rescale_activate(src, g_rescale_pend_mgdl, mg_dl, t);
+         rescale_started = 1;
       }
       g_rescale_pend_mgdl = 0;
       g_rescale_pend_id   = 0;
@@ -3592,7 +3689,7 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
     * newest sample from src is the one being added) and under the same lock
     * that protects g_hist. Feeds the CHIRP pitch below; -1 means this source
     * has no earlier sample, which chirps at the plain BEEP pitch. */
-   int prev_glu = hist_prev_glu(t, src);
+   int prev_glu = hist_prev_glu(t, src, t - CHIRP_MAX_GAP_S);
    int isnew    = hist_insert(t, mg_dl, trend, src, KIND_CGM);
    if (isnew) {
       /* Any non-zero result, matching what store_append persists below -- see
@@ -3648,10 +3745,18 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
     * sample of its own (a fresh session) the delta is 0, which is exactly the
     * BEEP tone -- the honest sound for "no change known yet". */
    if (isnew && src == prime) {
-      if (g_newdata_mode == ND_BEEP)
+      if (g_newdata_mode == ND_BEEP) {
          dexble_beep();
-      else if (g_newdata_mode == ND_CHIRP)
-         dexble_chirp(chirp_semitone10(prev_glu >= 0 ? mg_dl - prev_glu : 0));
+      } else if (g_newdata_mode == ND_CHIRP) {
+         /* A rescale that ACTIVATED on this very reading makes the comparison
+          * meaningless: mg_dl is already rescaled while every sample already
+          * in g_hist is not, so the "change" would be the calibration offset
+          * itself -- entering a 120 fingerstick against a sensor reading 100
+          * would chirp a full-cap rocket that never happened. Treat it as
+          * having no predecessor, which is the plain BEEP pitch. */
+         int delta = (prev_glu >= 0 && !rescale_started) ? mg_dl - prev_glu : 0;
+         dexble_chirp(chirp_semitone10(delta));
+      }
    }
 
    /* Alarm evaluation is deliberately NOT done here.
@@ -4694,14 +4799,28 @@ static int ins_action(int action)
  * pattern). Returns 1 when `action` was one of ours. */
 static int submenu_action(int action)
 {
-   if (action == MA_ALARM_LOW || action == MA_ALARM_HIGH) {
-      /* "LOW <value>" / "HIGH <value>" (main-screen row or ALARM submenu):
+   if (action == MA_ALARM_LOW || action == MA_ALARM_HIGH ||
+       action == MA_NUDGE_LOW || action == MA_NUDGE_HIGH) {
+      /* "LOW <value>" / "HIGH <value>" (main-screen rows or ALARM submenu):
        * type the threshold on the keypad (display units). The keypad
        * returns to WHERE this was tapped -- the origin rule. */
       g_kp_return = (g_menu == MENU_ALARM) ? MENU_ALARM : MENU_NONE;
       g_menu      = MENU_KEYPAD;
-      g_kp_mode   = (action == MA_ALARM_LOW) ? 10 : 11;
-      g_entrylen  = 0;
+      if (action == MA_ALARM_LOW)
+         g_kp_mode = 10;
+      else if (action == MA_ALARM_HIGH)
+         g_kp_mode = 11;
+      else if (action == MA_NUDGE_LOW)
+         g_kp_mode = 12;
+      else
+         g_kp_mode = 13;
+      g_entrylen = 0;
+   } else if (action == MA_NUDGE_SOUND) {
+      g_nudge_sound = !g_nudge_sound;
+      settings_save();
+   } else if (action == MA_NUDGE_VIB) {
+      g_nudge_vib = !g_nudge_vib;
+      settings_save();
    } else if (action == MA_ALARM_OPEN) {
       /* Entered from the settings row or the main alarm row; record the
        * origin so MA_ALARM_BACK returns exactly there. */
@@ -4918,16 +5037,28 @@ static void menu_action(int action)
          g_menu         = MENU_NONE;
       }
    } else if (action == MA_WEAR) {
-      /* Toggle this device's wear budget 10 <-> 15 days. The toggle writes an
-       * explicit override, so it survives whatever the model/type resolution
-       * would have guessed. Preferences only -- no radio, no provenance. */
+      /* Cycle this device's wear budget: AUTO -> 10 D -> 15 D -> AUTO.
+       *
+       * THREE STATES, NOT TWO, AND AUTO MUST BE REACHABLE. This was a
+       * 10 <-> 15 toggle, so the first tap wrote an explicit override and
+       * NOTHING could ever remove it again: sensor_wear_seconds gives a pin
+       * absolute priority, which permanently disabled the model resolution
+       * for that device. A G7 paired on 2026-07-23 -- one day before the
+       * SW14758 (G7 15 Day) model rule existed -- carried a pin of 10 from
+       * that era, so once the rule landed the app went on counting a 10-day
+       * budget for a sensor it could now positively identify as 15-day,
+       * declaring it nearly finished with five days left. One accidental tap
+       * on a full-width row was enough to cause it, and there was no way
+       * back. Preferences only -- no radio, no provenance. */
       if (g_sel >= 0 && g_sel < g_nslot) {
          sensors_lock();
-         const struct sensor_rec *r = sensor_rec_by_id(g_slot[g_sel].id);
-         long cur =
-             sensor_wear_seconds(r ? r->type : SENSOR_STELO,
-                                 g_slot[g_sel].wear_days, r ? r->model : "");
-         g_slot[g_sel].wear_days = (cur >= 15L * 86400) ? 10 : 15;
+         int w = g_slot[g_sel].wear_days;
+         if (w == 10)
+            g_slot[g_sel].wear_days = 15;
+         else if (w == 15)
+            g_slot[g_sel].wear_days = 0; /* back to the model/type rule */
+         else
+            g_slot[g_sel].wear_days = 10;
          slots_save();
          sensors_unlock();
       }
@@ -5251,13 +5382,18 @@ static void menu_action(int action)
          g_entry[g_entrylen++] = (char)('0' + (action - 100));
    } else if (action == MA_DOT) {
       /* '.' exists on the remote-IP keypad and, in mmol/L mode only, on the
-       * two alarm-threshold keypads (one dot, one decimal digit -- "5.5").
-       * The guard keeps a stale tap (racing a repaint) from injecting one
-       * into any other numeric entry. */
+       * four threshold keypads -- ALARM LOW/HIGH and NUDGE LOW/HIGH (one dot,
+       * one decimal digit -- "5.5"). The guard keeps a stale tap (racing a
+       * repaint) from injecting one into any other numeric entry.
+       *
+       * The RANGE must match ui.c's kp_thresh(). Left at 10/11 the renderer
+       * drew a dot key on the NUDGE keypads that this branch then ignored --
+       * a visible, tappable, DEAD key, and with it no way to enter a nudge
+       * threshold at all in mmol/L. */
       if (g_menu == MENU_KEYPAD && g_kp_mode == 4 && g_entrylen < 15) {
          g_entry[g_entrylen++] = '.';
-      } else if (g_menu == MENU_KEYPAD && g_units &&
-                 (g_kp_mode == 10 || g_kp_mode == 11) && g_entrylen < 4) {
+      } else if (g_menu == MENU_KEYPAD && g_units && g_kp_mode >= 10 &&
+                 g_kp_mode <= 13 && g_entrylen < 4) {
          int seen = 0;
          for (int i = 0; i < g_entrylen; i++)
             if (g_entry[i] == '.')
@@ -5406,21 +5542,30 @@ static void menu_action(int action)
             keypad_close();
             g_menu = MENU_RESCALE;
          }
-      } else if (g_kp_mode == 10 || g_kp_mode == 11) {
-         /* ALARM LOW / HIGH: entry in DISPLAY units. mg/dL is a plain
-          * integer; mmol/L is LITERAL mmol with an optional '.' and one
-          * decimal digit ("5.5") -- its keypad shows a dot key (ui.c).
-          * Both thresholds accept 0..AL_ENTRY_MAX: 0 parks LOW below any
-          * possible reading and a past-the-scale HIGH above any, each that
-          * alarm's deliberate OFF switch. Refuse VISIBLY (stay on the
-          * keypad, entry cleared) a malformed entry, an out-of-range value,
-          * or one that would invert the pair -- a silent clamp would move a
-          * threshold the user never typed. Equal is allowed. */
+      } else if (g_kp_mode >= 10 && g_kp_mode <= 13) {
+         /* ALARM LOW / HIGH (10/11) and NUDGE LOW / HIGH (12/13): entry in
+          * DISPLAY units. mg/dL is a plain integer; mmol/L is LITERAL mmol
+          * with an optional '.' and one decimal digit ("5.5") -- its keypad
+          * shows a dot key (ui.c).
+          * All four accept 0..AL_ENTRY_MAX: 0 parks LOW below any possible
+          * reading and a past-the-scale HIGH above any, each threshold's
+          * deliberate OFF switch. Refuse VISIBLY (stay on the keypad, entry
+          * cleared) a malformed entry, an out-of-range value, or one that
+          * would invert ITS OWN pair -- a silent clamp would move a threshold
+          * the user never typed. Equal is allowed.
+          *
+          * The two pairs are checked against THEMSELVES only, never against
+          * each other. A nudge inside the alarm band is pointless but
+          * harmless (nudge_fire suppresses it under the alarm), and refusing
+          * the entry would block the legitimate order of operations -- move
+          * the nudge first, then the alarm -- for no safety gain. */
          if (g_entrylen > 0) {
-            int ip  = 0;
-            int fd  = 0;
-            int dot = 0; /* 0 none, 1 seen, 2 decimal digit consumed */
-            int bad = 0;
+            int isnudge = g_kp_mode >= 12;
+            int islow   = (g_kp_mode % 2) == 0;
+            int ip      = 0;
+            int fd      = 0;
+            int dot     = 0; /* 0 none, 1 seen, 2 decimal digit consumed */
+            int bad     = 0;
             for (int i = 0; i < g_entrylen; i++) {
                char ch = g_entry[i];
                if (ch == '.') {
@@ -5439,22 +5584,28 @@ static void menu_action(int action)
             }
             int mgdl = g_units ? (((ip * 10) + fd) * 18) / 10 : ip;
             alarm_lock();
-            int lo = g_alarm_low;
-            int hi = g_alarm_high;
+            int lo = isnudge ? g_nudge_low : g_alarm_low;
+            int hi = isnudge ? g_nudge_high : g_alarm_high;
             alarm_unlock();
-            if (bad || mgdl > AL_ENTRY_MAX ||
-                (g_kp_mode == 10 ? mgdl > hi : mgdl < lo)) {
-               LOGI("alarm %s %d mg/dL refused (0..%d, low<=high)",
-                    g_kp_mode == 10 ? "low" : "high", mgdl, AL_ENTRY_MAX);
+            if (bad || mgdl > AL_ENTRY_MAX || (islow ? mgdl > hi : mgdl < lo)) {
+               LOGI("%s %s %d mg/dL refused (0..%d, low<=high)",
+                    isnudge ? "nudge" : "alarm", islow ? "low" : "high", mgdl,
+                    AL_ENTRY_MAX);
                g_entrylen = 0;
                g_ui_dirty = 1;
                return; /* cleared entry is the feedback; retype it */
             }
             /* Under alarm_lock: the pair is READ under it by the alarm
              * evaluators, and a mixed old/new pair can invert the range for
-             * one tick (see the old alarm_adjust's rationale). */
+             * one tick (see the old alarm_adjust's rationale). The nudge pair
+             * is read there too, on the same tick, so it takes the same lock.
+             */
             alarm_lock();
-            if (g_kp_mode == 10)
+            if (isnudge && islow)
+               g_nudge_low = mgdl;
+            else if (isnudge)
+               g_nudge_high = mgdl;
+            else if (islow)
                g_alarm_low = mgdl;
             else
                g_alarm_high = mgdl;
@@ -5783,7 +5934,7 @@ static int plot_rect(int *x, int *y, int *w, int *h)
 }
 
 /* (The +- stepper's alarm_adjust is gone: thresholds are now typed on the
- * keypad -- see the kp_mode 10/11 branch in the MA_OK handler, which keeps
+ * keypad -- see the kp_mode 10-13 branch in the MA_OK handler, which keeps
  * the same lock discipline: the pair is written under alarm_lock because the
  * evaluators read it under alarm_lock, and a mixed old/new pair can invert
  * the range for one tick.) */

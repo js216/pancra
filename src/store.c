@@ -175,7 +175,7 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
    return HIST_NEW;
 }
 
-int hist_prev_glu(long t, int src)
+int hist_prev_glu(long t, int src, long not_before)
 {
    /* g_hist is newest-first, so the first match older than `t` is the one
     * wanted. KIND_BGM is skipped: a fingerstick is a different instrument
@@ -186,7 +186,10 @@ int hist_prev_glu(long t, int src)
       if (g_hist[i].kind == KIND_BGM)
          continue;
       if (g_hist[i].t < t)
-         return g_hist[i].glu;
+         /* Inside the window it is the previous READING; older than that it
+          * is the far side of a GAP, and the difference across a gap is not a
+          * rate. Returning -1 there is what keeps the chirp honest. */
+         return (g_hist[i].t >= not_before) ? g_hist[i].glu : -1;
    }
    return -1;
 }

@@ -239,6 +239,23 @@ public final class PancraService extends Service {
         } catch (Throwable t) { Log.i("pancra", "scheduleWake: " + t); }
     }
 
+    /* Drop the periodic wake. Only for the giving-up path below: scheduleWake()
+     * re-arms on EVERY start, and the alarm outlives the process, so a service
+     * that stops because it has no native code would otherwise be restarted by
+     * its own alarm five minutes later -- foreground notification, wakelock,
+     * one failed tick, stop, repeat forever. Opening the activity re-arms it,
+     * which is exactly when it becomes useful again. */
+    private void cancelWake() {
+        try {
+            AlarmManager am = getSystemService(AlarmManager.class);
+            if (am == null) return;
+            Intent i = new Intent(this, PancraService.class).setAction(ACTION_WAKE);
+            PendingIntent pi = PendingIntent.getForegroundService(this, 1, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            am.cancel(pi);
+        } catch (Throwable t) { Log.i("pancra", "cancelWake: " + t); }
+    }
+
     @Override public int onStartCommand(Intent i, int flags, int startId) {
         try {
             if (Build.VERSION.SDK_INT >= 29)
@@ -319,6 +336,7 @@ public final class PancraService extends Service {
                 Log.i("pancra", "tick: " + t);
             } finally {
                 if (noNative) {
+                    cancelWake();   /* or its own alarm restarts this in 5 min */
                     stopSelf();
                 } else {
                     android.os.Handler h = tick;   /* read once */

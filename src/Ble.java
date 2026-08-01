@@ -282,14 +282,18 @@ public final class Ble {
                     long g = -1, i = -1;
                     String ln;
                     /* BOUNDED, like remoteRange's body read. The cursor reply
-                     * is two lines; an endpoint that answers HTTP and then
-                     * never closes the body -- a wrong address landing on an
-                     * event stream or a log tail -- used to hold this loop
-                     * forever, and sBusy with it. remoteBusy() then returned 1
-                     * for the life of the process, so no cursor, no batches and
-                     * no pull ever ran again; nothing cleared it, not even
-                     * toggling REMOTE off and on. setReadTimeout is no help,
-                     * being per-read rather than per-response. */
+                     * is two lines.
+                     *
+                     * setReadTimeout(5000) above already covers an endpoint
+                     * that answers and then goes SILENT: readLine() blocks,
+                     * throws SocketTimeoutException, and the finally clears
+                     * sBusy. What it cannot cover is an endpoint that keeps
+                     * EMITTING -- a wrong address landing on an event stream
+                     * or a log tail -- because every line resets the per-read
+                     * timer. That held this loop forever and sBusy with it, so
+                     * remoteBusy() stayed 1 for the life of the process: no
+                     * cursor, no batches, no pull, and nothing to clear it,
+                     * not even toggling REMOTE off and on. */
                     int nl = 0;
                     while (nl++ < 64 && (ln = r.readLine()) != null) {
                         String[] f = ln.trim().split("\\s+");

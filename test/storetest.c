@@ -129,6 +129,54 @@ int main(void)
    ck(g_nhist == NHIST, "...without growing past NHIST");
    ck(g_hist[NHIST - 1].t > oldest, "...by evicting the oldest");
 
+   printf("== hist_prev_glu: the SAME sensor's previous CGM value ==\n");
+   /* This is what the NEW DATAPOINT chirp pitches on, so a wrong answer is an
+    * alert that announces a swing the wearer never had. The per-source rule is
+    * the whole point: with two CGMs worn at once, the difference between them
+    * is a calibration offset between two devices, not a trend. */
+   {
+      const long win = 450; /* CHIRP_MAX_GAP_S at the real call site */
+      reset();
+      ck(hist_prev_glu(t0, 7, t0 - win) == -1, "no history at all yields -1");
+      (void)hist_insert(t0 - 600, 100, 1, 7, KIND_CGM);
+      (void)hist_insert(t0 - 300, 110, 1, 7, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == 110, "the NEWEST older sample wins");
+      ck(hist_prev_glu(t0 - 300, 7, t0 - 300 - win) == 100,
+         "...measured strictly BEFORE the given instant");
+      ck(hist_prev_glu(t0 - 600, 7, t0 - 600 - win) == -1,
+         "the oldest sample has no predecessor");
+      /* A second sensor's readings must be invisible to the first. */
+      (void)hist_insert(t0 - 60, 250, 1, 9, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == 110,
+         "another sensor's newer sample is NOT borrowed");
+      ck(hist_prev_glu(t0, 9, t0 - win) == 250,
+         "...and sensor 9 sees only its own");
+      ck(hist_prev_glu(t0, 4, t0 - win) == -1, "an unknown source yields -1");
+      /* A fingerstick is a different instrument with its own offset. */
+      (void)hist_insert(t0 - 30, 300, 1, 7, KIND_BGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == 110,
+         "a fingerstick from the same source is skipped");
+
+      /* THE GAP RULE. Across a dropout the difference is not a rate, so the
+       * chirp must fall back to its neutral pitch rather than announce the
+       * whole accumulated drift as a rocket. */
+      reset();
+      (void)hist_insert(t0 - 300, 95, 1, 7, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == 95,
+         "one cadence back is inside the window");
+      reset();
+      (void)hist_insert(t0 - win, 95, 1, 7, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == 95, "exactly at the edge counts");
+      reset();
+      (void)hist_insert(t0 - win - 1, 95, 1, 7, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == -1,
+         "one second past the edge is a GAP, not a previous reading");
+      reset();
+      (void)hist_insert(t0 - 5400, 95, 1, 7, KIND_CGM);
+      ck(hist_prev_glu(t0, 7, t0 - win) == -1,
+         "a 90-minute dropout never pitches on the drift across it");
+   }
+
    printf("== the big number belongs to the primary, or to nobody ==\n");
    reset();
    hist_insert(t0, 100, 1, 7, KIND_CGM);       /* old primary sample */

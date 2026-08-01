@@ -11,7 +11,17 @@
 extern char g_model[24], g_fw[24],
     g_mfr[24];                        /* DIS: model / fw / manufacturer */
 extern int g_alarm_low, g_alarm_high; /* thresholds, mg/dL */
-extern int g_sound_on, g_vib_on;      /* alarm sound / vibration */
+/* NUDGE thresholds, mg/dL -- the one-time heads-up band (alarmlogic.h). They
+ * live in the SAME file as the alarm pair because they are the same kind of
+ * fact and must not be able to load half-applied against each other. */
+extern int g_nudge_low, g_nudge_high;
+extern int g_sound_on, g_vib_on; /* alarm sound / vibration */
+/* NUDGE sound / vibration. SEPARATE from the alarm's, because the two alerts
+ * mean different things: the alarm is "act now" and the nudge is "have a
+ * look". Silencing the one you can ignore must not silence the one you
+ * cannot, and the reverse -- a user who mutes the alarm in a meeting may well
+ * still want the buzz. */
+extern int g_nudge_sound, g_nudge_vib;
 extern int g_orient;         /* 0 portrait 1 landscape 2 gravity 3 system */
 extern int g_screen_on;      /* 1 keep screen on while open, 0 follow the OS */
 extern int g_newdata_mode;   /* ND_OFF / ND_BEEP / ND_CHIRP (alarmlogic.h):
@@ -33,7 +43,10 @@ extern char g_info_path[256], g_alarm_path[256], g_settings_path[256],
 
 void info_save(void); /* device-info strings "model\nfw\nmfr\n" */
 void info_load(void);
-void alarm_save(void); /* "low high\n" */
+/* "low high nudge_low nudge_high\n". The nudge pair was appended, so files
+ * written before it exist with two fields only -- those load the alarm pair
+ * and leave the nudge at its (OFF) defaults, like every other loader here. */
+void alarm_save(void);
 void alarm_load(void);
 /* "sound vib orient units disc plot_max screen_on\n" -- fields are read
  * positionally and the parse stops at the first missing one, so appending a

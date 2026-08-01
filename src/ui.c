@@ -456,10 +456,125 @@ int ui_sensor_capacity(int w, int h)
    return n > UI_MAX_SLOTS ? UI_MAX_SLOTS : n;
 }
 
-/* Left/top column: big number + label column, plot tabs, plot, alarm-config
- * row. Draws into [cx, cx+cw); returns the y just below the last row. Records
- * the big-number band (open settings), the plot rect (scrub), the tab cells,
- * and the two +/- alarm buttons as touch targets. */
+/* A threshold that no reading can ever reach must SAY it is off, not show the
+ * number that makes it so.
+ *
+ * 0 sits below every possible reading and AL_ENTRY_MAX above every one -- each
+ * end is that threshold's deliberate OFF switch (alarmlogic.h). Rendering
+ * those as "0" and "999" states the mechanism and hides the consequence, and
+ * the consequence is the one this app must never let the user get wrong:
+ * believing a reminder is armed when nothing can ever trigger it. That is
+ * precisely the hazard the NUDGE exists to remove, and it would be perverse
+ * for the row announcing it to be ambiguous. */
+static int thresh_off(int mgdl, int ishigh)
+{
+   return ishigh ? (mgdl >= AL_ENTRY_MAX) : (mgdl <= 0);
+}
+
+static void fmt_thresh(int mgdl, int units, int ishigh, char *out, int n)
+{
+   if (thresh_off(mgdl, ishigh))
+      (void)snprintf(out, n, "OFF");
+   else
+      fmt_glu(mgdl, units, out, n);
+}
+
+/* One threshold row on the main screen: "<NAME>  LOW <v>  HIGH <v>", the full
+ * column width, returning the y below it.
+ *
+ * ALARM and NUDGE share this because their columns MUST agree: the two rows
+ * are read as a pair (the nudge is the outer band, the alarm the inner one),
+ * and values that do not line up cannot be compared at a glance. Both names
+ * are five characters and both rows reserve the SAME fixed icon cell -- the
+ * nudge simply leaves it empty -- so identical arithmetic here puts every
+ * column in the same place on both rows. */
+static int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                      struct hits *h, int cx, int cw, int y, int sc, int pad,
+                      int isalarm)
+{
+   uint32_t *px      = fb->bits;
+   const uint32_t gy = 0xFF888888;
+   const uint32_t wt = 0xFFFFFFFF;
+   int cwid          = 6 * sc;
+   char lo[8];
+   char hi[8];
+   fmt_thresh(isalarm ? m->alarm_low : m->nudge_low, m->units, 0, lo,
+              sizeof lo);
+   fmt_thresh(isalarm ? m->alarm_high : m->nudge_high, m->units, 1, hi,
+              sizeof hi);
+   const char *tok[5] = {isalarm ? "ALARM" : "NUDGE", "LOW", lo, "HIGH", hi};
+   uint32_t tcol[5]   = {gy, gy, wt, gy, wt};
+   /* Four icon cells LEFT of the name, at a FIXED 6*sc pitch, and the SAME
+    * four columns on both rows: speaker (sound), phone (vibration), then a
+    * row-specific third, then dot (NEW DATAPOINT). Each symbol always appears
+    * in the same place regardless of which others are enabled; an off state
+    * just leaves its cell empty, so toggling never shifts anything, and
+    * speaker sits above speaker so the two rows read as a table.
+    *
+    * Each row shows ITS OWN outputs. The nudge has its own sound and
+    * vibration -- one alert says "act now" and the other says "have a look",
+    * and muting either must not mute the other. The third cell is the
+    * DISCONNECT alarm on the ALARM row and nothing on the NUDGE row; the dot
+    * is on the NUDGE row because NEW DATAPOINT lives in the NUDGE section of
+    * the menu these rows open, and icons that contradict the menu behind them
+    * are worse than no icons. */
+   int icon_w = 23 * sc;
+   int total  = icon_w;
+   for (int i = 0; i < 5; i++)
+      total += str_len(tok[i]) * cwid;
+   int g = (cw - total) / 7;
+   if (g < cwid)
+      g = cwid;
+   int ax = cx + g;
+   if (isalarm ? m->sound_on : m->nudge_sound)
+      draw_icon(px, fb, ax, y, sc, icon_speaker, gy);
+   if (isalarm ? m->vib_on : m->nudge_vib)
+      draw_icon(px, fb, ax + (6 * sc), y, sc, icon_vibrate, gy);
+   if (isalarm && m->disc)
+      draw_icon(px, fb, ax + (12 * sc), y, sc, icon_nolink, gy);
+   if (!isalarm && m->newdata_mode)
+      draw_icon(px, fb, ax + (18 * sc), y, sc, icon_dot, gy);
+   ax += icon_w + g;
+   int al_y = y - (3 * sc);
+   /* EXACTLY the row advance, so consecutive rows ABUT rather than overlap.
+    * It used to be (3 + 7)*sc + pad while the advance is (7*sc) + pad, i.e.
+    * 3*sc taller than its own row -- harmless while ALARM was the only such
+    * row, and a mis-actuation the moment NUDGE appeared below it: ui_hit_idx
+    * scans backwards, so the bottom 3*sc of "ALARM HIGH" (9 px at 1080x1920)
+    * opened the NUDGE HIGH keypad instead. Measured at every geometry before
+    * this line changed. */
+   int al_h = (7 * sc) + pad;
+   /* Three targets on the row: everything LEFT of "LOW" (the icons and the
+    * ALARM label, from the screen's leftmost pixel) opens the ALARM
+    * submenu; "LOW <value>" and "HIGH <value>" are each ONE target (label +
+    * value + surrounding gap, full row height) opening that threshold's
+    * keypad. The three are DISJOINT -- the pressed highlight lights the
+    * armed control's whole rectangle, so they must not contain each other's
+    * pixels. Both rows open the SAME submenu: it holds both sections. */
+   int pair_x = 0;
+   for (int i = 0; i < 5; i++) {
+      if (i == 1 || i == 3)
+         pair_x = ax; /* start of the LOW / HIGH pair */
+      if (i == 1)
+         add_hit(h, 0, al_y, ax - (g / 2), al_h, ACT_MENU, MA_ALARM_OPEN);
+      draw_str(px, fb, ax, y, sc, tok[i], tcol[i]);
+      int tw = str_len(tok[i]) * cwid;
+      if (i == 2 || i == 4) {
+         int code = (i == 2) ? MA_ALARM_LOW : MA_ALARM_HIGH;
+         if (!isalarm)
+            code = (i == 2) ? MA_NUDGE_LOW : MA_NUDGE_HIGH;
+         add_hit(h, pair_x - (g / 2), al_y, (ax + tw) - pair_x + g, al_h,
+                 ACT_MENU, code);
+      }
+      ax += tw + g;
+   }
+   return y + (7 * sc) + pad;
+}
+
+/* Left/top column: big number + label column, plot tabs, plot, the ALARM and
+ * NUDGE threshold rows. Draws into [cx, cx+cw); returns the y just below the
+ * last row. Records the big-number band (open settings), the plot rect
+ * (scrub), the tab cells, and both threshold rows' targets. */
 static int render_glucose(struct ANativeWindow_Buffer *fb,
                           const struct screen *m, struct hits *h, int cx,
                           int cw, int y, int sc, int bottom)
@@ -738,19 +853,30 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * room to spare -- never clip. */
    /* Reserve, in sc units, everything drawn between the plot bottom and the
     * screen bottom AT FULL FONT:
-    *   34 = what render_glucose itself adds after the plot (the ALARM LOW/HIGH
-    *        config row: 9 gap + 7 row + 18 portrait pad),
+    *   59 = what render_glucose itself adds after the plot: a 9 gap, then the
+    *        ALARM and NUDGE threshold rows at 7 row + 18 portrait pad EACH.
+    *        This was 34 while there was one row; a second row that the
+    *        reserve does not count is a second row the plot grows over, and
+    *        the overlap lands on the thresholds -- the numbers whose whole
+    *        purpose is to be readable at a glance.
     *  186 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
     *        the banner's advance and glyph),
     *   16 = one blank line BELOW the alarm's large letters.
     * Reserving render_info's full budget keeps its font at sc (it only
     * downscales when squeezed), which is the point -- the plot grows into the
     * dead space, the text below it does NOT shrink. */
-   int reserve = (34 + 186 + 16) * sc;
+   int reserve = (59 + 186 + 16) * sc;
    int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
    int ph   = 0;
    if (landscape)
-      ph = bottom - y - (26 * sc);
+      /* 39, not 26: in landscape the plot is sized by SUBTRACTING what comes
+       * after it, and what comes after it is now TWO threshold rows -- a 9 gap
+       * then 7 glyph + 6 landscape pad EACH, i.e. 35, leaving the same 4 sc of
+       * slack the old 26 left over one row. Left at 26 the NUDGE row and all
+       * three of its tap targets landed below the buffer on every wide-short
+       * geometry (measured at 1440x1300 and 1600x720), which is the whole
+       * no-scrolling failure: drawn nowhere, tappable nowhere. */
+      ph = bottom - y - (39 * sc);
    else
       /* Never below the old fixed height (short screens keep exactly the
        * previous layout, so nothing that used to fit now clips); grow only
@@ -869,65 +995,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    add_hit(h, plot_x, plot_y, plot_w, ph, ACT_SCRUB, 0);
    y += ph + (9 * sc);
 
-   /* alarm config row: "ALARM  LOW 110  HIGH 300", full-column. The old
-    * per-step +- buttons were fiddly sub-fingertip targets; tapping
-    * "LOW <value>" or "HIGH <value>" opens the keypad on that threshold
-    * instead (entry in DISPLAY units, exactly like calibration). */
-   const uint32_t gy = 0xFF888888;
-   const uint32_t wt = 0xFFFFFFFF;
-   int cwid          = 6 * sc;
-   char lo[8];
-   char hi[8];
-   fmt_glu(m->alarm_low, m->units, lo, sizeof lo);
-   fmt_glu(m->alarm_high, m->units, hi, sizeof hi);
-   const char *tok[5] = {"ALARM", "LOW", lo, "HIGH", hi};
-   uint32_t tcol[5]   = {gy, gy, wt, gy, wt};
-   /* Four icon cells LEFT of "ALARM" -- speaker (sound), phone (vibration),
-    * slashed circle (DISCONNECT alarm), dot (NEW DATAPOINT beep) -- so with
-    * the LOW/HIGH values every alarm is represented on the main screen.
-    * FIXED cells at an equal 6*sc pitch: each symbol always appears in the
-    * same place regardless of which others are enabled; an off state just
-    * leaves its cell empty, so toggling never shifts anything. */
-   int icon_w = 23 * sc;
-   int total  = icon_w;
-   for (int i = 0; i < 5; i++)
-      total += str_len(tok[i]) * cwid;
-   int g = (cw - total) / 7;
-   if (g < cwid)
-      g = cwid;
-   int ax = cx + g;
-   if (m->sound_on)
-      draw_icon(px, fb, ax, y, sc, icon_speaker, gy);
-   if (m->vib_on)
-      draw_icon(px, fb, ax + (6 * sc), y, sc, icon_vibrate, gy);
-   if (m->disc)
-      draw_icon(px, fb, ax + (12 * sc), y, sc, icon_nolink, gy);
-   if (m->newdata_mode)
-      draw_icon(px, fb, ax + (18 * sc), y, sc, icon_dot, gy);
-   ax += icon_w + g;
-   int al_y = y - (3 * sc);
-   int al_h = (3 * sc) + (7 * sc) + pad;
-   /* Three targets on the row: everything LEFT of "LOW" (the icons and the
-    * ALARM label, from the screen's leftmost pixel) opens the ALARM
-    * submenu; "LOW <value>" and "HIGH <value>" are each ONE target (label +
-    * value + surrounding gap, full row height) opening that threshold's
-    * keypad. The three are DISJOINT -- the pressed highlight lights the
-    * armed control's whole rectangle, so they must not contain each other's
-    * pixels. */
-   int pair_x = 0;
-   for (int i = 0; i < 5; i++) {
-      if (i == 1 || i == 3)
-         pair_x = ax; /* start of the LOW / HIGH pair */
-      if (i == 1)
-         add_hit(h, 0, al_y, ax - (g / 2), al_h, ACT_MENU, MA_ALARM_OPEN);
-      draw_str(px, fb, ax, y, sc, tok[i], tcol[i]);
-      int tw = str_len(tok[i]) * cwid;
-      if (i == 2 || i == 4)
-         add_hit(h, pair_x - (g / 2), al_y, (ax + tw) - pair_x + g, al_h,
-                 ACT_MENU, (i == 2) ? MA_ALARM_LOW : MA_ALARM_HIGH);
-      ax += tw + g;
-   }
-   y += (7 * sc) + pad;
+   /* Threshold rows: "ALARM  LOW 110  HIGH 300" and, below it, the NUDGE
+    * pair. Both are the full column and both are laid out by thresh_row, so
+    * their LOW/HIGH columns line up exactly (see there). */
+   y = thresh_row(fb, m, h, cx, cw, y, sc, pad, 1);
+   y = thresh_row(fb, m, h, cx, cw, y, sc, pad, 0);
    return y;
 }
 
@@ -1254,7 +1326,13 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       /* A banner-only colour, for the same visibility-check reason as LOW. */
       c = 0xFF00D0FF;
    } else if (m->now - m->t <= 360) {
-      if (m->glu < m->alarm_low) {
+      /* INCLUSIVE, exactly like alarm_zone (alarmlogic.c): the alarm fires AT
+       * the limit, so the banner must appear at the limit too. While this read
+       * `<` and the alarm read `<=`, a reading of exactly LOW sounded the alarm
+       * and posted "Glucose LOW" while this screen drew no banner and coloured
+       * the big number in-range -- the app contradicting its own alarm, which
+       * is a reason to dismiss a real hypo. One threshold, one comparison. */
+      if (m->glu >= 0 && m->glu <= m->alarm_low) {
          msg = "LOW";
          /* Deliberately NOT glu_color's red (0xFF0000FF): sharing that value
           * made the offline visibility check vacuous, because the big number
@@ -1262,7 +1340,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
           * passed while the banner was entirely off-screen. A banner-only
           * colour is what makes that assertion mean something. */
          c = 0xFF2020E0;
-      } else if (m->glu > m->alarm_high) {
+      } else if (m->glu >= m->alarm_high) { /* inclusive, as above */
          msg = "HIGH";
          /* Banner-only, like LOW. Sharing glu_color's orange is what made the
           * LOW visibility assertion vacuous for five review rounds -- the
@@ -1435,8 +1513,8 @@ static int menu_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
                        int action)
 {
    uint32_t *px = fb->bits;
-   int bh       = 19 * sc; /* label glyph is 7*sc -> 6*sc padding each side
-                            * (was 4*sc; +50% padding app-wide) */
+   int bh       = 25 * sc; /* label glyph is 7*sc -> 9*sc padding each side
+                            * (4*sc -> 6*sc -> 9*sc; +50% padding app-wide) */
    int lw  = str_len(label) * 6 * sc;
    int lhh = 7 * sc;
    draw_frame(px, fb, x, y, w, bh, 0xFF888888);
@@ -1472,20 +1550,31 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    menu_row(fb, h, y, sc, lh, "DISPLAY ...", "", 0xFFFFFFFF, MA_DISPLAY_OPEN);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "ALARM", "", 0xFFFFFFFF, MA_ALARM_OPEN);
-   /* The row's "value" is the SAME icon language the main alarm row uses --
-    * speaker / phone / slashed circle / dot -- in the SAME fixed, equally
-    * spaced cells (6*sc pitch, right-aligned), each symbol always in its
-    * own place with an empty cell when that alarm is off. */
+   /* The row's "value" is the SAME icon language the two main-screen
+    * threshold rows use -- speaker / phone / slashed circle / dot -- in the
+    * SAME fixed, equally spaced cells (6*sc pitch, right-aligned), each
+    * symbol always in its own place with an empty cell when that alert is
+    * off.
+    *
+    * SIX cells, in two groups of three: the door leads to both sections, so
+    * summarising only the ALARM half would say a nudge is silent when it is
+    * not. Group order matches the menu -- ALARM's sound/vibration/disconnect,
+    * a half-cell gap, then NUDGE's sound/vibration/new-datapoint. */
    {
-      int iax = rx - (23 * sc);
+      int iax = rx - (38 * sc);
       if (m->sound_on)
          draw_icon(px, fb, iax, y, sc, icon_speaker, 0xFF888888);
       if (m->vib_on)
          draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
       if (m->disc)
          draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, 0xFF888888);
+      int nax = iax + (21 * sc); /* 3 cells + a half-cell group gap */
+      if (m->nudge_sound)
+         draw_icon(px, fb, nax, y, sc, icon_speaker, 0xFF888888);
+      if (m->nudge_vib)
+         draw_icon(px, fb, nax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
       if (m->newdata_mode)
-         draw_icon(px, fb, iax + (18 * sc), y, sc, icon_dot, 0xFF888888);
+         draw_icon(px, fb, nax + (12 * sc), y, sc, icon_dot, 0xFF888888);
    }
    y += 2 * lh;
    /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
@@ -1681,35 +1770,83 @@ static void render_perms(struct ANativeWindow_Buffer *fb,
 /* ---- ALARM submenu (opened from SETTINGS, or straight from the main
  * screen's alarm row left of "LOW") ---- */
 
+/* A section caption: grey, no value, NO HIT BOX. It must not be tappable --
+ * a target that looks like a row and does nothing teaches the user that rows
+ * here sometimes do nothing, which is the last thing an alarm screen should
+ * teach. menu_row with a negative code records none. */
+static void menu_head(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                      int sc, int lh, const char *name)
+{
+   (void)h;
+   (void)lh;
+   uint32_t *px = fb->bits;
+   /* DIMMER than a row name (0xCCCCCC) and underlined edge to edge. Colour
+    * alone was not enough: drawn at the row colour with no value beside it,
+    * a caption reads as a row whose value failed to render -- and on this
+    * screen "a threshold with no value" is the single most alarming thing it
+    * could accidentally say. The rule makes it structure, not content. */
+   draw_str(px, fb, 4 * sc, y, sc, name, 0xFF888888);
+   draw_frame(px, fb, 4 * sc, y + (11 * sc), fb->width - (8 * sc), 1,
+              0xFF444444);
+}
+
+/* One "LOW"/"HIGH" row: the value in display units, or OFF when the threshold
+ * can never be reached (fmt_thresh). */
+static void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h,
+                            int y, int sc, int lh, const char *name, int mgdl,
+                            int units, int ishigh, int code)
+{
+   char v[8];
+   char lv[16];
+   fmt_thresh(mgdl, units, ishigh, v, sizeof v);
+   if (thresh_off(mgdl, ishigh)) /* "OFF" carries no unit */
+      (void)snprintf(lv, sizeof lv, "%s", v);
+   else
+      (void)snprintf(lv, sizeof lv, "%s %s", v, UI_LBL(units));
+   menu_row(fb, h, y, sc, lh, name, lv, 0xFFFFFFFF, code);
+}
+
 static void render_alarm(struct ANativeWindow_Buffer *fb,
                          const struct screen *m, struct hits *h)
 {
    uint32_t *px = fb->bits;
-   int sc       = ui_fit_scale(fb->width, fb->height, 16);
-   int tsc      = 2 * sc;
-   int lh       = 16 * sc;
-   int x        = 4 * sc;
-   int rx       = fb->width - (4 * sc);
-   int y        = (fb->height / 20) + (8 * sc);
+   /* 26 rows, not 16: the NUDGE section added four rows (two thresholds, its
+    * own SOUND and VIBRATION), two captions and the blank line between the
+    * sections, and this screen has no scrolling to recover anything the
+    * budget under-counts. Measured bottom is 24.5 rows below the title's
+    * start plus the last row's hit box, i.e. 405 sc units against the 416
+    * that 26 buys; 25 buys 400 and is NOT enough. Re-measure this number
+    * whenever a row is added -- it is not a round guess. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 26);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int rx  = fb->width - (4 * sc);
+   int y   = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, "ALARM", 0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
    add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_ALARM_BACK);
    y += 3 * lh;
 
-   /* The two thresholds FIRST, in display units; a tap opens the keypad on
-    * that threshold (the same MA codes the main-screen row uses). */
-   char lo[8];
-   char hi[8];
-   char lv[16];
-   char hv[16];
-   fmt_glu(m->alarm_low, m->units, lo, sizeof lo);
-   fmt_glu(m->alarm_high, m->units, hi, sizeof hi);
-   (void)snprintf(lv, sizeof lv, "%s %s", lo, UI_LBL(m->units));
-   (void)snprintf(hv, sizeof hv, "%s %s", hi, UI_LBL(m->units));
-   menu_row(fb, h, y, sc, lh, "LOW", lv, 0xFFFFFFFF, MA_ALARM_LOW);
+   /* TWO SECTIONS, and the order is the point.
+    *
+    * ALARM first: the persistent, wake-you-up band, and the one that should
+    * be set once to a conservative value and then left alone. NUDGE second:
+    * the wider band that fires once, quietly, and is meant to be ignorable.
+    * Keeping them visibly separate is what stops the alarm being edited as a
+    * stand-in for the nudge -- the habit whose failure mode is an alarm left
+    * parked somewhere it can no longer help. See alarmlogic.h.
+    *
+    * NEW DATAPOINT lives under NUDGE because it is the same kind of thing: a
+    * one-shot sound that informs rather than demands. */
+   menu_head(fb, h, y, sc, lh, "ALARM");
+   y += (3 * lh) / 2;
+   thresh_menu_row(fb, h, y, sc, lh, "LOW", m->alarm_low, m->units, 0,
+                   MA_ALARM_LOW);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "HIGH", hv, 0xFFFFFFFF, MA_ALARM_HIGH);
+   thresh_menu_row(fb, h, y, sc, lh, "HIGH", m->alarm_high, m->units, 1,
+                   MA_ALARM_HIGH);
    y += 2 * lh;
    /* An enabled state reads GREEN, off stays white -- on/off is visible
     * from the colour alone, before reading a word. */
@@ -1721,6 +1858,21 @@ static void render_alarm(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "DISCONNECT", ui_disc_lbl[(unsigned)m->disc & 3U],
             m->disc ? 0xFF33FF88 : 0xFFFFFFFF, MA_DISC);
+   y += (5 * lh) / 2; /* two rows' worth, i.e. a blank line between sections */
+
+   menu_head(fb, h, y, sc, lh, "NUDGE");
+   y += (3 * lh) / 2;
+   thresh_menu_row(fb, h, y, sc, lh, "LOW", m->nudge_low, m->units, 0,
+                   MA_NUDGE_LOW);
+   y += 2 * lh;
+   thresh_menu_row(fb, h, y, sc, lh, "HIGH", m->nudge_high, m->units, 1,
+                   MA_NUDGE_HIGH);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "SOUND", m->nudge_sound ? "ON" : "OFF",
+            m->nudge_sound ? 0xFF33FF88 : 0xFFFFFFFF, MA_NUDGE_SOUND);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "VIBRATION", m->nudge_vib ? "ON" : "OFF",
+            m->nudge_vib ? 0xFF33FF88 : 0xFFFFFFFF, MA_NUDGE_VIB);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
             ui_newdata_lbl[(unsigned)m->newdata_mode % 3U],
@@ -1980,7 +2132,16 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
     * (settings gets 3), which read as microscopic. Size instead for 28 rows and
     * use a tighter 14*sc pitch: 28*16 == 32*14, so the same content still fits,
     * but sc lands on the normal value. */
-   int sc  = ui_fit_scale(fb->width, fb->height, 28);
+   /* 31, not 28. The worst case is every optional attribute present -- which
+    * is the NORMAL state once DIS has answered and a pairing code is stored:
+    * ENDS, REMAINING, PRED, SN and CODE all appear, 31 rows at the 14*sc
+    * pitch. 28 was about two rows short before the shared button padding grew
+    * and three after, so on 1080x1920, 1080x2400 and 2560x1440 the DISCONNECT
+    * button -- the one destructive action -- was drawn entirely below the
+    * buffer and could not be tapped. That is exactly the failure the note
+    * above says this sizing exists to prevent; the number just never kept up
+    * with the rows. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 31);
    int tsc = 2 * sc;
    int lh  = 14 * sc;
    int x   = 4 * sc;
@@ -2222,10 +2383,22 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       /* WEAR belongs with the device facts: the nominal budget the
        * countdown judges against. Dexcom sells 10- and 15-day G7s that
        * are indistinguishable on the air, so when the auto-resolution
-       * guesses wrong this row is the correction. */
+       * guesses wrong this row is the correction.
+       *
+       * AUTO IS NAMED, AND A PIN IS COLOURED. Both states used to print the
+       * same bare "10 DAYS", so a device whose model says 15 and whose
+       * override says 10 looked exactly like one correctly resolved to 10 --
+       * the countdown was five days short with nothing on screen to explain
+       * it. Green for a pin matches every other row here where green means
+       * "the user changed this from the default". */
       char wd[24];
-      (void)snprintf(wd, sizeof wd, "%d DAYS", (int)(s->wear_len / 86400));
-      menu_row(fb, h, y, sc, lh, "WEAR", wd, 0xFFFFFFFF, MA_WEAR);
+      int wdays = (int)(s->wear_len / 86400);
+      if (s->wear_auto)
+         (void)snprintf(wd, sizeof wd, "AUTO %d D", wdays);
+      else
+         (void)snprintf(wd, sizeof wd, "%d DAYS", wdays);
+      menu_row(fb, h, y, sc, lh, "WEAR", wd,
+               s->wear_auto ? 0xFFFFFFFF : 0xFF33FF88, MA_WEAR);
       y += lh;
    }
    /* RESCALE: the active multiplicative correction as a signed percentage, or
@@ -2784,12 +2957,18 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
     * form opens already knowing it. DEVICES: the three device types from
     * the ADD DEVICE picker, one tap instead of two. */
    int bw = fb->width - (2 * x);
+   /* Air BETWEEN buttons, 50% more than the one-row gap the rest of the menus
+    * use: this screen is nothing but stacked buttons, several of them
+    * destructive-adjacent (logging a dose vs. adding a device), so the extra
+    * separation is what stops a mistap. Header-to-button spacing stays at one
+    * row, which keeps each label visibly attached to the button it names. */
+   int gap = (3 * lh) / 2;
    draw_str(px, fb, x, y, sc, "INSULIN", 0xFF888888);
    y += lh;
    y = menu_button(fb, h, x, y, bw, sc, "FAST", 0xFFFFFFFF, MA_INS_FAST);
-   y += lh;
+   y += gap;
    y = menu_button(fb, h, x, y, bw, sc, "SLOW", 0xFFFFFFFF, MA_INS_SLOW);
-   y += lh;
+   y += gap;
    y = menu_button(fb, h, x, y, bw, sc, "VIEW INSULIN LOG", 0xFFFFFFFF,
                    MA_INSLOG_OPEN);
    y += 2 * lh;
@@ -2799,7 +2978,7 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
    for (int t = SENSOR_STELO; t < SENSOR_NTYPES; t++) {
       y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), 0xFFFFFFFF,
                       MA_TYPE + t);
-      y += lh;
+      y += gap;
    }
 }
 
@@ -3020,9 +3199,15 @@ static void render_inslog(struct ANativeWindow_Buffer *fb,
 
    if (npages > 1) {
       int navy = fb->height - lh - (4 * sc);
+      /* Height `lh + 7*sc`, not `2*lh`: from `navy - 3*sc` a 2*lh box ends at
+       * `height + 9*sc`, i.e. always 9*sc BELOW the buffer. The arrows drew
+       * correctly and the top of each box was tappable, so it worked by
+       * accident -- but an out-of-bounds target is exactly what the layout
+       * gate forbids everywhere else, and the bottom strip of the finger
+       * target simply did not exist. This ends flush with the bottom edge. */
       if (page > 0) {
          draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit(h, 0, navy - (3 * sc), fb->width / 3, 2 * lh, ACT_MENU,
+         add_hit(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc), ACT_MENU,
                  MA_INSLOG_PREV);
       }
       char pg[24];
@@ -3032,7 +3217,7 @@ static void render_inslog(struct ANativeWindow_Buffer *fb,
       if (page < npages - 1) {
          draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
          add_hit(h, fb->width - (fb->width / 3), navy - (3 * sc), fb->width / 3,
-                 2 * lh, ACT_MENU, MA_INSLOG_NEXT);
+                 lh + (7 * sc), ACT_MENU, MA_INSLOG_NEXT);
       }
    }
 }
@@ -3116,7 +3301,7 @@ static void render_olddev(struct ANativeWindow_Buffer *fb,
       int navy = fb->height - lh - (4 * sc);
       if (page > 0) {
          draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit(h, 0, navy - (3 * sc), fb->width / 3, 2 * lh, ACT_MENU,
+         add_hit(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc), ACT_MENU,
                  MA_OLDPAGE_PREV);
       }
       char pg[24];
@@ -3125,8 +3310,8 @@ static void render_olddev(struct ANativeWindow_Buffer *fb,
                0xFF888888);
       if (page < npages - 1) {
          draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
-         add_hit(h, (2 * fb->width) / 3, navy - (3 * sc), fb->width / 3, 2 * lh,
-                 ACT_MENU, MA_OLDPAGE_NEXT);
+         add_hit(h, (2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
+                 lh + (7 * sc), ACT_MENU, MA_OLDPAGE_NEXT);
       }
    }
 }
@@ -3162,7 +3347,12 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
       back = MA_SENSOR + (m->sel >= 0 ? m->sel : 0);
       curm = okk ? m->sensors[m->sel].marker : 0;
       curc = okk ? m->sensors[m->sel].color : 0;
-      curs = okk ? m->sensors[m->sel].size : MARK_SIZE_DEF;
+      /* size 0 means UNSET, i.e. the default (sensors.h) -- so resolve it the
+       * way the list row and the SIZE preview already do. Passing the raw 0
+       * through made the SIZE row highlight no cell at all, so a sensor that
+       * had never been styled showed no current selection. */
+      curs = (okk && m->sensors[m->sel].size >= 1) ? m->sensors[m->sel].size
+                                                   : MARK_SIZE_DEF;
    }
    uint32_t curcol = ui_sensor_color(curc);
 
@@ -3177,15 +3367,40 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
    int gw = fb->width - (2 * x);
 
+   /* CELLS ARE SQUARE, SO THEIR SIZE IS BOUNDED BY BOTH AXES.
+    *
+    * Sizing them from `gw / cols` alone is correct in portrait and badly
+    * wrong in landscape: at 1920x1080 the shape grid took 1912/4 = 478 px
+    * cells, and the three stacked grids ran some 800 px past the bottom of a
+    * 1080-px buffer. Every swatch below the fold was drawn off-screen while
+    * still recording a full-size tap target, so the styling picker was
+    * unusable in landscape and the gate never saw it -- this screen was
+    * absent from the reachability sweep. ui_settings_scale and ui_fit_scale
+    * already bound themselves by both axes; this is the same rule.
+    *
+    * `rows` counts the grid rows only (shape rows + colour + size); the
+    * labels and gaps between them are subtracted separately. */
+   int gridrows = ((UI_NMARKERS + 3) / 4) + 2;
+   int gridav   = fb->height - y   /* what is left below the title */
+                  - (3 * lh)       /* the SHAPE / COLOR / SIZE labels */
+                  - ((3 * lh) / 2) /* the half-line gap after each grid */
+                  - (lh / 2);      /* keep the last row off the very edge */
+   int cellmax  = (gridav > gridrows) ? gridav / gridrows : 1;
+
    /* SHAPE grid: each shape as a glyph in the sensor's own colour. */
    draw_str(px, fb, x, y, sc, "SHAPE", 0xFF888888);
    y += lh;
    {
       int cols = 4;
       int cell = gw / cols;
+      if (cell > cellmax)
+         cell = cellmax;
+      /* Centre what the height cap left over, so a wide screen reads as a
+       * deliberate block rather than a grid shoved against the left edge. */
+      int gx = x + ((gw - (cols * cell)) / 2);
       for (int i = 0; i < UI_NMARKERS; i++) {
          int mk = ui_marker_order[i];
-         int cx = x + ((i % cols) * cell);
+         int cx = gx + ((i % cols) * cell);
          int cy = y + ((i / cols) * cell);
          if (mk == MARK_HIDE) {
             int lw = str_len("OFF") * 6 * sc;
@@ -3209,8 +3424,11 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
    {
       int cols = UI_NCOLORS;
       int cell = gw / cols;
+      if (cell > cellmax)
+         cell = cellmax;
+      int gx = x + ((gw - (cols * cell)) / 2);
       for (int i = 0; i < UI_NCOLORS; i++) {
-         int cx = x + (i * cell);
+         int cx = gx + (i * cell);
          plot_marker_glyph(px, fb->stride, fb->width, fb->height,
                            cx + (cell / 2), y + (cell / 2),
                            (cell - (4 * sc)) / 2, MARK_SQUARE_F,
@@ -3226,11 +3444,14 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
    draw_str(px, fb, x, y, sc, "SIZE", 0xFF888888);
    y += lh;
    {
-      int cols  = MARK_SIZE_MAX;
-      int cell  = gw / cols;
+      int cols = MARK_SIZE_MAX;
+      int cell = gw / cols;
+      if (cell > cellmax)
+         cell = cellmax;
+      int gx    = x + ((gw - (cols * cell)) / 2);
       int shape = (curm == MARK_HIDE) ? MARK_SQUARE_F : curm;
       for (int s = 1; s <= MARK_SIZE_MAX; s++) {
-         int cx = x + ((s - 1) * cell);
+         int cx = gx + ((s - 1) * cell);
          /* Same scaling the plot uses (radius grows linearly with size), so the
           * preview reflects the real on-plot size rather than filling the cell.
           */
@@ -3256,11 +3477,12 @@ const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
 #define UI_LABEL_COLS 6
 
 /* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted quad's
- * 15; port = 5. Index is struct screen's kp_mode. */
+ * 15; port = 5; the four thresholds (10-13) = 4, which holds "999" and the
+ * mmol/L form "55.5". Index is struct screen's kp_mode. */
 int ui_kp_slots(int mode)
 {
-   static const int slots_for[12] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4};
-   return slots_for[(mode >= 0 && mode < 12) ? mode : 0];
+   static const int slots_for[14] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4, 4, 4};
+   return slots_for[(mode >= 0 && mode < 14) ? mode : 0];
 }
 
 int ui_label_nchars(void)
@@ -3434,6 +3656,17 @@ static void pad_key(struct ANativeWindow_Buffer *fb, struct hits *h, int cx,
       add_hit(h, cx, cy, cw, ch, ACT_MENU, code);
 }
 
+/* The four threshold-entry keypad modes -- ALARM LOW/HIGH and NUDGE LOW/HIGH.
+ * They share every behaviour that distinguishes a threshold entry from the
+ * other keypads: the unit suffix, the MAX line, the dot key in mmol/L, and the
+ * OK ceiling. One predicate, so adding the nudge pair could not leave one of
+ * those four sites behind -- which would have meant, for instance, a NUDGE
+ * screen in mmol/L with no '.' key and therefore no way to type 5.5. */
+static int kp_thresh(int mode)
+{
+   return mode >= 10 && mode <= 13;
+}
+
 /* Pairing / plot-max keypad: a title, a fixed-width entry field, and a 3x4
  * digit grid. Keys and the close band carry menu_action codes (100-113). */
 static void render_keypad(struct ANativeWindow_Buffer *fb,
@@ -3479,13 +3712,17 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
       kp_title = "ALARM LOW";
    else if (m->kp_mode == 11)
       kp_title = "ALARM HIGH";
+   else if (m->kp_mode == 12)
+      kp_title = "NUDGE LOW";
+   else if (m->kp_mode == 13)
+      kp_title = "NUDGE HIGH";
    else /* pairing: name the CGM being added, e.g. "PAIR NEW STELO" */
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->add_type ? m->add_type : "SENSOR");
    draw_str(px, fb, x, y, tsc, kp_title, 0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
    y += 2 * lh;
-   if (m->kp_mode == 10 || m->kp_mode == 11) {
+   if (kp_thresh(m->kp_mode)) {
       /* the accepted ceiling, in the entry's own units, then a blank row;
        * the key grid below sizes itself into whatever height remains */
       char mv[8];
@@ -3504,8 +3741,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    int nslots = ui_kp_slots(m->kp_mode);
    /* glucose entries carry the unit label: plot max / cal / rescale and the
     * two alarm thresholds */
-   int has_unit   = (m->kp_mode >= 1 && m->kp_mode <= 3) || m->kp_mode == 10 ||
-                    m->kp_mode == 11;
+   int has_unit = (m->kp_mode >= 1 && m->kp_mode <= 3) || kp_thresh(m->kp_mode);
    const char *en = m->entry ? m->entry : "";
    char shown[24];
    int k = 0;
@@ -3544,8 +3780,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
     * layout: the dot takes 0's old cell, 0 and DEL shift right, and OK
     * becomes a full-width bottom row (which also makes the confirm harder to
     * fat-finger from DEL). */
-   int dotkey = (m->kp_mode == 4) ||
-                ((m->kp_mode == 10 || m->kp_mode == 11) && m->units);
+   int dotkey = (m->kp_mode == 4) || (kp_thresh(m->kp_mode) && m->units);
    int iprows = dotkey ? 5 : 4;
    int gm     = fb->width / 12;
    int gw     = fb->width - (2 * gm);
@@ -3593,7 +3828,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
          /* display units, mmol as TENTHS (no dot key in these modes) */
          okval = m->units ? (ipart * 18) / 10 : ipart;
          okmax = 400;
-      } else if (m->kp_mode == 10 || m->kp_mode == 11) {
+      } else if (kp_thresh(m->kp_mode)) {
          long tenths = (ipart * 10) + (frac > 0 ? frac : 0);
          okval       = m->units ? (tenths * 18) / 10 : ipart;
          okmax       = AL_ENTRY_MAX;

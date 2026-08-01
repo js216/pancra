@@ -51,7 +51,8 @@ static const char *link_path(char *out, int cap, const char *base, int link)
 
 static JavaVM *g_vm;       /* for a JNIEnv on any thread */
 static jclass g_alarm_cls; /* com.jk.pancra.Alarm */
-static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep, m_alarm_chirp;
+static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep, m_alarm_chirp,
+    m_alarm_nudge;
 
 /* a JNIEnv valid on the calling thread (main-loop touches and binder callbacks
  * both drive the alarm), attaching if necessary */
@@ -143,6 +144,26 @@ void dexble_chirp(int st10)
    }
    LOGI("chirp: fire st10=%d", st10);
    (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_chirp, g_ctx, (jint)st10);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+}
+
+/* One NUDGE (a threshold crossing on the wider, one-time band). `kind` is
+ * 0 low, 1 high. Best-effort, same as dexble_beep: the nudge is by definition
+ * the alert the user is allowed to miss, and it must never be able to throw
+ * into the caller, which is the alarm evaluator. */
+void dexble_nudge(int kind, int sound, int vibrate)
+{
+   JNIEnv *e = any_env();
+   if (!e || !g_alarm_cls || !m_alarm_nudge) {
+      LOGI("nudge: not wired (e=%p cls=%p m=%p)", (void *)e,
+           (void *)g_alarm_cls, (void *)m_alarm_nudge);
+      return;
+   }
+   LOGI("nudge: fire kind=%d sound=%d vib=%d", kind, sound, vibrate);
+   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_nudge, g_ctx, (jint)kind,
+                              sound ? JNI_TRUE : JNI_FALSE,
+                              vibrate ? JNI_TRUE : JNI_FALSE);
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
 }
@@ -698,10 +719,24 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
                                              "(Landroid/content/Context;)V");
    m_alarm_beep    = (*e)->GetStaticMethodID(e, alarm_cls, "beep",
                                              "(Landroid/content/Context;)V");
+   m_alarm_nudge   = (*e)->GetStaticMethodID(e, alarm_cls, "nudge",
+                                             "(Landroid/content/Context;IZZ)V");
    m_alarm_chirp   = (*e)->GetStaticMethodID(e, alarm_cls, "chirp",
                                              "(Landroid/content/Context;I)V");
-   LOGI("alarm class wired (trigger=%p silence=%p)", (void *)m_alarm_trigger,
-        (void *)m_alarm_silence);
+   /* A missed method id leaves a pending NoSuchMethodError, and ANY further
+    * JNI call with one pending is illegal -- a VM abort under CheckJNI. The
+    * caller goes on to load settings and build strings, so the throw would
+    * surface far from here. dexble_register states this rule and obeys it;
+    * this function never did, and it now performs five lookups, any of which
+    * can miss if libpancra and classes.dex are ever out of step. Each id is
+    * separately NULL-checked at every use site, so clearing is safe. */
+   if ((*e)->ExceptionCheck(e)) {
+      (*e)->ExceptionClear(e);
+      LOGI("alarm class: a method id is missing (dex/so mismatch?)");
+   }
+   LOGI("alarm class wired (trigger=%p silence=%p chirp=%p nudge=%p)",
+        (void *)m_alarm_trigger, (void *)m_alarm_silence, (void *)m_alarm_chirp,
+        (void *)m_alarm_nudge);
 }
 
 void dexble_pair(int link, const char *mac, const char *code)

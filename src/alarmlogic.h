@@ -48,6 +48,72 @@
  * cannot produce a wild noise. */
 #define CHIRP_MGDL_PER_ST 2
 #define CHIRP_MAX_ST      5
+/* How old the sample being compared against may be. The pitch means "this
+ * much change since the LAST reading", which only carries a rate if the last
+ * reading is one cadence back. After a dropout -- a shower, the phone in
+ * another room -- the first reading back would otherwise chirp the whole
+ * accumulated drift at the cap, indistinguishable from a genuine 10 mg/dL
+ * -in-5-minutes rocket. Past this the honest sound is the plain BEEP.
+ * 450 s is one and a half CGM cycles: tolerant of jitter, short of a gap. */
+#define CHIRP_MAX_GAP_S 450
+
+/* ---- NUDGE: a one-time heads-up on a SECOND, wider pair of thresholds ----
+ *
+ * Why this exists, in the user's own words: a reading of 100 right after lunch
+ * is nothing, and a reading of 100 falling fast with no idea it was coming is
+ * a genuine problem. The only way to express that with one alarm was to keep
+ * MOVING the alarm threshold -- down to 70 after eating, back up when
+ * unaware -- and the failure mode of that habit is the dangerous one: the
+ * threshold gets left parked low, and the user goes on believing a reminder is
+ * armed that can no longer arrive.
+ *
+ * So the NUDGE is the threshold that gets to be permanent. It sits OUTSIDE the
+ * alarm's (a higher low, a lower high), fires ONCE, quietly, and is meant to
+ * be ignorable -- the sound says "look at the number", not "act now". The
+ * alarm underneath it can then stay at the conservative value it should always
+ * have had, and stops being something the user edits day to day.
+ *
+ * Consequences that follow from that, and are implemented below:
+ *   - EDGE-TRIGGERED. It announces the CROSSING, not the state. Re-announcing
+ *     every 5 minutes would make it exactly the thing the user must not learn
+ *     to ignore, and something ignorable that repeats is worse than nothing.
+ *   - SUPPRESSED UNDER THE ALARM. Once the alarm is sounding the nudge has
+ *     nothing left to add, and a gentle blip layered on a ringing alarm reads
+ *     as a malfunction.
+ *   - IT DOES NOT RE-ARM ON A DROPOUT. Staleness must not clear the latch, or
+ *     a flaky link turns one crossing into a nudge every few minutes. Only a
+ *     genuine return to range re-arms it. */
+#define NG_NONE 0
+#define NG_LOW  1
+#define NG_HIGH 2
+
+/* Which nudge band the current reading is in: 0 in range, 1 low, 2 high, and
+ * -1 for NO CURRENT READING -- distinct from 0, because the caller must HOLD
+ * the previous latch through a dropout rather than clear it. Thresholds are
+ * inclusive, exactly like alarm_zone. */
+int nudge_zone(int glu, long glu_t, long now, int lo, int hi);
+
+/* The latch to commit, given this tick's zone and the previous latch. Split
+ * from nudge_fire so that a SUPPRESSED crossing still updates the latch: a
+ * plunge straight past both thresholds must not leave the nudge armed to fire
+ * on the way back up, when the user is already looking at a ringing alarm. */
+int nudge_next(int nzone, int prev);
+
+/* NG_NONE, NG_LOW or NG_HIGH: what to sound right now.
+ *
+ * `nzone` is this tick's nudge zone. `alarming` is non-zero iff the ALARM is
+ * announcing anything -- and it must be the BROAD test, not just this tick's
+ * alarm_zone. The alarm can be sounding for three reasons the zone does not
+ * show: the imminent-hypo override (a prediction below PRED_LOW_MGDL forces
+ * AL_LOW at any current reading), the DISCONNECT alarm, and the stranded
+ * sustain. Passing the zone alone let a nudge blip through underneath the
+ * unsilenceable predicted-hypo alarm -- the loudest possible moment to add a
+ * sound that means "no action needed".
+ *
+ * The two zone-shaped arguments are named apart deliberately: they are the
+ * same type and the same shape, and swapping them would silently invert the
+ * suppression. */
+int nudge_fire(int nzone, int alarming, int prev);
 
 /* Semitones of bend for a delta in mg/dL, in TENTHS of a semitone (the app
  * has no floating point; Java turns tenths into a frequency ratio). A delta
