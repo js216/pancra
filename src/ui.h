@@ -9,6 +9,7 @@
 #include "ndk.h"
 #include "plotdata.h" /* PLOT_LONG_MAX: how many points a long span yields */
 #include "sensors.h"  /* sensor types/kinds the model and renderer share */
+#include "weight.h"   /* struct wt_rec: the WEIGHT LOG table rows */
 #include <stdint.h>
 
 /* ---- pixel/text primitives (font-based, no shared state) ----
@@ -91,6 +92,11 @@ void ui_clip_reset(void);
 long ui_clipped(void);
 int ui_sensor_capacity(int w, int h);
 
+/* Spans the WEIGHT LOG plot offers, in DAYS; 0 is "everything". Exported so
+ * the shell can map a tab tap back to a span without duplicating the list. */
+#define UI_WT_TABS 5
+extern const int ui_wt_days[UI_WT_TABS];
+
 /* The characters the rename keypad offers, in grid order. Exposed so the shell
  * can map an MA_CHAR code back to the character that was tapped. */
 extern const char ui_label_chars[];
@@ -99,6 +105,10 @@ int ui_label_nchars(void);
 /* Digit slots a keypad mode accepts. The renderer draws exactly this many
  * cells and the input path accepts exactly this many digits, so the two
  * cannot drift into disagreeing about how long an entry may be. */
+/* Keypad modes: 0 is the pairing code, 1..UI_KP_MODES-1 are the named value
+ * entries. Bounds BOTH the title table and the slot table in ui.c, so a mode
+ * cannot be added to one and forgotten in the other. */
+#define UI_KP_MODES 15
 int ui_kp_slots(int mode);
 
 const char *ui_marker_name(int marker);
@@ -139,6 +149,9 @@ enum ui_screen {
    SCR_RECONF,  /* confirm reconnecting an EXPIRED old device */
    SCR_REMOTE,  /* remote push: enable/disable, server IP and port */
    SCR_INSLOG,  /* insulin dose log: paginated when/type/units table */
+   SCR_WEIGHT,  /* LOG WEIGHT entry form */
+   SCR_WTLOG,   /* weight log: table + trend plot */
+   SCR_WTDEL,   /* confirm deleting a weight entry */
    SCR_DISPLAY, /* display settings submenu (off SETTINGS) */
    SCR_INSDEL,  /* confirm deleting an insulin dose: DELETE / CANCEL */
    SCR_ALARM,   /* alarm submenu: LOW/HIGH thresholds + outputs */
@@ -263,6 +276,17 @@ struct screen {
    int units, alarm_low, alarm_high, sound_on, vib_on, orient, disc;
    int nudge_low, nudge_high;  /* the one-time heads-up band (alarmlogic.h) */
    int nudge_sound, nudge_vib; /* the nudge's OWN outputs, not the alarm's */
+   int wunits;                 /* weight display unit: WT_KG / WT_LB */
+   /* WEIGHT log table (SCR_WTLOG) and entry form (SCR_WEIGHT). `wt` is the
+    * shell's tail, oldest first; wt_page is the table's page. The form's
+    * value is in TENTHS of the display unit, the shape the keypad accepts. */
+   const struct wt_rec *wt;
+   int nwt, wt_page;
+   int wt_edit;  /* 1 = the form is EDITING an entry, not logging a new one */
+   int wt_tab;   /* index into ui_wt_days: the plot's span */
+   int wt_scrub; /* index into wt of the scrubbed point, -1 = none */
+   int wt_tenths;
+   long wt_t;
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
    int newdata_mode;           /* ND_OFF / ND_BEEP / ND_CHIRP: what a new
                                 * primary-CGM datapoint sounds like */
@@ -300,7 +324,7 @@ struct screen {
    int statbar_val, lockscr_val;
    /* EXPORT DATA menu state: range 0 = 30 D, 1 = 1 Y, 2 = ALL; the three
     * section checkboxes (1 = included) */
-   int exp_range, exp_glu, exp_dev, exp_ins;
+   int exp_range, exp_glu, exp_dev, exp_ins, exp_wt;
    /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none.
     * DEVICES shows it as a tappable PENDING row (MA_PEND_CANCEL); the
     * choose-primary screen offers it too (MA_PRIM_PEND), and pend_primary
@@ -378,16 +402,42 @@ enum ui_menu {
    MA_EXP_GLU   = 272, /* toggle the GLUCOSE (readings) section */
    MA_EXP_DEV   = 273, /* toggle the DEVICES (sensors) section */
    MA_EXP_INS   = 274, /* toggle the INSULIN (doses) section */
+   MA_EXP_WT    = 294, /* toggle the WEIGHT section */
    MA_EXP_GO    = 275, /* build the CSV and open the share sheet */
    MA_EXP_BACK  = 276, /* back to settings, nothing exported */
    /* NUDGE thresholds (main-screen row / ALARM menu): keypad 12 / 13. Parked
     * in the same free band, above MA_EXP_BACK and below MA_CHAR (300); 129 is
     * the only gap left next to the MA_ALARM_* codes and one is not enough. */
-   MA_NUDGE_LOW     = 277,
-   MA_NUDGE_HIGH    = 278,
-   MA_NUDGE_SOUND   = 279, /* nudge section: toggle its sound */
-   MA_NUDGE_VIB     = 280, /* nudge section: toggle its vibration */
-   MA_PERM          = 10,  /* + permission index (0..2) */
+   MA_NUDGE_LOW   = 277,
+   MA_NUDGE_HIGH  = 278,
+   MA_NUDGE_SOUND = 279, /* nudge section: toggle its sound */
+   MA_NUDGE_VIB   = 280, /* nudge section: toggle its vibration */
+   /* WEIGHT log, in the same free band below MA_CHAR. */
+   MA_WT_OPEN    = 281, /* ADD menu: open the LOG WEIGHT form */
+   MA_WTLOG_OPEN = 282, /* ADD menu: open the weight table */
+   MA_WTLOG_BACK = 283, /* weight table: back to the ADD menu */
+   MA_WTLOG_PREV = 284,
+   MA_WTLOG_NEXT = 285,
+   MA_WT_CONFIRM = 286, /* LOG WEIGHT: append the entry */
+   MA_WT_DISCARD = 287, /* LOG WEIGHT: leave without logging */
+   /* LOG WEIGHT fields, mirroring MA_INS_EDIT: + 0 weight, + 1 date, + 2
+    * time, + 3 year. Tapping the value opens the keypad (mode 14/7/8/9). */
+   MA_WT_EDIT   = 288,
+   MA_WUNITS    = 293, /* DISPLAY: toggle KG / LB */
+   MA_WT_DELETE = 295, /* EDIT WEIGHT: delete this entry (red) */
+   MA_WTDEL_YES = 296, /* delete confirmation: really delete */
+   MA_WTDEL_NO  = 297, /* delete confirmation: back to the form */
+   /* 350, NOT 310: MA_CHAR is 300 + an index into ui_label_chars, which is 38
+    * long, so 300..337 is taken and 310 sat squarely inside it -- a tap on
+    * the weight plot's "1M" tab would have dispatched a letter into the
+    * rename keypad. 350..354 is clear of it and below MA_INS_EDIT (400). */
+   MA_WTTAB = 350, /* + tab index (0..UI_WT_TABS-1) */
+   /* WEIGHT LOG rows: + tail index (0..NWT-1) opens that entry in the EDIT
+    * WEIGHT form. 800, NOT 600: MA_INSLOG_EDIT is 500 + a tail index up to
+    * NINS-1 = 255, i.e. 500..755, so 600 was inside the INSULIN log's own
+    * range and a weight row would have opened a DOSE. Nothing above this. */
+   MA_WTLOG_EDIT    = 800,
+   MA_PERM          = 10, /* + permission index (0..2) */
    MA_BATTERY       = 20,
    MA_BGEXEC        = 22,
    MA_PAIR_CODE     = 30,
@@ -520,6 +570,13 @@ struct hits {
 };
 
 /* Render model `m` into framebuffer `fb`, recording touch targets into `h`. */
+/* The epoch the current span starts at (0 = everything), and the index into
+ * m->wt nearest an x pixel. Both PURE and both used by the renderer as well,
+ * so the scrub cursor lands exactly on the point the finger picked instead of
+ * near it. */
+long ui_wt_from(const struct screen *m);
+int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x);
+
 void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h);
 /* Map a tap at (x,y) against the targets from the last render. Pure. */

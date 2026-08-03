@@ -51,7 +51,7 @@ static void write_log(const char *path, long now, int recent, int imported)
 
 int main(void)
 {
-   const char *path = "tmp/uitest/plot-readings.csv";
+   const char *path = "build/test/plot-readings.csv";
    long now         = 1785272930;
    write_log(path, now, 5000, 30000);
 

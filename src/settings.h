@@ -26,7 +26,8 @@ extern int g_orient;         /* 0 portrait 1 landscape 2 gravity 3 system */
 extern int g_screen_on;      /* 1 keep screen on while open, 0 follow the OS */
 extern int g_newdata_mode;   /* ND_OFF / ND_BEEP / ND_CHIRP (alarmlogic.h):
                               * what a new primary-CGM datapoint sounds like */
-extern int g_units;          /* 0 mg/dL, 1 mmol/L */
+extern int g_units;          /* glucose: 0 mg/dL, 1 mmol/L */
+extern int g_wunits;         /* weight: WT_KG / WT_LB (weight.h) */
 extern int g_disc;           /* stale-data alarm: index into disc_min */
 extern int g_plot_max;       /* plot vertical-scale top, mg/dL */
 extern int g_ins_marker[2];  /* MARK_* per insulin type (INS_SLOW/FAST) */

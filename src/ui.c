@@ -519,9 +519,30 @@ static int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * the menu these rows open, and icons that contradict the menu behind them
     * are worse than no icons. */
    int icon_w = 23 * sc;
-   int total  = icon_w;
-   for (int i = 0; i < 5; i++)
-      total += str_len(tok[i]) * cwid;
+   /* FIXED COLUMNS, SIZED FROM BOTH ROWS.
+    *
+    * The widths used to come from THIS row's own tokens, so the two rows
+    * disagreed the moment their values differed in length: with ALARM 95/300
+    * and NUDGE 100/250 the nudge row was one character wider, which shrank
+    * its gap and shifted everything left -- measured 3 px on the icons and up
+    * to 9 px on the labels. The two rows are read as a table, so every column
+    * must start at the same x whatever the numbers happen to be. Take each
+    * column's width from the WIDER of the two rows and use it for both. */
+   char olo[8];
+   char ohi[8];
+   fmt_thresh(isalarm ? m->nudge_low : m->alarm_low, m->units, 0, olo,
+              sizeof olo);
+   fmt_thresh(isalarm ? m->nudge_high : m->alarm_high, m->units, 1, ohi,
+              sizeof ohi);
+   const char *oth[5] = {"XXXXX", "LOW", olo, "HIGH", ohi};
+   int colw[5];
+   int total = icon_w;
+   for (int i = 0; i < 5; i++) {
+      int a   = str_len(tok[i]);
+      int b   = str_len(oth[i]);
+      colw[i] = (a > b ? a : b) * cwid;
+      total += colw[i];
+   }
    int g = (cw - total) / 7;
    if (g < cwid)
       g = cwid;
@@ -557,16 +578,20 @@ static int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
          pair_x = ax; /* start of the LOW / HIGH pair */
       if (i == 1)
          add_hit(h, 0, al_y, ax - (g / 2), al_h, ACT_MENU, MA_ALARM_OPEN);
-      draw_str(px, fb, ax, y, sc, tok[i], tcol[i]);
+      /* Values RIGHT-aligned in their column so the digits line up under one
+       * another; labels left-aligned. Advance by the COLUMN width, never by
+       * this token's own width, or the columns drift apart again. */
       int tw = str_len(tok[i]) * cwid;
+      int tx = ((i == 2 || i == 4)) ? ax + (colw[i] - tw) : ax;
+      draw_str(px, fb, tx, y, sc, tok[i], tcol[i]);
       if (i == 2 || i == 4) {
          int code = (i == 2) ? MA_ALARM_LOW : MA_ALARM_HIGH;
          if (!isalarm)
             code = (i == 2) ? MA_NUDGE_LOW : MA_NUDGE_HIGH;
-         add_hit(h, pair_x - (g / 2), al_y, (ax + tw) - pair_x + g, al_h,
+         add_hit(h, pair_x - (g / 2), al_y, (ax + colw[i]) - pair_x + g, al_h,
                  ACT_MENU, code);
       }
-      ax += tw + g;
+      ax += colw[i] + g;
    }
    return y + (7 * sc) + pad;
 }
@@ -1921,6 +1946,8 @@ static void render_export(struct ANativeWindow_Buffer *fb,
    chk_row(fb, h, y, sc, lh, "DEVICES", m->exp_dev, MA_EXP_DEV);
    y += 2 * lh;
    chk_row(fb, h, y, sc, lh, "INSULIN", m->exp_ins, MA_EXP_INS);
+   y += lh;
+   chk_row(fb, h, y, sc, lh, "WEIGHT", m->exp_wt, MA_EXP_WT);
    y += 3 * lh;
 
    /* The one acting control. With every section unticked there is nothing
@@ -1954,8 +1981,13 @@ static void render_display(struct ANativeWindow_Buffer *fb,
    menu_row(fb, h, y, sc, lh, "ORIENTATION",
             ui_orient_lbl[(unsigned)m->orient & 3U], 0xFFFFFFFF, MA_ORIENT);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "UNITS", m->units ? "MMOL/L" : "MG/DL",
+   /* "GLUCOSE UNITS", not "UNITS": with a weight unit directly below it, a
+    * bare "UNITS" is the row that does not say what it governs. */
+   menu_row(fb, h, y, sc, lh, "GLUCOSE UNITS", m->units ? "MMOL/L" : "MG/DL",
             0xFFFFFFFF, MA_UNITS);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "WEIGHT UNITS", wt_unit_name(m->wunits),
+            0xFFFFFFFF, MA_WUNITS);
    y += 2 * lh;
    /* ALWAYS ON holds the screen awake while the app is open (the historical
     * behaviour); SYSTEM lets the normal display timeout apply. */
@@ -2939,12 +2971,16 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
 {
    (void)m;
    uint32_t *px = fb->bits;
-   int sc       = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc      = 2 * sc;
-   int lh       = 16 * sc;
-   int x        = 4 * sc;
-   int rx       = fb->width - (4 * sc);
-   int y        = (fb->height / 20) + (8 * sc);
+   /* 26 rows, unchanged. The two weight buttons are paid for out of the GAPS
+    * (see `gap` below), not out of the font: raising the budget to fit them
+    * shrank every label on this screen, and a smaller font on the menu that
+    * logs medication is a worse trade than tighter spacing. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 26);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int rx  = fb->width - (4 * sc);
+   int y   = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, "ADD ...", 0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
@@ -2953,24 +2989,43 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
    add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_CLOSE);
    y += 3 * lh;
 
-   /* Two sections. INSULIN: the type is chosen HERE (FAST / SLOW), so the
-    * form opens already knowing it. DEVICES: the three device types from
-    * the ADD DEVICE picker, one tap instead of two. */
+   /* Three sections. LOG: what the user records by hand -- the insulin type
+    * is chosen HERE (FAST / SLOW), so the form opens already knowing it, and
+    * weight sits alongside because it is the same kind of act. DEVICES: the
+    * device types from the ADD DEVICE picker, one tap instead of two. */
    int bw = fb->width - (2 * x);
-   /* Air BETWEEN buttons, 50% more than the one-row gap the rest of the menus
-    * use: this screen is nothing but stacked buttons, several of them
-    * destructive-adjacent (logging a dose vs. adding a device), so the extra
-    * separation is what stops a mistap. Header-to-button spacing stays at one
-    * row, which keeps each label visibly attached to the button it names. */
-   int gap = (3 * lh) / 2;
-   draw_str(px, fb, x, y, sc, "INSULIN", 0xFF888888);
+   /* Air BETWEEN buttons: this screen is nothing but stacked buttons, several
+    * of them destructive-adjacent (logging a dose vs. adding a device), so
+    * the separation is what stops a mistap. Header-to-button spacing stays at
+    * one row, which keeps each label visibly attached to the button it names.
+    *
+    * ONE row, reduced from one and a half when the two weight buttons landed.
+    * The arithmetic at the 26-row budget, in sc: 48 title + 16 header +
+    * 5*25 LOG buttons + 32 + 16 header + 3*25 device buttons = 312, leaving
+    * 416 - 312 = 104 for the six gaps between adjacent buttons, i.e. at most
+    * 17 each. A 24 gap does not fit and a 17 gap clears by 2 sc, which is no
+    * margin at all; one row (16) clears by 8 and is the spacing the rest of
+    * the menus already use. Recheck this if a button is ever added. */
+   int gap = lh;
+   draw_str(px, fb, x, y, sc, "LOG", 0xFF888888);
    y += lh;
-   y = menu_button(fb, h, x, y, bw, sc, "FAST", 0xFFFFFFFF, MA_INS_FAST);
+   /* The buttons NAME what they log. "FAST" and "SLOW" were only unambiguous
+    * while insulin was the sole thing on this screen; with weight beside them
+    * a bare "FAST" is a button whose meaning depends on a header three rows
+    * up, which is not a property to rely on when the tap logs a medication. */
+   y = menu_button(fb, h, x, y, bw, sc, "FAST INSULIN", 0xFFFFFFFF,
+                   MA_INS_FAST);
    y += gap;
-   y = menu_button(fb, h, x, y, bw, sc, "SLOW", 0xFFFFFFFF, MA_INS_SLOW);
+   y = menu_button(fb, h, x, y, bw, sc, "SLOW INSULIN", 0xFFFFFFFF,
+                   MA_INS_SLOW);
    y += gap;
    y = menu_button(fb, h, x, y, bw, sc, "VIEW INSULIN LOG", 0xFFFFFFFF,
                    MA_INSLOG_OPEN);
+   y += gap;
+   y = menu_button(fb, h, x, y, bw, sc, "WEIGHT", 0xFFFFFFFF, MA_WT_OPEN);
+   y += gap;
+   y = menu_button(fb, h, x, y, bw, sc, "VIEW WEIGHT LOG", 0xFFFFFFFF,
+                   MA_WTLOG_OPEN);
    y += 2 * lh;
 
    draw_str(px, fb, x, y, sc, "DEVICES", 0xFF888888);
@@ -3220,6 +3275,500 @@ static void render_inslog(struct ANativeWindow_Buffer *fb,
                  lh + (7 * sc), ACT_MENU, MA_INSLOG_NEXT);
       }
    }
+}
+
+/* ---- WEIGHT: the entry form and the log table ----
+ *
+ * Deliberately the insulin form's shape and helpers (value_row, the same
+ * keypad modes for date/time/year), because they are the same act: a number
+ * the user typed, filed against an instant they can correct. Nothing here is
+ * written before an explicit CONFIRM. */
+
+/* Render a stored weight into the DISPLAY unit, e.g. "154.2 LB". Grams are
+ * what the file holds; this is the only place the preference is applied. */
+static void fmt_weight(long g, int units, char *out, int n)
+{
+   int t = wt_to_tenths(g, units);
+   (void)snprintf(out, n, "%d.%d %s", t / 10, t % 10, wt_unit_name(units));
+}
+
+static void render_weight(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 26);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, m->wt_edit ? "EDIT WEIGHT" : "LOG WEIGHT",
+            0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   /* X discards -- nothing is written before an explicit CONFIRM. */
+   /* 2*lh - 2*sc, not 2*lh: value_row's target starts at its y - 4*sc, so a
+    * full 2*lh close band reached 4*sc into the WEIGHT row below it. */
+   add_hit(h, 0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc), ACT_MENU,
+           MA_WT_DISCARD);
+   y += 2 * lh;
+
+   /* fmt_date renders "YYYY-MM-DD HH:MM"; split it the way the insulin form
+    * does, into YEAR / MM-DD / HH:MM. */
+   char dt[20];
+   fmt_date(m->wt_t, m->tz_off, dt, sizeof dt);
+   char yearp[8];
+   char datep[8];
+   char timep[8];
+   str_snapshot(yearp, sizeof yearp, dt);
+   if (str_len(yearp) > 4)
+      yearp[4] = 0;
+   str_snapshot(datep, sizeof datep, (str_len(dt) > 5) ? dt + 5 : "");
+   if (str_len(datep) > 5)
+      datep[5] = 0;
+   str_snapshot(timep, sizeof timep, (str_len(dt) > 11) ? dt + 11 : "");
+
+   char val[20];
+   (void)snprintf(val, sizeof val, "%d.%d %s", m->wt_tenths / 10,
+                  m->wt_tenths % 10, wt_unit_name(m->wunits));
+   y = value_row(fb, h, y, sc, "WEIGHT", val, 0xFFFFFFFF, MA_WT_EDIT);
+   y += lh;
+   y = value_row(fb, h, y, sc, "TIME", timep, 0xFFFFFFFF, MA_WT_EDIT + 2);
+   y += lh;
+   y = value_row(fb, h, y, sc, "DATE", datep, 0xFFFFFFFF, MA_WT_EDIT + 1);
+   y += lh;
+   y = value_row(fb, h, y, sc, "YEAR", yearp, 0xFFFFFFFF, MA_WT_EDIT + 3);
+   y += 2 * lh;
+
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88, MA_WT_CONFIRM);
+   y += (3 * lh) / 2;
+   y = menu_button(fb, h, x, y, bw, sc, "DISCARD", 0xFFFFFFFF, MA_WT_DISCARD);
+   /* DELETE only when EDITING, red, and LAST -- furthest from CONFIRM, which
+    * is where the finger is aimed. It opens a confirmation; it never deletes
+    * on the tap itself (the EDIT INSULIN rule). */
+   if (m->wt_edit) {
+      y += (3 * lh) / 2;
+      (void)menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF4466FF,
+                        MA_WT_DELETE);
+   }
+}
+
+/* Confirm deleting one weight entry. Mirrors the insulin one: the value being
+ * destroyed is spelled out, CANCEL is first and DELETE is below it. */
+static void render_wtdel(struct ANativeWindow_Buffer *fb,
+                         const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 20);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "DELETE?", 0xFF4466FF);
+   y += 3 * lh;
+   char wv[16];
+   char when[20];
+   fmt_weight(wt_from_tenths(m->wt_tenths, m->wunits), m->wunits, wv,
+              sizeof wv);
+   fmt_date(m->wt_t, m->tz_off, when, sizeof when);
+   draw_str(px, fb, x, y, sc, wv, 0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, when, 0xFFCCCCCC);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, "This cannot be undone.", 0xFF888888);
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_WTDEL_NO);
+   y += (3 * lh) / 2;
+   (void)menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF4466FF, MA_WTDEL_YES);
+}
+
+const int ui_wt_days[UI_WT_TABS] = {30, 90, 180, 365, 0}; /* 0 = everything */
+static const char *const ui_wt_tab_lbl[UI_WT_TABS] = {"1M", "3M", "6M", "1Y",
+                                                      "ALL"};
+
+/* The window a span selects: the time and weight ranges the plot maps onto
+ * its rectangle. ONE definition, used by the renderer AND the hit test --
+ * computing it twice is how a scrub cursor ends up landing next to the point
+ * the finger actually picked. */
+struct wt_win {
+   long tmin, tmax;
+   long lo, hi;
+   int n;
+};
+
+static void wt_window(const struct screen *m, long from, struct wt_win *w)
+{
+   w->n = 0;
+   for (int i = 0; i < m->nwt; i++) {
+      if (m->wt[i].t < from)
+         continue;
+      if (!w->n || m->wt[i].g < w->lo)
+         w->lo = m->wt[i].g;
+      if (!w->n || m->wt[i].g > w->hi)
+         w->hi = m->wt[i].g;
+      if (!w->n)
+         w->tmin = m->wt[i].t;
+      w->n++;
+   }
+   if (!w->n)
+      return;
+   /* THE X AXIS IS THE SELECTED SPAN, not the data's own extent.
+    *
+    * Taking tmin/tmax from the points made "1Y" with three months of data
+    * draw those three months stretched across the full width -- identical to
+    * the "3M" view, with only the date ticks to tell them apart, so the tab
+    * appeared to do nothing. The right edge is now, the left edge is the span
+    * the tab names, and a short history simply leaves the left of the plot
+    * empty, which is the truth. ALL has no fixed start, so it spans from the
+    * first entry to now. */
+   if (from > 0)
+      w->tmin = from;
+   w->tmax = m->now;
+   /* A flat or single-point window has no range to scale to; pad it so the
+    * trace lands mid-plot instead of dividing by zero. */
+   if (w->hi - w->lo < 200) {
+      long mid = (w->hi + w->lo) / 2;
+      w->lo    = mid - 100;
+      w->hi    = mid + 100;
+   }
+   if (w->tmax - w->tmin < 60)
+      w->tmax = w->tmin + 60;
+}
+
+#define WT_PAD 6 /* inset in sc units, so points near the edge stay whole */
+
+static int wt_px(const struct wt_win *w, long t, int px0, int pw, int pad)
+{
+   return px0 + pad +
+          (int)(((t - w->tmin) * (long)(pw - (2 * pad))) / (w->tmax - w->tmin));
+}
+
+/* Separate TOP and BOTTOM insets, not one pad.
+ *
+ * The y bounds are printed inside the plot -- upper at the top-left, lower
+ * above the date ticks at the bottom-left -- so the data band has to stop
+ * short of both, or a point lands on the text that names it. Insetting the
+ * band is the same thing as expanding the y range, and it is exact: no point
+ * can enter a reserved strip, whatever the data does. */
+static int wt_py(const struct wt_win *w, long g, int py0, int ph, int pad_t,
+                 int pad_b)
+{
+   return py0 + pad_t +
+          (int)(((w->hi - g) * (long)(ph - pad_t - pad_b)) / (w->hi - w->lo));
+}
+
+long ui_wt_from(const struct screen *m)
+{
+   int tab = m->wt_tab;
+   if (tab < 0 || tab >= UI_WT_TABS)
+      tab = 0;
+   return ui_wt_days[tab] > 0 ? m->now - ((long)ui_wt_days[tab] * 86400L) : 0;
+}
+
+int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x)
+{
+   struct wt_win w;
+   wt_window(m, ui_wt_from(m), &w);
+   if (!w.n)
+      return -1;
+   int pad  = WT_PAD * sc;
+   int best = -1;
+   long bd  = 0;
+   for (int i = 0; i < m->nwt; i++) {
+      if (m->wt[i].t < ui_wt_from(m))
+         continue;
+      int cx = wt_px(&w, m->wt[i].t, plot_x, plot_w, pad);
+      long d = cx - x;
+      if (d < 0)
+         d = -d;
+      if (best < 0 || d < bd) {
+         bd   = d;
+         best = i;
+      }
+   }
+   return best;
+}
+
+/* The weight trend, drawn into [px0,px0+pw) x [py0,py0+ph).
+ *
+ * Its own plot, not plot.c's: that one is a glucose instrument -- fixed
+ * mg/dL scale, in-range band, per-sensor markers. A weight trend needs none
+ * of it and needs the one thing it cannot do, an AUTOSCALED y axis. A body
+ * weight moves a few percent over a year, so a fixed axis would draw every
+ * point as one flat line. Both axes are labelled with their real extremes,
+ * because an autoscaled plot that does not state its range is the one that
+ * misleads. */
+static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+                    const struct screen *m, int px0, int py0, int pw, int ph,
+                    int sc, long from)
+{
+   draw_frame(px, fb, px0, py0, pw, ph, 0xFF444444);
+   struct wt_win w;
+   wt_window(m, from, &w);
+   if (!w.n) {
+      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "no data in range",
+               0xFF888888);
+      return;
+   }
+   int pad = WT_PAD * sc;
+   /* Reserved strips: the upper bound's line at the top, and the lower
+    * bound's line PLUS the date-tick line at the bottom. */
+   /* + half a text height of breathing room, so the extreme datapoint clears
+    * the bound that names it instead of just touching it. */
+   int half  = (7 * sc) / 2;
+   int pad_t = (13 * sc) + half;
+   int pad_b = (22 * sc) + half;
+   if (pad_t + pad_b > (ph * 2) / 3) { /* a very short plot: share it out */
+      pad_t = ph / 6;
+      pad_b = ph / 4;
+   }
+
+   /* LIGHT GRID. Dark enough to sit behind the trace rather than compete with
+    * it: the trace is the data, the grid is only a ruler. Four horizontal
+    * divisions, and vertical lines on the same columns the date labels use so
+    * a label always names a line rather than floating between two. */
+   const uint32_t grid = 0xFF2A2A2A;
+   for (int i = 1; i < 4; i++) {
+      int gy = py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4);
+      fill_rect(px, fb, px0 + 1, gy, pw - 2, 1, grid);
+   }
+   int nticks = 4; /* 3 interior + the right edge; see the label loop */
+   for (int i = 1; i <= nticks; i++) {
+      int gx = px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1));
+      fill_rect(px, fb, gx, py0 + 1, 1, ph - 2, grid);
+   }
+
+   /* THE Y BOUNDS, upper at the top-left and lower at the bottom-left, each
+    * against the axis end it names. They used to be one "lo-hi" string in the
+    * top-right corner, which states the range but not which end is which way
+    * up. Always drawn: the reserved strips above keep the trace off them, so
+    * unlike the old corner label there is nothing to suppress while
+    * scrubbing. */
+   {
+      char slab[16];
+      fmt_weight(w.hi, m->wunits, slab, sizeof slab);
+      draw_str(px, fb, px0 + (4 * sc), py0 + (3 * sc), sc, slab, 0xFF888888);
+      fmt_weight(w.lo, m->wunits, slab, sizeof slab);
+      draw_str(px, fb, px0 + (4 * sc), py0 + ph - (19 * sc), sc, slab,
+               0xFF888888);
+   }
+
+   /* DATE TICKS on the vertical grid lines. Without them the x axis is
+    * unlabelled and "1Y" could be any year. MM-DD only -- the span already
+    * says how far back this is, and a full date at this size would collide
+    * with its neighbour. */
+   for (int i = 1; i <= nticks; i++) {
+      int gx  = px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1));
+      long tt = w.tmin + (((w.tmax - w.tmin) * i) / (nticks + 1));
+      char dt[20];
+      char md[8];
+      fmt_date(tt, m->tz_off, dt, sizeof dt);
+      str_snapshot(md, sizeof md, (str_len(dt) > 5) ? dt + 5 : "");
+      if (str_len(md) > 5)
+         md[5] = 0; /* "MM-DD" */
+      int lw = str_len(md) * 6 * sc;
+      draw_str(px, fb, gx - (lw / 2), py0 + ph - (9 * sc), sc, md, 0xFF777777);
+   }
+
+   int prevx = 0;
+   int prevy = 0;
+   int have  = 0;
+   for (int i = 0; i < m->nwt; i++) {
+      if (m->wt[i].t < from)
+         continue;
+      int cx = wt_px(&w, m->wt[i].t, px0, pw, pad);
+      int cy = wt_py(&w, m->wt[i].g, py0, ph, pad_t, pad_b);
+      /* Join consecutive points: a weight trend is read as a line, and dots
+       * alone at one a day over a year are unreadable. 0xAABBGGRR, so this is
+       * the soft blue the insulin log already uses. */
+      if (have) {
+         int dx = cx - prevx;
+         int dy = cy - prevy;
+         int ax = dx < 0 ? -dx : dx;
+         int ay = dy < 0 ? -dy : dy;
+         int st = ax > ay ? ax : ay;
+         for (int k = 1; k <= st && st > 0; k++)
+            fill_rect(px, fb, prevx + ((dx * k) / st), prevy + ((dy * k) / st),
+                      sc, sc, 0xFFFFAA66);
+      }
+      /* White, like the glucose trace. The SCRUBBED point is redrawn below in
+       * UI_HILITE grey -- the same "white normally, grey when picked" pair
+       * plot_render uses, so both plots read the same way. */
+      fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc,
+                0xFFFFFFFF);
+      prevx = cx;
+      prevy = cy;
+      have  = 1;
+   }
+
+   /* SCRUB CURSOR: a full-height rule through the picked point and its value
+    * spelled out, so the number under the finger is readable rather than
+    * estimated off the axis. */
+   if (m->wt_scrub >= 0 && m->wt_scrub < m->nwt &&
+       m->wt[m->wt_scrub].t >= from) {
+      const struct wt_rec *p = &m->wt[m->wt_scrub];
+      int cx                 = wt_px(&w, p->t, px0, pw, pad);
+      int cy                 = wt_py(&w, p->g, py0, ph, pad_t, pad_b);
+      fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, 0xFF666666);
+      fill_rect(px, fb, cx - (3 * sc), cy - (3 * sc), 6 * sc, 6 * sc,
+                UI_HILITE);
+   }
+}
+
+static void render_wtlog(struct ANativeWindow_Buffer *fb,
+                         const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "WEIGHT LOG", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_WTLOG_BACK);
+   y += 3 * lh;
+
+   if (m->nwt <= 0) {
+      draw_str(px, fb, x, y, sc, "No weights logged yet.", 0xFF888888);
+      return;
+   }
+
+   /* THE SCREEN IS SPLIT: table above, trend below. The plot gets the bottom
+    * ~40% and everything else is laid out against what is left, so the table
+    * cannot grow into the plot on a tall screen nor the plot squeeze the
+    * table to nothing on a short one. */
+   /* RESERVE THE SYSTEM GESTURE BAR. The activity draws edge to edge, so the
+    * phone's own navigation pill sits ON TOP of the bottom of this surface --
+    * the plot's bottom edge and its date labels were rendering underneath it.
+    * Everything else in the app happens to stop short of the bottom; this
+    * screen is the first to reach it, so it is the first to collide. */
+   int sysbar   = fb->height / 24;
+   int plot_h   = (fb->height * 2) / 5;
+   int tabs_h   = 2 * lh; /* the span tabs */
+   int plot_top = fb->height - plot_h - sysbar;
+   int tabs_y   = plot_top - tabs_h;
+   /* 6*sc, not 2: the nav box runs from nav_y - 3*sc for lh + 7*sc, i.e. to
+    * nav_y + lh + 4*sc, so a 2*sc gap left its bottom 2*sc inside the tab row
+    * -- and ui_hit_idx scans backwards, so the TAB won and the bottom sliver
+    * of the "next page" arrow silently changed the plot's span instead. */
+   /* The blank line goes BELOW the pagination, not above it: the page counter
+    * belongs to the TABLE it pages, and a gap between them grouped it with
+    * the plot instead -- the one thing it has nothing to do with. */
+   int nav_y = tabs_y - (2 * lh) - (6 * sc);
+   /* A blank line between the table and the pagination row, so the two halves
+    * of this screen read as two things rather than one crowded column. */
+
+   draw_str(px, fb, x, y, sc, "TIME              WEIGHT", 0xFF888888);
+   y += lh;
+
+   int avail = nav_y - y; /* rows run right down to the pagination */
+   int per   = (avail > 0) ? avail / lh : 1;
+   if (per < 1)
+      per = 1;
+   int npages = (m->nwt + per - 1) / per;
+   int page   = m->wt_page;
+   if (page < 0)
+      page = 0;
+   if (page >= npages)
+      page = npages - 1;
+   for (int r = page * per; r < (page + 1) * per && r < m->nwt; r++) {
+      int ti                 = m->nwt - 1 - r; /* tail is oldest-first */
+      const struct wt_rec *w = &m->wt[ti];
+      char when[20];
+      char wv[16];
+      char row[48];
+      fmt_date(w->t, m->tz_off, when, sizeof when);
+      fmt_weight(w->g, m->wunits, wv, sizeof wv);
+      (void)snprintf(row, sizeof row, "%s  %s", when, wv);
+      draw_str(px, fb, x, y, sc, row, 0xFFCCCCCC);
+      /* The pencil is the affordance; the WHOLE row is the target, opening
+       * this entry in the EDIT WEIGHT form (the insulin log's pattern). */
+      {
+         int te = x + (24 * 6 * sc);
+         int ix = te + (((rx - te) - (5 * sc)) / 2);
+         if (ix < te)
+            ix = rx - (6 * sc);
+         draw_icon(px, fb, ix, y, sc, icon_pencil, 0xFF888888);
+      }
+      add_hit(h, 0, y - (3 * sc), fb->width, lh, ACT_MENU, MA_WTLOG_EDIT + ti);
+      y += lh;
+   }
+
+   if (npages > 1) {
+      if (page > 0) {
+         draw_str(px, fb, x, nav_y, tsc, "<", 0xFFFFFFFF);
+         add_hit(h, 0, nav_y - (3 * sc), fb->width / 3, lh + (7 * sc), ACT_MENU,
+                 MA_WTLOG_PREV);
+      }
+      char pg[24];
+      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
+      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, nav_y, sc, pg,
+               0xFF888888);
+      if (page < npages - 1) {
+         draw_str(px, fb, rx - (6 * tsc), nav_y, tsc, ">", 0xFFFFFFFF);
+         add_hit(h, fb->width - (fb->width / 3), nav_y - (3 * sc),
+                 fb->width / 3, lh + (7 * sc), ACT_MENU, MA_WTLOG_NEXT);
+      }
+   }
+
+   /* Span tabs -- OR the scrub readout, exactly as the glucose plot does it:
+    * while a finger is down the tab row becomes the value under it, and the
+    * tabs come back the moment it lifts. The readout needs a fixed, roomy
+    * home, and drawing it inside the plot put it over the trace it describes.
+    */
+   int tab = m->wt_tab;
+   if (tab < 0 || tab >= UI_WT_TABS)
+      tab = 0;
+   int colw = (fb->width - (2 * x)) / UI_WT_TABS;
+   int trow = 14 * sc; /* render_glucose's tab row height */
+   int laby = plot_top - trow + ((trow - (7 * sc)) / 2);
+   if (m->wt_scrub >= 0 && m->wt_scrub < m->nwt) {
+      const struct wt_rec *p = &m->wt[m->wt_scrub];
+      char wv[16];
+      char when[24];
+      char line[48];
+      fmt_weight(p->g, m->wunits, wv, sizeof wv);
+      fmt_date(p->t, m->tz_off, when, sizeof when);
+      (void)snprintf(line, sizeof line, "%s   %s", when, wv);
+      int tsc2 = 2 * sc;
+      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
+         tsc2--;
+      int lw = str_len(line) * 6 * tsc2;
+      /* White, and the point marked in UI_HILITE grey -- the same pair the
+       * glucose plot uses. Green means "on / enabled" everywhere else in this
+       * app; a readout is neither. Top-aligned in the tab row, as there. */
+      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
+               0xFFFFFFFF);
+      /* No tab targets while scrubbing: the row is not showing tabs, and a
+       * target that does not match what is drawn is how a drag ends up
+       * changing the span it was only trying to read. */
+   } else {
+      for (int i = 0; i < UI_WT_TABS; i++) {
+         int lw   = str_len(ui_wt_tab_lbl[i]) * 6 * sc;
+         int tabx = x + (i * colw);
+         /* Same construction as render_glucose: the labels sit in a 14*sc row
+          * ending at the plot's top edge, vertically centred in it, so the
+          * gap between a tab and the plot is identical on both screens. The
+          * TARGET still spans the whole band above, which is empty. */
+         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, ui_wt_tab_lbl[i],
+                  i == tab ? 0xFFFFFFFF : 0xFF888888);
+         add_hit(h, tabx, tabs_y, colw, tabs_h, ACT_MENU, MA_WTTAB + i);
+      }
+   }
+
+   int pw = fb->width - (2 * x);
+   wt_plot(px, fb, m, x, plot_top, pw, plot_h, sc, ui_wt_from(m));
+   /* The whole plot scrubs; the shell resolves the point via ui_wt_hit. */
+   /* arg carries sc: the shell needs the SAME scale the plot was drawn at to
+    * map a finger x back to a point, and re-deriving it there would be a
+    * second copy of the layout that can drift. */
+   add_hit(h, x, plot_top, pw, plot_h, ACT_SCRUB, sc);
 }
 
 /* ---- OLD DEVICES: DISCONNECTED devices. Each keeps its whole slot, so a row
@@ -3481,8 +4030,16 @@ const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
  * mmol/L form "55.5". Index is struct screen's kp_mode. */
 int ui_kp_slots(int mode)
 {
-   static const int slots_for[14] = {4, 3, 3, 3, 15, 5, 2, 4, 4, 4, 4, 4, 4, 4};
-   return slots_for[(mode >= 0 && mode < 14) ? mode : 0];
+   /* mode 14 (WEIGHT) takes 4: "1542" is 154.2 lb, and 4 digits also holds a
+    * three-digit kilogram weight to a tenth. It was missing from this table,
+    * which happened to yield 4 anyway -- the out-of-range fallback is mode 0,
+    * the pairing code, which is also 4. Right answer, wrong reason, and it
+    * would have silently become 4-when-it-should-be-something-else the moment
+    * either changed. */
+   /* mode 14 (WEIGHT) takes 5: "162.4" -- three digits, a dot and a tenth. */
+   static const int slots_for[UI_KP_MODES] = {4, 3, 3, 3, 15, 5, 2, 4,
+                                              4, 4, 4, 4, 4,  4, 5};
+   return slots_for[(mode >= 0 && mode < UI_KP_MODES) ? mode : 0];
 }
 
 int ui_label_nchars(void)
@@ -3690,36 +4247,45 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    int ty = y;
    char pair_title[24];
    const char *kp_title = pair_title;
-   if (m->kp_mode == 1)
-      kp_title = "PLOT MAX";
-   else if (m->kp_mode == 2)
-      kp_title = "CALIBRATION";
-   else if (m->kp_mode == 3)
-      kp_title = "RESCALE";
-   else if (m->kp_mode == 4)
-      kp_title = "REMOTE IP";
-   else if (m->kp_mode == 5)
-      kp_title = "REMOTE PORT";
-   else if (m->kp_mode == 6)
-      kp_title = "UNITS";
-   else if (m->kp_mode == 7)
-      kp_title = "DATE (MMDD)";
-   else if (m->kp_mode == 8)
-      kp_title = "TIME (HHMM)";
-   else if (m->kp_mode == 9)
-      kp_title = "YEAR";
-   else if (m->kp_mode == 10)
-      kp_title = "ALARM LOW";
-   else if (m->kp_mode == 11)
-      kp_title = "ALARM HIGH";
-   else if (m->kp_mode == 12)
-      kp_title = "NUDGE LOW";
-   else if (m->kp_mode == 13)
-      kp_title = "NUDGE HIGH";
-   else /* pairing: name the CGM being added, e.g. "PAIR NEW STELO" */
+   /* TABLE-DRIVEN, AND THE FALLBACK IS AN ERROR, NOT A SCREEN.
+    *
+    * This was an if/else chain ending in `else -> pairing keypad`, so "no
+    * title for this mode" rendered a REAL, PLAUSIBLE screen: a mode added
+    * without a title silently became PAIR NEW <sensor>. The WEIGHT keypad did
+    * exactly that -- tapping a weight opened the sensor-pairing flow and
+    * nothing about it looked wrong. A default branch must never name a
+    * different feature. Pairing is mode 0 and ONLY mode 0; anything unknown
+    * says so, in red, where it cannot be mistaken for working. */
+   static const char *const kp_titles[UI_KP_MODES] = {
+       0,             /* 0: pairing -- title built from add_type below */
+       "PLOT MAX",    /* 1 */
+       "CALIBRATION", /* 2 */
+       "RESCALE",     /* 3 */
+       "REMOTE IP",   /* 4 */
+       "REMOTE PORT", /* 5 */
+       "UNITS",       /* 6 */
+       "DATE (MMDD)", /* 7 */
+       "TIME (HHMM)", /* 8 */
+       "YEAR",        /* 9 */
+       "ALARM LOW",   /* 10 */
+       "ALARM HIGH",  /* 11 */
+       "NUDGE LOW",   /* 12 */
+       "NUDGE HIGH",  /* 13 */
+       "WEIGHT",      /* 14 */
+   };
+   uint32_t title_col = 0xFFFFFFFF;
+   if (m->kp_mode == 0) {
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->add_type ? m->add_type : "SENSOR");
-   draw_str(px, fb, x, y, tsc, kp_title, 0xFFFFFFFF);
+   } else if (m->kp_mode > 0 && m->kp_mode < UI_KP_MODES &&
+              kp_titles[m->kp_mode]) {
+      kp_title = kp_titles[m->kp_mode];
+   } else {
+      (void)snprintf(pair_title, sizeof pair_title, "BAD KP MODE %d",
+                     m->kp_mode);
+      title_col = 0xFF4466FF; /* red: a bug, not a feature */
+   }
+   draw_str(px, fb, x, y, tsc, kp_title, title_col);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
    y += 2 * lh;
    if (kp_thresh(m->kp_mode)) {
@@ -3741,7 +4307,8 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    int nslots = ui_kp_slots(m->kp_mode);
    /* glucose entries carry the unit label: plot max / cal / rescale and the
     * two alarm thresholds */
-   int has_unit = (m->kp_mode >= 1 && m->kp_mode <= 3) || kp_thresh(m->kp_mode);
+   int has_unit   = (m->kp_mode >= 1 && m->kp_mode <= 3) ||
+                    kp_thresh(m->kp_mode) || m->kp_mode == 14;
    const char *en = m->entry ? m->entry : "";
    char shown[24];
    int k = 0;
@@ -3752,7 +4319,11 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    for (int i = 0; i < nslots && k < (int)sizeof shown - 1; i++)
       shown[k++] = *en ? *en++ : '_'; /* typed digits, then '_' for the rest */
    if (has_unit) {
-      int w = snprintf(shown + k, sizeof shown - k, " %s", UI_LBL(m->units));
+      /* The WEIGHT keypad is the one entry that is not a glucose value, so
+       * it must not be labelled with the glucose unit. */
+      const char *ul =
+          (m->kp_mode == 14) ? wt_unit_name(m->wunits) : UI_LBL(m->units);
+      int w = snprintf(shown + k, sizeof shown - k, " %s", ul);
       if (w > 0)
          k += (w < (int)sizeof shown - k) ? w : (int)sizeof shown - k - 1;
    }
@@ -3780,7 +4351,8 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
     * layout: the dot takes 0's old cell, 0 and DEL shift right, and OK
     * becomes a full-width bottom row (which also makes the confirm harder to
     * fat-finger from DEL). */
-   int dotkey = (m->kp_mode == 4) || (kp_thresh(m->kp_mode) && m->units);
+   int dotkey = (m->kp_mode == 4) || (kp_thresh(m->kp_mode) && m->units) ||
+                m->kp_mode == 14;
    int iprows = dotkey ? 5 : 4;
    int gm     = fb->width / 12;
    int gw     = fb->width - (2 * gm);
@@ -4024,6 +4596,9 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_REMOTE: render_remote(fb, m, h); break;
       case SCR_INSLOG: render_inslog(fb, m, h); break;
       case SCR_INSDEL: render_insdel(fb, m, h); break;
+      case SCR_WEIGHT: render_weight(fb, m, h); break;
+      case SCR_WTLOG: render_wtlog(fb, m, h); break;
+      case SCR_WTDEL: render_wtdel(fb, m, h); break;
       case SCR_ALARM: render_alarm(fb, m, h); break;
       case SCR_EXPORT: render_export(fb, m, h); break;
       case SCR_DISPLAY: render_display(fb, m, h); break;

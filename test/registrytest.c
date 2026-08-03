@@ -45,8 +45,8 @@ static void ck(int cond, const char *what)
 static void fresh(void)
 {
    (void)snprintf(g_sensors_path, sizeof g_sensors_path,
-                  "tmp/uitest/rt-sensors.csv");
-   (void)snprintf(g_slots_path, sizeof g_slots_path, "tmp/uitest/rt-slots.csv");
+                  "build/test/rt-sensors.csv");
+   (void)snprintf(g_slots_path, sizeof g_slots_path, "build/test/rt-slots.csv");
    unlink(g_sensors_path);
    unlink(g_slots_path);
    sensors_load();

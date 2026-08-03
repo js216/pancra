@@ -209,7 +209,7 @@ int main(void)
     * for the guards that were added to this file recently. */
    {
       (void)snprintf(g_store_path, sizeof g_store_path,
-                     "tmp/uitest/rt-read.csv");
+                     "build/test/rt-read.csv");
       unlink(g_store_path);
       long now = realtime_s();
 

@@ -44,7 +44,7 @@ build/stub/lib%.so: src/stub_%.c
 
 # native sources: UI/JNI core, BLE transport, protocol driver, self-contained crypto
 SRC := src/main.c src/font.c src/plot.c src/util.c src/stats.c src/store.c src/settings.c src/ui.c \
-       src/alarmlogic.c src/scanlogic.c src/insulin.c src/plotdata.c \
+       src/alarmlogic.c src/scanlogic.c src/insulin.c src/weight.c src/plotdata.c \
        src/sensors.c src/otble.c \
        src/dexble.c src/dexdriver.c \
        src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
@@ -158,7 +158,7 @@ TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 # one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
 # whole alarm actuation end (Alarm.java, PancraService.java, Ble.java)
 # unchecked by anything.
-check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest done
+check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest weighttest done
 
 format:
 	grep -rlP '\r' --exclude='.*' src test res Makefile AndroidManifest.xml \
@@ -274,10 +274,10 @@ JVM_INC := -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/inclu
 # at all, so this is the only place in the project that can see it.
 TESTWARN := -Wall -Wextra -Werror -Wformat=2 -O2
 uitest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(JVM_INC) $(TESTWARN) test/uitest.c src/ui.c src/font.c \
-	    src/plot.c src/sensors.c src/util.c -o tmp/uitest/uitest
-	./tmp/uitest/uitest
+	    src/plot.c src/sensors.c src/util.c -o build/test/uitest
+	./build/test/uitest
 
 # Behavioural gate for the LONG-SPAN plot data. The 30D plot is downsampled
 # from the log, and downsampling is where a plot lies quietly: this asserts
@@ -286,62 +286,62 @@ uitest:
 # times the memory. The bug it pins: plot depth was tied to a point budget,
 # so a 30-day plot showed ten days once four sources were logging.
 plottest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(JVM_INC) $(TESTWARN) -DPLOTDATA_HOST test/plottest.c \
-	    src/plotdata.c src/sensors.c src/util.c -o tmp/uitest/plottest
-	@./tmp/uitest/plottest > tmp/uitest/plottest.log 2>&1 \
-	    && grep -q "ALL PLOT TESTS PASSED" tmp/uitest/plottest.log \
+	    src/plotdata.c src/sensors.c src/util.c -o build/test/plottest
+	@./build/test/plottest > build/test/plottest.log 2>&1 \
+	    && grep -q "ALL PLOT TESTS PASSED" build/test/plottest.log \
 	    && printf '\033[1;32mplottest\033[0m: long-span plot data OK\n' \
-	    || { cat tmp/uitest/plottest.log; exit 1; }
+	    || { cat build/test/plottest.log; exit 1; }
 
 # Behavioural gate for the alarm decision logic. Until this existed, NOTHING in
 # main.c was covered by any test binary -- an adversarial review deleted the
 # glucose alarm outright and `make check` stayed green. The LOW alarm was in
 # fact dead at the time (see alarmlogic.h).
 alarmtest:
-	@mkdir -p tmp/uitest
-	cc -iquote src $(TESTWARN) test/alarmtest.c src/alarmlogic.c -o tmp/uitest/alarmtest
-	@./tmp/uitest/alarmtest > tmp/uitest/alarmtest.log 2>&1 \
-	    && grep -q "ALL ALARM TESTS PASSED" tmp/uitest/alarmtest.log \
+	@mkdir -p build/test
+	cc -iquote src $(TESTWARN) test/alarmtest.c src/alarmlogic.c -o build/test/alarmtest
+	@./build/test/alarmtest > build/test/alarmtest.log 2>&1 \
+	    && grep -q "ALL ALARM TESTS PASSED" build/test/alarmtest.log \
 	    && printf '\033[1;32malarmtest\033[0m: alarm decision logic OK\n' \
-	    || { cat tmp/uitest/alarmtest.log; exit 1; }
+	    || { cat build/test/alarmtest.log; exit 1; }
 
 # Behavioural gate for the reading history / dedup model. store.c was in no
 # test binary, and every caller persists only on a non-zero hist_insert result
 # -- so a wrong return there drops a reading permanently and silently.
 storetest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/storetest.c src/store.c src/util.c \
-	    src/sensors.c -o tmp/uitest/storetest
-	@./tmp/uitest/storetest > tmp/uitest/storetest.log 2>&1 \
-	    && grep -q "ALL STORE TESTS PASSED" tmp/uitest/storetest.log \
+	    src/sensors.c -o build/test/storetest
+	@./build/test/storetest > build/test/storetest.log 2>&1 \
+	    && grep -q "ALL STORE TESTS PASSED" build/test/storetest.log \
 	    && printf '\033[1;32mstoretest\033[0m: history + dedup model OK\n' \
-	    || { cat tmp/uitest/storetest.log; exit 1; }
+	    || { cat build/test/storetest.log; exit 1; }
 
 # Behavioural gate for the rolling TIR/average buckets. The ring aliases an
 # over-old reading onto a live bucket and ZEROES it, so the boundary guards are
 # the whole safety of the statistics -- and they are exactly what a hand-check
 # reads past.
 statstest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/statstest.c src/stats.c src/util.c \
-	    -o tmp/uitest/statstest
-	@./tmp/uitest/statstest > tmp/uitest/statstest.log 2>&1 \
-	    && grep -q "ALL STATS TESTS PASSED" tmp/uitest/statstest.log \
+	    -o build/test/statstest
+	@./build/test/statstest > build/test/statstest.log 2>&1 \
+	    && grep -q "ALL STATS TESTS PASSED" build/test/statstest.log \
 	    && printf '\033[1;32mstatstest\033[0m: rolling TIR/average OK\n' \
-	    || { cat tmp/uitest/statstest.log; exit 1; }
+	    || { cat build/test/statstest.log; exit 1; }
 
 # Behavioural gate for the OneTouch meter driver, which had none. It decides
 # which fingersticks reach the append-only log, and its timestamp gate, its
 # walk-advance rule and its counter handling have all been wrong at some point.
 metertest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/metertest.c src/otble.c src/util.c \
-	    -o tmp/uitest/metertest
-	@./tmp/uitest/metertest > tmp/uitest/metertest.log 2>&1 \
-	    && grep -q "ALL METER TESTS PASSED" tmp/uitest/metertest.log \
+	    -o build/test/metertest
+	@./build/test/metertest > build/test/metertest.log 2>&1 \
+	    && grep -q "ALL METER TESTS PASSED" build/test/metertest.log \
 	    && printf '\033[1;32mmetertest\033[0m: OneTouch meter driver OK\n' \
-	    || { cat tmp/uitest/metertest.log; exit 1; }
+	    || { cat build/test/metertest.log; exit 1; }
 
 # Behavioural gate for the provenance registry. An id names one physical device
 # forever and readings.csv cites those ids in rows that are never rewritten, so
@@ -349,49 +349,58 @@ metertest:
 # sensors.c was linked into other test binaries but nothing called mint, claim,
 # forget or rebind.
 registrytest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/registrytest.c src/sensors.c src/util.c \
-	    -o tmp/uitest/registrytest
-	@./tmp/uitest/registrytest > tmp/uitest/registrytest.log 2>&1 \
-	    && grep -q "ALL REGISTRY TESTS PASSED" tmp/uitest/registrytest.log \
+	    -o build/test/registrytest
+	@./build/test/registrytest > build/test/registrytest.log 2>&1 \
+	    && grep -q "ALL REGISTRY TESTS PASSED" build/test/registrytest.log \
 	    && printf '\033[1;32mregistrytest\033[0m: provenance registry OK\n' \
-	    || { cat tmp/uitest/registrytest.log; exit 1; }
+	    || { cat build/test/registrytest.log; exit 1; }
 
 # Behavioural gate for settings persistence. alarm_load's validation is the
 # last thing standing between a corrupt file and a hypo alarm that cannot fire
 # (an out-of-range low disables it; low > high latches both) -- while still
 # accepting low == high, which alarm_step legitimately produces.
 settingstest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/settingstest.c src/settings.c src/util.c \
-	    -o tmp/uitest/settingstest
-	@./tmp/uitest/settingstest > tmp/uitest/settingstest.log 2>&1 \
-	    && grep -q "ALL SETTINGS TESTS PASSED" tmp/uitest/settingstest.log \
+	    -o build/test/settingstest
+	@./build/test/settingstest > build/test/settingstest.log 2>&1 \
+	    && grep -q "ALL SETTINGS TESTS PASSED" build/test/settingstest.log \
 	    && printf '\033[1;32msettingstest\033[0m: settings persistence OK\n' \
-	    || { cat tmp/uitest/settingstest.log; exit 1; }
+	    || { cat build/test/settingstest.log; exit 1; }
 
 # Behavioural gate for the insulin dose log. Doses are user-entered facts in an
 # append-only file the app reloads at every launch: the load-time validation is
 # what keeps a corrupt row from resurrecting forever, and last-units-per-type is
 # what the LOG INSULIN form pre-populates with.
+weighttest:
+	@mkdir -p build/test
+	cc -iquote src $(TESTWARN) test/weighttest.c src/weight.c src/util.c \
+	    -o build/test/weighttest
+	@./build/test/weighttest > build/test/weighttest.log 2>&1 \
+	    && grep -q "ALL WEIGHT TESTS PASSED" build/test/weighttest.log \
+	    && printf '\033[1;32mweighttest\033[0m: weight log OK\n' \
+	    || { cat build/test/weighttest.log; exit 1; }
+
 insulintest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/insulintest.c src/insulin.c src/util.c \
-	    -o tmp/uitest/insulintest
-	@./tmp/uitest/insulintest > tmp/uitest/insulintest.log 2>&1 \
-	    && grep -q "ALL INSULIN TESTS PASSED" tmp/uitest/insulintest.log \
+	    -o build/test/insulintest
+	@./build/test/insulintest > build/test/insulintest.log 2>&1 \
+	    && grep -q "ALL INSULIN TESTS PASSED" build/test/insulintest.log \
 	    && printf '\033[1;32minsulintest\033[0m: insulin dose log OK\n' \
-	    || { cat tmp/uitest/insulintest.log; exit 1; }
+	    || { cat build/test/insulintest.log; exit 1; }
 
 # Behavioural gate for the scan-lifecycle decision, which governs whether an
 # already-paired CGM can reconnect at all. It has been wrong in both directions.
 scantest:
-	@mkdir -p tmp/uitest
-	cc -iquote src $(TESTWARN) test/scantest.c src/scanlogic.c -o tmp/uitest/scantest
-	@./tmp/uitest/scantest > tmp/uitest/scantest.log 2>&1 \
-	    && grep -q "ALL SCAN TESTS PASSED" tmp/uitest/scantest.log \
+	@mkdir -p build/test
+	cc -iquote src $(TESTWARN) test/scantest.c src/scanlogic.c -o build/test/scantest
+	@./build/test/scantest > build/test/scantest.log 2>&1 \
+	    && grep -q "ALL SCAN TESTS PASSED" build/test/scantest.log \
 	    && printf '\033[1;32mscantest\033[0m: scan lifecycle OK\n' \
-	    || { cat tmp/uitest/scantest.log; exit 1; }
+	    || { cat build/test/scantest.log; exit 1; }
 
 # Offline end-to-end protocol test: a simulated Stelo runs the real J-PAKE
 # server side and answers the driver's writes, and the final glucose is decoded
@@ -408,12 +417,12 @@ DRVTEST_SRC := test/test_driver.c src/dexdriver.c src/dexauth.c src/dexdata.c \
                src/p256.c src/sha256.c src/aes.c src/util.c
 
 drivertest:
-	@mkdir -p tmp/uitest
+	@mkdir -p build/test
 	cc -DDEXDRIVER_TEST -iquote src -iquote test $(JVM_INC) $(TESTWARN) \
-	    $(DRVTEST_SRC) -o tmp/uitest/drivertest
-	./tmp/uitest/drivertest > tmp/uitest/drivertest.log 2>&1 \
-	    && grep -q "ALL DRIVER TESTS PASSED" tmp/uitest/drivertest.log \
+	    $(DRVTEST_SRC) -o build/test/drivertest
+	./build/test/drivertest > build/test/drivertest.log 2>&1 \
+	    && grep -q "ALL DRIVER TESTS PASSED" build/test/drivertest.log \
 	    && printf '\033[1;32mdrivertest\033[0m: pairing + auth + EGV decode OK\n' \
-	    || { tail -20 tmp/uitest/drivertest.log; exit 1; }
+	    || { tail -20 build/test/drivertest.log; exit 1; }
 
 .PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest

@@ -53,11 +53,11 @@ static void ck(int cond, const char *what)
 
 static void paths(void)
 {
-   (void)snprintf(g_alarm_path, sizeof g_alarm_path, "tmp/uitest/st-alarm");
-   (void)snprintf(g_settings_path, sizeof g_settings_path, "tmp/uitest/st-set");
-   (void)snprintf(g_code_path, sizeof g_code_path, "tmp/uitest/st-code");
-   (void)snprintf(g_info_path, sizeof g_info_path, "tmp/uitest/st-info");
-   (void)snprintf(g_remote_path, sizeof g_remote_path, "tmp/uitest/st-remote");
+   (void)snprintf(g_alarm_path, sizeof g_alarm_path, "build/test/st-alarm");
+   (void)snprintf(g_settings_path, sizeof g_settings_path, "build/test/st-set");
+   (void)snprintf(g_code_path, sizeof g_code_path, "build/test/st-code");
+   (void)snprintf(g_info_path, sizeof g_info_path, "build/test/st-info");
+   (void)snprintf(g_remote_path, sizeof g_remote_path, "build/test/st-remote");
 }
 
 /* Write raw bytes to a settings file, so corruption can be simulated exactly.

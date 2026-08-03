@@ -455,19 +455,59 @@ void drv_mac_clear(void)
 /* Which protocol owns each link. The link id -- not the characteristic -- is
  * the routing key, so two sensors that share a GATT layout (Stelo and G7 do)
  * can be connected at once without their events being confused. */
+/* WHICH LINKS CARRY A METER. A bitmask, not the LINK_METER constant.
+ *
+ * Every routing decision below is by LINK ID, because two sensors can share a
+ * GATT layout and only the link tells their events apart. That was fine while
+ * exactly one link was the meter's -- but a meter is only reachable for the
+ * second or two it is switched on, so each registered meter needs its OWN
+ * standing connection, and therefore its own link. The link a meter occupies
+ * is now whatever the allocator gave it, so the transport has to be told
+ * rather than assume.
+ *
+ * Set from main.c as links are bound. A link with no bit set runs the Dexcom
+ * state machine, which is the safe default: an unset bit costs a meter a sync
+ * it can retry, while a wrongly SET bit would feed a CGM's notifications to
+ * the meter parser. */
+static unsigned g_meter_links;
+
+void dexble_set_meter_link(int link, int on)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return;
+   if (on)
+      g_meter_links |= 1U << (unsigned)link;
+   else
+      g_meter_links &= ~(1U << (unsigned)link);
+}
+
+static int is_meter_link(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return 0;
+   return (g_meter_links & (1U << (unsigned)link)) != 0;
+}
+
 static void jni_connected(JNIEnv *e, jclass c, jint link)
 {
    (void)c;
    (void)e;
    driver_lock();
-   if (link == LINK_METER) {
+   if (is_meter_link(link)) {
+      /* Ask the shell first: it owns the per-meter index and the single
+       * protocol state, and only it can say whether this link may have it. */
+      if (!pancra_meter_connected(link)) {
+         driver_unlock();
+         dexble_link_close(link);
+         return;
+      }
       ot_on_connected();
       /* Sample the meter's link RSSI now -- it is only connected during a sync,
-       * so this brief window is the one chance. Read LINK_METER explicitly
+       * so this brief window is the one chance. Read THIS link explicitly
        * (ble_read_rssi() targets driver_link(), which is not the meter here);
        * the result returns via onRssi -> jni_rssi -> pancra_meter_rssi. */
       if (e && m_readrssi) {
-         (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, (jint)LINK_METER);
+         (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, link);
          if ((*e)->ExceptionCheck(e)) /* we return into Java from here */
             (*e)->ExceptionClear(e);
       }
@@ -484,7 +524,7 @@ static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
    (void)c;
    (void)e;
    driver_lock();
-   if (link == LINK_METER) {
+   if (is_meter_link(link)) {
       ot_on_disconnected();
    } else {
       driver_select(link);
@@ -504,7 +544,7 @@ static void jni_written(JNIEnv *e, jclass c, jint link, jstring ju, jint s)
    }
    /* The meter driver is request/response and drives itself off notifications,
     * so a write ack needs no action there. */
-   if (link != LINK_METER) {
+   if (!is_meter_link(link)) {
       driver_lock();
       driver_select(link);
       driver_on_written(u, s);
@@ -533,7 +573,7 @@ static void jni_notify(JNIEnv *e, jclass c, jint link, jstring ju,
    if (n > 0)
       (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
    driver_lock();
-   if (link == LINK_METER) {
+   if (is_meter_link(link)) {
       ot_on_notify(buf, n);
    } else {
       driver_select(link);
@@ -592,7 +632,7 @@ static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
 {
    (void)e;
    (void)c;
-   if (link != LINK_METER)
+   if (!is_meter_link(link))
       pancra_rssi(rssi);
    else
       pancra_meter_rssi(rssi); /* meter's last-sync signal strength */
@@ -749,14 +789,17 @@ void dexble_pair(int link, const char *mac, const char *code)
 
 /* Open the meter's link. It is a plain connect: the meter driver takes over
  * from onConnected and tears the link down itself when it is finished. */
-void dexble_meter_connect(const char *mac)
+void dexble_meter_connect(int link, const char *mac)
 {
    /* Select the meter's link only for the duration of the connect, under the
     * lock, so a concurrent CGM reconnect cannot observe the swap and route a
     * sensor into the meter's protocol driver. */
+   if (link < 0 || link >= LINK_MAX)
+      return;
    driver_lock();
+   dexble_set_meter_link(link, 1); /* route this link's events to otble */
    int drv = driver_link();
-   driver_select(LINK_METER);
+   driver_select(link);
    drv_connect(mac);
    driver_select(drv);
    driver_unlock();

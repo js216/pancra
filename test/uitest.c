@@ -4,7 +4,7 @@
 
 /* The UI is a pure function of a `struct screen`, so it runs with no phone:
  * fill a model, call ui_render into a plain framebuffer, dump a PPM (into
- * tmp/uitest/, never the source tree), and assert that ui_hit maps a tap to the
+ * build/test/, never the source tree), and assert that ui_hit maps a tap to the
  * right action. As each screen is ported this harness grows a case per screen.
  * Built and run by `make uitest`. */
 #include "ui.h"
@@ -168,7 +168,7 @@ int main(void)
    /* --- portrait main screen --- */
    struct hits h;
    ui_render(&g_buf, &m, &h);
-   write_ppm("tmp/uitest/main.ppm");
+   write_ppm("build/test/main.ppm");
    long lit = lit_pixels(0xFF181818);
    printf("uitest: main.ppm %dx%d, %ld lit pixels, %d hit targets\n", W, H, lit,
           h.n);
@@ -231,7 +231,7 @@ int main(void)
                          .devs      = devs,
                          .ndev      = 2};
    ui_render(&g_buf, &scan, &h);
-   write_ppm("tmp/uitest/scan.ppm");
+   write_ppm("build/test/scan.ppm");
    if (lit_pixels(0xFF181818) < 200) {
       printf("  FAIL: no-reading screen rendered almost nothing\n");
       fail = 1;
@@ -264,7 +264,7 @@ int main(void)
    set.model                               = "SW11163";
    set.fw                                  = "1.6.5.15";
    ui_render(&g_buf, &set, &h);
-   write_ppm("tmp/uitest/settings.ppm");
+   write_ppm("build/test/settings.ppm");
    if (lit_pixels(0xFF181818) < 500) {
       printf("  FAIL: settings screen rendered almost nothing\n");
       fail = 1;
@@ -288,7 +288,7 @@ int main(void)
    /* --- pairing keypad (digits carry menu_action codes) --- */
    struct screen kp = {.scr = SCR_KEYPAD, .kp_mode = 0, .entry = "12"};
    ui_render(&g_buf, &kp, &h);
-   write_ppm("tmp/uitest/keypad.ppm");
+   write_ppm("build/test/keypad.ppm");
    int keys = 0;
    for (int i = 0; i < h.n; i++)
       keys += (h.box[i].kind == ACT_MENU);
@@ -300,7 +300,7 @@ int main(void)
    /* --- device list (a pick per scanned sensor) --- */
    struct screen dl = {.scr = SCR_DEVLIST, .devs = devs, .ndev = 2};
    ui_render(&g_buf, &dl, &h);
-   write_ppm("tmp/uitest/devlist.ppm");
+   write_ppm("build/test/devlist.ppm");
    int picks = 0;
    for (int i = 0; i < h.n; i++)
       picks += (h.box[i].kind == ACT_MENU && h.box[i].arg >= 200);
@@ -367,7 +367,7 @@ int main(void)
       fail = 1;
    }
    ui_render(&tall, &set, &h);
-   write_ppm_buf(&tall, "tmp/uitest/settings_tall.ppm");
+   write_ppm_buf(&tall, "build/test/settings_tall.ppm");
    {
       int saw[3] = {0, 0, 0};
       for (int i = 0; i < h.n; i++)
@@ -1739,7 +1739,7 @@ int main(void)
       ms.sensors       = sens;
       ms.nsensors      = 3;
       ui_render(&tall, &ms, &h);
-      write_ppm_buf(&tall, "tmp/uitest/main_multi.ppm");
+      write_ppm_buf(&tall, "build/test/main_multi.ppm");
       long c1   = count_color(&tall, ui_sensor_color(1)); /* sens[1] colour */
       long c2   = count_color(&tall, ui_sensor_color(2)); /* sens[2] colour */
       long orph = count_color(&tall, 0xFF8A8AA0);         /* UI_ORPHAN */
@@ -1851,7 +1851,7 @@ int main(void)
    det.scr           = SCR_SENSOR;
    det.sel           = 0;
    ui_render(&tall, &det, &h);
-   write_ppm_buf(&tall, "tmp/uitest/sensor.ppm");
+   write_ppm_buf(&tall, "build/test/sensor.ppm");
    {
       /* Marker shape, COLOUR and SIZE were combined into ONE picker opened from
        * the MARKER row, so the per-sensor screen no longer has a separate COLOR
@@ -1902,7 +1902,7 @@ int main(void)
    fg.scr           = SCR_FORGET;
    fg.sel           = 0;
    ui_render(&tall, &fg, &h);
-   write_ppm_buf(&tall, "tmp/uitest/forget.ppm");
+   write_ppm_buf(&tall, "build/test/forget.ppm");
    {
       int saw_yes = 0;
       int saw_no  = 0;
@@ -1929,7 +1929,7 @@ int main(void)
    };
    struct screen ml = {.scr = SCR_DEVLIST, .devs = meters, .ndev = 1};
    ui_render(&tall, &ml, &h);
-   write_ppm_buf(&tall, "tmp/uitest/meterlist.ppm");
+   write_ppm_buf(&tall, "build/test/meterlist.ppm");
    {
       int picks = 0;
       for (int i = 0; i < h.n; i++)
@@ -1946,7 +1946,7 @@ int main(void)
    lb.sel           = 0;
    lb.entry         = "KITCH";
    ui_render(&tall, &lb, &h);
-   write_ppm_buf(&tall, "tmp/uitest/label.ppm");
+   write_ppm_buf(&tall, "build/test/label.ppm");
    {
       int chars   = 0;
       int saw_del = 0;
@@ -1976,7 +1976,7 @@ int main(void)
    cal.sel           = 0;
    cal.cal_pending = 140; /* the value typed on the keypad, awaiting CONFIRM */
    ui_render(&tall, &cal, &h);
-   write_ppm_buf(&tall, "tmp/uitest/cal.ppm");
+   write_ppm_buf(&tall, "build/test/cal.ppm");
    {
       int saw_enter  = 0;
       int saw_cancel = 0;
@@ -1996,7 +1996,7 @@ int main(void)
    /* --- sensor-type picker offers every type --- */
    struct screen st2 = {.scr = SCR_SENSTYPE, .sel = -1};
    ui_render(&tall, &st2, &h);
-   write_ppm_buf(&tall, "tmp/uitest/senstype.ppm");
+   write_ppm_buf(&tall, "build/test/senstype.ppm");
    {
       int types = 0;
       for (int i = 0; i < h.n; i++)
@@ -2013,7 +2013,7 @@ int main(void)
    /* --- first-run gate screen (CONTINUE button) --- */
    struct screen gate = {.scr = SCR_GATE};
    ui_render(&g_buf, &gate, &h);
-   write_ppm("tmp/uitest/gate.ppm");
+   write_ppm("build/test/gate.ppm");
    int saw_cont = 0;
    for (int i = 0; i < h.n; i++)
       saw_cont = saw_cont || (h.box[i].kind == ACT_GATE_CONTINUE);

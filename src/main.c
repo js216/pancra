@@ -28,6 +28,7 @@
 #include "store.h"
 #include "ui.h"
 #include "util.h"
+#include "weight.h"
 #include <jni.h>
 #include <jni_md.h>
 #include <signal.h>
@@ -259,6 +260,9 @@ enum {
    MENU_ADD,        /* main-screen '+': NEW DEVICE / INSULIN */
    MENU_INSULIN,    /* LOG INSULIN entry form */
    MENU_INSLOG,     /* INSULIN LOG: paginated dose table */
+   MENU_WEIGHT,     /* LOG WEIGHT entry form */
+   MENU_WTLOG,      /* WEIGHT LOG: table + trend plot */
+   MENU_WTDEL,      /* confirm deleting a weight entry */
    MENU_DISPLAY,    /* display settings submenu */
    MENU_PRIMPICK,   /* choose which registered CGM owns the big number */
    MENU_PERMS,      /* permissions + background controls */
@@ -276,6 +280,7 @@ static int g_exp_range = 2;
 static int g_exp_glu   = 1;
 static int g_exp_dev   = 1;
 static int g_exp_ins   = 1;
+static int g_exp_wt    = 1; /* EXPORT DATA: include the weight log */
 
 /* Where the ALARM submenu was opened from -- the settings row, or the main
  * screen's alarm row -- so its X returns exactly there (the origin rule). */
@@ -283,6 +288,22 @@ static int g_alarm_from = MENU_SETTINGS;
 
 static int g_old_page;    /* which page the OLD DEVICES list is showing */
 static int g_inslog_page; /* which page the INSULIN LOG is showing */
+static int g_wtlog_page;  /* which page the WEIGHT LOG is showing */
+/* LOG WEIGHT form state. The value is held in TENTHS of the DISPLAY unit, not
+ * grams: it is what the user typed and what the keypad round-trips, and it is
+ * converted once, on CONFIRM. Holding grams here instead would re-render the
+ * field every time the unit preference changed mid-entry. */
+static long g_wt_t;
+static int g_wt_tenths;
+static int g_wt_tab;        /* which span the WEIGHT LOG plot is showing */
+static int g_wt_scrub = -1; /* scrubbed point in the WEIGHT LOG plot, -1 none */
+static int g_wt_scrubbing;  /* a drag across the weight plot is in progress */
+/* EDIT WEIGHT: which entry is being edited, and a COPY of it as it was.
+ * The copy is the match key for the rewrite -- an index into the tail would
+ * go stale the moment the log reloads, and rewriting by position is how an
+ * edit lands on the wrong row. -1 means the form is logging a NEW entry. */
+static int g_wt_edit = -1;
+static struct wt_rec g_wt_orig;
 /* EDIT INSULIN: which dose the form edits (-1 = none, logging new), and
  * the ORIGINAL row -- the rewrite matches on it, so edits of a stale tail
  * index can never hit the wrong dose. */
@@ -567,6 +588,11 @@ static uint32_t white_color(int g)
 
 static void start_scan(struct ANativeActivity *a);
 static void stop_scan(struct ANativeActivity *a);
+/* Force a genuine scan restart. start_scan alone CANNOT do this: it early
+ * returns whenever g_scanning is set, which it always is while the UI is up. */
+static void scan_restart(struct ANativeActivity *a);
+static void meter_sync_start(int mid, const char *mac);
+static int meter_armed(const char *mac);
 static int meter_index_all(int *ids, int *vals, int cap);
 static int meter_index_load(int id);
 static void request_ble_permissions(struct ANativeActivity *a);
@@ -583,8 +609,27 @@ static int g_cur_src;
 /* Registry id of the meter, and when it last synced. The meter's own record
  * index is persisted so a reconnect never re-reads what we already hold. */
 static int g_meter_src;
-static long g_meter_last_sync;
-static int g_meter_busy;   /* a meter sync is in flight on LINK_METER */
+static int g_meter_busy; /* a meter PROTOCOL SYNC is running */
+/* The link that sync is running on. otble.c holds ONE protocol state, so only
+ * one meter can be mid-exchange at a time -- but every meter now has its own
+ * link and its own standing connect, so which link that is has to be tracked
+ * rather than assumed. -1 = none. */
+static int g_meter_link = -1;
+/* Which links carry a meter, mirroring what the transport was told. The
+ * shell needs its own copy because several CGM-only passes below iterate the
+ * links and must skip meters -- a check that used to be `l == LINK_METER` and
+ * is now a per-link fact. Written only through link_set_meter, so the two
+ * copies cannot drift. */
+static int g_link_meter[LINK_MAX];
+
+static void link_set_meter(int link, int on)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return;
+   g_link_meter[link] = on ? 1 : 0;
+   dexble_set_meter_link(link, on);
+}
+
 static long g_meter_start; /* when it started, for the stall watchdog */
 /* Meter link RSSI, sampled during its sync connection (the meter is off between
  * syncs, so this is the last-sync signal strength shown in its SIGNAL row). */
@@ -740,7 +785,8 @@ static void data_path(char *dst, int cap, const char *dir, const char *name)
 }
 
 /* Map a sensor slot to its transport link. CGMs take LINK_CGM, then LINK_CGM2
- * and upward in slot order; the meter always uses LINK_METER. Each link has its
+ * and upward in slot order; meters take links from the SAME pool. Each link has
+ * its
  * own GATT connection, operation queue and driver context, so sensors run
  * genuinely concurrently rather than taking turns. */
 /* The CGM link whose driver context is bound to `identity`, or -1.
@@ -751,9 +797,11 @@ static int link_for_identity(const char *identity)
       return -1;
    int prev  = driver_link();
    int found = -1;
+   /* EVERY link, including a meter's. drv_connect stamps the address into the
+    * link's session whichever kind of device it is, so one lookup binds both
+    * -- and reserving a link for "the meter" is exactly what stopped a second
+    * and third meter from ever holding a connection of their own. */
    for (int l = 0; l < LINK_MAX && found < 0; l++) {
-      if (l == LINK_METER)
-         continue;
       driver_select(l);
       struct dex_session s;
       driver_get_session(&s);
@@ -779,8 +827,6 @@ static int free_cgm_link(int rank)
    int found = -1;
    int seen  = 0;
    for (int l = 0; l < LINK_MAX && found < 0; l++) {
-      if (l == LINK_METER)
-         continue;
       driver_select(l);
       struct dex_session s;
       driver_get_session(&s);
@@ -829,19 +875,26 @@ static int link_for_slot(int idx)
       }
    }
    sensors_unlock();
-   if (have && kind == KIND_BGM)
-      return LINK_METER;
+   (void)kind; /* meters and CGMs allocate by the same rule now */
    driver_lock();
    int link = have ? link_for_identity(ident) : -1;
    if (link < 0) {
       /* Not yet bound (no session on any link -- the normal state right after
-       * a restart). Rank this slot among the OTHER unbound CGM slots so each
-       * one claims a different free link. */
+       * a restart). Rank this slot among the OTHER unbound slots so each one
+       * claims a different free link.
+       *
+       * Every registered device is ranked, meters included: a meter needs a
+       * link of its own to hold a standing connect, because it is reachable
+       * only for the second or two it is switched on. Ranking by slot order
+       * means a device that IS bound never reaches here, so a forget cannot
+       * renumber a live one. */
       int rank = 0;
       sensors_lock(); /* driver -> reg, the documented order */
       for (int i = 0; i < idx && i < g_nslot; i++) {
+         if (g_slot[i].old)
+            continue; /* retired: holds no link */
          const struct sensor_rec *q = sensor_rec_by_id(g_slot[i].id);
-         if (!q || sensor_kind(q->type) != KIND_CGM)
+         if (!q)
             continue;
          char qid[24];
          str_snapshot(qid, sizeof qid, q->identity);
@@ -921,11 +974,10 @@ static int snap_link_for_slot(int idx)
    const struct snap_slot *d = &g_snap_slot[idx];
    if (!d->have_rec)
       return -1;
-   if (sensor_kind(d->type) == KIND_BGM)
-      return LINK_METER;
+   /* By ADDRESS for meters too: they hold their own links now, so there is
+    * no single link to return for "the meter". */
    for (int l = 0; l < LINK_MAX; l++)
-      if (l != LINK_METER && g_snap_sess[l].mac[0] &&
-          strcmp(g_snap_sess[l].mac, d->mac) == 0)
+      if (g_snap_sess[l].mac[0] && strcmp(g_snap_sess[l].mac, d->mac) == 0)
          return l;
    return -1;
 }
@@ -1140,8 +1192,8 @@ static void sensor_reconcile(void)
    sensors_lock();
    int prev_sel = driver_link();
    for (int l = 0; l < LINK_MAX && !s.mac[0]; l++) {
-      if (l == LINK_METER)
-         continue;
+      if (g_link_meter[l])
+         continue; /* CGMs only */
       driver_select(l);
       struct dex_session ls;
       driver_get_session(&ls);
@@ -1229,8 +1281,8 @@ static void sensor_reconcile(void)
    driver_lock();
    int psel = driver_link();
    for (int l = 0; l < LINK_MAX; l++) {
-      if (l == LINK_METER)
-         continue;
+      if (g_link_meter[l])
+         continue; /* CGMs only */
       driver_select(l);
       struct dex_session ls;
       driver_get_session(&ls);
@@ -1523,6 +1575,12 @@ static void build_model(struct screen *m)
       m->scr = SCR_ADDMENU;
    else if (g_menu == MENU_INSULIN)
       m->scr = SCR_INSULIN;
+   else if (g_menu == MENU_WEIGHT)
+      m->scr = SCR_WEIGHT;
+   else if (g_menu == MENU_WTLOG)
+      m->scr = SCR_WTLOG;
+   else if (g_menu == MENU_WTDEL)
+      m->scr = SCR_WTDEL;
    else if (g_menu == MENU_INSLOG)
       m->scr = SCR_INSLOG;
    else if (g_menu == MENU_DISPLAY)
@@ -1728,6 +1786,15 @@ static void build_model(struct screen *m)
    m->ins_log     = g_ins; /* global tail: the borrow is stable */
    m->ins_nlog    = g_nins;
    m->inslog_page = g_inslog_page;
+   m->wt          = g_wt;
+   m->nwt         = g_nwt;
+   m->wt_page     = g_wtlog_page;
+   m->wt_t        = g_wt_t;
+   m->wt_tenths   = g_wt_tenths;
+   m->wunits      = g_wunits;
+   m->wt_edit     = (g_wt_edit >= 0);
+   m->wt_tab      = g_wt_tab;
+   m->wt_scrub    = g_wt_scrub;
    m->ins_edit    = (g_ins_edit >= 0);
    for (int k = 0; k < 2; k++) {
       m->ins_marker[k] = g_ins_marker[k];
@@ -1741,6 +1808,7 @@ static void build_model(struct screen *m)
    m->exp_glu      = g_exp_glu;
    m->exp_dev      = g_exp_dev;
    m->exp_ins      = g_exp_ins;
+   m->exp_wt       = g_exp_wt;
    m->pend_type    = g_pend_pairing;
    m->pend_primary = g_pend_primary;
    m->old_page     = g_old_page;
@@ -2119,45 +2187,38 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
       struct meter_rt *rt = (mid > 0) ? meter_rt_get(mid, 1) : 0;
       long mlast          = rt ? rt->sync_t : 0;
       if (mid > 0 && realtime_s() - mlast > 60) {
-         g_meter_src = mid; /* this meter owns the sync that follows */
+         /* The advertisement IS the "last seen" event, and it carries an
+          * RSSI -- so SIGNAL STRENGTH is stamped here, from the same advert,
+          * not left blank until a connection completes (a meter that
+          * advertised but did not finish a sync used to show LAST SEEN with a
+          * "--" signal). A completed sync's connection RSSI
+          * (pancra_meter_rssi) refines this afterwards. meter_sync_start
+          * persists it, so it must be set BEFORE the call. */
          if (rt) {
-            rt->sync_t = realtime_s(); /* per-meter last-seen + throttle */
-            /* The advertisement IS the "last seen" event, and it carries an
-             * RSSI -- so SIGNAL STRENGTH is stamped here, from the same advert,
-             * not left blank until a connection completes (a meter that
-             * advertised but did not finish a sync used to show LAST SEEN with
-             * a
-             * "--" signal). A completed sync's connection RSSI
-             * (pancra_meter_rssi) refines this afterwards. */
+            /* An advertisement IS proof the meter is switched on and within
+             * range, so this is a real "last seen" -- and it is the only
+             * place other than an actual connection that may say so. */
+            rt->sync_t = realtime_s();
             if (rssi <= -1 && rssi >= -127) {
                rt->rssi    = rssi;
                rt->rssi_ok = 1;
                rt->rssi_t  = realtime_s();
             }
-            meter_sync_save(); /* persist so LAST SEEN + signal survive restart
-                                */
+            meter_sync_save(); /* survives a restart */
          }
-         str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
-         g_meter_busy  = 1;
-         g_meter_start = realtime_s(); /* or the watchdog kills it next tick */
-         /* Seed the driver with THIS meter's own stored index. The index is
-          * per-device: sharing one across meters made each sync read the
-          * other's counter as "gone backwards", so they reset each other
-          * forever and one meter's records were never reached again. */
-         driver_lock(); /* otble statics: same lock the notify path uses */
-         ot_init(meter_index_load(mid));
-         driver_unlock();
-         /* Clear the DIS strings too: they are process-global for the meter
-          * link, and a sync that finishes before the reads land (the common
-          * case -- "nothing new" ends after one round trip) would otherwise
-          * mint this meter against the PREVIOUS meter's model and firmware. */
-         sensors_lock(); /* the lock pancra_devinfo writes these under */
-         g_meter_model[0] = 0;
-         g_meter_fw[0]    = 0;
-         sensors_unlock();
-         LOGI("meter %s (id %d) advertising -> sync on link %d", mac, mid,
-              LINK_METER);
-         dexble_meter_connect(mac);
+         /* Already armed? Then the controller is initiating on its own and
+          * re-issuing the connect would only cancel and restart it -- during
+          * the one second the meter is awake. With every meter armed that is
+          * the normal case, so this path is now only a fallback for a meter
+          * that could not get a link of its own. */
+         /* Skip, do NOT return: this is still an advertisement the device
+          * list below has to record, and returning would silently drop the
+          * meter out of the ADD DEVICE list. */
+         if (!meter_armed(mac)) {
+            LOGI("meter %s (id %d) advertising, not armed -> connect", mac,
+                 mid);
+            meter_sync_start(mid, mac);
+         }
       }
    }
 
@@ -2390,8 +2451,8 @@ static int any_pred_low(void)
 {
    long now = realtime_s();
    for (int l = 0; l < LINK_MAX; l++) {
-      if (l == LINK_METER)
-         continue;
+      if (g_link_meter[l])
+         continue; /* CGMs only */
       if (g_link_pred[l] > 0 && g_link_pred[l] < PRED_LOW_MGDL &&
           g_link_pred_t[l] > 0 && now - g_link_pred_t[l] <= AL_FRESH_S)
          return 1;
@@ -2566,6 +2627,174 @@ static struct alarm_reading current_reading(void)
 static int alarming(int zone, int pred)
 {
    return zone || pred || g_alarm_want != AL_NONE;
+}
+
+/* The link a meter's standing connect is outstanding on, or -1.
+ *
+ * ITS OWN TABLE, not the driver session. The session's address is stamped by
+ * the DEXCOM handshake, and a meter never runs one -- so reading it back
+ * reported every meter as unarmed, the tick re-armed on every pass, and each
+ * pass issued a fresh connectGatt: a connect per second, forever, which is
+ * both a battery burn and a live risk of cancelling the connection during
+ * the one second the meter is actually awake. Measured on the device before
+ * this table existed: the same meter armed four times in four seconds. */
+static char g_link_armed[LINK_MAX][24];
+
+static int meter_link_of(const char *mac)
+{
+   if (!mac || !mac[0])
+      return -1;
+   for (int l = 0; l < LINK_MAX; l++)
+      if (g_link_armed[l][0] && strcmp(g_link_armed[l], mac) == 0)
+         return l;
+   return -1;
+}
+
+static int meter_armed(const char *mac)
+{
+   return meter_link_of(mac) >= 0;
+}
+
+/* Begin a meter sync on that meter's OWN link: seed the driver with its stored
+ * record index, clear the shared DIS strings, take the busy latch, and connect.
+ *
+ * SHARED BY THE ADVERT PATH AND "SYNC NOW", and it must be, because every step
+ * here is load-bearing and getting one wrong corrupts data rather than merely
+ * failing. The index is PER-DEVICE: sharing one across meters made each sync
+ * read the other's counter as "gone backwards", so they reset each other
+ * forever and one meter's records were never reached again. The DIS strings
+ * are process-global for the meter link, so a sync that finishes before the
+ * reads land -- the common case, since "nothing new" ends after one round
+ * trip -- would otherwise mint this meter against the PREVIOUS meter's model
+ * and firmware. Two call sites doing this by hand is two chances to omit one.
+ *
+ * The connect itself is autoConnect=true (Ble.java), so it does NOT need the
+ * meter to be advertising right now: the stack latches on as soon as the
+ * device is reachable. That is what lets SYNC NOW mean something. */
+static void meter_sync_start(int mid, const char *mac)
+{
+   /* Its OWN link, from the shared pool. Every registered meter holds one, so
+    * all of them can carry a standing connect at once -- with a single
+    * reserved link only the last-used meter could, and the others were back
+    * to catching a two-second advertisement. */
+   /* Already armed? Keep the SAME link. Re-allocating would strand the
+    * pending connect on the old one and hand this meter a second. */
+   int link = meter_link_of(mac);
+   if (link < 0) {
+      /* A free link: claimed by no other meter, and carrying no CGM session.
+       * NOT link_for_slot -- that ranks devices the DEXCOM session binds, and
+       * a meter never runs one, so two meters would rank to the same link and
+       * the second would evict the first. */
+      driver_lock();
+      int prev = driver_link();
+      for (int l = 0; l < LINK_MAX && link < 0; l++) {
+         if (g_link_armed[l][0])
+            continue; /* another meter holds it */
+         driver_select(l);
+         struct dex_session ls;
+         driver_get_session(&ls);
+         if (!ls.mac[0]) /* no CGM bound here */
+            link = l;
+      }
+      driver_select(prev);
+      driver_unlock();
+   }
+   if (link < 0) {
+      /* Every link is spoken for. Say so rather than connecting on someone
+       * else's: routing a meter onto a CGM's link would feed sensor
+       * notifications to the meter parser. */
+      LOGI("meter %s (id %d): no free link", mac, mid);
+      set_status("NO FREE LINK");
+      return;
+   }
+   link_set_meter(link, 1);
+   str_snapshot(g_link_armed[link], sizeof g_link_armed[link], mac);
+   /* DO NOT STAMP LAST SYNC HERE.
+    *
+    * This used to set rt->sync_t, which was truthful while the only caller
+    * was the advert path -- an advertisement means the meter really is
+    * switched on and in range. Arming a STANDING connect means nothing of the
+    * kind: it is issued for every registered meter on a timer, whether the
+    * meter is off, in another room, or a mile away. Stamping here made all
+    * three read "SYNCED a few seconds ago" at once, which is a plain lie
+    * about whether a fingerstick has been captured -- exactly the fact the
+    * user is looking at that row to learn. The stamp belongs where contact is
+    * PROVEN: the advert path (seen on air) and ot_drv_status (it answered).
+    */
+   /* ARM ONLY. Deliberately NOT ot_init / g_meter_src / g_meter_busy here.
+    *
+    * The connect below may sit pending for hours -- that is the point -- and
+    * with every meter holding one, seeding the shared otble state at arm time
+    * would let arming meter B reset the protocol out from under a sync
+    * already running on meter A: phase to idle mid-walk, last_index replaced,
+    * and A's remaining fingersticks written to readings.csv under B's id, in
+    * an append-only file that is never rewritten. The state is seeded when a
+    * meter actually ANSWERS instead -- pancra_meter_connected -- which is the
+    * only moment exactly one meter owns it. */
+   LOGI("meter %s (id %d) armed on link %d", mac, mid, link);
+   dexble_meter_connect(link, mac);
+}
+
+/* A meter answered on `link`. Returns 1 to let the protocol run, 0 to refuse.
+ *
+ * THIS is where the sync becomes real, so this is where the shared otble
+ * state is seeded and the busy latch taken. Called from the transport's
+ * connect callback, under driver_lock. */
+int pancra_meter_connected(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return 0;
+   /* Which meter is this? By the address the link is bound to. */
+   struct dex_session ls;
+   int prev = driver_link();
+   driver_select(link);
+   driver_get_session(&ls);
+   driver_select(prev);
+   int mid = -1;
+   char mac[24];
+   mac[0] = 0;
+   sensors_lock();
+   int idx = ls.mac[0] ? sensor_slot_by_mac(ls.mac) : -1;
+   if (idx >= 0) {
+      const struct sensor_rec *r = sensor_rec_by_id(g_slot[idx].id);
+      if (r && sensor_kind(r->type) == KIND_BGM) {
+         mid = g_slot[idx].id;
+         str_snapshot(mac, sizeof mac, r->identity);
+      }
+   }
+   sensors_unlock();
+   if (mid <= 0) {
+      LOGI("meter connect on link %d: no registered meter there", link);
+      return 0;
+   }
+   if (g_meter_busy && g_meter_link != link) {
+      /* Another meter is mid-exchange and there is only one protocol state.
+       * Refuse; its standing connect is re-armed by the tick, and the meter
+       * buffers its records, so nothing is lost -- only deferred. */
+      LOGI("meter on link %d deferred: link %d is mid-sync", link,
+           g_meter_link);
+      return 0;
+   }
+   g_meter_link = link;
+   g_meter_src  = mid;
+   str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
+   /* Seed THIS meter's own stored index. The index is per-device: sharing one
+    * made each sync read the other's counter as "gone backwards", so they
+    * reset each other forever and one meter's records were never reached. */
+   ot_init(meter_index_load(mid)); /* caller holds driver_lock */
+   /* Clear the DIS strings: they are process-global for a meter link, and a
+    * sync that finishes before the reads land -- the common case, since
+    * "nothing new" ends after one round trip -- would otherwise mint this
+    * meter against the PREVIOUS meter's model and firmware. */
+   sensors_lock();
+   g_meter_model[0] = 0;
+   g_meter_fw[0]    = 0;
+   sensors_unlock();
+   g_meter_busy  = 1;
+   g_meter_start = realtime_s();
+   LOGI("meter %s (id %d) answered on link %d -> sync in flight", mac, mid,
+        link);
+   return 1;
 }
 
 /* Emit the one-time nudge. NG_NONE is the answer on all but a handful of the
@@ -2757,12 +2986,59 @@ static void alarm_reactuate(void)
  * back-pressed or swiped the task away left the meter wedged for the whole
  * background lifetime, which is exactly the window the service exists to
  * cover, and it self-healed only when the activity was reopened. */
+
+/* Runs on the 1 Hz tick (and the service heartbeat, so it survives the
+ * activity being destroyed). Two jobs:
+ *
+ *   - release a sync that has WEDGED. Now that g_meter_busy is taken only when
+ *     the meter answers, this 90 s measures a real exchange rather than a
+ *     standing connect's wait, so it can no longer tear down a pending connect
+ *     that is behaving exactly as intended.
+ *   - keep exactly one standing connect ARMED. This is what makes a sync
+ *     survive a restart, a Bluetooth toggle, or the app being swiped away:
+ *     nothing else re-establishes it, and without it the first fingerstick
+ *     after any of those would be missed with no way for the user to know. */
 void meter_sync_watchdog(void)
 {
    if (g_meter_busy && realtime_s() - g_meter_start > 90) {
-      LOGI("meter sync timed out; releasing link %d", LINK_METER);
-      dexble_link_close(LINK_METER);
+      LOGI("meter sync timed out; releasing link %d", g_meter_link);
+      if (g_meter_link >= 0)
+         dexble_link_close(g_meter_link);
+      if (g_meter_link >= 0 && g_meter_link < LINK_MAX)
+         g_link_armed[g_meter_link][0] = 0;
       g_meter_busy = 0;
+      g_meter_link = -1;
+   }
+   /* ARM EVERY REGISTERED METER, not just one.
+    *
+    * Each holds its own link, so all of them can wait on the controller at
+    * once -- which is what makes "whichever meter I pick up" work rather than
+    * only the last one used. Arming is idempotent (meter_armed), so this is a
+    * no-op on every tick but the first after a restart or a finished sync. */
+   int ids[MAX_SLOTS];
+   char macs[MAX_SLOTS][24];
+   int n = 0;
+   sensors_lock();
+   for (int i = 0; i < g_nslot && n < MAX_SLOTS; i++) {
+      if (g_slot[i].old)
+         continue; /* retired: holds no link */
+      const struct sensor_rec *r = sensor_rec_by_id(g_slot[i].id);
+      if (!r || sensor_kind(r->type) != KIND_BGM)
+         continue;
+      ids[n] = g_slot[i].id;
+      str_snapshot(macs[n], sizeof macs[n], r->identity);
+      n++;
+   }
+   sensors_unlock();
+   for (int i = 0; i < n; i++) {
+      if (!macs[i][0] || meter_armed(macs[i]))
+         continue;
+      /* One per tick: meter_sync_start takes both locks and issues a GATT
+       * connect, and doing several in one pass would hold the main thread
+       * across a burst of binder calls for no gain -- the meters are almost
+       * certainly all switched off anyway. */
+      meter_sync_start(ids[i], macs[i]);
+      return;
    }
 }
 
@@ -2771,8 +3047,8 @@ void pancra_link_watchdog(void)
    static long last_kick[LINK_MAX];
    long now = realtime_s();
    for (int l = 0; l < LINK_MAX; l++) {
-      if (l == LINK_METER)
-         continue;
+      if (g_link_meter[l])
+         continue; /* CGMs only */
       struct dex_session s;
       driver_lock();
       driver_select(l);
@@ -3710,7 +3986,7 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
     * any_pred_low() tracks the live prediction. */
    {
       int lk = driver_link();
-      if (lk >= 0 && lk < LINK_MAX && lk != LINK_METER) {
+      if (lk >= 0 && lk < LINK_MAX && !g_link_meter[lk]) {
          struct dex_session ps;
          driver_get_session(&ps);
          g_link_pred[lk]   = ps.predicted;
@@ -3980,7 +4256,7 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
     * model/firmware is part of its permanent provenance, and mixing them would
     * attribute readings to hardware that never produced them. */
    char *dst = 0;
-   if (link == LINK_METER) {
+   if (link >= 0 && link < LINK_MAX && g_link_meter[link]) {
       if (strncmp(uuid + 4, "2a24", 4) == 0)
          dst = g_meter_model;
       else if (strncmp(uuid + 4, "2a26", 4) == 0)
@@ -4012,7 +4288,7 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
     * append-only file. Readers hold the same lock: sensor_mint takes it
     * internally, and the reconcile passes copy under it. */
    sensors_lock();
-   if (link >= 0 && link < LINK_MAX && link != LINK_METER) {
+   if (link >= 0 && link < LINK_MAX && !g_link_meter[link]) {
       char *ld = 0;
       if (strncmp(uuid + 4, "2a24", 4) == 0)
          ld = g_model_l[link];
@@ -4057,10 +4333,10 @@ static void sys_export_data(void)
       cutoff = realtime_s() - (30L * 86400);
    else if (g_exp_range == 1)
       cutoff = realtime_s() - (365L * 86400);
-   (*e)->CallStaticVoidMethod(e, g_ble, m_export, g_act->clazz, (jlong)cutoff,
-                              (jboolean)(g_exp_glu != 0),
-                              (jboolean)(g_exp_dev != 0),
-                              (jboolean)(g_exp_ins != 0));
+   (*e)->CallStaticVoidMethod(
+       e, g_ble, m_export, g_act->clazz, (jlong)cutoff,
+       (jboolean)(g_exp_glu != 0), (jboolean)(g_exp_dev != 0),
+       (jboolean)(g_exp_ins != 0), (jboolean)(g_exp_wt != 0));
 }
 
 static int sys_perm_granted(const char *perm)
@@ -4286,14 +4562,25 @@ static void commit_pair(const char *mac)
       sensors_unlock();
       g_smart_pairing = 0;
       str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
+      /* The new meter's own link, by the same allocation as every other
+       * device -- link_for_slot binds it to this slot's address. */
+      int mlink = link_for_slot(idx);
+      if (mlink < 0) {
+         set_status("NO FREE LINK");
+         keypad_close();
+         return;
+      }
+      link_set_meter(mlink, 1);
+      g_meter_link  = mlink;
       g_meter_busy  = 1;
       g_meter_start = realtime_s();
       set_status("METER: PAIRING");
-      LOGI("registered meter id=%d mac=%s; connecting to bond", id, mac);
+      LOGI("registered meter id=%d mac=%s on link %d; connecting to bond", id,
+           mac, mlink);
       if (g_act) {
          g_scan_hold_until = realtime_s() + 20; /* quiet radio to bond */
          stop_scan(g_act);
-         dexble_meter_connect(mac);
+         dexble_meter_connect(mlink, mac);
       }
       keypad_close();
       return;
@@ -4672,6 +4959,109 @@ static void civil_from_days(long z, long *y, long *m, long *d)
 /* Every insulin-related menu action (the LOG/EDIT form, the dose log
  * table, the marker picker), split out of menu_action so neither function
  * outgrows the size gate. Returns 1 when `action` was one of ours. */
+/* WEIGHT actions, split out like ins_action so menu_action stays small.
+ * Returns 1 when `action` was one of ours. */
+static int wt_action(int action)
+{
+   if (action == MA_WT_OPEN) {
+      /* Pre-populate: now, and the LAST logged weight -- a weigh-in moves by
+       * ounces, so the previous value is nearly always one or two keypresses
+       * from the new one, and starting from zero would make every entry a
+       * full retype. */
+      g_wt_t      = realtime_s();
+      g_wt_tenths = (g_nwt > 0) ? wt_to_tenths(g_wt[g_nwt - 1].g, g_wunits)
+                                : wt_to_tenths(70000L, g_wunits);
+      g_wt_edit   = -1; /* a NEW entry, not an edit */
+      g_menu      = MENU_WEIGHT;
+   } else if (action >= MA_WTLOG_EDIT && action < MA_WTLOG_EDIT + NWT) {
+      /* A row in the table opens that entry in the EDIT WEIGHT form. Keep a
+       * COPY as the rewrite's match key -- see g_wt_orig. */
+      int i = action - MA_WTLOG_EDIT;
+      if (i >= 0 && i < g_nwt) {
+         g_wt_orig   = g_wt[i];
+         g_wt_edit   = i;
+         g_wt_t      = g_wt[i].t;
+         g_wt_tenths = wt_to_tenths(g_wt[i].g, g_wunits);
+         g_menu      = MENU_WEIGHT;
+      }
+   } else if (action >= MA_WTTAB && action < MA_WTTAB + UI_WT_TABS) {
+      g_wt_tab   = action - MA_WTTAB;
+      g_wt_scrub = -1; /* the picked point may not be in the new span */
+   } else if (action == MA_WT_DELETE) {
+      if (g_wt_edit >= 0)
+         g_menu = MENU_WTDEL; /* confirm first; this tap deletes nothing */
+   } else if (action == MA_WTDEL_NO) {
+      g_menu = MENU_WEIGHT;
+   } else if (action == MA_WTDEL_YES) {
+      if (g_wt_edit >= 0 && weight_delete(&g_wt_orig) == 0) {
+         LOGI("weight entry deleted: %ld g at %ld", g_wt_orig.g, g_wt_orig.t);
+         set_status("WEIGHT DELETED");
+      } else {
+         set_status("WEIGHT: DELETE FAILED");
+      }
+      g_wt_edit  = -1;
+      g_menu     = MENU_WTLOG;
+      g_ui_dirty = 1;
+   } else if (action == MA_WTLOG_OPEN) {
+      g_wtlog_page = 0;
+      g_menu       = MENU_WTLOG;
+   } else if (action == MA_WTLOG_BACK) {
+      g_menu = MENU_ADD;
+   } else if (action == MA_WTLOG_PREV) {
+      if (g_wtlog_page > 0)
+         g_wtlog_page--;
+   } else if (action == MA_WTLOG_NEXT) {
+      g_wtlog_page++; /* the renderer clamps to the last page */
+   } else if (action >= MA_WT_EDIT && action < MA_WT_EDIT + 4) {
+      /* Tapping a form value opens the keypad for EXACT entry. The weight
+       * gets its own mode (14); date/time/year reuse the insulin form's
+       * modes 7/8/9, which are about a calendar instant and carry no insulin
+       * meaning -- the keypad returns here, so nothing crosses over. */
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = (action == MA_WT_EDIT) ? 14 : (6 + (action - MA_WT_EDIT));
+      g_kp_return = MENU_WEIGHT;
+      g_entrylen  = 0;
+   } else if (action == MA_WT_CONFIRM) {
+      /* The one write, on the explicit CONFIRM only (the calibration rule). */
+      if (g_menu == MENU_WEIGHT) {
+         long g = wt_from_tenths(g_wt_tenths, g_wunits);
+         int rc = -1;
+         int ed = (g_wt_edit >= 0);
+         if (g > 0)
+            rc = ed ? weight_update(&g_wt_orig, g_wt_t, g, g_tz_off)
+                    : weight_append(g_wt_t, g, g_tz_off);
+         if (rc == 0) {
+            LOGI("weight %s: %ld g at %ld", ed ? "edited" : "logged", g,
+                 g_wt_t);
+            set_status(ed ? "WEIGHT EDITED" : "WEIGHT LOGGED");
+            /* An EDIT returns to the log it was opened from; a NEW entry is a
+             * completed task and lands on the main screen (the insulin rule).
+             */
+            g_menu    = ed ? MENU_WTLOG : MENU_NONE;
+            g_wt_edit = -1;
+         } else {
+            /* Refuse VISIBLY. A weight the user believes recorded but is not
+             * is a silent hole in the only copy of that number. */
+            set_status("WEIGHT: WRITE FAILED");
+         }
+         g_ui_dirty = 1;
+      }
+   } else if (action == MA_WT_DISCARD) {
+      /* Back where it came from: the log for an edit, the ADD menu for a new
+       * entry (the record-the-origin rule). */
+      g_menu    = (g_wt_edit >= 0) ? MENU_WTLOG : MENU_ADD;
+      g_wt_edit = -1;
+   } else if (action == MA_WUNITS) {
+      /* Display only: the file is grams, so this re-renders history rather
+       * than converting it. */
+      g_wunits = (g_wunits == WT_LB) ? WT_KG : WT_LB;
+      settings_save();
+   } else {
+      return 0; /* not ours */
+   }
+   return 1;
+}
+
 static int ins_action(int action)
 {
    if (action == MA_INS_OPEN || action == MA_INS_FAST ||
@@ -4838,8 +5228,11 @@ static int submenu_action(int action)
       g_exp_dev = !g_exp_dev;
    } else if (action == MA_EXP_INS) {
       g_exp_ins = !g_exp_ins;
+   } else if (action == MA_EXP_WT) {
+      g_exp_wt = !g_exp_wt;
    } else if (action == MA_EXP_GO) {
-      if (g_menu == MENU_EXPORT && (g_exp_glu || g_exp_dev || g_exp_ins))
+      if (g_menu == MENU_EXPORT &&
+          (g_exp_glu || g_exp_dev || g_exp_ins || g_exp_wt))
          sys_export_data(); /* Java builds the CSV per the checkboxes/range
                              * and opens the share sheet; the menu stays,
                              * its X returns to settings */
@@ -5196,28 +5589,66 @@ static void menu_action(int action)
          g_menu = g_sensor_from;
       }
    } else if (action == MA_SYNC) {
-      /* An explicit request must not be swallowed by the auto-sync throttle:
-       * clear it so the next advertisement syncs immediately. The meter still
-       * has to be switched on -- that is the meter's rule, not ours. */
-      g_meter_last_sync = 0;
-      LOGI("manual sync requested for slot %d", g_sel);
-      /* Ensure a scan is running, WITHOUT entering pairing mode.
+      /* SYNC NOW CONNECTS. It used to do nothing whatsoever.
        *
-       * This used to call pair_scan_start(), which sets g_smart_pairing -- the
-       * flag that suppresses every CGM's advert-driven reconnect -- and is
-       * never cleared from this screen, so a single SYNC NOW tap killed CGM
-       * reconnection for the life of the process.
+       * All three of its old statements were no-ops by the time they ran:
        *
-       * Do NOT stop the scan on a timer afterwards: its lifecycle belongs to
-       * on_resume/on_pause, one is already running whenever the UI is up
-       * (start_scan is idempotent via g_scanning), and every CGM's reconnect
-       * depends on it. Tearing it down here would trade this bug for a worse
-       * one. */
+       *   - it cleared g_meter_last_sync "so the next advertisement syncs
+       *     immediately", but the per-meter throttle refactor moved the gate
+       *     to meter_rt.sync_t and left that global read by NOTHING. Grep it:
+       *     one declaration, one write here, one write on completion, zero
+       *     reads. The throttle it claimed to clear was untouched.
+       *   - it called start_scan, which early-returns whenever g_scanning is
+       *     set -- always, while the UI is up. See scan_restart.
+       *   - and it never attempted a connection at all. The whole design waits
+       *     passively for an advertisement, so with the meter switched on but
+       *     between advertising bursts, the one control the user has to force
+       *     a sync did literally nothing, silently, however many times it was
+       *     pressed. Confirmed from an HCI capture on 2026-08-03: 26 minutes
+       *     of taps with no radio traffic to the meter at all, then a sync
+       *     1.3 s after the first advertisement finally arrived.
+       *
+       * A registered meter is BONDED and its address is known, and
+       * dexble_meter_connect uses autoConnect=true -- so there is no reason
+       * whatsoever to wait for an advertisement. Connect, and let the stack
+       * latch on when the meter is reachable. The 90 s watchdog releases the
+       * link if it never is. */
+      int mid = -1;
+      char mmac[24];
+      mmac[0] = 0;
+      sensors_lock();
+      if (g_sel >= 0 && g_sel < g_nslot && !g_slot[g_sel].old) {
+         const struct sensor_rec *r = sensor_rec_by_id(g_slot[g_sel].id);
+         if (r && sensor_kind(r->type) == KIND_BGM) {
+            mid = g_slot[g_sel].id;
+            str_snapshot(mmac, sizeof mmac, r->identity);
+         }
+      }
+      sensors_unlock();
+      if (mid > 0 && mmac[0]) {
+         if (g_meter_busy) {
+            /* SAY SO. Refusing is right -- meter_sync_start resets the otble
+             * statics, and doing that under a sync in flight writes one
+             * meter's records under another's id -- but refusing SILENTLY is
+             * what this whole handler was already guilty of. */
+            LOGI("manual sync refused: a meter sync is already in flight");
+            set_status("METER BUSY, RETRY");
+         } else {
+            LOGI("manual sync: connecting to meter %s (id %d)", mmac, mid);
+            set_status("METER: SYNCING");
+            meter_sync_start(mid, mmac);
+         }
+      }
+      /* Refresh the scan as well, for the CGM's sake and to recover one
+       * Android has quietly demoted (scan_restart). Deliberately NOT
+       * pair_scan_start(): that sets g_smart_pairing, which suppresses every
+       * CGM's advert-driven reconnect and is never cleared from this screen,
+       * so a single SYNC NOW tap used to kill CGM reconnection for the life
+       * of the process. */
       devlist_lock(); /* atomic vs the binder-thread advert writer */
       g_ndevs = 0;
       devlist_unlock();
-      if (g_act)
-         start_scan(g_act);
+      scan_restart(g_act);
    }
    /* --- calibration: user-initiated only, never automatic --- */
    else if (action == MA_CAL_OPEN) {
@@ -5392,8 +5823,10 @@ static void menu_action(int action)
        * threshold at all in mmol/L. */
       if (g_menu == MENU_KEYPAD && g_kp_mode == 4 && g_entrylen < 15) {
          g_entry[g_entrylen++] = '.';
-      } else if (g_menu == MENU_KEYPAD && g_units && g_kp_mode >= 10 &&
-                 g_kp_mode <= 13 && g_entrylen < 4) {
+      } else if (g_menu == MENU_KEYPAD &&
+                 ((g_units && g_kp_mode >= 10 && g_kp_mode <= 13) ||
+                  g_kp_mode == 14) &&
+                 g_entrylen < ui_kp_slots(g_kp_mode)) {
          int seen = 0;
          for (int i = 0; i < g_entrylen; i++)
             if (g_entry[i] == '.')
@@ -5473,7 +5906,8 @@ static void menu_action(int action)
        * action (a swiped-away notification returns on notify()). */
       g_notify_dirty = 1;
       pancra_notify_refresh();
-   } else if (ins_action(action) || submenu_action(action)) {
+   } else if (ins_action(action) || wt_action(action) ||
+              submenu_action(action)) {
       /* handled by a split-out family (see them above menu_action):
        * LOG/EDIT INSULIN + dose log + marker picker (ins_action), or the
        * ALARM / EXPORT DATA / REMOTE / PERMISSIONS / DISPLAY / OLD DEVICES
@@ -5687,6 +6121,50 @@ static void menu_action(int action)
             g_entrylen = 0;
             keypad_close();
          }
+      } else if (g_kp_mode == 14) { /* WEIGHT: "162" or "162.4" */
+         if (g_entrylen > 0) {
+            /* THE DIGITS ARE THE WHOLE NUMBER, with an optional '.' and one
+             * decimal -- exactly the alarm-threshold entry's shape.
+             *
+             * They used to be TENTHS, so "162" meant 16.2 lb: below the
+             * minimum, refused, entry cleared, and the only way to enter 162
+             * was to type "1620". Nobody would. An entry form has to accept
+             * the number as it is spoken and as the row displays it. */
+            int ip  = 0;
+            int fd  = 0;
+            int dot = 0; /* 0 none, 1 seen, 2 decimal digit consumed */
+            int bad = 0;
+            for (int i = 0; i < g_entrylen; i++) {
+               char ch = g_entry[i];
+               if (ch == '.') {
+                  if (dot)
+                     bad = 1; /* one dot only */
+                  else
+                     dot = 1;
+               } else if (dot == 0) {
+                  ip = (ip * 10) + (ch - '0');
+               } else if (dot == 1) {
+                  fd  = ch - '0';
+                  dot = 2;
+               } else {
+                  bad = 1; /* a second decimal digit: not representable */
+               }
+            }
+            int tenths = (ip * 10) + fd;
+            /* Validate by CONVERTING: wt_from_tenths returns 0 outside the
+             * stored range, so an impossible weight is refused VISIBLY rather
+             * than silently clamped into the log. */
+            if (bad || ip > 999 || wt_from_tenths(tenths, g_wunits) <= 0) {
+               LOGI("weight %d.%d %s refused (out of range)", tenths / 10,
+                    tenths % 10, wt_unit_name(g_wunits));
+               g_entrylen = 0;
+               g_ui_dirty = 1;
+               return; /* stay: the cleared entry is the feedback */
+            }
+            g_wt_tenths = tenths;
+            g_entrylen  = 0;
+            keypad_close();
+         }
       } else if (g_kp_mode == 6) { /* INSULIN UNITS: 1..99 */
          if (g_entrylen > 0) {
             int v = 0;
@@ -5701,12 +6179,18 @@ static void menu_action(int action)
             g_entrylen  = 0;
             keypad_close();
          }
-      } else if (g_kp_mode == 9) { /* INSULIN YEAR: 4 digits */
+      } else if (g_kp_mode == 9) { /* YEAR: 4 digits */
          if (g_entrylen == 4) {
             int v = 0;
             for (int i = 0; i < 4; i++)
                v = (v * 10) + (g_entry[i] - '0');
-            long local = g_ins_t + g_tz_off;
+            /* Modes 7/8/9 are about a calendar instant and carry no insulin
+             * meaning, so the LOG WEIGHT form reuses them. g_kp_return says
+             * which form is waiting, and therefore which instant to edit --
+             * without this, typing a date on the weight form silently moved
+             * the insulin form's dose instead. */
+            long *tp   = (g_kp_return == MENU_WEIGHT) ? &g_wt_t : &g_ins_t;
+            long local = *tp + g_tz_off;
             long secs  = local % 86400;
             long z     = local / 86400;
             if (secs < 0) {
@@ -5727,16 +6211,18 @@ static void menu_action(int action)
             int leap = (v % 4 == 0 && v % 100 != 0) || v % 400 == 0;
             if (mm == 2 && dd == 29 && !leap)
                dd = 28;
-            g_ins_t    = (days_from_civil(v, mm, dd) * 86400) + secs - g_tz_off;
+            *tp        = (days_from_civil(v, mm, dd) * 86400) + secs - g_tz_off;
             g_entrylen = 0;
             keypad_close();
          }
-      } else if (g_kp_mode == 7 || g_kp_mode == 8) { /* INSULIN MMDD/HHMM */
+      } else if (g_kp_mode == 7 || g_kp_mode == 8) { /* MMDD / HHMM */
          if (g_entrylen == 4) {
             int a = ((g_entry[0] - '0') * 10) + (g_entry[1] - '0');
             int b = ((g_entry[2] - '0') * 10) + (g_entry[3] - '0');
-            /* split the dose instant into local civil date + seconds */
-            long local = g_ins_t + g_tz_off;
+            /* whichever form opened the keypad -- see mode 9 above */
+            long *tp = (g_kp_return == MENU_WEIGHT) ? &g_wt_t : &g_ins_t;
+            /* split the instant into local civil date + seconds */
+            long local = *tp + g_tz_off;
             long secs  = local % 86400;
             long z     = local / 86400;
             if (secs < 0) {
@@ -5757,14 +6243,14 @@ static void menu_action(int action)
                   g_ui_dirty = 1;
                   return; /* invalid date: stay, entry cleared */
                }
-               g_ins_t = (days_from_civil(yy, a, b) * 86400) + secs - g_tz_off;
+               *tp = (days_from_civil(yy, a, b) * 86400) + secs - g_tz_off;
             } else { /* HHMM: keep the civil date, set the time of day */
                if (a > 23 || b > 59) {
                   g_entrylen = 0;
                   g_ui_dirty = 1;
                   return; /* invalid time: stay, entry cleared */
                }
-               g_ins_t = (z * 86400) + (a * 3600L) + (b * 60L) - g_tz_off;
+               *tp = (z * 86400) + (a * 3600L) + (b * 60L) - g_tz_off;
             }
             g_entrylen = 0;
             keypad_close();
@@ -6155,21 +6641,43 @@ static int meter_index_load(int id)
  * meter needs no transport of its own -- only its own protocol. */
 void ot_drv_write(const uint8_t *data, int n)
 {
-   dexble_write(LINK_METER, OT_WRITE, data, n, 0);
+   if (g_meter_link >= 0)
+      dexble_write(g_meter_link, OT_WRITE, data, n, 0);
 }
 
 void ot_drv_subscribe(void)
 {
-   dexble_subscribe(LINK_METER, OT_NOTIFY, 0);
+   if (g_meter_link < 0)
+      return;
+   dexble_subscribe(g_meter_link, OT_NOTIFY, 0);
    /* Queued on the meter's own link, so its model/firmware are known by the
     * time the sync finishes and can be written into its provenance. */
-   dexble_request_devinfo_link(LINK_METER);
+   dexble_request_devinfo_link(g_meter_link);
 }
 
+/* Re-arm the standing connect on the meter we just finished with.
+ *
+ * The meter has powered itself off by now, so this connect simply sits in the
+ * controller's whitelist until the NEXT fingerstick -- which is the whole
+ * mechanism. Without it every sync would be the last one that worked without
+ * the user opening the app, because nothing else re-establishes the pending
+ * connect. Gated on having a meter and no sync in flight, so it cannot loop
+ * against a meter that is still connected. */
 void ot_drv_disconnect(void)
 {
-   dexble_link_close(LINK_METER);
+   if (g_meter_link >= 0)
+      dexble_link_close(g_meter_link);
    g_meter_busy = 0;
+   /* Releasing the link is what ASKS for the re-arm: meter_armed reads the
+    * link binding, dexble_link_close cleared it, so the next tick sees this
+    * meter unarmed and connects again. Deliberately not re-armed inline --
+    * this runs from the driver's own callback, and closing a link then
+    * immediately reconnecting on it races Ble.java's teardown of the same
+    * GATT client. One second later from the timer is early enough (the meter
+    * has powered off by then anyway) and costs none of that risk. */
+   if (g_meter_link >= 0 && g_meter_link < LINK_MAX)
+      g_link_armed[g_meter_link][0] = 0; /* un-armed: the tick re-arms it */
+   g_meter_link = -1;
 }
 
 void ot_drv_status(const char *s)
@@ -6263,7 +6771,6 @@ void ot_drv_done(int new_records)
          g_meter_src = id;
       }
    }
-   g_meter_last_sync = realtime_s();
    meter_index_save(g_meter_src, ot_last_index());
    LOGI("meter sync complete: %d new record(s), index now %d", new_records,
         ot_last_index());
@@ -6407,6 +6914,41 @@ static void stop_scan(struct ANativeActivity *a)
    /* don't surface "PAUSED": stopping the background scan is an internal detail
     * (it happens on pause and on every orientation flip); the driver's own
     * connection status stays the meaningful thing to show */
+}
+
+/* Tear the scan down and bring it back up.
+ *
+ * WHY THIS EXISTS, and it is the bug that made SYNC NOW useless: start_scan is
+ * idempotent on g_scanning, so calling it while a scan is already registered
+ * does NOTHING. That is right for the self-heal -- stacking a second scan
+ * client is how the app used to hit Android's scan-throttle block -- but it
+ * meant the app had no way at all to REFRESH a scan that was still registered
+ * yet no longer delivering.
+ *
+ * And Android degrades scans behind our back with no callback: send the
+ * activity to the background and the stack quietly demotes SCAN_MODE_LOW_
+ * LATENCY towards opportunistic, so results only arrive when some other app
+ * happens to scan. Measured on 2026-08-03: ~20 advertisements a minute from
+ * 3 devices while degraded, versus ~14000 a minute from 140 devices once
+ * genuinely restarted -- a 700x difference, with g_scanning reading 1 and the
+ * app believing all was well the entire time. A OneTouch meter that advertises
+ * in short bursts is invisible in that state, which is exactly how a meter
+ * switched on and sitting next to the phone went 26 minutes without syncing
+ * while the user pressed SYNC NOW.
+ *
+ * on_pause/on_resume was the ONLY path that produced a real restart, so the
+ * user's workaround was to leave the app and come back. An explicit request
+ * must not require that.
+ *
+ * If Java cannot confirm the stop, stop_scan leaves g_scanning set on purpose
+ * and start_scan will no-op -- deliberately, so we never stack a second
+ * client; the 1 Hz retry finishes the job. */
+static void scan_restart(struct ANativeActivity *a)
+{
+   if (!a || !a->env)
+      return;
+   stop_scan(a);
+   start_scan(a);
 }
 
 /* --- input: drain the queue so the ANR watchdog stays fed --- */
@@ -6843,6 +7385,54 @@ static int on_input(int fd, int events, void *data)
           * -- back on the same target -- dispatches its menu_action code.
           * Sliding off first cancels without firing anything. */
          if (g_menu) {
+            /* The WEIGHT LOG plot scrubs. It lives on a MENU screen, where
+             * every other target is press-arm/release, so it is handled here
+             * rather than in the main screen's gesture code: a press picks the
+             * nearest point and a drag keeps picking, using the plot rect the
+             * last render recorded. */
+            if (g_menu == MENU_WTLOG &&
+                (action == AMOTION_EVENT_ACTION_DOWN ||
+                 (action == AMOTION_EVENT_ACTION_MOVE && g_wt_scrubbing))) {
+               for (int i = 0; i < g_hits.n; i++) {
+                  if (g_hits.box[i].kind != ACT_SCRUB)
+                     continue;
+                  if (action == AMOTION_EVENT_ACTION_DOWN &&
+                      (tx < g_hits.box[i].x ||
+                       tx >= g_hits.box[i].x + g_hits.box[i].w ||
+                       ty < g_hits.box[i].y ||
+                       ty >= g_hits.box[i].y + g_hits.box[i].h))
+                     break; /* the press began outside the plot */
+                  struct screen sm;
+                  build_model(&sm);
+                  int pick = ui_wt_hit(&sm, g_hits.box[i].x, g_hits.box[i].w,
+                                       g_hits.box[i].arg, tx);
+                  if (pick >= 0) {
+                     g_wt_scrub     = pick;
+                     g_wt_scrubbing = 1;
+                     press_cancel(); /* scrubbing is not a button press */
+                     g_ui_dirty = 1;
+                     draw(g_win);
+                  }
+                  break;
+               }
+               if (g_wt_scrubbing) {
+                  AInputQueue_finishEvent(q, ev, 1);
+                  continue;
+               }
+            }
+            if (action == AMOTION_EVENT_ACTION_UP ||
+                action == AMOTION_EVENT_ACTION_CANCEL) {
+               /* Scrubbing lasts only while a finger is down, as on the
+                * glucose plot: the readout borrows the tab row, so leaving it
+                * up would hide the span tabs indefinitely and leave a stale
+                * value on screen with nothing touching it. */
+               if (g_wt_scrubbing) {
+                  g_wt_scrubbing = 0;
+                  g_wt_scrub     = -1;
+                  g_ui_dirty     = 1;
+                  draw(g_win);
+               }
+            }
             if (action == AMOTION_EVENT_ACTION_DOWN) {
                struct action a = ui_hit(&g_hits, tx, ty);
                if (a.kind == ACT_MENU)
@@ -7166,7 +7756,17 @@ static void on_queue_destroyed(struct ANativeActivity *a, struct AInputQueue *q)
 static void on_resume(struct ANativeActivity *a)
 {
    g_paused = 0;
-   start_scan(a);
+   /* scan_restart, NOT start_scan.
+    *
+    * on_pause's stop_scan leaves g_scanning SET when Java cannot confirm the
+    * cancel (deliberately -- it stops the self-heal stacking a second scan
+    * client). start_scan then early-returns on that same flag, so the resume
+    * silently failed to bring the scan back and the app went on believing one
+    * was running. Coming back to the foreground is the user's own recovery
+    * gesture and the only path that ever produced a real restart; it must not
+    * be the one that no-ops. In the healthy case the stop below is itself a
+    * no-op (on_pause already cleared g_scanning), so this costs nothing. */
+   scan_restart(a);
    sys_refresh();        /* a permission/settings dialog may have returned */
    if (g_want_battery) { /* first-boot: chain the battery-opt prompt once */
       g_want_battery = 0;
@@ -7446,7 +8046,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       m_set_orient = (*env)->GetStaticMethodID(env, g_ble, "setOrientation",
                                                "(Landroid/content/Context;I)V");
       m_export = (*env)->GetStaticMethodID(env, g_ble, "exportData",
-                                           "(Landroid/content/Context;JZZZ)V");
+                                           "(Landroid/content/Context;JZZZZ)V");
       m_perm_granted = (*env)->GetStaticMethodID(
           env, g_ble, "permGranted",
           "(Landroid/content/Context;Ljava/lang/String;)Z");
@@ -7539,6 +8139,8 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          remote_load(); /* remote-push server config */
          data_path(g_ins_path, sizeof g_ins_path, dir, "/insulin.csv");
          insulin_load(); /* doses: pre-populates the LOG INSULIN form */
+         data_path(g_wt_path, sizeof g_wt_path, dir, "/weight.csv");
+         weight_load();
          sensors_load(); /* before store_load: readings resolve through it */
          /* Bonded-MAC recovery runs HERE, after sensors_load().
           *

@@ -212,7 +212,7 @@ int main(void)
        * older than the ring and nothing is loaded at all. The first version of
        * this test did exactly that and asserted on three identical numbers. */
       char path[64];
-      (void)snprintf(path, sizeof path, "tmp/uitest/st-replay.csv");
+      (void)snprintf(path, sizeof path, "build/test/st-replay.csv");
       long rnow = realtime_s();
       long base = rnow - (10L * 3600);
 

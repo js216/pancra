@@ -18,7 +18,22 @@
 #define LINK_CGM   0 /* first Dexcom sensor */
 #define LINK_METER 1 /* OneTouch meter */
 #define LINK_CGM2  2 /* a second Dexcom sensor, streaming concurrently */
-#define LINK_MAX   5
+/* 8, raised from 5 when every meter gained its own standing connect.
+ *
+ * A link is a GATT connection, an operation queue and a driver context, and
+ * every registered device now needs one AT THE SAME TIME: CGMs stream
+ * continuously, and a meter must hold a pending connect permanently because
+ * it is reachable only for the second or two it is switched on. At 5 a user
+ * with two sensors and three meters was already at the ceiling.
+ *
+ * Not raised to MAX_SLOTS (10): the practical limit is the Bluetooth
+ * controller's simultaneous-connection count, which is around 7-8 on typical
+ * phones, and asking for more than the controller can hold makes connects
+ * fail rather than queue. 8 covers every realistic set-up; past that,
+ * link_for_slot returns -1 and the caller says so instead of connecting on
+ * another device's link. Ble.java's MAX_LINKS must match -- the Makefile's
+ * crosscheck target fails the build if it does not. */
+#define LINK_MAX 8
 
 /* Dexcom GATT characteristic UUIDs. */
 #define U_CTRL  "f8083534-849e-531c-c594-30f1f86a4ea5"

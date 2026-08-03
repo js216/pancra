@@ -10,7 +10,8 @@
 #include "dexlibc.h"
 #include "plot.h"
 #include "util.h"
-#include <stdio.h> /* snprintf */
+#include "weight.h" /* WT_KG / WT_LB: the weight display unit */
+#include <stdio.h>  /* snprintf */
 
 char g_model[24], g_fw[24], g_mfr[24];
 /* THE TWO BANDS, NESTED, AND THE NUDGE IS THE OUTER ONE. Chosen by the user,
@@ -40,6 +41,10 @@ int g_orient;
 int g_screen_on = 1; /* default: hold the screen on, as the app always has */
 int g_newdata_mode;  /* ND_OFF / ND_BEEP / ND_CHIRP; default silent */
 int g_units;
+/* Weight display unit. Pounds by default because that is what the migrated
+ * log was kept in; the file itself is always grams, so this only chooses how
+ * the numbers are rendered (weight.h). */
+int g_wunits = WT_LB;
 int g_disc;
 int g_plot_max = PLOT_GLU_MAX;
 /* Insulin plot styling, PER TYPE (index INS_SLOW / INS_FAST): marker
@@ -214,11 +219,12 @@ void settings_save(void)
     * tail fields silently revert to their defaults on every launch. */
    char b[128];
    int n = snprintf(
-       b, sizeof b, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
-       g_sound_on, g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
+       b, sizeof b,
+       "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", g_sound_on,
+       g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
        g_newdata_mode, g_ins_marker[0], g_ins_color[0], g_ins_size[0],
        g_ins_marker[1], g_ins_color[1], g_ins_size[1], g_statbar_val,
-       g_lockscr_val, g_nudge_sound, g_nudge_vib);
+       g_lockscr_val, g_nudge_sound, g_nudge_vib, g_wunits);
    n = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
@@ -236,13 +242,13 @@ void settings_load(void)
    if (n <= 0)
       return;
    b[n]      = 0;
-   int v[18] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
+   int v[19] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
                 g_disc,          g_plot_max,     g_screen_on,   g_newdata_mode,
                 g_ins_marker[0], g_ins_color[0], g_ins_size[0], g_ins_marker[1],
                 g_ins_color[1],  g_ins_size[1],  g_statbar_val, g_lockscr_val,
-                g_nudge_sound,   g_nudge_vib};
+                g_nudge_sound,   g_nudge_vib,    g_wunits};
    char *q   = b;
-   for (int i = 0; i < 18; i++) {
+   for (int i = 0; i < 19; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -288,6 +294,7 @@ void settings_load(void)
     * their (ON) defaults -- see the header comment on the format. */
    g_nudge_sound = v[16] ? 1 : 0;
    g_nudge_vib   = v[17] ? 1 : 0;
+   g_wunits      = v[18] ? WT_LB : WT_KG;
    plot_set_max(g_plot_max);
 }
 

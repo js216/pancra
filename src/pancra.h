@@ -76,8 +76,15 @@ void dexble_link_close(int link);
 void dexble_subscribe(int link, const char *uuid, int indicate);
 void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
                   int no_resp);
-/* Connect to a OneTouch meter on LINK_METER (independent of the CGM link). */
-void dexble_meter_connect(const char *mac);
+/* Connect to a OneTouch meter on `link`, and mark that link as carrying a
+ * meter so the transport routes its events to the otble driver. */
+void dexble_meter_connect(int link, const char *mac);
+/* Tell the transport whether `link` carries a meter (1) or a CGM (0). */
+void dexble_set_meter_link(int link, int on);
+/* A meter answered on `link`: seed the shared protocol state for it and take
+ * the busy latch. 1 to proceed, 0 to refuse (another meter is mid-exchange,
+ * or no registered meter is bound to that link). Called under driver_lock. */
+int pancra_meter_connected(int link);
 int dexble_alarm(int kind, int sound, int vibrate); /* 0 low, 1 high, 2 stale */
 void dexble_beep(void); /* one short NEW DATAPOINT beep */
 /* One NEW DATAPOINT chirp, pitch-bent by `st10` tenths of a semitone

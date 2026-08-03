@@ -34,7 +34,7 @@ static void ck(int cond, const char *what)
 
 static void fresh(void)
 {
-   (void)snprintf(g_ins_path, sizeof g_ins_path, "tmp/uitest/rt-insulin.csv");
+   (void)snprintf(g_ins_path, sizeof g_ins_path, "build/test/rt-insulin.csv");
    unlink(g_ins_path);
    insulin_load();
 }

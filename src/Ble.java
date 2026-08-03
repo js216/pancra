@@ -43,9 +43,12 @@ public final class Ble {
     /* ---- settings-menu helpers (ctx is the NativeActivity, i.e. an Activity) ---- */
 
     /* EXPORT DATA: build ONE file -- sensors.csv (the device map), a blank line,
-     * readings.csv (the glucose log), a blank line, then insulin.csv (the dose
-     * log) -- and hand it to another app via the system share sheet. Each
-     * section carries its own '#' header row, so the three stay self-describing
+     * readings.csv (the glucose log), a blank line, insulin.csv (the dose log),
+     * a blank line, then weight.csv -- and hand it to another app via the
+     * system share sheet. Each section carries its own '#' header row (the
+     * weight one names GRAMS, since the display unit is only a preference and
+     * an exported file must be readable without it), so the sections stay
+     * self-describing
      * and a reader can tell them apart. The content:// URI comes from
      * PancraFiles (see the manifest); FLAG_GRANT_READ_URI_PERMISSION lets the
      * chosen app read it. */
@@ -54,7 +57,8 @@ public final class Ble {
      * three flags mirror the EXPORT DATA menu's checkboxes; the DEVICES
      * section is a registry, not a time series, so it never filters. */
     public static void exportData(Context ctx, long cutoff, boolean glucose,
-                                  boolean devices, boolean insulin) {
+                                  boolean devices, boolean insulin,
+                                  boolean weight) {
         try {
             java.io.File dir = ctx.getFilesDir();
             java.io.File out = new java.io.File(dir, "pancra.csv");
@@ -67,8 +71,12 @@ public final class Ble {
                 copyFiltered(os, new java.io.File(dir, "readings.csv"), cutoff);
                 os.write('\n');
             }
-            if (insulin)
+            if (insulin) {
                 copyFiltered(os, new java.io.File(dir, "insulin.csv"), cutoff);
+                os.write('\n');
+            }
+            if (weight)
+                copyFiltered(os, new java.io.File(dir, "weight.csv"), cutoff);
             os.close();
             if (out.length() == 0) return;
             Uri uri = Uri.parse("content://com.jk.pancra.files/pancra.csv");
@@ -550,7 +558,7 @@ public final class Ble {
      * up every other one and make it miss its advertising window. Each Link
      * therefore owns its own gatt, queue and busy flag, and its own callback
      * instance so every event already knows which link it belongs to. */
-    static final int MAX_LINKS = 5;
+    static final int MAX_LINKS = 8; /* == LINK_MAX (dexdriver.h); crosschecked */
 
     private static final class Link {
         final int id;

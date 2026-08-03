@@ -1,15 +1,15 @@
 #!/bin/sh
-# Pull the app's data files off the phone into tmp/.
+# Pull the app's data files off the phone into data/, names unchanged.
 # One line per file: add one when the app learns to write a new one.
 # exec-out, not shell -- the PTY rewrites LF and would corrupt stelo.key.
-mkdir -p tmp
-a() { adb exec-out run-as com.jk.pancra cat "files/$1" >"tmp/${2:-$1}"; }
+mkdir -p data
+a() { adb exec-out run-as com.jk.pancra cat "files/$1" >"data/$1"; }
 
-a readings.csv data.csv
-a readings.csv.remapped
+a readings.csv
 a sensors.csv
 a slots.csv
 a insulin.csv
+a weight.csv
 a pancra.csv
 a alarm.cfg
 a settings.cfg
