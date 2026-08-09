@@ -9,6 +9,7 @@
 #include "stats.h"
 #include "dexlibc.h"
 #include "sensors.h" /* KIND_BGM: fingersticks are excluded from the stats */
+#include "store.h"   /* STORE_GLU_MIN/MAX: the writer's actual range */
 #include "util.h"
 #include <limits.h> /* LONG_MAX: saturate over-long numeric fields */
 #include <stdio.h>  /* SEEK_SET / SEEK_END */
@@ -269,12 +270,31 @@ static void stat_load_chunk(char *buf)
          knd++;
          k++;
       }
+      /* source_id is field 6, four separators on from where q sits (the one
+       * after field 2) -- the same walk `kind` makes to field 9. Needed here
+       * for the WARMUP rule below, which is per-sensor. Digit-capped like
+       * every other accumulation in this parser: a wrapped id would resolve to
+       * the wrong sensor's activation, or to none at all. */
+      int src = 0;
+      char *s = skip_fields(q, 4);
+      int sd  = 0;
+      while (*s >= '0' && *s <= '9') {
+         if (sd < 9)
+            src = (src * 10) + (*s - '0');
+         sd++;
+         s++;
+      }
       /* This predicate MUST match the live path's exactly (see
        * glucose_plausible in main.c). When replay used `glu > 0` while the
        * live path had no bound at all, an implausible sample was counted
        * before a restart and skipped after it, so TIR and average silently
        * changed value across a restart of the same log. */
-      if (t > 0 && glu >= 20 && glu <= 600 && kind != KIND_BGM)
+      /* WARMUP is excluded for the same reason BGM is, and by the same
+       * both-paths rule: the value is uncalibrated, so counting it skews TIR
+       * and the average. sensors_load() runs before stat_load (main.c), so the
+       * activation this resolves against is already on hand. */
+      if (t > 0 && glu >= STORE_GLU_MIN && glu <= STORE_GLU_MAX &&
+          kind != KIND_BGM && !sensor_in_warmup(src, t))
          stat_add(t, glu);
       p = skip_line(p);
    }

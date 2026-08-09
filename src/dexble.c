@@ -19,6 +19,8 @@
 #include <jni.h>
 #include <jni_md.h>
 #include <stdint.h>
+#include <stdio.h>  /* snprintf: the bond table copies an address */
+#include <string.h> /* strcmp: ...and looks one up by address */
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
@@ -26,7 +28,7 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 static jclass g_ble;
 static jobject g_ctx;
 static jmethodID m_connect, m_subscribe, m_write, m_readrssi, m_read,
-    m_startsvc, m_disconnect;
+    m_startsvc, m_disconnect, m_createbond, m_bondwatch;
 static char g_keypath[256];
 static char g_macpath[256];
 
@@ -219,6 +221,93 @@ void drv_connect(const char *mac)
       }
       (*e)->DeleteLocalRef(e, err);
    }
+}
+
+/* The last bond state the receiver reported, per address.
+ *
+ * A tiny fixed table rather than a field on the sensor slot: the bond is a
+ * property of the ADDRESS as the OS sees it, the broadcast arrives on a binder
+ * thread with nothing but a MAC, and a device can be bonding before it has a
+ * slot at all (the meter path connects to a bond it is still forming). Sized
+ * for LINK_MAX devices plus slack; the oldest entry is recycled, which is
+ * harmless because only the newest transition per device is ever interesting.
+ */
+#define BOND_SLOTS 12
+
+static struct {
+   char mac[20];
+   int state;
+} g_bond[BOND_SLOTS];
+
+static int g_bond_n;
+
+int dexble_bond_state(const char *mac)
+{
+   if (!mac || !mac[0])
+      return 0;
+   /* No lock: written on a binder thread, read on the main loop, and both are
+    * a single int per entry whose only use is a status string. A torn read
+    * would cost one frame of a stale label. Taking driver_lock here would put
+    * a BLE callback behind the driver mutex for a cosmetic value. */
+   for (int i = 0; i < g_bond_n; i++)
+      if (strcmp(g_bond[i].mac, mac) == 0)
+         return g_bond[i].state;
+   return 0;
+}
+
+static void bond_state_set(const char *mac, int state)
+{
+   for (int i = 0; i < g_bond_n; i++) {
+      if (strcmp(g_bond[i].mac, mac) == 0) {
+         g_bond[i].state = state;
+         return;
+      }
+   }
+   int i = (g_bond_n < BOND_SLOTS) ? g_bond_n++ : (BOND_SLOTS - 1);
+   (void)snprintf(g_bond[i].mac, sizeof g_bond[i].mac, "%s", mac);
+   g_bond[i].state = state;
+}
+
+static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
+{
+   (void)cls;
+   if (!mac)
+      return;
+   const char *m = (*e)->GetStringUTFChars(e, mac, 0);
+   if (!m)
+      return;
+   bond_state_set(m, (int)state);
+   LOGI("bond: %s state=%d", m, (int)state);
+   (*e)->ReleaseStringUTFChars(e, mac, m);
+}
+
+int dexble_create_bond(const char *mac)
+{
+   JNIEnv *e = any_env();
+   if (!e || !m_createbond || !mac || !mac[0])
+      return 0;
+   jstring m = (*e)->NewStringUTF(e, mac);
+   if (!m) {
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
+      return 0;
+   }
+   jstring err = (*e)->CallStaticObjectMethod(e, g_ble, m_createbond, g_ctx, m);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   (*e)->DeleteLocalRef(e, m);
+   if (!err) {
+      LOGI("createBond %s: requested", mac);
+      return 1;
+   }
+   const char *s = (*e)->GetStringUTFChars(e, err, 0);
+   if (s) {
+      LOGI("createBond %s: %s", mac, s);
+      pancra_status(s);
+      (*e)->ReleaseStringUTFChars(e, err, s);
+   }
+   (*e)->DeleteLocalRef(e, err);
+   return 0;
 }
 
 void dexble_subscribe(int link, const char *uuid, int indicate)
@@ -475,10 +564,21 @@ void dexble_set_meter_link(int link, int on)
 {
    if (link < 0 || link >= LINK_MAX)
       return;
+   /* UNDER driver_lock, because every READER is.
+    *
+    * jni_connected / jni_disconnected / jni_notify / jni_written consult this
+    * on a binder thread with driver_lock held, while the shell arms and
+    * releases links from the main thread. Writing it unlocked was a plain
+    * data race on the value that decides whether a packet goes to the Dexcom
+    * state machine or the OneTouch parser -- the same misrouting the bitmask
+    * was introduced to prevent. driver_lock is recursive, so callers that
+    * already hold it (dexble_meter_connect) pay nothing. */
+   driver_lock();
    if (on)
       g_meter_links |= 1U << (unsigned)link;
    else
       g_meter_links &= ~(1U << (unsigned)link);
+   driver_unlock();
 }
 
 static int is_meter_link(int link)
@@ -525,7 +625,16 @@ static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
    (void)e;
    driver_lock();
    if (is_meter_link(link)) {
-      ot_on_disconnected();
+      /* ONLY the link that owns the exchange may reset otble's state.
+       *
+       * Every registered meter holds a standing connect, so a disconnect can
+       * arrive for a meter that is merely idle -- or for one the shell just
+       * refused because another was mid-sync. Routing that into
+       * ot_on_disconnected wiped the protocol state out from under the meter
+       * that WAS syncing: phase to idle mid-walk, and its remaining records
+       * lost or filed under the wrong id. The shell owns that decision. */
+      if (pancra_meter_disconnected(link))
+         ot_on_disconnected();
    } else {
       driver_select(link);
       driver_on_disconnected(s);
@@ -543,13 +652,23 @@ static void jni_written(JNIEnv *e, jclass c, jint link, jstring ju, jint s)
       return;
    }
    /* The meter driver is request/response and drives itself off notifications,
-    * so a write ack needs no action there. */
+    * so a write ack needs no action there.
+    *
+    * THE TEST ITSELF MUST BE UNDER THE LOCK. g_meter_links is written from
+    * the MAIN thread (link_set_meter -> dexble_set_meter_link) and read from
+    * BINDER threads, and the writer takes driver_lock on the stated premise
+    * that "the readers already hold it" -- which jni_connected,
+    * jni_disconnected and jni_notify do, and this did not. A stale read here
+    * is not cosmetic: it feeds a METER's write-ack into driver_on_written on
+    * a link with no Dexcom session, or drops a real CGM ack, and the J-PAKE
+    * handshake is a state machine driven by exactly those acks. Recursive,
+    * so hoisting it costs nothing. */
+   driver_lock();
    if (!is_meter_link(link)) {
-      driver_lock();
       driver_select(link);
       driver_on_written(u, s);
-      driver_unlock();
    }
+   driver_unlock();
    (*e)->ReleaseStringUTFChars(e, ju, u);
 }
 
@@ -632,7 +751,14 @@ static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
 {
    (void)e;
    (void)c;
-   if (!is_meter_link(link))
+   /* Same unlocked-read as jni_written had -- see there. Only the TEST needs
+    * the lock, so snapshot the bit and dispatch outside it: pancra_*_rssi
+    * call back into main.c and may take sensors_lock, and there is no reason
+    * to widen the critical section to cover them. */
+   driver_lock();
+   int meter = is_meter_link(link);
+   driver_unlock();
+   if (!meter)
       pancra_rssi(rssi);
    else
       pancra_meter_rssi(rssi); /* meter's last-sync signal strength */
@@ -701,6 +827,8 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    static char s6[]                 = "()V";
    static char n7[]                 = "onRemoteOk";
    static char s7[]                 = "()V";
+   static char n8[]                 = "onBondState";
+   static char s8[]                 = "(Ljava/lang/String;I)V";
    static const JNINativeMethod m[] = {
        {n0, s0, (void *)jni_connected   },
        {n1, s1, (void *)jni_disconnected},
@@ -710,8 +838,12 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n5, s5, (void *)jni_read        },
        {n6, s6, (void *)jni_tick        },
        {n7, s7, (void *)jni_remote_ok   },
+       {n8, s8, (void *)jni_bond_state  },
    };
-   if ((*e)->RegisterNatives(e, ble, m, 8) != 0)
+   /* The COUNT, not a literal that has to be remembered: registering 8 of 9
+    * leaves onBondState unbound, and the first bond transition then takes the
+    * process down with an UnsatisfiedLinkError from a binder thread. */
+   if ((*e)->RegisterNatives(e, ble, m, (jint)(sizeof m / sizeof m[0])) != 0)
       return 0;
    m_connect = (*e)->GetStaticMethodID(
        e, ble, "connect",
@@ -729,8 +861,21 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
    m_read = (*e)->GetStaticMethodID(e, ble, "read", "(ILjava/lang/String;)V");
-   m_startsvc = (*e)->GetStaticMethodID(e, ble, "startService",
-                                        "(Landroid/content/Context;)V");
+   m_startsvc   = (*e)->GetStaticMethodID(e, ble, "startService",
+                                          "(Landroid/content/Context;)V");
+   m_createbond = (*e)->GetStaticMethodID(
+       e, ble, "createBond",
+       "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
+   m_bondwatch = (*e)->GetStaticMethodID(e, ble, "bondWatch",
+                                         "(Landroid/content/Context;)V");
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   /* Start watching bond state right away, not at the first createBond: the
+    * sensor can begin pairing on its own (a reconnect after the bond was
+    * cleared does exactly that), and those are the transitions the user most
+    * needs told about. */
+   if (m_bondwatch)
+      (*e)->CallStaticVoidMethod(e, g_ble, m_bondwatch, g_ctx);
    if (m_startsvc)
       (*e)->CallStaticVoidMethod(e, g_ble, m_startsvc,
                                  g_ctx); /* keep alive in bg */
@@ -740,7 +885,7 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
     * meter awake past its own power-off -- the one thing otble.h says must
     * never happen. */
    return m_connect && m_subscribe && m_write && m_readrssi && m_read &&
-          m_disconnect && m_startsvc;
+          m_disconnect && m_startsvc && m_createbond && m_bondwatch;
 }
 
 /* Wire the Alarm class. FindClass here would resolve via the framework loader,
@@ -789,13 +934,19 @@ void dexble_pair(int link, const char *mac, const char *code)
 
 /* Open the meter's link. It is a plain connect: the meter driver takes over
  * from onConnected and tears the link down itself when it is finished. */
-void dexble_meter_connect(int link, const char *mac)
+int dexble_meter_connect(int link, const char *mac)
 {
    /* Select the meter's link only for the duration of the connect, under the
     * lock, so a concurrent CGM reconnect cannot observe the swap and route a
     * sensor into the meter's protocol driver. */
    if (link < 0 || link >= LINK_MAX)
-      return;
+      return 0;
+   /* Report whether the request actually reached Java. drv_connect is
+    * best-effort and returns nothing, so a missing JNIEnv (Bluetooth off, or
+    * before the transport is wired) used to look exactly like success -- and
+    * the caller then recorded the meter as armed forever. */
+   if (!any_env())
+      return 0;
    driver_lock();
    dexble_set_meter_link(link, 1); /* route this link's events to otble */
    int drv = driver_link();
@@ -803,6 +954,7 @@ void dexble_meter_connect(int link, const char *mac)
    drv_connect(mac);
    driver_select(drv);
    driver_unlock();
+   return 1;
 }
 
 void dexble_reconnect(int link)

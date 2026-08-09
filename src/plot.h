@@ -28,6 +28,15 @@ struct plot_pt {
    uint32_t col;
 };
 
+/* A drawn letter W, for logged body weights on the doses line.
+ *
+ * NOT a MARK_* value: those are user-selectable device markers persisted in
+ * slots.csv, and this must never appear in the marker picker or be storable as
+ * a device's shape. It sits far above the MARK_ range so the two cannot
+ * collide as shapes are appended there. plot.c stays font-free -- the letter
+ * is four strokes, drawn like every other shape here, not a glyph lookup. */
+#define PLOT_MARK_W 100
+
 /* Vertical scale runs PLOT_GLU_MIN..(runtime max, default PLOT_GLU_MAX) mg/dL.
  */
 #define PLOT_GLU_MIN 50
@@ -44,10 +53,14 @@ void plot_set_max(int mgdl);
  * row and total size `fbw`x`fbh`; writes are clipped to those bounds. */
 /* As above; the point at index `hi_idx` (if in-window) is drawn larger in
  * `hi_color` -- pass hi_idx < 0 for no highlight. */
+/* `tz` is the local UTC offset in seconds, used ONLY to anchor the day
+ * gridlines. Without it the 24 h step anchored on UTC midnight, so in UTC-7
+ * every "day" line on the 3D/7D/30D plots sat at 17:00 local and the day
+ * boundaries the grid exists to show were wrong by the offset. */
 void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
                  int w, int h, const struct plot_pt *pts, int npts, long now,
                  int hours, int radius, uint32_t (*color)(int glu), int hi_idx,
-                 uint32_t hi_color);
+                 uint32_t hi_color, long tz);
 
 /* Return the index into pts of the in-window point nearest to pixel (tx,ty),
  * using the same mapping as plot_render, or -1 if there are no in-window

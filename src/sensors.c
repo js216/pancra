@@ -205,6 +205,19 @@ const struct sensor_rec *sensor_rec_by_id(int id)
    return 0;
 }
 
+/* See sensors.h for why activation is the anchor and why this fails open. */
+int sensor_in_warmup(int id, long t)
+{
+   int warm = 0;
+   sensors_lock();
+   const struct sensor_rec *r = sensor_rec_by_id(id);
+   if (r && r->activation > 0 && t >= r->activation &&
+       t < r->activation + SENSOR_WARMUP_S)
+      warm = 1;
+   sensors_unlock();
+   return warm;
+}
+
 struct sensor_slot *sensor_slot_by_id(int id)
 {
    for (int i = 0; i < g_nslot; i++)

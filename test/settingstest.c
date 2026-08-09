@@ -21,6 +21,7 @@
  * Built and run by `make settingstest`.
  */
 #include "settings.h"
+#include "sensors.h" /* MARK_N / MARK_SIZE_MAX */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -388,6 +389,42 @@ int main(void)
    ck(!remote_ip_valid("1.2.3."), "a trailing dot fails");
    ck(!remote_ip_valid("1111.2.3.4"), "a four-digit octet fails before it "
                                       "can wrap");
+
+   /* EVERY VALUE THE PICKER OFFERS MUST SURVIVE A RESTART.
+    *
+    * settings_load bounded the insulin marker size with a literal 4 while
+    * MARK_SIZE_MAX is 5, under a comment asserting "4 == MARK_SIZE_MAX;
+    * crosschecked by eye". The size picker offers 1..MARK_SIZE_MAX and
+    * menu_action saves what it is handed, so choosing the LARGEST size
+    * applied, persisted, and was silently reset to 2 on the next launch --
+    * the worst shape of settings bug, because nothing reports it. Loop the
+    * whole offered range rather than pinning the one value that broke, so a
+    * future off-by-one at either end fails here too. */
+   for (int sz = 1; sz <= MARK_SIZE_MAX; sz++)
+      for (int k = 0; k < 2; k++) {
+         g_ins_size[k] = sz;
+         settings_save();
+         g_ins_size[k] = -1;
+         settings_load();
+         if (g_ins_size[k] != sz) {
+            printf("  [FAIL] insulin size %d (type %d) came back as %d\n", sz,
+                   k, g_ins_size[k]);
+            all = 0;
+         }
+      }
+   ck(all, "every insulin marker size 1..MARK_SIZE_MAX round-trips");
+   for (int mk = 0; mk < MARK_N; mk++) {
+      g_ins_marker[0] = mk;
+      settings_save();
+      g_ins_marker[0] = -1;
+      settings_load();
+      if (g_ins_marker[0] != mk) {
+         printf("  [FAIL] insulin marker %d came back as %d\n", mk,
+                g_ins_marker[0]);
+         all = 0;
+      }
+   }
+   ck(all, "every insulin marker 0..MARK_N-1 round-trips");
 
    printf("\n%s\n", all ? "ALL SETTINGS TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;

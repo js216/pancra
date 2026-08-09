@@ -9,6 +9,7 @@
 #include "ndk.h"
 #include "plotdata.h" /* PLOT_LONG_MAX: how many points a long span yields */
 #include "sensors.h"  /* sensor types/kinds the model and renderer share */
+#include "settings.h" /* SC_MAX: the main-screen shortcut slots */
 #include "weight.h"   /* struct wt_rec: the WEIGHT LOG table rows */
 #include <stdint.h>
 
@@ -43,44 +44,82 @@ void fmt_ago(long now, long then, char *out, int n);
 /* Format a duration as "3 D 4 H" / "5 H 20 M" / "45 M". Pure. */
 void fmt_dur(long seconds, char *out, int n);
 
+/* OS bond states, mirroring android.bluetooth.BluetoothDevice's own constants
+ * because Ble passes them through unchanged. UI_BOND_UNKNOWN (0) is not one of
+ * the framework's: it means the bond receiver has never reported this address,
+ * which is the normal state for a device registered before the app started. It
+ * must render as "nothing to say", NOT as "not paired" -- an existing, working,
+ * long-bonded sensor reads as 0 until its next transition. */
+#define UI_BOND_UNKNOWN 0
+#define UI_BOND_NONE    10
+#define UI_BOND_BONDING 11
+#define UI_BOND_BONDED  12
+
 /* ---- sensor presentation (shared by the list, the detail screen, the plot) */
 #define UI_MAX_SLOTS MAX_SLOTS
 /* Refuse to render a sensor list shorter than this rather than silently
  * truncating it, so a cramped screen is a visible error, not a quiet lie. */
 #define UI_MIN_SLOTS 3
 
-/* Rows the settings screen consumes ABOVE (and below) the sensor entries:
- * title (2), the four submenu rows -- DISPLAY ... / ALARM / PERMISSIONS /
- * REMOTE -- each with a blank line after it (8), the DEVICES header (1),
- * and the two trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA --
- * each a separator + a ~1-row button (4 total). Keep in step with
- * render_settings.
+/* Rows the DEVICES screen consumes ABOVE (and below) the device entries:
+ * title (2), the five-line P explainer plus its trailing air (~3), the P
+ * column header (1), the armed-pairing "PENDING..." row (1), the page-nav row
+ * (1), the blank line above OLD DEVICES (1), the "OLD DEVICES (n)" row (1),
+ * the blank line below it (1), the separator before the button (1) and the ADD
+ * NEW DEVICE button itself (25*sc, i.e. ~1.6 rows -> 2). Keep in step with
+ * render_devices.
+ *
+ * The explainer is five glyph lines at gh + 2*sc each, which is under three
+ * 16*sc rows -- counted as 3, rounding UP, because rounding down here is
+ * indistinguishable from forgetting a row.
+ *
+ * The three middle rows are each OPTIONAL, and every one of them must still be
+ * counted: a user with a full list, a retired device and a pairing in flight
+ * draws all three at once. The count must be the WORST case the renderer can
+ * produce, not the common one -- being pessimistic costs a little font size on
+ * a crowded screen, while being optimistic costs the ADD button entirely, with
+ * no scrolling to recover it. (This budget used to cover render_settings, which
+ * carried the list inline; the list now has its own screen, so the four
+ * submenu rows and EXPORT DATA are no longer part of it.)
  *
  * Exported deliberately. It used to be private to ui.c while test/uitest.c
  * carried its own literal for the same quantity, so the two could drift
- * apart silently -- and adding rows to render_settings without bumping this is
- * exactly the mistake that leaves sensor rows and their tap targets below the
+ * apart silently -- and adding rows to render_devices without bumping this is
+ * exactly the mistake that leaves device rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-/* 19, not 16. Three rows render_settings can draw were never in this count,
- * because each is optional: the armed-pairing "PENDING..." row, the
- * "N MORE NOT SHOWN" row when the list is longer than fits, and the
- * "OLD DEVICES (n)" row once a device has been retired. A user with a full
- * list, a retired device and a pairing in flight draws all three, and the
- * budget then under-counts by three rows -- which put EXPORT DATA's frame and
- * its tap target past the bottom edge (measured: 130 px over at 1440x2560,
- * and worse once the shared button padding grew). The count must be the WORST
- * case the renderer can produce, not the common one; being pessimistic here
- * costs a little font size on a crowded screen, while being optimistic costs
- * the button entirely, with no scrolling to recover it. */
-#define UI_SET_ABOVE 19
+#define UI_DEV_ABOVE 14
 
-/* How many sensor rows fit in the settings screen at this geometry, given
- * everything above the SENSORS section. The whole UI never scrolls, so this is
+/* AIR BETWEEN DEVICE ROWS. The list packed rows at the bare 16*sc line height,
+ * which ran the devices together -- each row already carries a label, a plot
+ * marker, a status and a countdown, so with no gap the eye cannot tell where
+ * one device ends and the next begins.
+ *
+ * Half a line, not a full one: the gap is spent on HEIGHT and the screen does
+ * not scroll, so every pixel here comes straight out of ui_sensor_capacity. A
+ * full blank line reads no better and costs a third of the list.
+ *
+ * The PITCH is a macro rather than a literal in render_devices because
+ * ui_sensor_capacity must divide by the SAME number the renderer advances by.
+ * When those two disagree the list overflows the bottom of the screen and the
+ * rows below it -- OLD DEVICES and the ADD NEW DEVICE button -- become
+ * unreachable, with no scrolling to recover them. One definition, both users;
+ * this is the same drift UI_DEV_ABOVE is exported to prevent. */
+#define UI_DEV_GAP(sc)   (8 * (sc))
+#define UI_DEV_PITCH(sc) ((16 * (sc)) + UI_DEV_GAP(sc))
+/* UI_MIN_SLOTS device rows expressed in whole 16*sc lines, rounded UP, so
+ * ui_devices_scale can keep reserving space in the units ui_fit_scale counts.
+ * ceil(n * 3/2): at UI_MIN_SLOTS 3 the minimum list is 4.5 lines -> 5. Rounding
+ * DOWN here would hand back a scale at which the minimum list does not fit,
+ * which is precisely the early-return the scale exists to avoid. */
+#define UI_DEV_MIN_ROWS ((((UI_MIN_SLOTS) * 3) + 1) / 2)
+
+/* How many device rows fit in the DEVICES screen at this geometry, given
+ * everything above and below the list. The whole UI never scrolls, so this is
  * what bounds the list. Pure, and exposed so the shell can log a warning. */
-/* Layout scale for the settings screen: bounded by BOTH width and height, so
- * the sensor list and ADD row stay on screen on 16:9 phones too. */
-int ui_settings_scale(int w, int h);
+/* Layout scale for the DEVICES screen: bounded by BOTH width and height, so
+ * the device list and ADD button stay on screen on 16:9 phones too. */
+int ui_devices_scale(int w, int h);
 /* Largest scale at which `rows` rows fit in height h (also bounded by width).
  * Every full-screen menu must size itself through this. */
 int ui_fit_scale(int w, int h, int rows);
@@ -110,6 +149,19 @@ int ui_label_nchars(void);
  * cannot be added to one and forgotten in the other. */
 #define UI_KP_MODES 15
 int ui_kp_slots(int mode);
+
+/* THE SHORTCUT TABLE: which ADD-menu actions may be promoted to the main
+ * screen, in ADD-menu order. Exported because the shell has to turn a tapped
+ * checkbox (MA_SCTOGGLE + slot) into the MA_* code it persists, and deriving
+ * that mapping twice is how the stored code and the drawn row drift apart.
+ * `abbrev` gives the short label the main screen falls back to when two or
+ * three buttons share the row -- the font never shrinks, the words do. */
+int ui_shortcut_count(void);
+int ui_shortcut_code(int slot); /* MA_* action, or 0 if slot is out of range */
+const char *ui_shortcut_label(int slot, int abbrev);
+/* The slot holding `code`, or -1. The inverse of ui_shortcut_code, for
+ * rendering what the persisted codes point at. */
+int ui_shortcut_slot(int code);
 
 const char *ui_marker_name(int marker);
 const char *ui_color_name(int color);
@@ -143,7 +195,7 @@ enum ui_screen {
    SCR_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
    SCR_ADDMENU,    /* main-screen '+': ADD ... (NEW DEVICE / INSULIN) */
    SCR_INSULIN,    /* LOG INSULIN entry form */
-   SCR_PRIMPICK,   /* big-number tap with >1 registered CGM: choose primary */
+   SCR_DEVICES,    /* the device registry: active, old, and ADD NEW DEVICE */
    SCR_PERMS,      /* permissions + background controls, moved off SETTINGS */
    SCR_OLDDEV,  /* previously-used (forgotten) devices: restyle their trace */
    SCR_RECONF,  /* confirm reconnecting an EXPIRED old device */
@@ -206,6 +258,15 @@ struct ui_sensor {
    int wear_auto;
    int glu, trend, predicted, sequence;
    int rssi, rssi_ok, connected;
+   /* OS bond state, in the framework's own constants: 0 = never heard,
+    * 10 = NONE, 11 = BONDING, 12 = BONDED (dexble_bond_state).
+    *
+    * Distinct from `connected` and from the Dexcom app-layer auth: a device
+    * can be registered, reachable and still unbonded because the user never
+    * answered the system pairing dialog. That state was previously invisible
+    * -- the row just never came alive and nothing said why -- which is the
+    * whole reason the bond-state receiver exists. */
+   int bond;
    /* Calibration state for this CGM's LAST CAL row. cal_pending!=0 means a
     * calibration is queued and not yet accepted (cal_pending is its mg/dL);
     * otherwise cal_t>0 gives the last RESOLVED calibration, whose kind is
@@ -285,6 +346,10 @@ struct screen {
    int wt_edit;  /* 1 = the form is EDITING an entry, not logging a new one */
    int wt_tab;   /* index into ui_wt_days: the plot's span */
    int wt_scrub; /* index into wt of the scrubbed point, -1 = none */
+   /* The entry EDIT WEIGHT is editing, as it was on disk. The delete
+    * confirmation must name THIS, not the form's current (possibly edited)
+    * value -- it is what weight_delete will actually remove. */
+   long wt_orig_t, wt_orig_g;
    int wt_tenths;
    long wt_t;
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
@@ -325,12 +390,14 @@ struct screen {
    /* EXPORT DATA menu state: range 0 = 30 D, 1 = 1 Y, 2 = ALL; the three
     * section checkboxes (1 = included) */
    int exp_range, exp_glu, exp_dev, exp_ins, exp_wt;
-   /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none.
-    * DEVICES shows it as a tappable PENDING row (MA_PEND_CANCEL); the
-    * choose-primary screen offers it too (MA_PRIM_PEND), and pend_primary
-    * marks that it will take the big number when it lands. */
-   int pend_type, pend_primary;
+   /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none. The
+    * DEVICES screen shows it as a tappable PENDING row (MA_PEND_CANCEL). */
+   int pend_type;
    int old_page; /* OLD DEVICES: which page of the list is showing */
+   int dev_page; /* DEVICES: which page of the LIVE device list is showing */
+   /* The MA_* codes promoted to the main screen's '+' row, dense, 0 = empty.
+    * Mirrors g_shortcut (settings.h). */
+   int shortcut[SC_MAX];
    unsigned adv_total;
    /* system snapshot for the settings screen (perm[]: BT scan/connect/notify)
     */
@@ -352,8 +419,6 @@ enum {
    ACT_PLOT_TAB,      /* arg = plot span in hours */
    ACT_SCRUB,         /* a press inside the plot; shell resolves the point */
    ACT_GATE_CONTINUE, /* first-run rationale: request permissions */
-   ACT_PICK_PRIMARY,  /* big-number tap: choose the primary (shell decides
-                         whether >1 active CGM makes it worth asking) */
    /* Modal screens (settings / keypad / device list) speak the shell's
     * menu_action protocol; arg carries that integer code so menu_action stays
     * the single dispatch point for their JNI/pairing side effects. */
@@ -394,10 +459,10 @@ enum ui_menu {
    MA_ALARM_HIGH   = 126, /* HIGH <value> (main row / ALARM menu): keypad 11 */
    MA_ALARM_OPEN   = 127, /* open the ALARM submenu (settings row, or the
                            * main alarm row LEFT of "LOW") */
-   MA_ALARM_BACK = 128,   /* ALARM submenu: back to where it was opened */
-   /* EXPORT DATA menu: parked in the free band ABOVE MA_PRIM_PICK's range
-    * end (260 + MAX_SLOTS = 270) and below MA_CHAR (300); the existing
-    * MA_PRIM_PICK assert covers the lower neighbour. */
+   MA_ALARM_BACK   = 128, /* ALARM submenu: back to where it was opened */
+   MA_DEVICES_BACK = 129, /* DEVICES screen: back to where it was opened */
+   /* EXPORT DATA menu: parked in the free band above the device-picker codes
+    * (which end at 270) and below MA_CHAR (300). */
    MA_EXP_RANGE = 271, /* cycle the range: 30 D / 1 Y / ALL */
    MA_EXP_GLU   = 272, /* toggle the GLUCOSE (readings) section */
    MA_EXP_DEV   = 273, /* toggle the DEVICES (sensors) section */
@@ -406,8 +471,9 @@ enum ui_menu {
    MA_EXP_GO    = 275, /* build the CSV and open the share sheet */
    MA_EXP_BACK  = 276, /* back to settings, nothing exported */
    /* NUDGE thresholds (main-screen row / ALARM menu): keypad 12 / 13. Parked
-    * in the same free band, above MA_EXP_BACK and below MA_CHAR (300); 129 is
-    * the only gap left next to the MA_ALARM_* codes and one is not enough. */
+    * in the same free band, above MA_EXP_BACK and below MA_CHAR (300); the
+    * only gap left next to the MA_ALARM_* codes is 129, and one is not
+    * enough (it now holds MA_DEVICES_BACK). */
    MA_NUDGE_LOW   = 277,
    MA_NUDGE_HIGH  = 278,
    MA_NUDGE_SOUND = 279, /* nudge section: toggle its sound */
@@ -475,34 +541,39 @@ enum ui_menu {
    MA_RESCALE_CHANGE = 68, /* active screen: enter a new value */
    MA_RESCALE_STOP   = 69, /* active screen: turn rescaling off */
    MA_TYPE           = 70, /* + sensor type (SENSOR_STELO..) */
-   MA_EXPORT      = 75,  /* settings: EXPORT DATA via the system share sheet */
-   MA_PAIR_YES    = 76,  /* pairing confirmation: commit to the picked device */
-   MA_PAIR_NO     = 77,  /* pairing confirmation: back to the device list */
-   MA_ADD_OPEN    = 78,  /* main-screen '+': open the ADD menu */
-   MA_INS_OPEN    = 79,  /* ADD menu: open the LOG INSULIN form */
-   MA_INS_TYPE    = 80,  /* LOG INSULIN: toggle SLOW / FAST */
-   MA_INS_UMINUS  = 81,  /* LOG INSULIN: units - 1 */
-   MA_INS_UPLUS   = 82,  /* LOG INSULIN: units + 1 */
-   MA_INS_DMINUS  = 83,  /* LOG INSULIN: date - 1 day */
-   MA_INS_DPLUS   = 84,  /* LOG INSULIN: date + 1 day */
-   MA_INS_TMINUS  = 85,  /* LOG INSULIN: time - 5 min */
-   MA_INS_TPLUS   = 86,  /* LOG INSULIN: time + 5 min */
-   MA_INS_CONFIRM = 87,  /* LOG INSULIN: append the dose */
-   MA_INS_DISCARD = 88,  /* LOG INSULIN: leave without logging */
-   MA_WEAR        = 89,  /* device screen: toggle wear length 10 D / 15 D */
-   MA_PEND_CANCEL = 90,  /* DEVICES: cancel the armed (pending) pairing */
-   MA_PERMS_OPEN  = 91,  /* settings: open the PERMISSIONS submenu */
-   MA_PERMS_BACK  = 92,  /* permissions submenu: back to settings */
-   MA_PRIM_PEND   = 93,  /* choose-primary: the PENDING sensor becomes primary
-                            the moment its pairing commits */
-   MA_OLDDEV_OPEN  = 94, /* settings DEVICES: open the OLD DEVICES list */
-   MA_OLDDEV_BACK  = 95, /* OLD DEVICES list: back to settings */
+   MA_EXPORT       = 75, /* settings: EXPORT DATA via the system share sheet */
+   MA_PAIR_YES     = 76, /* pairing confirmation: commit to the picked device */
+   MA_PAIR_NO      = 77, /* pairing confirmation: back to the device list */
+   MA_ADD_OPEN     = 78, /* main-screen '+': open the ADD menu */
+   MA_INS_OPEN     = 79, /* ADD menu: open the LOG INSULIN form */
+   MA_INS_TYPE     = 80, /* LOG INSULIN: toggle SLOW / FAST */
+   MA_INS_UMINUS   = 81, /* LOG INSULIN: units - 1 */
+   MA_INS_UPLUS    = 82, /* LOG INSULIN: units + 1 */
+   MA_INS_DMINUS   = 83, /* LOG INSULIN: date - 1 day */
+   MA_INS_DPLUS    = 84, /* LOG INSULIN: date + 1 day */
+   MA_INS_TMINUS   = 85, /* LOG INSULIN: time - 5 min */
+   MA_INS_TPLUS    = 86, /* LOG INSULIN: time + 5 min */
+   MA_INS_CONFIRM  = 87, /* LOG INSULIN: append the dose */
+   MA_INS_DISCARD  = 88, /* LOG INSULIN: leave without logging */
+   MA_WEAR         = 89, /* device screen: toggle wear length 10 D / 15 D */
+   MA_PEND_CANCEL  = 90, /* DEVICES: cancel the armed (pending) pairing */
+   MA_PERMS_OPEN   = 91, /* settings: open the PERMISSIONS submenu */
+   MA_PERMS_BACK   = 92, /* permissions submenu: back to settings */
+   MA_DEVICES_OPEN = 93, /* open the DEVICES screen: the main screen's big
+                            number, or the SETTINGS row */
+   MA_OLDDEV_OPEN  = 94, /* DEVICES: open the OLD DEVICES list */
+   MA_OLDDEV_BACK  = 95, /* OLD DEVICES list: back to DEVICES */
    MA_OLDPAGE_PREV = 97, /* OLD DEVICES: previous page */
    MA_OLDPAGE_NEXT = 98, /* OLD DEVICES: next page */
-   MA_RECONNECT    = 96, /* old device: revive it (direct if not yet expired,
-                          * else via a confirmation screen) */
-   MA_RECON_YES  = 8,    /* reconnect-expired confirmation: do it */
-   MA_RECON_NO   = 9,    /* reconnect-expired confirmation: cancel */
+   MA_DEVPAGE_PREV = 71, /* DEVICES: previous page of the live list */
+   MA_DEVPAGE_NEXT = 72, /* DEVICES: next page of the live list */
+   /* + a slot index into the ui_shortcut_* table: the SHORTCUT checkbox on
+    * the ADD menu. Reserves 37..47, which bounds the table at 11 entries. */
+   MA_SCTOGGLE  = 37,
+   MA_RECONNECT = 96, /* old device: revive it (direct if not yet expired,
+                       * else via a confirmation screen) */
+   MA_RECON_YES  = 8, /* reconnect-expired confirmation: do it */
+   MA_RECON_NO   = 9, /* reconnect-expired confirmation: cancel */
    MA_CLOSE      = 99,
    MA_DIGIT      = 100, /* + digit 0..9 */
    MA_OK         = 111, /* keypad / label confirm */
@@ -514,8 +585,11 @@ enum ui_menu {
    MA_MARK_PICK  = 220, /* + marker enum value */
    MA_COLOR_PICK = 240, /* + colour index */
    MA_SIZE_PICK  = 250, /* + size 1..MARK_SIZE_MAX */
-   MA_PRIM_PICK  = 260, /* + slot index: make that CGM the primary */
-   MA_CHAR       = 300, /* + index into ui_label_chars[] */
+   /* + slot index: the PRIMARY checkbox on the DEVICES screen. The row itself
+    * carries MA_SENSOR + slot, so the checkbox needs its own code -- it is a
+    * second target inside the same row rectangle. */
+   MA_PRIM_PICK = 260,
+   MA_CHAR      = 300, /* + index into ui_label_chars[] */
    /* LOG INSULIN fields: + 0 units, + 1 date, + 2 time, + 3 year. Tapping
     * the value opens the keypad for exact entry (kp_mode 6/7/8/9). */
    MA_INS_EDIT = 400,
@@ -545,15 +619,35 @@ _Static_assert(MA_SENSOR + MAX_SLOTS <= MA_DEV_CANCEL,
 _Static_assert(MA_SENSOR > MA_KP_CLOSE, "MA_SENSOR range hits the keypad");
 _Static_assert(MA_TYPE + SENSOR_NTYPES <= MA_CLOSE,
                "MA_TYPE range hits MA_CLOSE");
+/* The last unasserted base+index range. MARK_N grows whenever a marker shape
+ * is appended -- and shapes ARE appended, the enum says so -- so this is the
+ * one most likely to drift into its neighbour without anyone noticing. */
+_Static_assert(MA_MARK_PICK + MARK_N <= MA_COLOR_PICK,
+               "MA_MARK_PICK range hits MA_COLOR_PICK");
 _Static_assert(MA_DIGIT + 10 <= MA_BACKSPACE,
                "MA_DIGIT range hits MA_BACKSPACE");
-_Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_CHAR,
-               "MA_PRIM_PICK range hits MA_CHAR");
+_Static_assert(MA_SIZE_PICK + MARK_SIZE_MAX <= MA_PRIM_PICK,
+               "MA_SIZE_PICK range hits MA_PRIM_PICK");
 _Static_assert(MA_PRIM_PICK + MAX_SLOTS <= MA_EXP_RANGE,
                "MA_PRIM_PICK range hits the EXPORT DATA codes");
 
-/* Up to this many touch targets per frame. */
+/* Up to this many touch targets per frame.
+ *
+ * Headroom is thinner than it looks: SCR_LABEL (the letter keypad) peaks at
+ * 41 of these across the swept geometries, so seven more controls anywhere
+ * on that screen is the ceiling. add_hit DROPS the excess, and a dropped box
+ * is a control the user simply cannot tap -- drawn normally, dead to touch,
+ * with nothing logged. That is the failure mode `overflow` below exists to
+ * make loud; uitest asserts it stays clear at every screen and geometry. */
 #define UI_MAX_HITS 48
+
+/* Touch targets a paginated log screen spends on its OWN controls before any
+ * row: the title/close band and the two pagination arrows, plus slack for a
+ * per-screen extra (the weight log's span tabs). Rows are capped at
+ * UI_MAX_HITS - UI_LOG_FIXED so a tall window cannot push a row -- or the
+ * next-page arrow behind it -- past the budget and into add_hit's silent
+ * drop. */
+#define UI_LOG_FIXED 12
 
 struct hits {
    struct {
@@ -567,6 +661,10 @@ struct hits {
    } box[UI_MAX_HITS];
 
    int n;
+   /* Set once add_hit has had to drop a target. Never reset by add_hit --
+    * ui_render clears it with n at the start of a frame -- so one drop
+    * anywhere in a frame is still visible after the frame is built. */
+   int overflow;
 };
 
 /* Render model `m` into framebuffer `fb`, recording touch targets into `h`. */

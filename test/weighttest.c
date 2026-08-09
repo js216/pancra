@@ -117,6 +117,66 @@ int main(void)
       ck(g_wt[2].g == 70500, "and it is the one that parsed");
    }
 
+   printf("== update rewrites the RIGHT row, and only that row ==\n");
+   {
+      unlink(g_wt_path);
+      g_nwt = 0;
+      for (int i = 0; i < 5; i++)
+         weight_append(1700000000L + i, 70000L + ((long)i * 100), 0);
+      struct wt_rec orig = g_wt[2];
+      ck(weight_update(&orig, orig.t, 71234L, 0) == 0, "an update succeeds");
+      weight_load();
+      ck(g_nwt == 5, "the row count is unchanged");
+      ck(g_wt[2].g == 71234, "the target row carries the new value");
+      ck(g_wt[0].g == 70000 && g_wt[4].g == 70400,
+         "its neighbours are untouched");
+      /* Matching is by CONTENT: an update whose original is not in the file
+       * must change nothing rather than rewrite an arbitrary row. */
+      struct wt_rec ghost = {1600000000L, 65000L};
+      ck(weight_update(&ghost, 1600000000L, 66000L, 0) < 0,
+         "an update for a row that is not there is refused");
+      weight_load();
+      ck(g_nwt == 5 && g_wt[2].g == 71234, "...and the file is unchanged");
+      ck(weight_update(&orig, orig.t, 5L, 0) < 0,
+         "an out-of-range update is refused");
+   }
+
+   printf("== delete removes exactly one row ==\n");
+   {
+      struct wt_rec d = g_wt[1];
+      ck(weight_delete(&d) == 0, "a delete succeeds");
+      weight_load();
+      ck(g_nwt == 4, "one row fewer");
+      for (int i = 0; i < g_nwt; i++)
+         if (g_wt[i].t == d.t && g_wt[i].g == d.g)
+            ck(0, "the deleted row is really gone");
+      ck(weight_delete(&d) < 0, "deleting it again is refused");
+      weight_load();
+      ck(g_nwt == 4, "...and removes nothing else");
+   }
+
+   printf("== duplicates: the LAST match is the one touched ==\n");
+   {
+      unlink(g_wt_path);
+      g_nwt = 0;
+      /* Two rows can be genuinely identical -- two weigh-ins recorded at the
+       * same second. The rewrite must touch exactly one of them, or a delete
+       * silently removes both. */
+      weight_append(1700000000L, 70000L, 0);
+      weight_append(1700000000L, 70000L, 0);
+      weight_append(1700000100L, 71000L, 0);
+      ck(g_nwt == 3, "three rows, two of them identical");
+      struct wt_rec dup = {1700000000L, 70000L};
+      ck(weight_delete(&dup) == 0, "deleting a duplicated row succeeds");
+      weight_load();
+      ck(g_nwt == 2, "exactly ONE row went, not both");
+      int left = 0;
+      for (int i = 0; i < g_nwt; i++)
+         if (g_wt[i].t == dup.t && g_wt[i].g == dup.g)
+            left++;
+      ck(left == 1, "...and the other copy survived");
+   }
+
    printf("\n%s\n", all ? "ALL WEIGHT TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

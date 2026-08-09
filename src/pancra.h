@@ -37,6 +37,16 @@ int dexble_register(JNIEnv *env, jclass ble, jobject ctx);
 void dexble_set_alarm(JNIEnv *env, jclass alarm_cls);
 /* Pair/connect a Dexcom sensor on `link`. */
 void dexble_pair(int link, const char *mac, const char *code);
+/* Ask the OS to bond with `mac` NOW, so the system pairing dialog appears as a
+ * consequence of the user's tap rather than minutes later when the stack
+ * happens to hit an encrypted characteristic. See the comment block above
+ * Ble.createBond for why auto-accepting the dialog is not available to us.
+ * Returns 1 if the request went out (or the device was already bonded). */
+int dexble_create_bond(const char *mac);
+/* Latest OS bond state seen for `mac`, using the framework's own constants:
+ * 0 = never heard, 10 = NONE, 11 = BONDING, 12 = BONDED. Fed by Ble's
+ * ACTION_BOND_STATE_CHANGED receiver. */
+int dexble_bond_state(const char *mac);
 /* Evaluate + actuate the alarm. Any thread; must NOT hold driver_lock. */
 void pancra_alarm_check(void);
 /* Re-connect any CGM link that has gone quiet. Safe on any thread, and safe
@@ -78,13 +88,17 @@ void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
                   int no_resp);
 /* Connect to a OneTouch meter on `link`, and mark that link as carrying a
  * meter so the transport routes its events to the otble driver. */
-void dexble_meter_connect(int link, const char *mac);
+int dexble_meter_connect(int link, const char *mac);
 /* Tell the transport whether `link` carries a meter (1) or a CGM (0). */
 void dexble_set_meter_link(int link, int on);
 /* A meter answered on `link`: seed the shared protocol state for it and take
  * the busy latch. 1 to proceed, 0 to refuse (another meter is mid-exchange,
  * or no registered meter is bound to that link). Called under driver_lock. */
 int pancra_meter_connected(int link);
+/* A meter link dropped. Returns 1 if it was the link owning the current
+ * exchange (so otble's state should be reset), 0 if it was merely an idle
+ * standing connect. Called under driver_lock. */
+int pancra_meter_disconnected(int link);
 int dexble_alarm(int kind, int sound, int vibrate); /* 0 low, 1 high, 2 stale */
 void dexble_beep(void); /* one short NEW DATAPOINT beep */
 /* One NEW DATAPOINT chirp, pitch-bent by `st10` tenths of a semitone

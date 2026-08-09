@@ -119,6 +119,20 @@ void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
  * an unsynchronized read of a concurrently-shifted array, and locking it here
  * would invert the reg->hist order. */
 void hist_refresh_current(int prime);
+/* The bound a STORED reading must satisfy, which is NOT the live sensor bound.
+ *
+ * main.c's glucose_plausible (20..600) gates the RAW value off the sensor and
+ * is right for that. But a rescale is applied AFTER it and before the write,
+ * scaling by up to RESCALE_MAX_PM (+25%), so a legitimately stored value
+ * reaches 750 -- and 20 at -25% reaches 15. Both replay readers used the raw
+ * 20..600, so a genuine extreme excursion was displayed, alarmed and counted
+ * live, then silently excluded from history, the plot and TIR/AVG/A1C on the
+ * next launch: the record of exactly the readings that matter clinically
+ * disappeared, and live stats disagreed with replayed ones. Widen once, here,
+ * so both readers and any future one share the writer's actual range. */
+#define STORE_GLU_MIN 15
+#define STORE_GLU_MAX 750
+
 /* Load the tail of the CSV into g_hist (most-recent NHIST rows) + g_cur_*. */
 void store_load(void);
 /* Count the rows currently in the log (one pass). */

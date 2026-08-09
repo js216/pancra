@@ -525,7 +525,16 @@ void driver_on_disconnected(int status)
        * connect re-pairs from scratch via the J-PAKE rounds (ctx->have_key=0
        * path).
        */
-      if (ctx->have_key &&
+      /* NOT when the peer already PROVED it holds the key this connection.
+       * ctx->chal_ok is set once the AuthChallenge tokenHash verified, which
+       * is cryptographic proof the key is good -- a drop after that is RF,
+       * not a stale key. Counting it meant three range-edge drops during the
+       * cert exchange deleted a working bond, and the pairing code is not
+       * persisted, so recovery needs the applicator: discard it and the
+       * sensor is unusable for the rest of its wear. A genuinely stale key
+       * fails the tokenHash instead, which is handled at once where it is
+       * proven. */
+      if (ctx->have_key && !ctx->chal_ok &&
           (was == P_AUTH || was == P_CERT || was == P_KEYCHAL) &&
           ++ctx->authfails >= 3) {
          LOGI("!! %d post-auth failures with a key -> discard key, re-pair",
@@ -599,11 +608,20 @@ void driver_forget(void)
 /* Watchdog reconnect: re-issue a connect from a stalled state. The transport's
  * connect() closes any lingering GATT client first, so this recovers a stranded
  * link (e.g. an orphaned client after a crash/force-stop) without a BT toggle.
- * A no-op while actively streaming, so it never disturbs a healthy cycle. */
+ *
+ * NO P_STREAM GUARD. There used to be an early return here on the grounds
+ * that "actively streaming" means healthy and must not be disturbed -- but
+ * the ONE path into this function is pancra_link_watchdog -> dexble_reconnect,
+ * which fires only after a link has produced no reading for 420 s. By the
+ * time we are called the caller has already PROVEN the link is not healthy,
+ * so the guard could only ever suppress the recovery it was written to
+ * protect. A link whose disconnect callback was lost sits at P_STREAM
+ * forever: the watchdog no-opped every cycle and, with the screen off, the
+ * advert path needs a scan that is down -- monitoring stopped silently until
+ * the app was restarted. A healthy streaming link cannot reach here, because
+ * its own samples are newer than the watchdog's threshold. */
 void driver_kick(void)
 {
-   if (ctx->phase == P_STREAM)
-      return;
    if (ctx->have_key || ctx->g_codelen > 0) {
       ctx->phase = P_IDLE;
       /* Clear the give-up counters so the watchdog can always revive a link
@@ -1041,8 +1059,14 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
             LOGI("   unsolicited 34 -- not re-reading bounds");
          }
       } else if (!strcmp(uuid, U_DATA)) {
-         struct dex_record r[8];
-         int k = dexdata_records(buf, (size_t)n, r, 8);
+         /* Size for what the TRANSPORT can actually deliver, not a guess.
+          * jni_notify clamps a notification to 256 bytes and records are 9
+          * bytes, so up to 28 can arrive; decoding only 8 silently dropped
+          * the rest, and because a re-request returns the same frame the
+          * loss was permanent -- gap recovery quietly losing exactly the
+          * points it exists to recover. */
+         struct dex_record r[DEX_MAX_RECORDS];
+         int k = dexdata_records(buf, (size_t)n, r, DEX_MAX_RECORDS);
          LOGI("   %d backfill record(s)", k);
          for (int i = 0; i < k; i++) {
             LOGI("     rec ts=%u glu=%d", r[i].timestamp, r[i].glucose);

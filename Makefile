@@ -276,7 +276,7 @@ TESTWARN := -Wall -Wextra -Werror -Wformat=2 -O2
 uitest:
 	@mkdir -p build/test
 	cc -iquote src $(JVM_INC) $(TESTWARN) test/uitest.c src/ui.c src/font.c \
-	    src/plot.c src/sensors.c src/util.c -o build/test/uitest
+	    src/plot.c src/sensors.c src/util.c src/weight.c -o build/test/uitest
 	./build/test/uitest
 
 # Behavioural gate for the LONG-SPAN plot data. The 30D plot is downsampled
@@ -325,7 +325,7 @@ storetest:
 statstest:
 	@mkdir -p build/test
 	cc -iquote src $(TESTWARN) test/statstest.c src/stats.c src/util.c \
-	    -o build/test/statstest
+	    src/sensors.c -o build/test/statstest
 	@./build/test/statstest > build/test/statstest.log 2>&1 \
 	    && grep -q "ALL STATS TESTS PASSED" build/test/statstest.log \
 	    && printf '\033[1;32mstatstest\033[0m: rolling TIR/average OK\n' \

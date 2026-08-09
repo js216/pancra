@@ -12,6 +12,7 @@
 #include "ndk.h"
 #include "plot.h" /* the capping case asserts plot_render's own mapping */
 #include "sensors.h"
+#include "weight.h" /* struct wt_rec / NWT for the sweep fixture */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,14 +96,33 @@ static long count_color_from(const struct ANativeWindow_Buffer *b,
    return n;
 }
 
-/* Where render_info lives, which depends on orientation: it is the lower half
- * in portrait but the RIGHT-HAND COLUMN in landscape (render_main splits the
- * screen). Getting this wrong makes the assertion test the wrong pixels. */
+/* As above, bounded on the right as well, so a landscape assertion can be
+ * about ONE column rather than everything to its right. */
+static long count_color_box(const struct ANativeWindow_Buffer *b, uint32_t want,
+                            int x0, int y0, int x1)
+{
+   long n = 0;
+   if (x1 > b->width)
+      x1 = b->width;
+   for (int y = y0; y < b->height; y++)
+      for (int x = x0; x < x1; x++)
+         if (g_px[(y * b->stride) + x] == want)
+            n++;
+   return n;
+}
+
+/* Where render_info lives, which depends on orientation: the lower half in
+ * portrait, and the LOWER LEFT column in landscape -- the stats table sits
+ * under the big number now, with the plot and threshold rows in the right
+ * column. It used to be the whole right column, and this helper has to follow
+ * that move or the assertion silently tests the wrong pixels (which is the
+ * failure its own comment records). Bounded on the right so a stray CCCCCC in
+ * the plot column cannot stand in for the block under test. */
 static long count_info_block(const struct ANativeWindow_Buffer *b,
                              uint32_t want)
 {
    int landscape = b->width > b->height;
-   return landscape ? count_color_from(b, want, b->width / 2, 0)
+   return landscape ? count_color_box(b, want, 0, b->height / 2, b->width / 2)
                     : count_color_from(b, want, 0, b->height / 2);
 }
 
@@ -191,6 +211,10 @@ int main(void)
                saw_settings = 0;
          }
       if (!saw_settings) {
+         /* The band is bounded by its COLUMN, so in landscape its centre must
+          * still resolve to it -- a full-width band reached into the plot
+          * column, where the later tab targets took the pixels back and left a
+          * control that looked present and was not. */
          printf("  FAIL: no tappable hamburger (ACT_OPEN_SETTINGS) on main\n");
          fail = 1;
       }
@@ -309,7 +333,7 @@ int main(void)
       fail = 1;
    }
 
-   /* --- sensor list in settings (space check + rows) --- */
+   /* --- device list on the DEVICES screen (space check + rows) --- */
    struct ui_sensor sens[3] = {
        {.id              = 1,
         .type            = SENSOR_STELO,
@@ -366,8 +390,12 @@ int main(void)
              UI_MIN_SLOTS);
       fail = 1;
    }
-   ui_render(&tall, &set, &h);
-   write_ppm_buf(&tall, "build/test/settings_tall.ppm");
+   /* The registry lives on its OWN screen now, opened from the main screen's
+    * big number and from the SETTINGS row -- not inlined into settings. */
+   struct screen devs_scr = set;
+   devs_scr.scr           = SCR_DEVICES;
+   ui_render(&tall, &devs_scr, &h);
+   write_ppm_buf(&tall, "build/test/devices_tall.ppm");
    {
       int saw[3] = {0, 0, 0};
       for (int i = 0; i < h.n; i++)
@@ -375,7 +403,7 @@ int main(void)
             if (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_SENSOR + k)
                saw[k] = 1;
       if (!(saw[0] && saw[1] && saw[2])) {
-         printf("  FAIL: sensor rows not all tappable (%d %d %d)\n", saw[0],
+         printf("  FAIL: device rows not all tappable (%d %d %d)\n", saw[0],
                 saw[1], saw[2]);
          fail = 1;
       }
@@ -393,8 +421,8 @@ int main(void)
     *
     * Two failure modes, both shipped before: (a) the scale was derived from
     * WIDTH while the pitch it produced was spent on HEIGHT, so capacity fell
-    * below the minimum on 16:9/18:9 phones and render_settings drew no sensor
-    * rows and no ADD row at all; (b) ui_settings_scale and ui_sensor_capacity
+    * below the minimum on 16:9/18:9 phones and the renderer drew no device
+    * rows and no ADD button at all; (b) ui_devices_scale and ui_sensor_capacity
     * disagreed by 8*sc, so the lockout still fired on 1080x2280 (Galaxy S10)
     * and 1440x3200. Scrolling is ruled out by design, so off-screen content is
     * simply unreachable. Sweep geometries AND assert the controls exist. */
@@ -411,6 +439,13 @@ int main(void)
           {1080, 2400},
           {720,  1600},
           {720,  1280},
+          /* TALL AND NARROW. The list stopped at 720 wide, so the paginated
+           * log screens -- whose row count scales with height while the hit
+           * budget does not -- were never laid out anywhere the two could
+           * disagree. These are freeform/split-screen windows an app with no
+           * scrolling has to survive, and where the overflow reproduces. */
+          {480,  1920},
+          {540,  2340},
           {480,  800 },
           /* LANDSCAPE. The sweep had none, which is why three screens kept
            * width-only scaling: in landscape that puts their controls below
@@ -449,12 +484,12 @@ int main(void)
       for (int i = 0; i < nshape; i++) {
          int sw   = shapes[i][0];
          int sh   = shapes[i][1];
-         int ssc  = ui_settings_scale(sw, sh);
+         int ssc  = ui_devices_scale(sw, sh);
          int scap = ui_sensor_capacity(sw, sh);
          int slh  = 16 * ssc;
-         /* UI_SET_ABOVE, not a literal: a stale copy of the overhead here is
+         /* UI_DEV_ABOVE, not a literal: a stale copy of the overhead here is
           * exactly the drift the dense sweep below exists to catch. */
-         int need = (sh / 20) + (8 * ssc) + ((UI_SET_ABOVE + scap + 1) * slh);
+         int need = (sh / 20) + (8 * ssc) + ((UI_DEV_ABOVE + scap + 1) * slh);
          if (scap < UI_MIN_SLOTS || need > sh) {
             printf("  FAIL: %dx%d capacity %d (min %d), needs %d of %d px\n",
                    sw, sh, scap, UI_MIN_SLOTS, need, sh);
@@ -470,10 +505,10 @@ int main(void)
       for (unsigned wi = 0; wi < sizeof widths / sizeof widths[0]; wi++) {
          int sw = widths[wi];
          for (int sh = (sw * 12) / 10; sh <= sw * 3; sh++) {
-            int ssc  = ui_settings_scale(sw, sh);
+            int ssc  = ui_devices_scale(sw, sh);
             int scap = ui_sensor_capacity(sw, sh);
             int need =
-                (sh / 20) + (8 * ssc) + ((UI_SET_ABOVE + scap + 1) * 16 * ssc);
+                (sh / 20) + (8 * ssc) + ((UI_DEV_ABOVE + scap + 1) * 16 * ssc);
             swept++;
             if (scap < UI_MIN_SLOTS || need > sh) {
                if (!swbad)
@@ -495,6 +530,26 @@ int main(void)
        * LOW/HIGH/STALE banner were invisible on every realistic phone window
        * while this sweep reported OK. Colour presence is the honest detector:
        * if the content did not land on screen, its pixels do not exist. */
+      /* FULL LOGS, for the same reason the sensor fields below are filled:
+       * the paginated log screens size their row count from the window and
+       * their hit boxes from the rows, so with the empty tables this sweep
+       * used to pass, SCR_INSLOG and SCR_WTLOG were laid out with nothing in
+       * them and their worst case was never rendered at any geometry. */
+      static struct ins_rec sweep_ins[NINS];
+      static struct wt_rec sweep_wt[NWT];
+      for (int z = 0; z < NINS; z++) {
+         sweep_ins[z].t     = 1700000000L + ((long)z * 3600);
+         sweep_ins[z].type  = z % 2;
+         sweep_ins[z].units = 10 + (z % 90);
+      }
+      for (int z = 0; z < NWT; z++) {
+         sweep_wt[z].t = 1700000000L + ((long)z * 86400);
+         sweep_wt[z].g = 70000 + ((long)z * 10);
+      }
+      set.ins_log         = sweep_ins;
+      set.ins_nlog        = NINS;
+      set.wt              = sweep_wt;
+      set.nwt             = NWT;
       struct ui_sensor rs = sens[0];
       rs.session_seconds  = 16L * 86400; /* expired -> PAIR NEW SENSOR prompt */
       /* Populate EVERY optional row, or render_sensor's worst case -- the one
@@ -521,16 +576,23 @@ int main(void)
           * BUT stacked buttons, and ALARM grew a row. A screen absent from
           * this list is a screen where a control can sit below the bottom
           * edge, draw nothing, and still record a hit box the gate accepts. */
-         static const int scrs[] = {
-             SCR_MAIN,       SCR_SETTINGS, SCR_SENSOR,   SCR_CAL,
-             SCR_FORGET,     SCR_LABEL,    SCR_KEYPAD,   SCR_DEVLIST,
-             SCR_GATE,       SCR_SENSTYPE, SCR_REMOTE,   SCR_ADDMENU,
-             SCR_ALARM,      SCR_EXPORT,   SCR_INSDEL,   SCR_RECONF,
-             SCR_METERHELP,  SCR_PAIRCONF, SCR_CALPEND,  SCR_RESCALE,
-             SCR_RESCALEACT, SCR_DISPLAY,  SCR_PRIMPICK, SCR_OLDDEV,
-             SCR_MARKPICK,   SCR_COLORPICK};
-         nscr = (int)(sizeof scrs / sizeof scrs[0]);
-         for (int c = 0; c < (int)(sizeof scrs / sizeof scrs[0]); c++) {
+         /* EVERY screen, from the enum -- not a hand-kept list.
+          *
+          * The list this replaces held 26 of 33, and the seven it omitted
+          * were the paginated log and entry screens (INSLOG, WTLOG,
+          * INSULIN, WEIGHT, WTDEL, PERMS, NOREADING) -- which size their
+          * rows from window height with no cap tied to UI_MAX_HITS, so on
+          * tall-narrow geometries add_hit silently drops the trailing
+          * targets INCLUDING the next-page arrow: drawn, and dead to touch.
+          * The hits.overflow gate claims to cover "every screen and
+          * geometry" and did not, because a list that must be updated by
+          * hand is exactly how a new screen escapes the sweep. Deriving it
+          * from SCR_N cannot drift. */
+         static int scrs[SCR_N];
+         for (int z = 0; z < SCR_N; z++)
+            scrs[z] = z;
+         nscr = SCR_N;
+         for (int c = 0; c < SCR_N; c++) {
             struct screen rr = set;
             rr.scr           = scrs[c];
             /* SCR_CAL was only ever swept with cal_have == 0, which renders a
@@ -545,10 +607,10 @@ int main(void)
             rr.t             = now_ts - 100;
             /* A FULL sensor list, not one row.
              *
-             * This swept nsensors = 1, so the settings screen -- the only
+             * This swept nsensors = 1, so the DEVICES screen -- the only
              * screen whose height grows with content -- was never laid out at
              * its worst case at any of these geometries. A mutation adding
-             * three rows to render_settings without bumping UI_SET_ABOVE
+             * three rows to render_devices without bumping UI_DEV_ABOVE
              * passed the entire gate, while a full list clipped 8368 glyph
              * cells and put hit boxes 52 px below a 1080x1920 screen. With no
              * scrolling those rows and their tap targets are permanently
@@ -557,15 +619,17 @@ int main(void)
             /* ...and the list must be as long as the geometry CLAIMS it can
              * show, plus the optional rows. `min(cap, 3)` left every screen
              * with cap > 3 short of its own worst case, and none of the three
-             * conditional rows was ever drawn, so UI_SET_ABOVE could
-             * under-count by three and the gate still passed while EXPORT
-             * DATA sat 130 px below the bottom edge. The worst case is: the
-             * full list, one device RETIRED (the "OLD DEVICES (n)" row), more
-             * live devices than fit (the "N MORE NOT SHOWN" row), and a
-             * pairing armed (the "PENDING..." row). */
+             * conditional rows was ever drawn, so UI_DEV_ABOVE could
+             * under-count by three and the gate still passed while the
+             * trailing button sat 130 px below the bottom edge. The worst
+             * case is: the
+             * full list, one device RETIRED (the "OLD DEVICES (n)" row plus
+             * the blank line either side of it), more live devices than fit
+             * (the page-nav row), and a pairing armed (the "PENDING..." row).
+             */
             int cap_here = ui_sensor_capacity(sw, sh);
             static struct ui_sensor full[UI_MAX_SLOTS];
-            int nfull = cap_here + 2; /* > what fits: forces "MORE NOT SHOWN" */
+            int nfull = cap_here + 2; /* > one page: forces the page-nav row */
             if (nfull > UI_MAX_SLOTS)
                nfull = UI_MAX_SLOTS;
             for (int q = 0; q < nfull; q++) {
@@ -588,19 +652,47 @@ int main(void)
                full[q].cal_t           = now_ts - 3600;
                full[q].cal_mgdl        = 120;
                full[q].cal_state       = CAL_ST_APPLIED;
+               /* An UNSETTLED bond draws render_sensor's PAIRING row, which is
+                * one more optional row in that screen's budget. Left at 0 the
+                * row never appeared, so the budget could be a row short and
+                * the sweep would still pass -- exactly the gap the note above
+                * describes for the other five optional rows. */
+               full[q].bond = UI_BOND_BONDING;
                snprintf(full[q].serial, sizeof full[q].serial, "SN1234567");
                snprintf(full[q].code, sizeof full[q].code, "7381");
             }
             full[nfull - 1].old = 1; /* the OLD DEVICES row */
             rr.sensors          = full;
             rr.nsensors         = nfull;
-            rr.pend_type        = 1; /* the PENDING... row */
-            rr.sel              = 0;
-            rr.devs             = devs;
-            rr.ndev             = 2;
-            rr.entry            = "1234";
+            /* THREE shortcuts: the worst case for the main screen's '+' row,
+             * where the buttons are narrowest and the '+' has least space
+             * left. With none set the row is exactly what it always was, so
+             * the sweep would never lay the new controls out at all. */
+            rr.shortcut[0] = MA_INS_FAST;
+            rr.shortcut[1] = MA_INS_SLOW;
+            rr.shortcut[2] = MA_WT_OPEN;
+            rr.pend_type   = 1; /* the PENDING... row */
+            rr.sel         = 0;
+            rr.devs        = devs;
+            rr.ndev        = 2;
+            rr.entry       = "1234";
             ui_clip_reset();
             ui_render(&rb, &rr, &h);
+            /* THE HIT-BOX BUDGET MUST NOT OVERFLOW.
+             *
+             * add_hit drops any target past UI_MAX_HITS, and a dropped one
+             * draws perfectly while being dead to touch -- indistinguishable
+             * from a control that just does not work, with nothing logged.
+             * The margin is thinner than it looks: SCR_LABEL peaks at 41 of
+             * 48, so seven more controls on that screen is the ceiling. This
+             * is the gate that turns "silently untappable" into a build
+             * failure. */
+            if (h.overflow) {
+               printf("  FAIL: scr %d at %dx%d: hit-box budget overflowed "
+                      "(UI_MAX_HITS=%d)\n",
+                      scrs[c], sw, sh, UI_MAX_HITS);
+               fail = 1;
+            }
             /* Nothing may be laid out past an edge. This is the check that
              * actually catches invisible content -- hit-box bounds and colour
              * presence both miss it (a shared colour drawn elsewhere keeps the
@@ -800,6 +892,46 @@ int main(void)
        * gets dropped from the sweep without anyone noticing. */
       printf("uitest: reachability+visibility on %d shapes x %d screens\n",
              nshape, nscr);
+   }
+
+   /* --- every keypad mode must have its own title ---
+    *
+    * The title chain used to end in `else -> pairing keypad`, so a mode with
+    * no title silently rendered PAIR NEW <sensor> -- a real screen for a
+    * different feature. The WEIGHT keypad shipped exactly that way: tapping a
+    * weight opened the sensor-pairing flow and nothing looked wrong. The
+    * fallback is now a red "BAD KP MODE n", so this checks that no mode
+    * reaches it -- i.e. that the title table has an entry for every mode the
+    * slot table admits. */
+   {
+      int w                          = 720;
+      int hgt                        = 1600;
+      int bad                        = 0;
+      struct ANativeWindow_Buffer kb = {
+          .width = w, .height = hgt, .stride = w, .format = 1, .bits = g_px};
+      for (int mode = 0; mode < UI_KP_MODES; mode++) {
+         struct hits kh;
+         struct screen km = set;
+         km.scr           = SCR_KEYPAD;
+         km.kp_mode       = mode;
+         km.entry         = "8";
+         km.add_type      = "STELO";
+         for (long q = 0; q < (long)w * hgt; q++)
+            g_px[q] = 0;
+         ui_render(&kb, &km, &kh);
+         /* the fallback's colour, which nothing else on this screen uses */
+         long red = 0;
+         for (long q = 0; q < (long)w * hgt; q++)
+            if (g_px[q] == 0xFF4466FF)
+               red++;
+         if (red > 0) {
+            printf("  FAIL: keypad mode %d has no title (BAD KP MODE)\n", mode);
+            bad  = 1;
+            fail = 1;
+         }
+      }
+      if (!bad)
+         printf("uitest: all %d keypad modes carry a title\n", UI_KP_MODES);
    }
 
    /* --- an AUTO wear budget must not look like a pinned one ---
@@ -1277,14 +1409,73 @@ int main(void)
             printf("uitest: insulin form carries every control, one CONFIRM\n");
          }
 
-         /* CHOOSE PRIMARY: EVERY registered CGM is offered -- including one
-          * just paired with no session and no datapoint yet (promoting it is
-          * how the user pre-arms the switch to a new sensor). A meter never
-          * appears, however fresh its data. The row's code must index the
-          * sensor MODEL (MA_PRIM_PICK + slot), the same discipline as the
+         /* LOG WEIGHT mirrors the insulin form: cancel on TOP, the one
+          * writing control (CONFIRM) exactly once on the BOTTOM, and in
+          * EDIT mode (the worst case) DELETE between the two. */
+         fm.scr       = SCR_WEIGHT;
+         fm.wt_edit   = 1;
+         fm.wt_t      = now_ts;
+         fm.wt_tenths = 1542;
+         ui_render(&fb2, &fm, &fh);
+         {
+            int nconf = 0;
+            int ydisc = -1;
+            int ydel  = -1;
+            int yconf = -1;
+            for (int i = 0; i < fh.n; i++) {
+               if (fh.box[i].kind != ACT_MENU)
+                  continue;
+               if (fh.box[i].arg == MA_WT_CONFIRM) {
+                  nconf++;
+                  yconf = fh.box[i].y;
+               }
+               if (fh.box[i].arg == MA_WT_DISCARD && fh.box[i].y > ydisc)
+                  ydisc = fh.box[i].y; /* the button, not the title X */
+               if (fh.box[i].arg == MA_WT_DELETE)
+                  ydel = fh.box[i].y;
+            }
+            if (nconf != 1) {
+               printf("  FAIL: SCR_WEIGHT records %d MA_WT_CONFIRM targets, "
+                      "want exactly 1\n",
+                      nconf);
+               fail = 1;
+            }
+            if (ydisc < 0) {
+               printf("  FAIL: SCR_WEIGHT records no MA_WT_DISCARD\n");
+               fail = 1;
+            }
+            if (ydel < 0) {
+               printf("  FAIL: EDIT WEIGHT records no MA_WT_DELETE\n");
+               fail = 1;
+            }
+            if (yconf >= 0 && (yconf <= ydisc || yconf <= ydel)) {
+               printf("  FAIL: SCR_WEIGHT CONFIRM (y=%d) is not the BOTTOM "
+                      "button (cancel y=%d, delete y=%d)\n",
+                      yconf, ydisc, ydel);
+               fail = 1;
+            }
+            if (ydel >= 0 && ydel <= ydisc) {
+               printf("  FAIL: EDIT WEIGHT DELETE (y=%d) is not below "
+                      "CANCEL (y=%d)\n",
+                      ydel, ydisc);
+               fail = 1;
+            }
+            printf("uitest: weight form commits once, cancel on top\n");
+            fm.wt_edit = 0; /* don't leak EDIT mode into later blocks */
+         }
+
+         /* THE PRIMARY COLUMN on the DEVICES screen: a checkbox for every
+          * LIVE, UNEXPIRED CGM -- including one just paired with no session
+          * and no datapoint yet, since promoting it is how the user pre-arms
+          * the switch to a new sensor. A meter never gets one, however fresh
+          * its data; neither does an old (disconnected) or an expired sensor,
+          * because sensor_set_primary refuses all three and a control that
+          * cannot work is worse than no control. The box's code must index
+          * the sensor MODEL (MA_PRIM_PICK + slot), the same discipline as the
           * device pick. */
          {
-            struct ui_sensor ps[4] = {sens[0], sens[1], sens[2], sens[0]};
+            struct ui_sensor ps[5] = {sens[0], sens[1], sens[2], sens[0],
+                                      sens[0]};
             ps[0].session_seconds  = 3L * 86400; /* live session */
             ps[1].session_seconds  = 0;          /* just paired: no session,
                                                     no data */
@@ -1294,35 +1485,61 @@ int main(void)
             /* An OLD (disconnected) CGM lives in OLD DEVICES and nowhere
              * else -- however live its session looks, it is not streaming
              * and must never be offered the big number. */
-            ps[3].old        = 1;
-            struct screen pm = set;
-            pm.scr           = SCR_PRIMPICK;
-            pm.now           = now_ts;
-            pm.sensors       = ps;
-            pm.nsensors      = 4;
+            ps[3].old = 1;
+            /* An EXPIRED one: past its wear budget AND its grace window. */
+            ps[4].wear_len        = 10L * 86400;
+            ps[4].session_seconds = 11L * 86400;
+            struct screen pm      = set;
+            pm.scr                = SCR_DEVICES;
+            pm.now                = now_ts;
+            pm.sensors            = ps;
+            pm.nsensors           = 5;
             ui_render(&fb2, &pm, &fh);
-            int rows    = 0;
+            int boxes   = 0;
             int saw_bgm = 0;
             int saw_old = 0;
+            int saw_exp = 0;
             for (int i = 0; i < fh.n; i++)
                if (fh.box[i].kind == ACT_MENU &&
                    fh.box[i].arg >= MA_PRIM_PICK &&
                    fh.box[i].arg < MA_PRIM_PICK + UI_MAX_SLOTS) {
-                  rows++;
+                  boxes++;
                   if (fh.box[i].arg == MA_PRIM_PICK + 2)
                      saw_bgm = 1;
                   if (fh.box[i].arg == MA_PRIM_PICK + 3)
                      saw_old = 1;
+                  if (fh.box[i].arg == MA_PRIM_PICK + 4)
+                     saw_exp = 1;
                }
-            if (rows != 2 || saw_bgm || saw_old) {
-               printf("  FAIL: PRIMPICK offers %d rows (bgm=%d old=%d); want "
-                      "both LIVE CGMs (even the dataless one) and never the "
-                      "meter or an old device\n",
-                      rows, saw_bgm, saw_old);
+            if (boxes != 2 || saw_bgm || saw_old || saw_exp) {
+               printf("  FAIL: DEVICES offers %d PRIMARY boxes (bgm=%d old=%d "
+                      "expired=%d); want both LIVE CGMs (even the dataless "
+                      "one) and never the meter, the old or the expired one\n",
+                      boxes, saw_bgm, saw_old, saw_exp);
                fail = 1;
             }
-            printf("uitest: choose-primary lists live CGMs only -- never a "
-                   "meter, never an old device\n");
+            /* The checkbox must WIN its own rectangle: the row underneath it
+             * carries MA_SENSOR + slot across the full width, so if the box
+             * were recorded first (or omitted) a tap on it would open the
+             * device menu instead of switching the primary. */
+            int cbi = -1;
+            for (int i = 0; i < fh.n; i++)
+               if (fh.box[i].kind == ACT_MENU &&
+                   fh.box[i].arg == MA_PRIM_PICK + 0)
+                  cbi = i;
+            if (cbi >= 0) {
+               struct action cb =
+                   ui_hit(&fh, fh.box[cbi].x + (fh.box[cbi].w / 2),
+                          fh.box[cbi].y + (fh.box[cbi].h / 2));
+               if (cb.kind != ACT_MENU || cb.arg != MA_PRIM_PICK + 0) {
+                  printf("  FAIL: PRIMARY checkbox is shadowed by its row "
+                         "(hit gave kind %d arg %d)\n",
+                         cb.kind, cb.arg);
+                  fail = 1;
+               }
+            }
+            printf("uitest: PRIMARY column offers live unexpired CGMs only, "
+                   "and its box outranks the row\n");
          }
 
          /* An ARMED (pending) pairing must be visible in DEVICES and
@@ -1330,7 +1547,7 @@ int main(void)
           * would be indistinguishable from the app acting on its own. */
          {
             struct screen sm = set;
-            sm.scr           = SCR_SETTINGS;
+            sm.scr           = SCR_DEVICES;
             sm.pend_type     = SENSOR_G7;
             ui_render(&fb2, &sm, &fh);
             int saw_cancel = 0;
@@ -1339,7 +1556,7 @@ int main(void)
                    fh.box[i].arg == MA_PEND_CANCEL)
                   saw_cancel = 1;
             if (!saw_cancel) {
-               printf("  FAIL: SETTINGS shows no cancellable PENDING row "
+               printf("  FAIL: DEVICES shows no cancellable PENDING row "
                       "while a pairing is armed\n");
                fail = 1;
             }
@@ -1606,24 +1823,24 @@ int main(void)
             int esc;
             const char *name;
          } esc[] = {
-             {SCR_SETTINGS, MA_CLOSE,       "SETTINGS"},
-             {SCR_KEYPAD,   MA_KP_CLOSE,    "KEYPAD"  },
-             {SCR_DEVLIST,  MA_DEV_CANCEL,  "DEVLIST" },
-             {SCR_SENSOR,   MA_SENSOR_BACK, "SENSOR"  },
-             {SCR_CAL,      MA_CAL_BACK,    "CAL"     },
-             {SCR_FORGET,   MA_FORGET_NO,   "FORGET"  },
-             {SCR_SENSTYPE, MA_SENSOR_BACK, "SENSTYPE"},
-             {SCR_LABEL,    MA_KP_CLOSE,    "LABEL"   },
-             {SCR_PAIRCONF, MA_PAIR_NO,     "PAIRCONF"},
-             {SCR_ADDMENU,  MA_CLOSE,       "ADDMENU" },
-             {SCR_INSULIN,  MA_INS_DISCARD, "INSULIN" },
-             {SCR_INSDEL,   MA_INSDEL_NO,   "INSDEL"  },
-             {SCR_ALARM,    MA_ALARM_BACK,  "ALARM"   },
-             {SCR_EXPORT,   MA_EXP_BACK,    "EXPORT"  },
-             {SCR_PRIMPICK, MA_CLOSE,       "PRIMPICK"},
-             {SCR_PERMS,    MA_PERMS_BACK,  "PERMS"   },
-             {SCR_OLDDEV,   MA_OLDDEV_BACK, "OLDDEV"  },
-             {SCR_RECONF,   MA_RECON_NO,    "RECONF"  },
+             {SCR_SETTINGS, MA_CLOSE,        "SETTINGS"},
+             {SCR_KEYPAD,   MA_KP_CLOSE,     "KEYPAD"  },
+             {SCR_DEVLIST,  MA_DEV_CANCEL,   "DEVLIST" },
+             {SCR_SENSOR,   MA_SENSOR_BACK,  "SENSOR"  },
+             {SCR_CAL,      MA_CAL_BACK,     "CAL"     },
+             {SCR_FORGET,   MA_FORGET_NO,    "FORGET"  },
+             {SCR_SENSTYPE, MA_SENSOR_BACK,  "SENSTYPE"},
+             {SCR_LABEL,    MA_KP_CLOSE,     "LABEL"   },
+             {SCR_PAIRCONF, MA_PAIR_NO,      "PAIRCONF"},
+             {SCR_ADDMENU,  MA_CLOSE,        "ADDMENU" },
+             {SCR_INSULIN,  MA_INS_DISCARD,  "INSULIN" },
+             {SCR_INSDEL,   MA_INSDEL_NO,    "INSDEL"  },
+             {SCR_ALARM,    MA_ALARM_BACK,   "ALARM"   },
+             {SCR_EXPORT,   MA_EXP_BACK,     "EXPORT"  },
+             {SCR_DEVICES,  MA_DEVICES_BACK, "DEVICES" },
+             {SCR_PERMS,    MA_PERMS_BACK,   "PERMS"   },
+             {SCR_OLDDEV,   MA_OLDDEV_BACK,  "OLDDEV"  },
+             {SCR_RECONF,   MA_RECON_NO,     "RECONF"  },
          };
          struct ANativeWindow_Buffer eb = {.width  = W,
                                            .height = TALL_H,
@@ -2020,6 +2237,65 @@ int main(void)
    if (!saw_cont) {
       printf("  FAIL: gate recorded no ACT_GATE_CONTINUE target\n");
       fail = 1;
+   }
+
+   /* THE AGE READOUT MUST NOT BE A PLOT TAB.
+    *
+    * The span-tab band starts just under the big number, and the age bar and
+    * its value were later moved down into that gap -- so a tap on "how fresh
+    * is this?" dispatched ACT_PLOT_TAB and switched the plot to 30D.
+    *
+    * Found BY PIXEL, not by guessing at the layout: the age/units/trend
+    * column is the only text drawn in 0xFFCCCCCC (the tab labels are white
+    * or grey), so every pixel of that colour is a label glyph, and a tap on
+    * one must never dispatch a tab. Same colour-presence idiom the
+    * reachability sweep above uses, and it needs no knowledge of the
+    * geometry it is checking. */
+   {
+      static const int ashapes[][2] = {
+          {1080, 1920},
+          {1440, 2560},
+          {720,  1280},
+          {1080, 2400},
+          {480,  1920},
+          {1920, 1080}
+      };
+      int nas    = (int)(sizeof ashapes / sizeof ashapes[0]);
+      int agebad = 0;
+      for (int i = 0; i < nas; i++) {
+         int sw                         = ashapes[i][0];
+         int sh                         = ashapes[i][1];
+         struct ANativeWindow_Buffer ab = {.width  = sw,
+                                           .height = sh,
+                                           .stride = sw,
+                                           .format = 1,
+                                           .bits   = g_px};
+         struct screen am               = set;
+         am.scr                         = SCR_MAIN;
+         am.t                           = now_ts - 100;
+         am.now                         = now_ts;
+         am.glu                         = 120;
+         am.has_cgm                     = 1;
+         struct hits ah;
+         ui_render(&ab, &am, &ah);
+         int hits_here = 0;
+         for (int py = 0; py < sh && hits_here < 3; py++)
+            for (int pxx = 0; pxx < sw && hits_here < 3; pxx++) {
+               if (g_px[(py * sw) + pxx] != 0xFFCCCCCCU)
+                  continue;
+               struct action a = ui_hit(&ah, pxx, py);
+               if (a.kind != ACT_PLOT_TAB)
+                  continue;
+               printf("  FAIL: %dx%d label pixel (%d,%d) dispatches "
+                      "ACT_PLOT_TAB\n",
+                      sw, sh, pxx, py);
+               hits_here++;
+               agebad++;
+            }
+      }
+      if (agebad)
+         fail = 1;
+      printf("uitest: label column is not a plot tab on %d shapes\n", nas);
    }
 
    printf("uitest: %s\n", fail ? "FAIL" : "OK");

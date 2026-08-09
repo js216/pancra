@@ -292,6 +292,82 @@ int main(void)
       ck(g_nhist == 1, "a truncated trailing row is refused, not half-parsed");
    }
 
+   /* A KIND OUT OF RANGE IS NORMALISED, not stored as given.
+    *
+    * store.h declares this field to be KIND_CGM or KIND_BGM, and four things
+    * downstream assume it: ui.c draws kind == KIND_INS along the bottom edge
+    * (so a 2 would render as a phantom insulin dose on the glucose plot),
+    * stats count anything != KIND_BGM toward TIR/AVG/A1C, the link
+    * watchdogs read it as a live sample, and the dedup below compares kind
+    * for equality so a bad one will not dedup against the real row. The
+    * loader bounds the timestamp and the glucose beside it but passed the
+    * kind straight through, and readings.csv is append-only -- a row
+    * admitted once is re-admitted at every launch, for good. */
+   {
+      reset();
+      ck(hist_insert(1700000000L, 100, 0, 5, KIND_INS) == HIST_NEW,
+         "a KIND_INS row inserts");
+      ck(g_hist[0].kind == KIND_CGM, "...normalised to KIND_CGM, not stored");
+      reset();
+      hist_insert(1700000000L, 100, 0, 5, 200); /* garbage from a torn write */
+      ck(g_hist[0].kind == KIND_CGM, "an out-of-range kind becomes KIND_CGM");
+      /* A real fingerstick must still survive the normalisation: forcing
+       * everything to CGM would silently reclassify every meter reading. */
+      reset();
+      hist_insert(1700000000L, 100, 0, 5, KIND_BGM);
+      ck(g_hist[0].kind == KIND_BGM, "KIND_BGM is preserved");
+      /* And the normalisation must happen BEFORE the dedup, or two rows that
+       * differ only in a corrupt kind sit beside each other and double-count.
+       */
+      reset();
+      hist_insert(1700000000L, 100, 0, 5, KIND_CGM);
+      ck(hist_insert(1700000000L, 100, 0, 5, 7) == HIST_DUP,
+         "a corrupt-kind duplicate dedups against the real row");
+   }
+
+   /* EVICTION AND OUT-OF-ORDER INSERTION, INTERLEAVED.
+    *
+    * The cases above exercise each alone: a backfill into a part-full
+    * history, and an eviction from a full one fed in order. Real data does
+    * both at once -- readings.csv is in ARRIVAL order, and imported history
+    * is appended long after the rows it predates, so a measured log of
+    * 37337 rows carried 334 that went backwards while the buffer was
+    * already full at NHIST. That is the state where an insertion sort walks
+    * a full array and the eviction shifts under it, and no small case
+    * reaches it. Assert the documented total order (newest first, ties by
+    * ascending source) survives it. */
+   {
+      reset();
+      unsigned rng   = 20260804U;
+      const long t0s = 1700000000L;
+      for (int i = 0; i < NHIST * 3; i++) {
+         rng = (rng * 1103515245U) + 12345U;
+         /* Mostly forward, sometimes well backwards -- the shape of an
+          * import landing behind the live tail. */
+         long back =
+             ((rng >> 16U) % 100U) < 10U ? (long)((rng >> 8U) % 50000U) : 0;
+         long t  = t0s + ((long)i * 300) - back;
+         int src = (int)((rng >> 20U) % 5U) + 1;
+         int knd = ((rng >> 24U) % 8U) == 0 ? KIND_BGM : KIND_CGM;
+         (void)hist_insert(t, 80 + (int)((rng >> 12U) % 200U), 0, src, knd);
+      }
+      ck(g_nhist == NHIST, "the shuffled stream fills history to NHIST");
+      int ord = 0;
+      int dup = 0;
+      for (int i = 0; i + 1 < g_nhist; i++) {
+         if (!(g_hist[i].t > g_hist[i + 1].t ||
+               (g_hist[i].t == g_hist[i + 1].t &&
+                g_hist[i].src < g_hist[i + 1].src)))
+            ord++;
+         if (g_hist[i].t == g_hist[i + 1].t &&
+             g_hist[i].src == g_hist[i + 1].src &&
+             g_hist[i].kind == g_hist[i + 1].kind)
+            dup++;
+      }
+      ck(ord == 0, "...and stays totally ordered under eviction + backfill");
+      ck(dup == 0, "...with no duplicate (t, src, kind) surviving the dedup");
+   }
+
    printf("\n%s\n", all ? "ALL STORE TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

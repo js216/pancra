@@ -57,8 +57,21 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
    long v        = 0;
    if (*p < '0' || *p > '9')
       return 0;
-   while (*p >= '0' && *p <= '9')
-      v = (v * 10) + (*p++ - '0');
+   /* CAP THE DIGITS, the rdfield/stats/sensors/insulin/weight idiom.
+    * Signed overflow is UB and happens DURING parsing, before any range
+    * check downstream can reject the value -- and this parser reads an
+    * append-only file that a torn write can corrupt. Saturate so the
+    * bounds below discard the row instead. */
+   int nt = 0;
+   while (*p >= '0' && *p <= '9') {
+      if (nt < 18) {
+         v = (v * 10) + (*p - '0');
+         nt++;
+      }
+      p++;
+   }
+   if (nt >= 18)
+      v = 0; /* unparseable: fails the *t > 0 bound below */
    *t = v;
    if (*p != ',')
       return 0;
@@ -66,7 +79,11 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
    int g = 0;
    int d = 0;
    while (*p >= '0' && *p <= '9') {
-      g = (g * 10) + (*p++ - '0');
+      if (d < 9)
+         g = (g * 10) + (*p - '0');
+      else
+         g = 16777216; /* saturate: fails the *glu < 2000 bound below */
+      p++;
       d++;
    }
    if (!d)
@@ -99,7 +116,19 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
       if (f == 5)
          *src = neg ? 0 : n;
       else if (f == 8)
-         *kind = neg ? KIND_CGM : n;
+         /* NORMALISE, do not store what the file says. This is the SECOND
+          * reader of readings.csv -- hist_insert is the other, and it had the
+          * identical gap -- and the return below bounds t and glu while
+          * letting any digit run through as a kind. A fuzz of this function
+          * accepted 9, 15, 149, 363 and 2312.
+          *
+          * The consequence is on screen: this kind is copied into the
+          * ui_point handed to the long-span plot, and ui.c draws
+          * kind == KIND_INS along the bottom edge -- so a corrupt 2 becomes
+          * an insulin dose that never happened, and anything else is not
+          * KIND_BGM so it draws as a CGM line point. The log is append-only,
+          * so a row admitted once is redrawn at every launch. */
+         *kind = (!neg && n == KIND_BGM) ? KIND_BGM : KIND_CGM;
    }
    return *t > 0 && *glu > 0 && *glu < 2000;
 }

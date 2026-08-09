@@ -22,17 +22,25 @@ extern int g_sound_on, g_vib_on; /* alarm sound / vibration */
  * cannot, and the reverse -- a user who mutes the alarm in a meeting may well
  * still want the buzz. */
 extern int g_nudge_sound, g_nudge_vib;
-extern int g_orient;         /* 0 portrait 1 landscape 2 gravity 3 system */
-extern int g_screen_on;      /* 1 keep screen on while open, 0 follow the OS */
-extern int g_newdata_mode;   /* ND_OFF / ND_BEEP / ND_CHIRP (alarmlogic.h):
-                              * what a new primary-CGM datapoint sounds like */
-extern int g_units;          /* glucose: 0 mg/dL, 1 mmol/L */
-extern int g_wunits;         /* weight: WT_KG / WT_LB (weight.h) */
-extern int g_disc;           /* stale-data alarm: index into disc_min */
-extern int g_plot_max;       /* plot vertical-scale top, mg/dL */
-extern int g_ins_marker[2];  /* MARK_* per insulin type (INS_SLOW/FAST) */
-extern int g_ins_color[2];   /* ui palette index per insulin type */
-extern int g_ins_size[2];    /* marker size 1..MARK_SIZE_MAX per type */
+extern int g_orient;        /* 0 portrait 1 landscape 2 gravity 3 system */
+extern int g_screen_on;     /* 1 keep screen on while open, 0 follow the OS */
+extern int g_newdata_mode;  /* ND_OFF / ND_BEEP / ND_CHIRP (alarmlogic.h):
+                             * what a new primary-CGM datapoint sounds like */
+extern int g_units;         /* glucose: 0 mg/dL, 1 mmol/L */
+extern int g_wunits;        /* weight: WT_KG / WT_LB (weight.h) */
+extern int g_disc;          /* stale-data alarm: index into disc_min */
+extern int g_plot_max;      /* plot vertical-scale top, mg/dL */
+extern int g_ins_marker[2]; /* MARK_* per insulin type (INS_SLOW/FAST) */
+extern int g_ins_color[2];  /* ui palette index per insulin type */
+extern int g_ins_size[2];   /* marker size 1..MARK_SIZE_MAX per type */
+/* MAIN-SCREEN SHORTCUTS: up to three ADD-menu actions promoted onto the main
+ * screen, beside the big '+'. Stored as the MA_* action codes themselves, not
+ * as positions in the ADD menu -- that menu's order is presentation and has
+ * changed before, and a stored position would silently start launching a
+ * different action the next time a button is inserted. 0 = an empty slot.
+ * Kept dense (empties last) so the main screen can just walk it. */
+#define SC_MAX 3
+extern int g_shortcut[SC_MAX];
 extern int g_statbar_val;    /* 1 = status bar shows the value, 0 = icon */
 extern int g_lockscr_val;    /* 1 = notification visible on lock screen */
 extern char g_code_str[16];  /* runtime pairing code (PAIR NEW SENSOR) */
@@ -59,6 +67,13 @@ void code_load(void);
 /* "on ip port\n" -- garbage keeps the prior values, like every loader here. */
 void remote_save(void);
 void remote_load(void);
+/* How many sensor/marker colours exist. The table itself (UI_NCOLORS) is
+ * private to ui.c, so settings_load cannot bound its stored colour index
+ * against it directly. This is the shared name for that count, and ui.c
+ * static-asserts the two agree -- the crosschecked-by-eye version of this
+ * is exactly what let MARK_SIZE_MAX drift to a stale literal here. */
+#define SET_NCOLORS 7
+
 /* 1 iff s is a well-formed dotted quad (four octets, each 0..255). Pure. */
 int remote_ip_valid(const char *s);
 

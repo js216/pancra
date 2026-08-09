@@ -43,9 +43,13 @@ enum sensor_type {
 enum sensor_kind {
    KIND_CGM = 0, /* continuous, 5-min, trend arrow, drawn as a line */
    KIND_BGM,     /* sparse fingersticks, drawn as discrete markers */
-   KIND_INS      /* insulin doses: plotted along the bottom edge, in the
+   KIND_INS,     /* insulin doses: plotted along the bottom edge, in the
                   * user-chosen INSULIN MARKER; excluded from stats and
                   * from the remote push (they are not glucose) */
+   KIND_WT       /* logged body weights: same bottom line as the doses, drawn
+                  * as a small W. Like KIND_INS these never enter g_hist, so
+                  * they cannot reach TIR, the average or the remote push --
+                  * they exist only in the plot model the UI is handed. */
 };
 
 /* MARK_HIDE is not a plot.c shape: it means "do not draw this device's points"
@@ -149,6 +153,36 @@ long sensor_wear_seconds(int type, int wear_days, const char *model);
  * preferred anchor is therefore the LIVE session clock; the pairing instant
  * is only the estimate used until a first 4e response arrives. */
 #define SENSOR_WARMUP_S 3600L
+
+/* Does reading `t` from sensor `id` fall in that sensor's WARMUP hour?
+ *
+ * Warmup glucose is REAL but uncalibrated -- the sensor reports it with
+ * state=0x02 and the official Dexcom UIs hide it outright. Pancra shows it (it
+ * is the user's data and the WARMUP label says what it is) but must not COUNT
+ * it: an uncalibrated first hour skews TIR and the average, and a fresh sensor
+ * reading far from truth would otherwise drag the day's numbers with it.
+ *
+ * The anchor is sensor_rec.activation -- the session start, learned from the
+ * session clock and persisted in sensors.csv -- NOT the pairing instant, which
+ * is only an estimate, and NOT the live state byte, which no replayed row
+ * carries. That choice is what lets the LIVE path and stat_load_chunk apply the
+ * identical rule; anything the CSV cannot express would make TIR and the
+ * average change across a restart of the same log, the drift stats.c records
+ * having been fixed twice.
+ *
+ * FAILS OPEN, by design: an unknown id or an activation still 0 (session start
+ * never learned) counts the reading. A reading that cannot be proven to be
+ * warmup is ordinary data, and silently dropping it would be the worse error.
+ * The `t >= activation` bound is what makes a stale activation harmless -- a
+ * physical CGM is one session in practice (a new sensor advertises a new
+ * address and mints a new id), but sensor_complete never overwrites a learned
+ * value, so a reused device keeps its FIRST session's activation and every
+ * later reading simply falls outside the window and counts.
+ *
+ * Takes the registry lock itself. The lock order in this codebase is
+ * registry -> history, so callers on the live path MUST call this BEFORE
+ * hist_lock(), alongside sensor_primary_id(), never inside it. */
+int sensor_in_warmup(int id, long t);
 
 /* How recently a CGM must have delivered to still count as an ACTIVE session
  * when it holds no live bond (right after an app restart no sensor does --

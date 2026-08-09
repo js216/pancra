@@ -165,6 +165,18 @@ void ot_on_connected(void)
    ask_time();
 }
 
+/* The retry_from rewind, shared by the clean finish and the mid-walk drop:
+ * see the block comment above finish() for why each condition exists. */
+static void rewind_refused(void)
+{
+   if (retry_from >= 0 && new_records == 0 && walked < OT_MAX_WALK &&
+       retry_from - 1 < last_index) {
+      LOGI("meter: rewinding stored index %d -> %d to retry a refused record",
+           last_index, retry_from - 1);
+      last_index = retry_from - 1;
+   }
+}
+
 void ot_on_disconnected(void)
 {
    if (phase != P_IDLE && phase != P_DONE) {
@@ -172,6 +184,14 @@ void ot_on_disconnected(void)
        * completion meant a mid-sync drop replayed every record next time --
        * and if the source id had changed meanwhile they were appended a second
        * time rather than deduped. */
+      /* Same rewind finish() applies, same conditions. Without it a drop
+       * right after a timestamp-refused record persisted last_index already
+       * advanced PAST it, so the refusal -- often the PHONE's clock being
+       * wrong, not the record -- was never retried and the fingerstick was
+       * permanently lost. That silently defeated the header's "must not
+       * persist its walk past this" contract on exactly the abnormal path
+       * where it matters. */
+      rewind_refused();
       LOGI("meter: link dropped mid-sync at record %d; keeping index %d",
            want_index, last_index);
       ot_drv_done(0);
@@ -207,12 +227,7 @@ static void finish(void)
     * worth of records is refused with nothing accepted, retrying them forever
     * would never reach the good ones behind them. Both conditions are needed
     * -- dropping either one reintroduces a different permanent data loss. */
-   if (retry_from >= 0 && new_records == 0 && walked < OT_MAX_WALK &&
-       retry_from - 1 < last_index) {
-      LOGI("meter: rewinding stored index %d -> %d to retry a refused record",
-           last_index, retry_from - 1);
-      last_index = retry_from - 1;
-   }
+   rewind_refused();
    phase = P_DONE;
    ot_drv_status(new_records ? "METER: SYNCED" : "METER: NOTHING NEW");
    ot_drv_done(new_records);
@@ -328,8 +343,15 @@ void ot_on_notify(const uint8_t *buf, int n)
       int from = last_index + 1;
       /* First ever sync: take only a recent window rather than the meter's
        * whole memory, so a new pairing is not a multi-minute session. */
+      /* + 1: the walk advance stops at `walked >= OT_MAX_WALK`, so a
+       * session fetches at most OT_MAX_WALK records INCLUSIVE of `from`.
+       * Starting at top - OT_MAX_WALK spans OT_MAX_WALK + 1 records, and
+       * the cap fired one short of top_index -- the NEWEST record, i.e.
+       * the fingerstick that prompted the pairing, was never requested
+       * that session (it arrived only on the next power-on, because
+       * last_index had persisted at top - 1). */
       if (last_index < 0 && top_index > OT_MAX_WALK)
-         from = top_index - OT_MAX_WALK;
+         from = top_index - OT_MAX_WALK + 1;
       /* Start the walk at index 0, NOT 1. Verio firmwares disagree on the base:
        * RI_02.02.00 errors (0x09) on index 0 and stores from 1, but RI_01.09.04
        * errors on index 1 with valid records elsewhere -- so a fixed clamp to 1

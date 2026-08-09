@@ -17,7 +17,8 @@
  * what a hand-check reads past. Built and run by `make statstest`.
  */
 #include "stats.h"
-#include "util.h" /* realtime_s: stat_load uses the real clock */
+#include "sensors.h" /* g_srec: seeded directly to drive the WARMUP rule */
+#include "util.h"    /* realtime_s: stat_load uses the real clock */
 #include <stdio.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...)
@@ -268,6 +269,78 @@ int main(void)
       int a3 = -1;
       ck(stat_window_at(7, &t3, &a3, rnow) == 1,
          "an absurd kind field parses without hanging");
+
+      /* WARMUP: a sensor's first hour is real data but UNCALIBRATED, so it is
+       * shown and stored yet never counted. Confirmed live on 2026-08-07 -- a
+       * fresh Stelo answered 0x4e with state=0x02, clock=495 and glucose=271
+       * while the G7 beside it read 158, so counting warmup would have moved
+       * the average by a value that was never true.
+       *
+       * The rule is per-sensor and anchored on sensor_rec.activation, and it
+       * has to hold on BOTH paths: this exercises the replay half, which is
+       * the one that had no coverage at all. */
+      g_nsrec              = 1;
+      g_srec[0].id         = 11;
+      g_srec[0].activation = base + 100; /* session start */
+
+      f = fopen(path, "w");
+      if (f) {
+         /* Inside [activation, activation + 3600) -- so base+100 up to
+          * base+3699, NOT base+3599: the window is measured from activation,
+          * not from `base`. Both ends, since a half-open window is exactly
+          * where an off-by-one hides. */
+         fprintf(f, "%ld,400,1,,0,11,0,0,0\n", base + 100);
+         fprintf(f, "%ld,400,1,,0,11,0,0,0\n", base + 3699);
+         fclose(f);
+      }
+      stat_load(path);
+      int t4 = -1;
+      int a4 = -1;
+      stat_window_at(7, &t4, &a4, rnow);
+      ck(a4 == a3 && t4 == t3,
+         "a sensor's warmup hour does not move TIR or the average");
+
+      /* One second past the window, the SAME sensor and value must count --
+       * otherwise the assertion above passes for any reason at all. */
+      f = fopen(path, "w");
+      if (f) {
+         fprintf(f, "%ld,400,1,,0,11,0,0,0\n", base + 3700);
+         fclose(f);
+      }
+      stat_load(path);
+      int t5 = -1;
+      int a5 = -1;
+      stat_window_at(7, &t5, &a5, rnow);
+      ck(a5 > a4, "...and the second the warmup hour ends, it counts again");
+
+      /* FAILS OPEN. An UNKNOWN source id resolves to no activation, and a
+       * reading that cannot be proven to be warmup is ordinary data -- the
+       * legacy rows in every existing log carry ids this test never seeded,
+       * and dropping them from TIR would rewrite history on the next launch.
+       * Same for a known sensor whose activation was never learned. */
+      f = fopen(path, "w");
+      if (f) {
+         fprintf(f, "%ld,400,1,,0,99,0,0,0\n", base + 200); /* unknown id */
+         fclose(f);
+      }
+      stat_load(path);
+      int t6 = -1;
+      int a6 = -1;
+      stat_window_at(7, &t6, &a6, rnow);
+      ck(a6 > a5, "an unknown sensor counts: the rule fails OPEN");
+
+      g_srec[0].activation = 0; /* known sensor, session start never learned */
+      f                    = fopen(path, "w");
+      if (f) {
+         fprintf(f, "%ld,400,1,,0,11,0,0,0\n", base + 300);
+         fclose(f);
+      }
+      stat_load(path);
+      int t7 = -1;
+      int a7 = -1;
+      stat_window_at(7, &t7, &a7, rnow);
+      ck(a7 > a6, "...as does a sensor whose activation is still unknown");
+      g_nsrec = 0;
    }
 
    printf("\n%s\n", all ? "ALL STATS TESTS PASSED" : "SOME TESTS FAILED");

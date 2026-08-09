@@ -6,9 +6,10 @@
  * display/settings-menu prefs, and the pairing code. The UI (main.c) owns when
  * to save/load; this module owns the state and the on-disk format. */
 #include "settings.h"
-#include "alarmlogic.h" /* AL_HIGH_MAX: alarm_load's bound = the keypad's */
+#include "alarmlogic.h" /* AL_ENTRY_MAX: alarm_load's bound = the keypad's */
 #include "dexlibc.h"
 #include "plot.h"
+#include "sensors.h" /* MARK_N / MARK_SIZE_MAX: the real bounds */
 #include "util.h"
 #include "weight.h" /* WT_KG / WT_LB: the weight display unit */
 #include <stdio.h>  /* snprintf */
@@ -53,8 +54,11 @@ int g_plot_max = PLOT_GLU_MAX;
 int g_ins_marker[2] = {1, 1};
 int g_ins_color[2]  = {6, 1};
 int g_ins_size[2]   = {2, 2};
-int g_statbar_val   = 1;      /* status bar shows the VALUE (0 = app icon) */
-int g_lockscr_val   = 1;      /* notification visible on the lock screen */
+int g_statbar_val   = 1; /* status bar shows the VALUE (0 = app icon) */
+int g_lockscr_val   = 1; /* notification visible on the lock screen */
+/* No shortcuts by default: the main screen stays as it was until the user
+ * asks for one on the ADD menu. */
+int g_shortcut[SC_MAX] = {0, 0, 0};
 char g_code_str[16] = "9973"; /* Stelo applicator default (rebuild to change) */
 int g_remote_on;              /* push each new datapoint; default off */
 char g_remote_ip[16];         /* dotted quad; "" until the user sets one */
@@ -220,11 +224,12 @@ void settings_save(void)
    char b[128];
    int n = snprintf(
        b, sizeof b,
-       "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", g_sound_on,
-       g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
+       "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+       g_sound_on, g_vib_on, g_orient, g_units, g_disc, g_plot_max, g_screen_on,
        g_newdata_mode, g_ins_marker[0], g_ins_color[0], g_ins_size[0],
        g_ins_marker[1], g_ins_color[1], g_ins_size[1], g_statbar_val,
-       g_lockscr_val, g_nudge_sound, g_nudge_vib, g_wunits);
+       g_lockscr_val, g_nudge_sound, g_nudge_vib, g_wunits, g_shortcut[0],
+       g_shortcut[1], g_shortcut[2]);
    n = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
@@ -242,13 +247,14 @@ void settings_load(void)
    if (n <= 0)
       return;
    b[n]      = 0;
-   int v[19] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
+   int v[22] = {g_sound_on,      g_vib_on,       g_orient,      g_units,
                 g_disc,          g_plot_max,     g_screen_on,   g_newdata_mode,
                 g_ins_marker[0], g_ins_color[0], g_ins_size[0], g_ins_marker[1],
                 g_ins_color[1],  g_ins_size[1],  g_statbar_val, g_lockscr_val,
-                g_nudge_sound,   g_nudge_vib,    g_wunits};
+                g_nudge_sound,   g_nudge_vib,    g_wunits,      g_shortcut[0],
+                g_shortcut[1],   g_shortcut[2]};
    char *q   = b;
-   for (int i = 0; i < 19; i++) {
+   for (int i = 0; i < 22; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -275,17 +281,28 @@ void settings_load(void)
     * still mean exactly what they meant, and anything else falls back to
     * silent rather than to a noise the user never chose. */
    g_newdata_mode = (v[7] >= ND_OFF && v[7] <= ND_CHIRP) ? v[7] : ND_OFF;
-   /* Fields 9-14 are newer than some files on disk: out-of-range (or
-    * absent, leaving the default) falls back to the defaults. Bounds:
-    * 9 == MARK_N, 7 colours, 4 == MARK_SIZE_MAX; settings.c stays
-    * decoupled from sensors.h, crosschecked by eye. */
+   /* Fields 9-14 are newer than some files on disk: out-of-range (or absent,
+    * leaving the default) falls back to the defaults.
+    *
+    * THE BOUNDS COME FROM sensors.h NOW. They used to be literals, with a
+    * comment saying "9 == MARK_N, 7 colours, 4 == MARK_SIZE_MAX; settings.c
+    * stays decoupled from sensors.h, crosschecked by eye" -- and the eye is
+    * what failed: MARK_SIZE_MAX is 5, not 4. The size picker offers 1..5 and
+    * menu_action saves whatever it is handed, so choosing the LARGEST insulin
+    * marker worked, persisted to disk, and was then silently reset to 2 by
+    * this line on the next launch. A setting that quietly forgets itself
+    * across a restart is worse than one that refuses the value outright.
+    *
+    * The colour count still has to be a literal: UI_NCOLORS is private to
+    * ui.c, so the static assert below is what keeps it honest instead. */
    for (int k = 0; k < 2; k++) {
       int base        = 8 + (k * 3);
       int defc        = k ? 1 : 6; /* SLOW white, FAST blue */
-      g_ins_marker[k] = (v[base] >= 0 && v[base] < 9) ? v[base] : 1;
+      g_ins_marker[k] = (v[base] >= 0 && v[base] < MARK_N) ? v[base] : 1;
       g_ins_color[k] =
-          (v[base + 1] >= 0 && v[base + 1] < 7) ? v[base + 1] : defc;
-      g_ins_size[k] = (v[base + 2] >= 1 && v[base + 2] <= 4) ? v[base + 2] : 2;
+          (v[base + 1] >= 0 && v[base + 1] < SET_NCOLORS) ? v[base + 1] : defc;
+      g_ins_size[k] =
+          (v[base + 2] >= 1 && v[base + 2] <= MARK_SIZE_MAX) ? v[base + 2] : 2;
    }
    g_statbar_val = v[14] ? 1 : 0;
    g_lockscr_val = v[15] ? 1 : 0;
@@ -295,6 +312,19 @@ void settings_load(void)
    g_nudge_sound = v[16] ? 1 : 0;
    g_nudge_vib   = v[17] ? 1 : 0;
    g_wunits      = v[18] ? WT_LB : WT_KG;
+   /* Fields 19-21: the main-screen shortcuts, appended after them. An older
+    * file stops the loop before these and leaves the (empty) defaults, which
+    * is the whole point of the positional format. Compacted so a hole in the
+    * middle -- which nothing writes, but a hand-edited file could -- cannot
+    * leave a live slot stranded behind an empty one. */
+   {
+      int n2 = 0;
+      for (int i = 0; i < SC_MAX; i++)
+         if (v[19 + i] > 0)
+            g_shortcut[n2++] = v[19 + i];
+      while (n2 < SC_MAX)
+         g_shortcut[n2++] = 0;
+   }
    plot_set_max(g_plot_max);
 }
 

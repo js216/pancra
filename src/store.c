@@ -120,6 +120,27 @@ int hist_have_point(long t, int glu)
 
 int hist_insert(long t, int glu, int trend, int src, int kind)
 {
+   /* NORMALISE THE KIND FIRST. Two callers pass a value PARSED FROM A FILE
+    * -- the readings.csv loader and the import path -- and neither bounds
+    * it, though both bound the timestamp and the glucose beside it with
+    * comments explaining why. The kind was simply cast through.
+    *
+    * A row carrying anything but 0 or 1 (the log is append-only and never
+    * rewritten, and the loader's own comments cite "a spliced row from a
+    * pre-rollback partial write" twice as a real occurrence) then breaks
+    * four things at once, permanently, on every launch:
+    *   - build_model copies this byte straight into the plot model, and
+    *     ui.c draws kind == KIND_INS along the bottom edge -- so a 2 renders
+    *     as a phantom INSULIN DOSE on the glucose plot;
+    *   - it is not KIND_BGM, so stats count it toward TIR, AVG and A1C;
+    *   - the watchdogs read it as a live CGM sample and hold off a
+    *     reconnect;
+    *   - and the dedup below compares kind for equality, so it will not
+    *     dedup against the real row it duplicates.
+    * KIND_BGM or KIND_CGM, nothing else, which is exactly what store.h
+    * declares this field to be. One place, so both parsing callers are
+    * covered. */
+   kind = (kind == KIND_BGM) ? KIND_BGM : KIND_CGM;
    /* CGM samples land on a ~5-min grid, so a nearby sample from the SAME
     * source is a restatement of one fact; a fingerstick is always its own
     * event and is only ever deduped on an exact timestamp match. */
@@ -376,7 +397,11 @@ static void store_load_chunk(char *buf)
        * head and pins a phantom point to the right edge of every plot.
        * stat_add_at already rejects hour > now, so without this the plot and
        * the statistics disagreed about the same file. */
-      if (t > 0 && t <= now + 3600 && glu >= 20 && glu <= 600) {
+      /* now, not now + 3600: stat_add_at rejects any hour past now, so a
+       * row in that one-hour margin entered the plot and not the statistics
+       * -- the two disagreeing about one file, which is exactly what the
+       * bound above it was widened to prevent. */
+      if (t > 0 && t <= now && glu >= STORE_GLU_MIN && glu <= STORE_GLU_MAX) {
          hist_insert(t, (int)glu, (int)tr, (int)src, (int)kind);
          if (t >= best_t) {
             best_t    = t;

@@ -119,9 +119,10 @@ int main(void)
    printf("== a hypo alarm is not SILENCED by the sensor dropping out ==\n");
    {
       /* The regression that mattered: with DISCONNECT off (the default), the
-       * zone decayed at 6 min and alarm_want returned AL_NONE, so alarm_apply
+       * zone decayed at AL_FRESH_S and alarm_want returned AL_NONE, so
+       * alarm_apply
        * actively called silence() on a ringing hypo. */
-      const long gt = now - AL_FRESH_S - 60; /* last reading 7 min ago */
+      const long gt = now - AL_FRESH_S - 60; /* one minute past fresh */
       int zone      = alarm_zone(45, gt, now, lo, hi);
       int stale_off = alarm_stale(45, gt, now, now - 100000, 0); /* disc OFF */
       ck(zone == 0, "the zone still decays (it must not mask a stale alarm)");
@@ -144,7 +145,7 @@ int main(void)
 
    printf("== a stranded alarm SUSTAINS, it never originates or relabels ==\n");
    {
-      const long gt = now - AL_FRESH_S - 60; /* last reading 7 min ago */
+      const long gt = now - AL_FRESH_S - 60; /* one minute past fresh */
       int zone      = alarm_zone(45, gt, now, lo, hi);
       int stranded  = alarm_stranded(45, gt, now, lo, hi);
       ck(zone == 0 && stranded == 1, "a stale low is stranded but out of zone");

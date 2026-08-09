@@ -39,6 +39,24 @@ static void dot(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
 /* One marker of the given shape, half-width r, centred on (cx,cy). Shapes are
  * kept simple and open-centred (except the dot) so overlapping sensors stay
  * readable where their traces cross. */
+/* One straight segment, stepped along whichever axis is longer so the line has
+ * no gaps. Used by the W glyph; this module draws its own shapes and has no
+ * general line routine. */
+static void wseg(uint32_t *fb, int stride, int fbw, int fbh, int x0, int y0,
+                 int x1, int y1, uint32_t c)
+{
+   int dx  = x1 - x0;
+   int dy  = y1 - y0;
+   int adx = dx < 0 ? -dx : dx;
+   int ady = dy < 0 ? -dy : dy;
+   int n   = adx > ady ? adx : ady;
+   if (n < 1)
+      n = 1;
+   for (int i = 0; i <= n; i++)
+      putc_clipped(fb, stride, fbw, fbh, x0 + ((dx * i) / n),
+                   y0 + ((dy * i) / n), c);
+}
+
 static void mark(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
                  int r, int shape, uint32_t c)
 {
@@ -46,6 +64,26 @@ static void mark(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
     * 5 square-filled, 6 triangle-filled, 7 circle, 8 circle-filled. (4 = HIDE
     * never reaches here.) */
    switch (shape) {
+      case PLOT_MARK_W: {
+         /* A letter W: FOUR strokes, drawn as segments.
+          *
+          * The first version stepped two diagonals from the top corners to
+          * the bottom centre, where they met -- which is a V, not a W. A W
+          * needs two valleys either side of a centre peak, and the peak must
+          * stop short of the top or the middle stroke closes into an X at
+          * this size. Half height for the peak reads correctly down to r=2.
+          *
+          * seg() steps the DOMINANT axis so a stroke stays continuous; the
+          * short axis alone would leave gaps in a glyph a few pixels tall. */
+         int hw   = r;            /* half width */
+         int vx   = r / 2;        /* where the two valleys sit */
+         int peak = cy - (r / 2); /* the centre peak, half way up */
+         wseg(fb, stride, fbw, fbh, cx - hw, cy - r, cx - vx, cy + r, c);
+         wseg(fb, stride, fbw, fbh, cx - vx, cy + r, cx, peak, c);
+         wseg(fb, stride, fbw, fbh, cx, peak, cx + vx, cy + r, c);
+         wseg(fb, stride, fbw, fbh, cx + vx, cy + r, cx + hw, cy - r, c);
+         return;
+      }
       case 1: /* cross */
          for (int d = -r; d <= r; d++) {
             putc_clipped(fb, stride, fbw, fbh, cx + d, cy + d, c);
@@ -158,7 +196,7 @@ static int t_to_x(long dt, int x, int w, long span)
 void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
                  int w, int h, const struct plot_pt *pts, int npts, long now,
                  int hours, int radius, uint32_t (*color)(int glu), int hi_idx,
-                 uint32_t hi_color)
+                 uint32_t hi_color, long tz)
 {
    const uint32_t frame = 0xFF555555; /* 50/max reference lines + sides   */
    const uint32_t band  = 0xFF262626; /* very slight dark-gray shade 70-180 */
@@ -202,7 +240,11 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
     * before now -- so every vertical line lands on a round time instead of an
     * arbitrary offset back from now. (Whole-hour time zones; sub-hour zones
     * shift slightly as this layer carries no tz.) */
-   long first = now % gstep;
+   /* In LOCAL time: the boundary the user reads off the axis is local
+    * midnight (or the local hour), not UTC's. Shifting by tz before the
+    * modulo is the whole fix -- with gstep = 3600 and a whole-hour zone it
+    * changes nothing, which is why only the daily lines were visibly wrong. */
+   long first = (now + tz) % gstep;
    if (first <= 0)
       first = gstep; /* exactly on a boundary: skip the right edge */
    for (long ts = first; ts <= span; ts += gstep) {

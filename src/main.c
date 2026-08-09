@@ -264,7 +264,7 @@ enum {
    MENU_WTLOG,      /* WEIGHT LOG: table + trend plot */
    MENU_WTDEL,      /* confirm deleting a weight entry */
    MENU_DISPLAY,    /* display settings submenu */
-   MENU_PRIMPICK,   /* choose which registered CGM owns the big number */
+   MENU_DEVICES,    /* the device registry: active, old, and ADD NEW DEVICE */
    MENU_PERMS,      /* permissions + background controls */
    MENU_OLDDEV,     /* previously-used (forgotten) devices */
    MENU_RECONF,     /* confirm reconnecting an EXPIRED old device */
@@ -287,6 +287,7 @@ static int g_exp_wt    = 1; /* EXPORT DATA: include the weight log */
 static int g_alarm_from = MENU_SETTINGS;
 
 static int g_old_page;    /* which page the OLD DEVICES list is showing */
+static int g_dev_page;    /* which page the LIVE device list is showing */
 static int g_inslog_page; /* which page the INSULIN LOG is showing */
 static int g_wtlog_page;  /* which page the WEIGHT LOG is showing */
 /* LOG WEIGHT form state. The value is held in TENTHS of the DISPLAY unit, not
@@ -315,7 +316,18 @@ static int g_markpick_ins = -1; /* INS_SLOW/INS_FAST being styled; -1 =
  * CANCEL, DELETE, CONFIRM) returns exactly there. Recorded at each entry
  * point, never inferred: inferring the return target is the recurring
  * menu-navigation bug this app keeps re-growing. */
-static int g_ins_from = MENU_ADD;
+/* WHERE THE FOUR LOGGING SCREENS WERE OPENED FROM.
+ *
+ * They used to hardcode MENU_ADD, which was true while the ADD menu was their
+ * only door. The main screen's SHORTCUT buttons are a second door, so a
+ * hardcoded return drops the user into a menu they never opened -- the exact
+ * failure the record-the-origin rule exists to prevent, and one this codebase
+ * has now hit on the devices screen, the sensor screen and the pairing flow.
+ * Captured at open, never inferred at close. */
+static int g_ins_from    = MENU_ADD;
+static int g_wt_from     = MENU_ADD;
+static int g_wtlog_from  = MENU_ADD;
+static int g_inslog_from = MENU_ADD;
 
 /* LOG INSULIN form state. The instant is edited as a whole (date and time
  * steppers both move g_ins_t); units re-populate from the last dose of the
@@ -344,9 +356,6 @@ static int g_smart_pairing;
  * moment an unambiguous candidate appears. DEVICES shows a PENDING row
  * (tappable to cancel) so the armed state is visible, not mysterious. */
 static int g_pend_pairing;
-/* The pending sensor should own the big number the moment it lands (set from
- * the choose-primary screen while the pairing is still armed). */
-static int g_pend_primary;
 
 static int g_menu; /* which modal screen is open */
 
@@ -366,7 +375,12 @@ static int g_arm_in;         /* finger currently on the armed control */
 static int g_arm_x, g_arm_y; /* where it last touched it (finds the box) */
 static int g_gate;           /* first-run permission-rationale screen */
 static int g_want_battery;   /* pop battery-opt prompt after perms */
-static const int disc_min[] = {0, 10, 30, 60}; /* DISCONNECT-alarm minutes */
+/* DISCONNECT-alarm minutes. The shortest MUST stay above AL_FRESH_S (11 min),
+ * or a fresh-but-out-of-range zone outranks AL_STALE and delays the label the
+ * threshold exists to produce -- see alarm_stranded in alarmlogic.h. This was
+ * 10, i.e. under the window, for exactly as long as AL_FRESH_S was 6 min.
+ * ui_disc_lbl (ui.c) prints these; the two tables move together. */
+static const int disc_min[] = {0, 15, 30, 60};
 static long g_launch_t; /* for the stale-alarm grace period */
 /* Per-CGM-link DIS strings. g_model/g_fw (settings.c) are process-global and
  * shared by every link, which is fine for the headline display but WRONG for
@@ -447,7 +461,11 @@ static int g_rescale_expired;
 static int g_rescale_expired_id;
 static char g_rescale_path[256]; /* persistence file */
 static int
-    g_link_raw[LINK_MAX];   /* latest RAW (pre-rescale) reading, per link */
+    g_link_raw[LINK_MAX]; /* latest RAW (pre-rescale) reading, per link */
+/* Per-link signal strength: see pancra_rssi. Retained "last known", like the
+ * globals it backs, so it never expires into "--" while readings lag. */
+static int g_link_rssi[LINK_MAX], g_link_rssi_ok[LINK_MAX];
+static long g_link_rssi_t[LINK_MAX];
 #define RESCALE_MIN_PM 750  /* -25% */
 #define RESCALE_MAX_PM 1250 /* +25% */
 
@@ -622,12 +640,83 @@ static int g_meter_link = -1;
  * copies cannot drift. */
 static int g_link_meter[LINK_MAX];
 
+/* The link a meter's standing connect is outstanding on, or -1.
+ *
+ * ITS OWN TABLE, not the driver session. The session's address is stamped by
+ * the DEXCOM handshake, and a meter never runs one -- so reading it back
+ * reported every meter as unarmed, the tick re-armed on every pass, and each
+ * pass issued a fresh connectGatt: a connect per second, forever, which is
+ * both a battery burn and a live risk of cancelling the connection during
+ * the one second the meter is actually awake. Measured on the device before
+ * this table existed: the same meter armed four times in four seconds. */
+static char g_link_armed[LINK_MAX][24];
+
+/* When a meter link was left ARMED with no exchange running -- i.e. when
+ * ot_drv_disconnect asked for the close and handed the link back to the
+ * transport to tear down. 0 means "not waiting on a teardown".
+ *
+ * This exists because ot_drv_disconnect deliberately does NOT un-arm (that
+ * un-arm was what let the 1 Hz tick reconnect a still-awake meter and re-run
+ * the whole exchange 29 times in 29 seconds). Waiting for the real GATT
+ * disconnect is right, but it removed the only thing that guaranteed the
+ * link ever came back: meter_sync_watchdog fires only while g_meter_busy is
+ * set, and this state has it clear, while pancra_link_watchdog skips meter
+ * links outright. A lost disconnect callback would therefore strand the link
+ * armed forever and that meter would never sync again until a restart. */
+static long g_link_idle_t[LINK_MAX];
+
+/* Both link tables are written from the MAIN thread and read from BINDER
+ * threads (pancra_meter_connected, pancra_devinfo), so every write takes
+ * driver_lock -- the lock those readers already hold. g_link_armed is a
+ * 24-byte string, and a str_snapshot racing a strcmp really can be read
+ * half-written, which would mis-identify the meter that just connected.
+ * driver_lock is recursive, and no caller holds sensors_lock here, so this
+ * cannot invert the documented driver -> reg order. */
 static void link_set_meter(int link, int on)
 {
    if (link < 0 || link >= LINK_MAX)
       return;
+   driver_lock();
    g_link_meter[link] = on ? 1 : 0;
    dexble_set_meter_link(link, on);
+   driver_unlock();
+}
+
+/* Give a link back: no longer armed, and no longer a METER link.
+ *
+ * Clearing the meter bit is the part that was missing. link_set_meter was
+ * only ever called with 1, so a link stayed marked "meter" for the life of
+ * the process -- and since the link pool is shared, a CGM that later landed
+ * on it would have had its notifications routed into the OneTouch parser.
+ * Releasing is the other half of arming and has to undo both facts. */
+/* Un-arm: this meter no longer has a connection outstanding, so the tick may
+ * arm it again. The link keeps its METER ROUTING BIT -- see below. */
+static void meter_unarm_link(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return;
+   g_link_idle_t[link] = 0;
+   driver_lock();
+   g_link_armed[link][0] = 0;
+   driver_unlock();
+}
+
+/* Give the link back completely: un-armed AND no longer routed to otble.
+ *
+ * Only correct once the GATT disconnect has actually ARRIVED. Clearing the
+ * routing bit at the moment we ASK for a close is too early: the callback is
+ * still in flight, and with the bit gone it lands in the CGM branch instead,
+ * running the Dexcom disconnect logic on a link that has no Dexcom session --
+ * which posts "CONNECTION ERROR" after every successful meter sync. */
+static void meter_release_link(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return;
+   g_link_idle_t[link] = 0; /* no longer waiting on a teardown */
+   driver_lock();
+   g_link_armed[link][0] = 0;
+   link_set_meter(link, 0);
+   driver_unlock();
 }
 
 static long g_meter_start; /* when it started, for the stall watchdog */
@@ -641,9 +730,35 @@ static long g_meter_rssi_t;
  * g_meter_* above only ever hold the LAST meter, which with two meters made one
  * meter's sync throttle the other (a global 60 s gate) and show one meter's
  * signal/sync-time against both. */
+/* How long after a finished exchange the tick refuses to re-arm that meter.
+ *
+ * This is only a second line of defence: ot_drv_disconnect keeping the link
+ * armed until the real disconnect is what actually stops the re-sync loop,
+ * and this exists so a link that FLAPS -- drops and is immediately reachable
+ * again -- cannot walk back into a sync per second.
+ *
+ * It was 60 s, which was too blunt. The link stays armed for the ~35 s a
+ * Verio remains awake, so a 60 s gate kept biting for ~25 s AFTER the
+ * teardown -- a window with no standing connect at all, during which a
+ * second fingerstick was caught by nothing (the advert path carries its own
+ * pre-existing 60 s per-meter throttle). 15 s is still ten times the 1.5 s
+ * period of the loop this guards against, and being shorter than the awake
+ * time means it has always expired by the time the link is actually free,
+ * so it never delays a legitimate re-arm. */
+#define METER_REARM_COOLDOWN 15
+
+/* How long a link may sit armed waiting for a disconnect callback before the
+ * watchdog assumes it was lost. See the recovery in meter_sync_watchdog. */
+#define METER_TEARDOWN_MAX 180
+
 struct meter_rt {
    int id;
    long sync_t; /* last connect/sync of THIS meter (0 = never this launch) */
+   /* When the last protocol exchange FINISHED. Distinct from sync_t, which
+    * also moves on a bare advertisement: this one means "we actually talked
+    * to it and finished", and it is what the tick's re-arm cooldown reads so
+    * a meter that is still awake is not immediately synced again. */
+   long synced_t;
    int rssi, rssi_ok;
    long rssi_t;
    char stat[24]; /* last driver phase text (HELLO/COUNT/READING/SYNCED/...) */
@@ -710,6 +825,178 @@ static void meter_sync_save(void)
    }
 }
 
+/* ---- LAST-KNOWN SESSION, per sensor, across restarts -------------------
+ *
+ * The session clock, the state byte and the prediction all live in the DRIVER,
+ * which is per-process state built from 0x4e responses. The last reading, its
+ * trend and its age survive a restart because they are replayed from
+ * readings.csv -- so after every launch the main screen showed a glucose value
+ * and its age while PRED and the session countdown sat blank for up to a full
+ * five-minute cadence, waiting for the sensor to answer. Two of the four
+ * numbers on one line disappearing, repeatedly, for no reason the user can
+ * see.
+ *
+ * So cache them. The clock is stored WITH the wall time it was read at, and
+ * projected forward on load exactly as driver_get_session projects it between
+ * responses -- storing the raw number would restore a countdown frozen at
+ * whenever the app last ran, which is worse than blank because it looks live.
+ *
+ * The live driver ALWAYS wins: this is consulted only while have_reading is
+ * still 0 for that link, i.e. before its first response of this process. */
+struct sess_cache {
+   long clock_t; /* wall clock when `clock` was read */
+   long clock;   /* session seconds at that instant */
+   int id, state, predicted, sequence;
+};
+static struct sess_cache g_sessc[MAX_SLOTS];
+static int g_nsessc;
+static char g_sess_path[256];
+/* NOT "when the newest change happened" -- that never fires.
+ *
+ * driver_get_session projects the clock forward by wall time, so it reads a
+ * DIFFERENT value every second and sessc_put marks a change every second. A
+ * "quiet for 60 s" rule is therefore never satisfied while a sensor is
+ * connected, and session.cache was never written at all -- the restore this
+ * exists for silently did nothing on every launch. Rate-limit against the last
+ * SAVE instead, which is what was meant. */
+static int g_sess_dirty;  /* a change is pending */
+static long g_sess_saved; /* wall time of the last successful save */
+
+static struct sess_cache *sessc_get(int id, int create)
+{
+   for (int i = 0; i < g_nsessc; i++)
+      if (g_sessc[i].id == id)
+         return &g_sessc[i];
+   if (create && g_nsessc < MAX_SLOTS) {
+      struct sess_cache *c = &g_sessc[g_nsessc++];
+      *c                   = (struct sess_cache){0};
+      c->id                = id;
+      return c;
+   }
+   return 0;
+}
+
+static void sess_save(void)
+{
+   char tmp[300];
+   int tn = snprintf(tmp, sizeof tmp, "%s.tmp", g_sess_path);
+   if (tn <= 0 || tn >= (int)sizeof tmp)
+      return;
+   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (fd < 0)
+      return;
+   int ok = 1;
+   for (int i = 0; i < g_nsessc && ok; i++) {
+      if (g_sessc[i].id <= 0 || g_sessc[i].clock_t <= 0)
+         continue;
+      char b[96];
+      int bn = snprintf(b, sizeof b, "%d,%ld,%ld,%d,%d,%d\n", g_sessc[i].id,
+                        g_sessc[i].clock_t, g_sessc[i].clock, g_sessc[i].state,
+                        g_sessc[i].predicted, g_sessc[i].sequence);
+      bn     = clampn(bn, sizeof b);
+      if (write(fd, b, bn) != bn)
+         ok = 0;
+   }
+   close(fd);
+   if (ok) {
+      if (rename(tmp, g_sess_path) != 0)
+         unlink(tmp);
+   } else {
+      unlink(tmp);
+   }
+}
+
+static void sess_load(void)
+{
+   int fd = open(g_sess_path, O_RDONLY, 0);
+   if (fd < 0)
+      return;
+   char b[1024];
+   int n = (int)read(fd, b, (sizeof b) - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   b[n]    = 0;
+   char *p = b;
+   while (*p) {
+      long v[6] = {0, 0, 0, 0, 0, 0};
+      int vi    = 0;
+      int any   = 0;
+      while (*p && *p != '\n') {
+         if (*p >= '0' && *p <= '9') {
+            /* Digit-capped, like every other loader here: an unbounded
+             * accumulation is UB and a wrapped value would restore a
+             * nonsense clock that the projection below then counts on. */
+            if (v[vi] < 100000000000000000L)
+               v[vi] = (v[vi] * 10) + (*p - '0');
+            any = 1;
+         } else if (*p == ',' && vi < 5) {
+            vi++;
+         }
+         p++;
+      }
+      if (*p == '\n')
+         p++;
+      if (any && v[0] > 0) {
+         struct sess_cache *c = sessc_get((int)v[0], 1);
+         if (c) {
+            c->clock_t   = v[1];
+            c->clock     = v[2];
+            c->state     = (int)v[3];
+            c->predicted = (int)v[4];
+            c->sequence  = (int)v[5];
+         }
+      }
+   }
+}
+
+/* Record a LIVE session for `id`. Cheap enough to call every frame, but only
+ * marks the file dirty when the clock actually moved -- the flush is on the
+ * 1 Hz tick, so a redraw storm cannot turn this into a write storm. */
+static void sessc_put(int id, const struct dex_session *s, long now)
+{
+   if (id <= 0 || !s->have_reading)
+      return;
+   struct sess_cache *c = sessc_get(id, 1);
+   if (!c)
+      return;
+   if (c->clock == (long)s->session_seconds && c->state == s->state &&
+       c->predicted == s->predicted)
+      return; /* nothing new to persist */
+   c->clock_t   = now;
+   c->clock     = (long)s->session_seconds;
+   c->state     = s->state;
+   c->predicted = s->predicted;
+   c->sequence  = s->sequence;
+   g_sess_dirty = 1;
+}
+
+/* Fill `out` from the cache for `id`, projecting the clock forward to `now`.
+ * Returns 1 if a usable cached session was restored.
+ *
+ * REFUSED once the cache is older than SENSOR_ACTIVE_S: past that the sensor
+ * has been silent for a day and a countdown derived from it would be fiction
+ * presented as a live reading. Refused for a non-positive clock too -- a
+ * session that never started has nothing to project. */
+static int sessc_restore(int id, long now, struct dex_session *out)
+{
+   struct sess_cache *c = sessc_get(id, 0);
+   if (!c || c->clock_t <= 0 || c->clock <= 0)
+      return 0;
+   long dt = now - c->clock_t;
+   if (dt < 0 || dt > SENSOR_ACTIVE_S)
+      return 0;
+   out->have_reading    = 1;
+   out->session_seconds = (unsigned)(c->clock + dt);
+   out->state           = c->state;
+   out->predicted       = c->predicted;
+   out->sequence        = c->sequence;
+   /* NOT bonded: that is a live-link fact and nothing here can vouch for it.
+    * The connected/WAITING status is driven by it, and claiming a bond we do
+    * not have would paint a dead sensor green. */
+   return 1;
+}
+
 static void meter_sync_load(void)
 {
    int fd = open(g_metersync_path, O_RDONLY, 0);
@@ -764,9 +1051,14 @@ static void meter_sync_load(void)
 static int g_sel      = -1;
 static int g_add_type = SENSOR_STELO;
 /* Where the per-device menu was opened FROM, so closing it returns there:
- * MENU_SETTINGS when reached via the DEVICES list, MENU_NONE (main screen) when
- * reached via the STATE/STORED info-block shortcut. */
+ * MENU_DEVICES when reached via the device list, MENU_OLDDEV via the old-device
+ * list, MENU_NONE (main screen) when reached via the STATE/STORED info-block
+ * shortcut. */
 static int g_sensor_from = MENU_NONE;
+/* Where the DEVICES screen was opened FROM -- MENU_NONE for the main screen's
+ * big number, MENU_SETTINGS for the settings row -- so its X returns exactly
+ * there. Recorded, never inferred (the recurring bug). */
+static int g_devices_from = MENU_NONE;
 /* Where the PAIRING flow (type tap -> keypad / meter help) was entered
  * from: the ADD menu or the ADD DEVICE picker. Every abort path returns
  * exactly there -- recorded, never inferred (the recurring bug). */
@@ -827,6 +1119,14 @@ static int free_cgm_link(int rank)
    int found = -1;
    int seen  = 0;
    for (int l = 0; l < LINK_MAX && found < 0; l++) {
+      /* SKIP A LINK A METER HOLDS. drv_connect does not stamp the driver
+       * session -- only the Dexcom handshake does -- so a meter's link reads
+       * as having no session and looked FREE here. A CGM allocated onto it
+       * would have taken over the meter's GATT client and, with the link
+       * still routed to otble, fed its sensor notifications to the OneTouch
+       * parser. The armed table is the only record that the link is taken. */
+      if (g_link_armed[l][0] || g_link_meter[l])
+         continue;
       driver_select(l);
       struct dex_session s;
       driver_get_session(&s);
@@ -1093,6 +1393,20 @@ static void sensor_reconcile(void)
    if (__atomic_exchange_n(&g_reconcile_busy, 1, __ATOMIC_SEQ_CST))
       return;
    meter_sync_watchdog();
+   /* Flush the session cache at most once a minute. sessc_put marks it dirty
+    * from the draw path, which runs far more often than the 5-minute cadence
+    * that actually changes anything; rate-limiting here keeps a redraw storm
+    * from becoming a write storm on a file whose only job is to survive the
+    * next launch. Losing up to a minute of it costs nothing -- the clock is
+    * projected forward from whatever instant was stored. */
+   {
+      long nowt = realtime_s();
+      if (g_sess_dirty && nowt - g_sess_saved >= 60) {
+         sess_save();
+         g_sess_saved = nowt;
+         g_sess_dirty = 0;
+      }
+   }
 
    /* Walk every CGM link so a newly bonded second sensor is registered too,
     * not just whichever one happened to connect first. */
@@ -1397,6 +1711,10 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
    u->wear_auto  = (sl->wear_days != 10 && sl->wear_days != 15);
    u->paired     = sl->paired;
    u->activation = sl->activation;
+   /* The OS bond, keyed by the address the framework knows this device by --
+    * for a G7 that is the BOND IDENTITY address, which is what the snapshot's
+    * mac holds (a rotating RPA would never match a bond record). */
+   u->bond = dexble_bond_state(sl->mac);
    /* newest reading from this source, for the "last seen" column */
    for (int k = 0; k < g_nhist; k++)
       if (g_hist[k].src == (unsigned short)sl->id) {
@@ -1412,14 +1730,26 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
       int sl_link = snap_link_for_slot(i);
       struct dex_session s =
           (sl_link >= 0) ? g_snap_sess[sl_link] : (struct dex_session){0};
-      u->connected       = s.bonded && (now - u->last) < 360;
+      /* LIVE WINS; the cache only fills the gap before this link's first 0x4e
+       * of the process. Both directions in one place, so the per-device screen
+       * and the top block cannot disagree about a sensor's session. */
+      if (s.have_reading)
+         sessc_put(sl->id, &s, now);
+      else
+         (void)sessc_restore(sl->id, now, &s);
+      u->connected       = s.bonded && (now - u->last) < AL_FRESH_S;
       u->session_seconds = (long)s.session_seconds;
       u->sess_state      = s.state;
       u->predicted       = s.predicted;
       u->sequence        = s.sequence;
-      u->rssi            = g_cur_rssi;
-      u->rssi_ok         = g_cur_rssi_ok;
-      u->rssi_t          = g_conn_rssi_t;
+      /* THIS link's signal, not the last one measured on any link. */
+      {
+         int lk     = snap_link_for_slot(i);
+         int haveit = lk >= 0 && lk < LINK_MAX && g_link_rssi_ok[lk];
+         u->rssi    = haveit ? g_link_rssi[lk] : 0;
+         u->rssi_ok = haveit;
+         u->rssi_t  = haveit ? g_link_rssi_t[lk] : 0;
+      }
       /* The pairing code is the GLOBAL last-entered one (g_code_str), not a
        * per-device secret we persist -- so only show it on a LIVE CGM (where
        * it is at least the code in current use). An OLD device would otherwise
@@ -1440,7 +1770,17 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
        * CONNECTED/WAITING while live, ENDED once the sensor's own state
        * byte says the session is over. History always keeps the device's
        * colours; only FORGETTING a device orphans its points to grey. */
-      if (u->sess_state == SENSOR_STATE_ENDED)
+      /* AN UNANSWERED PAIRING DIALOG OUTRANKS EVERYTHING BELOW.
+       *
+       * It rides on the STATUS string rather than a row of its own: the
+       * per-device screen is already at its row ceiling, and one more row
+       * there drops ui_fit_scale over its cliff and shrinks the whole screen's
+       * text (see the note at render_sensor). The state is genuinely a status
+       * -- the device is registered and doing nothing, and this says why --
+       * so the row that reports status is where it belongs. */
+      if (u->bond == UI_BOND_BONDING)
+         str_snapshot(u->status, sizeof u->status, "CONFIRM PAIRING");
+      else if (u->sess_state == SENSOR_STATE_ENDED)
          str_snapshot(u->status, sizeof u->status, "ENDED");
       else if (u->sess_state == SENSOR_STATE_WARMUP ||
                (u->sess_state == 0 && u->last == 0 &&
@@ -1534,7 +1874,11 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
 
 static void build_model(struct screen *m)
 {
-   static struct ui_point pts[PLOT_LONG_MAX + NINS]; /* glucose + doses */
+   /* glucose + doses + weights. All three ride in one array because plot_render
+    * and plot_hit take points in any order, and the scrub index the UI hands
+    * back has to index a single list. */
+#define UI_PTS_MAX (PLOT_LONG_MAX + NINS + NWT)
+   static struct ui_point pts[UI_PTS_MAX];
    static struct ui_dev devs[MAX_DEVS];
    long now = realtime_s();
 
@@ -1585,8 +1929,8 @@ static void build_model(struct screen *m)
       m->scr = SCR_INSLOG;
    else if (g_menu == MENU_DISPLAY)
       m->scr = SCR_DISPLAY;
-   else if (g_menu == MENU_PRIMPICK)
-      m->scr = SCR_PRIMPICK;
+   else if (g_menu == MENU_DEVICES)
+      m->scr = SCR_DEVICES;
    else if (g_menu == MENU_PERMS)
       m->scr = SCR_PERMS;
    else if (g_menu == MENU_OLDDEV)
@@ -1611,7 +1955,7 @@ static void build_model(struct screen *m)
    m->t            = g_cur_time;
    m->rssi         = g_cur_rssi;
    m->rssi_ok      = g_cur_rssi_ok;
-   m->stale        = (g_cur_glu >= 0) && (now - g_cur_time > 360);
+   m->stale        = (g_cur_glu >= 0) && (now - g_cur_time > AL_FRESH_S);
    m->disc_alarmed = g_disc_alarmed;
 
    /* g_hist is read WITHOUT an explicit hist_lock() here, and that is correct,
@@ -1644,11 +1988,23 @@ static void build_model(struct screen *m)
     * plot_render and plot_hit take points in any order, so appending
     * after the newest-first glucose is fine. They are NEVER in g_hist,
     * so they cannot leak into stats or the remote push. */
-   for (int i = 0; i < g_nins && nh < PLOT_LONG_MAX + NINS; i++) {
+   for (int i = 0; i < g_nins && nh < UI_PTS_MAX; i++) {
       pts[nh].t    = g_ins[i].t;
       pts[nh].glu  = g_ins[i].units;
       pts[nh].src  = g_ins[i].type; /* the scrub shows "2U FAST" etc. */
       pts[nh].kind = KIND_INS;
+      nh++;
+   }
+   /* Logged WEIGHTS ride along the same way, on the same bottom line, as a
+    * small W. Carried in GRAMS -- the log's canonical unit -- so the scrub
+    * renders them in whichever display unit is set at the time, exactly as
+    * the weight table does. Like the doses these are never in g_hist, so they
+    * cannot leak into TIR, the average or the remote push. */
+   for (int i = 0; i < g_nwt && nh < UI_PTS_MAX; i++) {
+      pts[nh].t   = g_wt[i].t;
+      pts[nh].glu = (int)g_wt[i].g; /* grams; WT_MAX_G is 400000, fits an int */
+      pts[nh].src = 0;
+      pts[nh].kind = KIND_WT;
       nh++;
    }
    m->hist       = pts;
@@ -1671,6 +2027,12 @@ static void build_model(struct screen *m)
       if (g_snap_slot[i].primary) {
          int pl = snap_link_for_slot(i);
          s      = (pl >= 0) ? g_snap_sess[pl] : (struct dex_session){0};
+         /* Same restore as the per-device rows: without it PRED and the
+          * session countdown under the big number blanked for a whole
+          * five-minute cadence after every launch, while the reading and its
+          * age beside them came straight back from readings.csv. */
+         if (!s.have_reading)
+            (void)sessc_restore(g_snap_slot[i].id, now, &s);
          break;
       }
    m->bonded          = s.bonded;
@@ -1795,6 +2157,8 @@ static void build_model(struct screen *m)
    m->wt_edit     = (g_wt_edit >= 0);
    m->wt_tab      = g_wt_tab;
    m->wt_scrub    = g_wt_scrub;
+   m->wt_orig_t   = g_wt_orig.t;
+   m->wt_orig_g   = g_wt_orig.g;
    m->ins_edit    = (g_ins_edit >= 0);
    for (int k = 0; k < 2; k++) {
       m->ins_marker[k] = g_ins_marker[k];
@@ -1810,8 +2174,10 @@ static void build_model(struct screen *m)
    m->exp_ins      = g_exp_ins;
    m->exp_wt       = g_exp_wt;
    m->pend_type    = g_pend_pairing;
-   m->pend_primary = g_pend_primary;
    m->old_page     = g_old_page;
+   m->dev_page     = g_dev_page;
+   for (int i = 0; i < SC_MAX; i++)
+      m->shortcut[i] = g_shortcut[i];
 
    /* Must hold the LONGEST entry any keypad accepts, not just a PIN. The
     * rename keypad caps at min(label-1, g_entry-1) = 11 characters, so an
@@ -2629,25 +2995,17 @@ static int alarming(int zone, int pred)
    return zone || pred || g_alarm_want != AL_NONE;
 }
 
-/* The link a meter's standing connect is outstanding on, or -1.
- *
- * ITS OWN TABLE, not the driver session. The session's address is stamped by
- * the DEXCOM handshake, and a meter never runs one -- so reading it back
- * reported every meter as unarmed, the tick re-armed on every pass, and each
- * pass issued a fresh connectGatt: a connect per second, forever, which is
- * both a battery burn and a live risk of cancelling the connection during
- * the one second the meter is actually awake. Measured on the device before
- * this table existed: the same meter armed four times in four seconds. */
-static char g_link_armed[LINK_MAX][24];
-
 static int meter_link_of(const char *mac)
 {
    if (!mac || !mac[0])
       return -1;
-   for (int l = 0; l < LINK_MAX; l++)
+   int found = -1;
+   driver_lock();
+   for (int l = 0; l < LINK_MAX && found < 0; l++)
       if (g_link_armed[l][0] && strcmp(g_link_armed[l], mac) == 0)
-         return l;
-   return -1;
+         found = l;
+   driver_unlock();
+   return found;
 }
 
 static int meter_armed(const char *mac)
@@ -2671,6 +3029,71 @@ static int meter_armed(const char *mac)
  * The connect itself is autoConnect=true (Ble.java), so it does NOT need the
  * meter to be advertising right now: the stack latches on as soon as the
  * device is reachable. That is what lets SYNC NOW mean something. */
+/* A free link a meter may take, or -1.
+ *
+ * Shared by the arming path and by pairing a NEW meter. Pairing used to go
+ * through link_for_slot, whose free-link search knows nothing about armed
+ * meters and will happily hand back LINK_CGM. Two callers, one rule. */
+static int meter_alloc_link(void)
+{
+   int link = -1;
+   /* CGMS COME FIRST. A CGM only claims its link when it next advertises,
+    * while the tick arms every meter within seconds of launch -- so with
+    * more devices than links the meters would take them all and a sensor
+    * that streams continuously would be left with none. Count the live
+    * CGMs still waiting for a link and leave that many free. */
+   driver_lock();
+   int prev = driver_link();
+   int want = 0;
+   sensors_lock(); /* driver -> reg, the documented order */
+   for (int i = 0; i < g_nslot; i++) {
+      if (g_slot[i].old)
+         continue;
+      const struct sensor_rec *r = sensor_rec_by_id(g_slot[i].id);
+      if (!r || sensor_kind(r->type) != KIND_CGM)
+         continue;
+      char qid[24];
+      str_snapshot(qid, sizeof qid, r->identity);
+      if (link_for_identity(qid) < 0)
+         want++;
+   }
+   sensors_unlock();
+   /* FROM LINK_CGM + 1. Link 0 is reserved for a sensor.
+    *
+    * Nothing routes by link id any more, so a meter on link 0 would work
+    * -- but a dozen places still say driver_select(LINK_CGM) meaning "the
+    * usual sensor context", and the key-file names drop the suffix for
+    * link 0 (dexble.c). At cold start no CGM is bound yet, so link 0 looks
+    * free and the first meter armed would take it, quietly changing what
+    * all of those refer to. There are eight links; leaving the first to
+    * the sensors costs nothing and keeps every one of those assumptions
+    * true. */
+   int freen = 0;
+   for (int l = LINK_CGM + 1; l < LINK_MAX; l++) {
+      if (g_link_armed[l][0])
+         continue;
+      driver_select(l);
+      struct dex_session ls;
+      driver_get_session(&ls);
+      if (!ls.mac[0])
+         freen++;
+   }
+   if (freen > want) {
+      for (int l = LINK_CGM + 1; l < LINK_MAX && link < 0; l++) {
+         if (g_link_armed[l][0])
+            continue; /* another meter holds it */
+         driver_select(l);
+         struct dex_session ls;
+         driver_get_session(&ls);
+         if (!ls.mac[0]) /* no CGM bound here */
+            link = l;
+      }
+   }
+   driver_select(prev);
+   driver_unlock();
+   return link;
+}
+
 static void meter_sync_start(int mid, const char *mac)
 {
    /* Its OWN link, from the shared pool. Every registered meter holds one, so
@@ -2685,57 +3108,92 @@ static void meter_sync_start(int mid, const char *mac)
        * NOT link_for_slot -- that ranks devices the DEXCOM session binds, and
        * a meter never runs one, so two meters would rank to the same link and
        * the second would evict the first. */
-      driver_lock();
-      int prev = driver_link();
-      for (int l = 0; l < LINK_MAX && link < 0; l++) {
-         if (g_link_armed[l][0])
-            continue; /* another meter holds it */
-         driver_select(l);
-         struct dex_session ls;
-         driver_get_session(&ls);
-         if (!ls.mac[0]) /* no CGM bound here */
-            link = l;
-      }
-      driver_select(prev);
-      driver_unlock();
+      link = meter_alloc_link();
    }
-   if (link < 0) {
-      /* Every link is spoken for. Say so rather than connecting on someone
+   if (link < 0 || link >= LINK_MAX) {
+      /* Every link is spoken for. Refuse rather than connect on someone
        * else's: routing a meter onto a CGM's link would feed sensor
-       * notifications to the meter parser. */
-      LOGI("meter %s (id %d): no free link", mac, mid);
-      set_status("NO FREE LINK");
+       * notifications to the meter parser.
+       *
+       * Throttled. The tick retries every second, so an unthrottled report
+       * here wrote a log line and overwrote the status banner once a second
+       * for as long as the condition lasted -- burying whatever the status
+       * line was actually there to say. */
+      static long last_warn;
+      long now = realtime_s();
+      if (now - last_warn > 60) {
+         last_warn = now;
+         LOGI("meter %s (id %d): no free link", mac, mid);
+         set_status("NO FREE LINK");
+      }
       return;
    }
    link_set_meter(link, 1);
+   /* ARMED FIRST, THEN CONNECT -- the order matters.
+    *
+    * pancra_meter_connected identifies the meter from this table, and
+    * jni_connected fires on a BINDER thread. A meter switched on right next
+    * to the phone connects in milliseconds, so issuing the connect first
+    * left a window where the callback read an empty entry, failed to
+    * identify the meter, and closed the link -- losing exactly the sync the
+    * user was standing there waiting for.
+    *
+    * If the connect never reaches Java (no JNIEnv, Bluetooth off) the link
+    * is released again, so a silent failure cannot leave the meter marked
+    * armed forever with nothing behind it. */
+   driver_lock(); /* the binder-thread readers hold this */
    str_snapshot(g_link_armed[link], sizeof g_link_armed[link], mac);
+   driver_unlock();
+   if (!dexble_meter_connect(link, mac)) {
+      LOGI("meter %s (id %d): connect did not reach the transport", mac, mid);
+      meter_release_link(link);
+      return;
+   }
    /* DO NOT STAMP LAST SYNC HERE.
     *
     * This used to set rt->sync_t, which was truthful while the only caller
     * was the advert path -- an advertisement means the meter really is
-    * switched on and in range. Arming a STANDING connect means nothing of the
-    * kind: it is issued for every registered meter on a timer, whether the
-    * meter is off, in another room, or a mile away. Stamping here made all
-    * three read "SYNCED a few seconds ago" at once, which is a plain lie
+    * switched on and in range. Arming a STANDING connect means nothing of
+    * the kind: it is issued for every registered meter on a timer, whether
+    * the meter is off, in another room, or a mile away. Stamping here made
+    * all three read "SYNCED a few seconds ago" at once, which is a plain lie
     * about whether a fingerstick has been captured -- exactly the fact the
-    * user is looking at that row to learn. The stamp belongs where contact is
-    * PROVEN: the advert path (seen on air) and ot_drv_status (it answered).
+    * user is looking at that row to learn. The stamp belongs where contact
+    * is PROVEN: the advert path (seen on air) and ot_drv_status (it
+    * answered).
     */
    /* ARM ONLY. Deliberately NOT ot_init / g_meter_src / g_meter_busy here.
     *
     * The connect below may sit pending for hours -- that is the point -- and
-    * with every meter holding one, seeding the shared otble state at arm time
-    * would let arming meter B reset the protocol out from under a sync
-    * already running on meter A: phase to idle mid-walk, last_index replaced,
-    * and A's remaining fingersticks written to readings.csv under B's id, in
-    * an append-only file that is never rewritten. The state is seeded when a
-    * meter actually ANSWERS instead -- pancra_meter_connected -- which is the
-    * only moment exactly one meter owns it. */
+    * with every meter holding one, seeding the shared otble state at arm
+    * time would let arming meter B reset the protocol out from under a sync
+    * already running on meter A: phase to idle mid-walk, last_index
+    * replaced, and A's remaining fingersticks written to readings.csv under
+    * B's id, in an append-only file that is never rewritten. The state is
+    * seeded when a meter actually ANSWERS instead -- pancra_meter_connected
+    * -- which is the only moment exactly one meter owns it. */
    LOGI("meter %s (id %d) armed on link %d", mac, mid, link);
-   dexble_meter_connect(link, mac);
 }
 
-/* A meter answered on `link`. Returns 1 to let the protocol run, 0 to refuse.
+/* A meter link dropped. 1 if it owned the current exchange, 0 if it was an
+ * idle standing connect. Either way the link is released so the next tick
+ * re-arms it -- a meter whose connection died must not stay marked armed, or
+ * it never reconnects. */
+int pancra_meter_disconnected(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return 0;
+   int active = (link == g_meter_link);
+   meter_release_link(link);
+   if (active) {
+      g_meter_link = -1;
+      g_meter_busy = 0;
+   }
+   return active;
+}
+
+/* A meter answered on `link`. Returns 1 to let the protocol run, 0 to
+ * refuse.
  *
  * THIS is where the sync becomes real, so this is where the shared otble
  * state is seeded and the busy latch taken. Called from the transport's
@@ -2744,23 +3202,24 @@ int pancra_meter_connected(int link)
 {
    if (link < 0 || link >= LINK_MAX)
       return 0;
-   /* Which meter is this? By the address the link is bound to. */
-   struct dex_session ls;
-   int prev = driver_link();
-   driver_select(link);
-   driver_get_session(&ls);
-   driver_select(prev);
-   int mid = -1;
+   /* Which meter is this? FROM THE ARMED TABLE -- the address we issued the
+    * connect with.
+    *
+    * NOT from the driver session: drv_connect does not write it, only the
+    * Dexcom handshake does, so for a meter link it is always empty. Reading
+    * it here made the lookup fail every single time, which refused and
+    * closed every meter connection that ever arrived -- meters could not
+    * sync at all. The armed table is the only record of which meter owns a
+    * link. */
    char mac[24];
-   mac[0] = 0;
+   str_snapshot(mac, sizeof mac, g_link_armed[link]);
+   int mid = -1;
    sensors_lock();
-   int idx = ls.mac[0] ? sensor_slot_by_mac(ls.mac) : -1;
+   int idx = mac[0] ? sensor_slot_by_mac(mac) : -1;
    if (idx >= 0) {
       const struct sensor_rec *r = sensor_rec_by_id(g_slot[idx].id);
-      if (r && sensor_kind(r->type) == KIND_BGM) {
+      if (r && sensor_kind(r->type) == KIND_BGM)
          mid = g_slot[idx].id;
-         str_snapshot(mac, sizeof mac, r->identity);
-      }
    }
    sensors_unlock();
    if (mid <= 0) {
@@ -2778,9 +3237,10 @@ int pancra_meter_connected(int link)
    g_meter_link = link;
    g_meter_src  = mid;
    str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
-   /* Seed THIS meter's own stored index. The index is per-device: sharing one
-    * made each sync read the other's counter as "gone backwards", so they
-    * reset each other forever and one meter's records were never reached. */
+   /* Seed THIS meter's own stored index. The index is per-device: sharing
+    * one made each sync read the other's counter as "gone backwards", so
+    * they reset each other forever and one meter's records were never
+    * reached. */
    ot_init(meter_index_load(mid)); /* caller holds driver_lock */
    /* Clear the DIS strings: they are process-global for a meter link, and a
     * sync that finishes before the reads land -- the common case, since
@@ -2799,17 +3259,18 @@ int pancra_meter_connected(int link)
 
 /* Emit the one-time nudge. NG_NONE is the answer on all but a handful of the
  * ~86400 ticks in a day, so this is a no-op almost always. Best-effort, like
- * the NEW DATAPOINT beep: a missed nudge is a missed hint, not a missed alarm,
- * and it must never be able to delay or throw into the alarm path. */
+ * the NEW DATAPOINT beep: a missed nudge is a missed hint, not a missed
+ * alarm, and it must never be able to delay or throw into the alarm path. */
 static void nudge_emit(int ng)
 {
    if (ng == NG_NONE)
       return;
    /* Its OWN outputs, not the alarm's: one alert means "act now" and the
-    * other "have a look", so muting either must not mute the other. With both
-    * off there is nothing to emit and no reason to cross into Java at all --
-    * the latch has already been committed by the caller either way, so the
-    * crossing stays announced and will not fire again on the next tick. */
+    * other "have a look", so muting either must not mute the other. With
+    * both off there is nothing to emit and no reason to cross into Java at
+    * all -- the latch has already been committed by the caller either way,
+    * so the crossing stays announced and will not fire again on the next
+    * tick. */
    if (!g_nudge_sound && !g_nudge_vib)
       return;
    LOGI("nudge %s (sound=%d vib=%d)", ng == NG_LOW ? "low" : "high",
@@ -2818,8 +3279,8 @@ static void nudge_emit(int ng)
 }
 
 /* Gather the alarm zone, the stranded flag and the NUDGE zone across every
- * live CGM from ONE snapshot of the history. The nudge rides along rather than
- * gathering again: two passes could see different samples, and a nudge
+ * live CGM from ONE snapshot of the history. The nudge rides along rather
+ * than gathering again: two passes could see different samples, and a nudge
  * evaluated against a reading the alarm never saw is a nudge that can fire
  * underneath its own alarm -- exactly what nudge_fire exists to prevent.
  * `*nzone` comes back -1 when no live CGM has a current reading. */
@@ -2867,9 +3328,10 @@ static void alarm_gather(long now, int *zone, int *stranded, int *nzone)
       if (alarm_stranded(smp[i].glu, smp[i].t, now, g_alarm_low, g_alarm_high))
          *stranded = 1;
       /* Merged the same way the alarm zone is -- the worst band on ANY worn
-       * CGM wins, and a LOW outranks a HIGH. A sensor with no current reading
-       * contributes nothing rather than voting "in range", which would clear
-       * the latch on a dropout and re-arm the nudge to fire again. */
+       * CGM wins, and a LOW outranks a HIGH. A sensor with no current
+       * reading contributes nothing rather than voting "in range", which
+       * would clear the latch on a dropout and re-arm the nudge to fire
+       * again. */
       int nz = nudge_zone(smp[i].glu, smp[i].t, now, g_nudge_low, g_nudge_high);
       if (nz >= 0)
          *nzone = (*nzone < 0) ? nz : alarm_zone_merge(*nzone, nz);
@@ -2896,9 +3358,9 @@ static void alarm_reeval(void)
 /* Re-issue the CURRENT alarm level to Java, even though the level has not
  * changed.
  *
- * alarm_apply is idempotent on the level -- re-asserting the same one must not
- * re-chime -- but that early return also swallowed a change to whether the
- * level is PERCEPTIBLE. With SOUND and VIBRATION both off, a low reading
+ * alarm_apply is idempotent on the level -- re-asserting the same one must
+ * not re-chime -- but that early return also swallowed a change to whether
+ * the level is PERCEPTIBLE. With SOUND and VIBRATION both off, a low reading
  * commits g_alarm_want = AL_LOW while nothing sounds; turning SOUND on then
  * left want unchanged, so dexble_alarm() was never called again and the hypo
  * stayed silent for its entire duration, becoming audible only if glucose
@@ -2912,23 +3374,23 @@ static void alarm_reactuate(void)
     * window in which a binder thread or the service tick could run
     * pancra_alarm_check, re-commit the same g_alarm_want, and make the
     * re-evaluation early-return on `want == g_alarm_want` -- silently losing
-    * the re-actuation, which is precisely the failure this function exists to
-    * prevent. alarm_lock is recursive, so nesting is free.
+    * the re-actuation, which is precisely the failure this function exists
+    * to prevent. alarm_lock is recursive, so nesting is free.
     *
-    * No current_reading() here: re-announcing the level we already hold needs
-    * no fresh sample, so this function no longer touches hist_lock at all --
-    * which also removes the hist-under-alarm nesting it once had. */
+    * No current_reading() here: re-announcing the level we already hold
+    * needs no fresh sample, so this function no longer touches hist_lock at
+    * all -- which also removes the hist-under-alarm nesting it once had. */
    alarm_lock();
    /* RE-ANNOUNCE THE COMMITTED LEVEL. Do not clear it and recompute.
     *
-    * Clearing g_alarm_want and re-evaluating looks equivalent and is not: the
-    * sustain rule is keyed on the PREVIOUS level, so zeroing it deletes the
-    * only thing keeping a stranded hypo alive, and the recompute then yields
-    * AL_NONE. Three failures follow from that one line -- a 45 mg/dL alarm
-    * that can never be made audible, a tone that keeps playing after the user
-    * switches SOUND off, and no silence when glucose recovers, because
-    * want == prev_want makes every later evaluation a no-op. Re-issuing the
-    * level we already hold has no such dependency. */
+    * Clearing g_alarm_want and re-evaluating looks equivalent and is not:
+    * the sustain rule is keyed on the PREVIOUS level, so zeroing it deletes
+    * the only thing keeping a stranded hypo alive, and the recompute then
+    * yields AL_NONE. Three failures follow from that one line -- a 45 mg/dL
+    * alarm that can never be made audible, a tone that keeps playing after
+    * the user switches SOUND off, and no silence when glucose recovers,
+    * because want == prev_want makes every later evaluation a no-op.
+    * Re-issuing the level we already hold has no such dependency. */
    if (alarm_reactuate_allowed(g_alarm_acked) && g_alarm_want != AL_NONE) {
       int kind         = alarm_java_kind(g_alarm_want);
       int was_sounding = g_alarm_sounding;
@@ -2941,20 +3403,20 @@ static void alarm_reactuate(void)
    alarm_unlock();
 }
 
-/* Stale-data ("DISCONNECT") alarm: fire when the newest reading is older than
- * the chosen threshold. A freshly opened app gets a grace period equal to the
- * threshold (data may be stale until the first sync). Evaluated on the 1 Hz
- * timer because it's the ABSENCE of new data that triggers it. */
+/* Stale-data ("DISCONNECT") alarm: fire when the newest reading is older
+ * than the chosen threshold. A freshly opened app gets a grace period equal
+ * to the threshold (data may be stale until the first sync). Evaluated on
+ * the 1 Hz timer because it's the ABSENCE of new data that triggers it. */
 /* Evaluate and actuate the alarm. Safe to call from ANY thread, and
  * deliberately callable with no activity alive.
  *
- * This must NOT be called with driver_lock held: it can block for hundreds of
- * milliseconds inside Alarm.trigger (MediaPlayer prepare), and driver_lock is a
- * no-timeout spin lock that the main looper also takes. The BLE transport
- * therefore calls this AFTER releasing driver_lock, not from inside the notify
- * dispatch. */
-/* Stranded-link watchdog. Callable from ANY thread, and deliberately callable
- * with no activity alive.
+ * This must NOT be called with driver_lock held: it can block for hundreds
+ * of milliseconds inside Alarm.trigger (MediaPlayer prepare), and
+ * driver_lock is a no-timeout spin lock that the main looper also takes. The
+ * BLE transport therefore calls this AFTER releasing driver_lock, not from
+ * inside the notify dispatch. */
+/* Stranded-link watchdog. Callable from ANY thread, and deliberately
+ * callable with no activity alive.
  *
  * TWO defects, both of which ended in silent, indefinite loss of monitoring:
  *
@@ -2963,22 +3425,23 @@ static void alarm_reactuate(void)
  *    supported mode -- the foreground service deliberately keeps the BLE
  *    connection alive for days afterwards -- but from that moment nothing
  *    repaired a stranded link: this watchdog needed on_timer, and the
- *    advert-driven reconnect needed a scan that on_pause had already stopped.
- *    The link died and stayed dead, and with the DISCONNECT alarm defaulting
- *    to OFF there was no alarm of any kind to say so. The service heartbeat
- *    was added so ALARMS would survive the activity; the self-heal that keeps
- *    DATA arriving was left behind. It now runs from both.
+ *    advert-driven reconnect needed a scan that on_pause had already
+ * stopped. The link died and stayed dead, and with the DISCONNECT alarm
+ * defaulting to OFF there was no alarm of any kind to say so. The service
+ * heartbeat was added so ALARMS would survive the activity; the self-heal
+ * that keeps DATA arriving was left behind. It now runs from both.
  *
  * 2. It only ever looked at LINK_CGM, and judged staleness by g_cur_time --
- *    the newest sample across all sources, which hist_refresh_current binds to
- *    the PRIMARY sensor. With two CGMs a healthy primary kept `age` under the
- *    threshold forever, so no link was ever kicked, including LINK_CGM's own.
- *    That is the same trap jni_on_advert documents and fixed for reconnects.
- *    Staleness is now judged per link, from that link's OWN newest reading. */
-/* Meter-sync watchdog. If the link drops mid-sync or the connect never lands,
- * g_meter_busy latches and the meter never syncs again -- jni_on_advert gates
- * every sync on !g_meter_busy, and dexble_link_close is never reached so the
- * GATT client stays open too.
+ *    the newest sample across all sources, which hist_refresh_current binds
+ * to the PRIMARY sensor. With two CGMs a healthy primary kept `age` under
+ * the threshold forever, so no link was ever kicked, including LINK_CGM's
+ * own. That is the same trap jni_on_advert documents and fixed for
+ * reconnects. Staleness is now judged per link, from that link's OWN newest
+ * reading. */
+/* Meter-sync watchdog. If the link drops mid-sync or the connect never
+ * lands, g_meter_busy latches and the meter never syncs again --
+ * jni_on_advert gates every sync on !g_meter_busy, and dexble_link_close is
+ * never reached so the GATT client stays open too.
  *
  * Called from the service tick as well as the 1 Hz timer. It used to live
  * inside sensor_reconcile, whose only caller is on_timer -- the ACTIVITY's
@@ -2990,31 +3453,59 @@ static void alarm_reactuate(void)
 /* Runs on the 1 Hz tick (and the service heartbeat, so it survives the
  * activity being destroyed). Two jobs:
  *
- *   - release a sync that has WEDGED. Now that g_meter_busy is taken only when
- *     the meter answers, this 90 s measures a real exchange rather than a
- *     standing connect's wait, so it can no longer tear down a pending connect
- *     that is behaving exactly as intended.
+ *   - release a sync that has WEDGED. Now that g_meter_busy is taken only
+ * when the meter answers, this 90 s measures a real exchange rather than a
+ *     standing connect's wait, so it can no longer tear down a pending
+ * connect that is behaving exactly as intended.
  *   - keep exactly one standing connect ARMED. This is what makes a sync
  *     survive a restart, a Bluetooth toggle, or the app being swiped away:
  *     nothing else re-establishes it, and without it the first fingerstick
- *     after any of those would be missed with no way for the user to know. */
-void meter_sync_watchdog(void)
+ *     after any of those would be missed with no way for the user to know.
+ */
+static void meter_sync_watchdog_locked(void)
 {
    if (g_meter_busy && realtime_s() - g_meter_start > 90) {
       LOGI("meter sync timed out; releasing link %d", g_meter_link);
       if (g_meter_link >= 0)
          dexble_link_close(g_meter_link);
-      if (g_meter_link >= 0 && g_meter_link < LINK_MAX)
-         g_link_armed[g_meter_link][0] = 0;
+      /* Un-arm only, for the same reason as ot_drv_disconnect: the close is
+       * in flight and its callback still has to route to otble. */
+      meter_unarm_link(g_meter_link);
       g_meter_busy = 0;
       g_meter_link = -1;
+   }
+   /* RECOVER A LINK STRANDED WAITING FOR A TEARDOWN.
+    *
+    * ot_drv_disconnect asks for the close and leaves the link ARMED, because
+    * un-arming there is what let the tick reconnect a still-awake meter and
+    * re-run the exchange once a second. The release then depends entirely on
+    * the GATT disconnect callback arriving -- and nothing else covers this
+    * state: the timeout above needs g_meter_busy, which is clear by now, and
+    * pancra_link_watchdog skips meter links. A callback that never lands
+    * would strand the link armed for the life of the process, and that meter
+    * would never sync again.
+    *
+    * The bound is generous on purpose. A real teardown is either immediate
+    * (an app-initiated close: 0.3 s in an HCI capture) or the meter powering
+    * itself off (a supervision timeout ~35 s later). Three minutes is far
+    * past both, so this only ever fires on a callback that is genuinely
+    * lost, and re-arming costs one connect. */
+   long now = realtime_s();
+   for (int l = 0; l < LINK_MAX; l++) {
+      if (!g_link_idle_t[l] || g_meter_busy)
+         continue;
+      if (now - g_link_idle_t[l] < METER_TEARDOWN_MAX)
+         continue;
+      LOGI("meter link %d stranded waiting for a disconnect; releasing", l);
+      meter_release_link(l); /* clears g_link_idle_t[l] too */
    }
    /* ARM EVERY REGISTERED METER, not just one.
     *
     * Each holds its own link, so all of them can wait on the controller at
-    * once -- which is what makes "whichever meter I pick up" work rather than
-    * only the last one used. Arming is idempotent (meter_armed), so this is a
-    * no-op on every tick but the first after a restart or a finished sync. */
+    * once -- which is what makes "whichever meter I pick up" work rather
+    * than only the last one used. Arming is idempotent (meter_armed), so
+    * this is a no-op on every tick but the first after a restart or a
+    * finished sync. */
    int ids[MAX_SLOTS];
    char macs[MAX_SLOTS][24];
    int n = 0;
@@ -3030,8 +3521,21 @@ void meter_sync_watchdog(void)
       n++;
    }
    sensors_unlock();
+   now = realtime_s(); /* re-read: the block above can take a moment */
    for (int i = 0; i < n; i++) {
       if (!macs[i][0] || meter_armed(macs[i]))
+         continue;
+      /* COOLDOWN after a finished exchange.
+       *
+       * Second line of defence for the re-sync loop fixed in
+       * ot_drv_disconnect: that one keeps the link armed until the meter
+       * really goes away, which is enough on its own, but a link that flaps
+       * -- drops and is immediately reachable again -- would otherwise walk
+       * straight back into a sync-per-second. A meter that has genuinely
+       * powered off does not come back within seconds, so nothing legitimate
+       * waits on this. */
+      struct meter_rt *rt = meter_rt_get(ids[i], 0);
+      if (rt && rt->synced_t && now - rt->synced_t < METER_REARM_COOLDOWN)
          continue;
       /* One per tick: meter_sync_start takes both locks and issues a GATT
        * connect, and doing several in one pass would hold the main thread
@@ -3040,6 +3544,25 @@ void meter_sync_watchdog(void)
       meter_sync_start(ids[i], macs[i]);
       return;
    }
+}
+
+/* SELF-GUARDED. Two threads run this: the activity's 1 Hz timer reaches it
+ * through sensor_reconcile (which holds g_reconcile_busy) and the service
+ * tick calls it DIRECTLY, outside that guard -- so the serialisation the
+ * reconcile path relies on did not actually cover both callers. Interleaving
+ * could arm one meter on two links or bump a connect generation mid-connect;
+ * the refusal path in pancra_meter_connected cleans up after it, so the cost
+ * was transient battery and latency rather than lost data, but a function
+ * whose safety depends on which caller you came from is one edit away from
+ * being wrong. Guarding here covers every caller, present and future.
+ * Skipping a tick is free -- the next one is a second away. */
+void meter_sync_watchdog(void)
+{
+   static volatile int busy;
+   if (__atomic_exchange_n(&busy, 1, __ATOMIC_SEQ_CST))
+      return;
+   meter_sync_watchdog_locked();
+   __atomic_store_n(&busy, 0, __ATOMIC_SEQ_CST);
 }
 
 void pancra_link_watchdog(void)
@@ -3070,12 +3593,13 @@ void pancra_link_watchdog(void)
       /* CLAIM the throttle atomically -- only one thread may kick.
        *
        * This runs on BOTH the activity's 1 Hz timer and the service's 20 s
-       * tick, and last_kick was a plain read-modify-write shared between them.
-       * Both could see the interval elapsed and both call dexble_reconnect on
-       * the same link: the second Ble.connect bumps the link generation, so
-       * the first closes the client it had just created, tearing down the very
-       * reconnect this watchdog exists to start and leaving the link down for
-       * another cycle. A compare-exchange makes the claim single-winner. */
+       * tick, and last_kick was a plain read-modify-write shared between
+       * them. Both could see the interval elapsed and both call
+       * dexble_reconnect on the same link: the second Ble.connect bumps the
+       * link generation, so the first closes the client it had just created,
+       * tearing down the very reconnect this watchdog exists to start and
+       * leaving the link down for another cycle. A compare-exchange makes
+       * the claim single-winner. */
       /* One missed 5-min cycle plus two minutes of slack. This is the ONLY
        * reconnect mechanism while the screen is off (the advert path needs
        * the scan, whose lifecycle follows on_resume/on_pause), so at the old
@@ -3085,14 +3609,15 @@ void pancra_link_watchdog(void)
        * either way; this recovers the latency. */
       if (age > 420) {
          /* Atomic exchange, so exactly one thread wins the throttle. Whoever
-          * swaps in `now` reads the PREVIOUS stamp; only the one that finds it
-          * genuinely stale kicks, and the loser reads the winner's `now` and
-          * stands down. (An exchange rather than a compare-exchange because
-          * the latter's `weak` parameter is a _Bool this freestanding build
-          * has no stdbool.h to spell.) */
+          * swaps in `now` reads the PREVIOUS stamp; only the one that finds
+          * it genuinely stale kicks, and the loser reads the winner's `now`
+          * and stands down. (An exchange rather than a compare-exchange
+          * because the latter's `weak` parameter is a _Bool this
+          * freestanding build has no stdbool.h to spell.) */
          long prev = __atomic_exchange_n(&last_kick[l], now, __ATOMIC_SEQ_CST);
          if (now - prev > 300) {
-            LOGI("watchdog: link %d %ld s since its last reading -> reconnect",
+            LOGI("watchdog: link %d %ld s since its last reading -> "
+                 "reconnect",
                  l, age);
             dexble_reconnect(l);
          }
@@ -3116,20 +3641,22 @@ void pancra_alarm_check(void)
    alarm_gather(now, &zone, &stranded, &nzone);
    alarm_lock();
    g_alarm_state = zone;
-   /* The nudge is decided under the SAME hold as the alarm, so the two see one
-    * consistent zone pair and only one thread can claim a given crossing --
-    * pancra_alarm_check runs on the main looper, the service tick AND a GATT
-    * binder thread. The SOUND is emitted after the unlock: it is a JNI call
-    * that synthesises and plays audio, and alarm_lock is a spin lock the main
-    * looper takes. Nothing depends on when it lands, unlike the glucose alarm
-    * whose actuation must stay inside the lock (see alarm_apply_ex). */
+   /* The nudge is decided under the SAME hold as the alarm, so the two see
+    * one consistent zone pair and only one thread can claim a given crossing
+    * -- pancra_alarm_check runs on the main looper, the service tick AND a
+    * GATT binder thread. The SOUND is emitted after the unlock: it is a JNI
+    * call that synthesises and plays audio, and alarm_lock is a spin lock
+    * the main looper takes. Nothing depends on when it lands, unlike the
+    * glucose alarm whose actuation must stay inside the lock (see
+    * alarm_apply_ex). */
    int pred      = any_pred_low();
    int ng        = nudge_fire(nzone, alarming(zone, pred), g_nudge_state);
    g_nudge_state = nudge_next(nzone, g_nudge_state);
    /* Either the user's configured DISCONNECT threshold, or -- regardless of
-    * that setting -- data going stale while the last reading was out of range.
-    * Without the second term a ringing hypo alarm was silenced after 6 minutes
-    * of dropout in the DEFAULT configuration. See alarm_stranded. */
+    * that setting -- data going stale while the last reading was out of
+    * range. Without the second term a ringing hypo alarm was silenced after
+    * AL_FRESH_S of dropout in the DEFAULT configuration. See alarm_stranded.
+    */
    g_disc_alarmed = alarm_stale(cur.glu, cur.t, now, g_launch_t,
                                 (long)disc_min[(unsigned)g_disc & 3U] * 60);
    /* Stranded is passed SEPARATELY, not folded into g_disc_alarmed: it may
@@ -3144,10 +3671,10 @@ void pancra_alarm_check(void)
 
 static void disc_reeval(void)
 {
-   /* One implementation, shared with the transport and the service heartbeat.
-    * The zone is recomputed here so it DECAYS with time -- this path runs when
-    * no readings are arriving, which is exactly when a stale zone would
-    * otherwise mask the disconnect alarm. */
+   /* One implementation, shared with the transport and the service
+    * heartbeat. The zone is recomputed here so it DECAYS with time -- this
+    * path runs when no readings are arriving, which is exactly when a stale
+    * zone would otherwise mask the disconnect alarm. */
    pancra_alarm_check();
 }
 
@@ -3316,11 +3843,11 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
    char line[256];
    int llen = 0;
    /* Bytes this line REALLY occupies, which is not llen once a line overruns
-    * `line`: llen stops at 255 while the file keeps going. The offset we hand
-    * back is a byte position in the file, so counting the truncation instead
-    * of the line would leave every later offset short by the difference --
-    * the next batch would resume mid-line and the queue would mis-parse or
-    * skip exactly the records this offset exists to protect. */
+    * `line`: llen stops at 255 while the file keeps going. The offset we
+    * hand back is a byte position in the file, so counting the truncation
+    * instead of the line would leave every later offset short by the
+    * difference -- the next batch would resume mid-line and the queue would
+    * mis-parse or skip exactly the records this offset exists to protect. */
    long rawlen = 0;
    int over    = 0; /* over-long line: step past it, never parse a truncation */
    long got    = 0;
@@ -3344,14 +3871,30 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
             /* "<epoch>,<mg/dL>,..." -- the first two fields, plus the kind
              * column further along (see g_store_hdr in store.c) */
             const char *p = line;
-            while (*p >= '0' && *p <= '9')
-               t = (t * 10) + (*p++ - '0');
+            /* CAP THE DIGITS: signed overflow is UB and happens during
+             * parsing, before `ok` can reject anything -- and a wrapped
+             * value here would ship a FABRICATED point to the remote
+             * server. Same idiom as rdfield in store.c. */
+            int nt = 0;
+            while (*p >= '0' && *p <= '9') {
+               if (nt < 18) {
+                  t = (t * 10) + (*p - '0');
+                  nt++;
+               }
+               p++;
+            }
+            if (nt >= 18)
+               t = 0; /* fails `t > 0` below */
             if (*p == ',') {
                p++;
                int v = 0;
                int d = 0;
                while (*p >= '0' && *p <= '9') {
-                  v = (v * 10) + (*p++ - '0');
+                  if (d < 9)
+                     v = (v * 10) + (*p - '0');
+                  else
+                     v = 16777216; /* saturate: fails `v < 2000` below */
+                  p++;
                   d++;
                }
                if (d > 0 && (*p == ',' || *p == '\0'))
@@ -3374,7 +3917,24 @@ static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
          if (ok) {
             int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, glu, ty);
             if (w <= 0 || (size_t)w >= cap - used) {
-               *full = 1;
+               /* CUT THE PARTIAL ROW OFF. snprintf has already written as
+                * much of it as fitted and terminated THAT at buf[cap-1], so
+                * the buffer no longer ends where `used` says it does -- and
+                * the caller hands this to NewStringUTF, which reads to the
+                * first NUL. Without this the batch ships a half-written
+                * final row on top of the good ones.
+                *
+                * It is not a rare path: `body` is REMOTE_BATCH*24 = 2400
+                * bytes, a row is about 17 with a ten-digit timestamp, and
+                * nothing breaks the loop on REMOTE_BATCH -- that test only
+                * runs after EOF. So the byte cap is what ends every catch-up
+                * batch, and every one of them carried the partial row.
+                *
+                * The cursor is safe either way: this returns before
+                * `at`/`*end` advance, so the row is re-sent whole next time.
+                * used < cap, so the write is in bounds. */
+               buf[used] = 0;
+               *full     = 1;
                close(fd);
                return n; /* body full: the rest rides the next batch */
             }
@@ -3421,8 +3981,18 @@ static int ob_fill_ins(char *buf, size_t cap, int from, int *nsent)
       if (t <= 0 || u <= 0 || u > 300)
          continue;
       int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, ty, u);
-      if (w <= 0 || (size_t)w >= cap - used)
+      if (w <= 0 || (size_t)w >= cap - used) {
+         /* Same cut as ob_fill: snprintf has already written the part that
+          * fitted and terminated it at buf[cap-1], and the caller passes
+          * this buffer to NewStringUTF, which reads to the first NUL. Break
+          * alone would ship a half-written dose. The cursor is unaffected --
+          * `i` still names the row that did not fit, so *nsent resumes on
+          * it. Reached less often than in ob_fill (the loop here DOES stop
+          * at REMOTE_BATCH, so the row cap normally bites first), but the
+          * defect is identical and so is the fix. */
+         buf[used] = 0;
          break;
+      }
       used += (size_t)w;
       n++;
    }
@@ -3514,7 +4084,8 @@ static int unknown_id(void)
 }
 
 /* The value rule every ingestion path shares (defined with the live-reading
- * handler below; declared here because the import must not invent its own). */
+ * handler below; declared here because the import must not invent its own).
+ */
 static int glucose_plausible(int mg_dl);
 
 /* Import one window's worth of "<epoch> <mg/dL> [<type>]" lines (type 1 =
@@ -3526,9 +4097,9 @@ static int pull_import(const char *body)
    int added = 0;
    if (src < 0)
       return 0;
-   /* One cutoff for the whole batch, sampled once: a per-line clock read would
-    * let the acceptance boundary drift mid-import, so two identical lines could
-    * be judged differently in the same response. */
+   /* One cutoff for the whole batch, sampled once: a per-line clock read
+    * would let the acceptance boundary drift mid-import, so two identical
+    * lines could be judged differently in the same response. */
    long horizon  = realtime_s() + 3600;
    const char *p = body;
    while (*p) {
@@ -3544,11 +4115,11 @@ static int pull_import(const char *body)
          continue;
       }
       /* CAP THE DIGITS, exactly as rdfield/stat_load_chunk/ob_load/pull_load
-       * do. Signed overflow is undefined behaviour and it happens HERE, during
-       * parsing, before any range check below can reject the value -- and this
-       * is the one parser in the app fed bytes from off the device, so a
-       * 10-digit field like 4294967396 wrapped to a perfectly plausible 100
-       * and was written to the log as a reading that was never taken. */
+       * do. Signed overflow is undefined behaviour and it happens HERE,
+       * during parsing, before any range check below can reject the value --
+       * and this is the one parser in the app fed bytes from off the device,
+       * so a 10-digit field like 4294967396 wrapped to a perfectly plausible
+       * 100 and was written to the log as a reading that was never taken. */
       int nd = 0;
       while (*p >= '0' && *p <= '9') {
          if (nd++ < 18) {
@@ -3583,24 +4154,29 @@ static int pull_import(const char *body)
        * rule every other ingestion path uses.
        *
        * This accepted any t > 0, and a FUTURE-dated point is not merely a
-       * wrong dot on the plot: hist_insert has no time bound either, so future
-       * points sort to the head of g_hist and evict the oldest entry on every
-       * insert. Once NHIST of them are in, g_hist[NHIST-1].t is itself in the
-       * future, so every genuine live reading fails hist_insert's
-       * `t <= g_hist[NHIST-1].t` test and returns HIST_OLD -- logged, but
-       * never re-entered into memory. alarm_gather then finds no sample for
-       * any live CGM (the synthetic IMPORTED source is flagged old and is not
-       * in its id set), ns stays 0, and zone stays 0: a real hypo can no
-       * longer raise AL_LOW for the rest of the process lifetime. A remote
-       * server whose clock ran ahead is enough to do it -- no hostility
-       * required. store_load_chunk already bounds its replay this way.
+       * wrong dot on the plot: hist_insert has no time bound either, so
+       * future points sort to the head of g_hist and evict the oldest entry
+       * on every insert. Once NHIST of them are in, g_hist[NHIST-1].t is
+       * itself in the future, so every genuine live reading fails
+       * hist_insert's `t <= g_hist[NHIST-1].t` test and returns HIST_OLD --
+       * logged, but never re-entered into memory. alarm_gather then finds no
+       * sample for any live CGM (the synthetic IMPORTED source is flagged
+       * old and is not in its id set), ns stays 0, and zone stays 0: a real
+       * hypo can no longer raise AL_LOW for the rest of the process
+       * lifetime. A remote server whose clock ran ahead is enough to do it
+       * -- no hostility required. store_load_chunk already bounds its replay
+       * this way.
        *
-       * glucose_plausible is the 20..600 rule pancra_glucose, pancra_backfill
-       * and both loaders enforce; this path used its own 1..1999, which let
-       * values no sensor can produce into the log and the statistics. */
+       * glucose_plausible is the 20..600 rule pancra_glucose,
+       * pancra_backfill and both loaders enforce; this path used its
+       * own 1..1999, which let values no sensor can produce into the log and
+       * the statistics. */
       if (t <= 0 || t > horizon || !glucose_plausible(glu))
          continue;
       int prime = sensor_primary_id();
+      /* BEFORE hist_lock: the lock order is registry -> history (see
+       * sensors.h), and sensor_in_warmup takes the registry lock. */
+      int warm = sensor_in_warmup(src, t);
       hist_lock();
       /* ONLY what we do not already hold, from ANY source. Imported data
        * has no provenance, so adding a point the phone already recorded
@@ -3613,13 +4189,14 @@ static int pull_import(const char *body)
          isnew = hist_insert(t, glu, 127, src, kind);
       /* NOT fingersticks -- the same rule stat_load_chunk enforces on replay
        * (stats.c: `kind != KIND_BGM`). Since this import learned to carry a
-       * type, an imported meter reading would otherwise be counted in the live
-       * hour buckets now and skipped when the log is replayed at next launch,
-       * so TIR, AVG and A1C would show one set of numbers today and different
-       * ones after a restart from the identical log -- the exact drift the
-       * comment in stats.c records having been fixed twice already. The live
-       * meter path (ot_drv_reading) does not call stat_add either. */
-      if (isnew && kind != KIND_BGM)
+       * type, an imported meter reading would otherwise be counted in the
+       * live hour buckets now and skipped when the log is replayed at next
+       * launch, so TIR, AVG and A1C would show one set of numbers today and
+       * different ones after a restart from the identical log -- the exact
+       * drift the comment in stats.c records having been fixed twice
+       * already. The live meter path (ot_drv_reading) does not call stat_add
+       * either. */
+      if (isnew && kind != KIND_BGM && !warm)
          stat_add(t, glu);
       hist_refresh_current(prime);
       hist_unlock();
@@ -3649,19 +4226,20 @@ static void remote_sync_locked(void);
 /* SINGLE-FLIGHT, because this runs on TWO threads.
  *
  * The activity's 1 Hz on_timer and the service's tick thread both drive the
- * sync, and the Java-side sBusy flag does not serialise them: remoteBusy() is
- * polled at the top while sBusy is not set until remoteBatch/remoteRange is
- * actually entered, and the whole batch build -- three open/lseek/read cycles
- * into one SHARED static body[] -- sits in between. Two threads inside that
- * window fill the same buffer from different file offsets, so the POST can
- * carry a spliced line: a fabricated <epoch> <mg/dL> pair stored as a real
- * reading, after which the acknowledged offset advances past data that was
- * never correctly sent. Every other function reachable from both callers
- * already has such a guard (g_notify_busy, g_reconcile_busy, alarm_lock, the
- * atomic on last_kick); this one was the exception.
+ * sync, and the Java-side sBusy flag does not serialise them: remoteBusy()
+ * is polled at the top while sBusy is not set until remoteBatch/remoteRange
+ * is actually entered, and the whole batch build -- three open/lseek/read
+ * cycles into one SHARED static body[] -- sits in between. Two threads
+ * inside that window fill the same buffer from different file offsets, so
+ * the POST can carry a spliced line: a fabricated <epoch> <mg/dL> pair
+ * stored as a real reading, after which the acknowledged offset advances
+ * past data that was never correctly sent. Every other function reachable
+ * from both callers already has such a guard (g_notify_busy,
+ * g_reconcile_busy, alarm_lock, the atomic on last_kick); this one was the
+ * exception.
  *
- * Skipping rather than waiting is right: the loser has nothing to contribute,
- * and the next tick is at most REMOTE_GAP away. */
+ * Skipping rather than waiting is right: the loser has nothing to
+ * contribute, and the next tick is at most REMOTE_GAP away. */
 void pancra_remote_sync(void)
 {
    if (__atomic_exchange_n(&g_sync_busy, 1, __ATOMIC_SEQ_CST))
@@ -3852,14 +4430,16 @@ static void remote_forget_cursor(void)
 
 /* Is this a usable glucose value?
  *
- * The 12-bit field carries 0..4095 verbatim, and a sentinel (0 during warm-up
- * or a sensor-error state) would otherwise become g_cur_glu -- the headline
- * number, with a trend arrow, feeding the alarm and firing a spurious LOW.
- * It would also be written to the permanent log and into the stats. The meter
- * path already bounds its values; this is the equivalent for the sensor.
+ * The 12-bit field carries 0..4095 verbatim, and a sentinel (0 during
+ * warm-up or a sensor-error state) would otherwise become g_cur_glu -- the
+ * headline number, with a trend arrow, feeding the alarm and firing a
+ * spurious LOW. It would also be written to the permanent log and into the
+ * stats. The meter path already bounds its values; this is the equivalent
+ * for the sensor.
  *
- * The bound matches what a CGM can physically report (Dexcom reads 40..400 and
- * clamps there), widened slightly so a genuine extreme is never discarded. */
+ * The bound matches what a CGM can physically report (Dexcom reads 40..400
+ * and clamps there), widened slightly so a genuine extreme is never
+ * discarded. */
 static int glucose_plausible(int mg_dl)
 {
    return mg_dl >= 20 && mg_dl <= 600;
@@ -3875,19 +4455,20 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    }
    /* BOUND THE AGE, not just the value.
     *
-    * age comes straight off the wire as a full uint16 (dexdata.c: le16(p+10)),
-    * and only the glucose was gated here. A frame carrying age=65535 backdates
-    * the reading 18.2 hours: it enters g_hist, skews stat_add's TIR and
-    * average, and is written to readings.csv -- a file that is never rewritten
-    * and whose only load-time timestamp guard is t > 0, so it is re-admitted on
-    * every restart. It also poisons the per-sensor gap sizing below, provoking
-    * repeated 24 h backfill requests.
+    * age comes straight off the wire as a full uint16 (dexdata.c:
+    * le16(p+10)), and only the glucose was gated here. A frame carrying
+    * age=65535 backdates the reading 18.2 hours: it enters g_hist, skews
+    * stat_add's TIR and average, and is written to readings.csv -- a file
+    * that is never rewritten and whose only load-time timestamp guard is t >
+    * 0, so it is re-admitted on every restart. It also poisons the
+    * per-sensor gap sizing below, provoking repeated 24 h backfill requests.
     *
-    * A live 0x4e reading is seconds to a few minutes old (the cycle is ~5 min);
-    * 15 minutes is generous. Reject rather than clamp -- clamping would stamp a
-    * genuinely stale reading as current, which for a glucose display is the
-    * more dangerous of the two errors. The meter path has bounded its timestamp
-    * all along (otble.c); this is the equivalent the Dexcom path never had. */
+    * A live 0x4e reading is seconds to a few minutes old (the cycle is ~5
+    * min); 15 minutes is generous. Reject rather than clamp -- clamping
+    * would stamp a genuinely stale reading as current, which for a glucose
+    * display is the more dangerous of the two errors. The meter path has
+    * bounded its timestamp all along (otble.c); this is the equivalent the
+    * Dexcom path never had. */
    if (age_s < 0 || age_s > 900) {
       LOGI("glucose age %d s implausible, ignored", age_s);
       return;
@@ -3895,47 +4476,50 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    long t  = realtime_s() - age_s;
    int has = (g_conn_rssi_t &&
               realtime_s() - g_conn_rssi_t < 120); /* this connection */
-   /* Mutate the shared history / current-reading state under the same guard the
-    * renderer holds (hist_history_lock), so a main-thread draw never reads a
-    * half-shifted g_hist, torn stats, or a mismatched g_cur_glu/g_cur_time. */
-   /* Resolve the source BEFORE taking hist_lock: this reads the driver and the
-    * registry, and the established lock order is driver -> reg -> hist. */
+   /* Mutate the shared history / current-reading state under the same guard
+    * the renderer holds (hist_history_lock), so a main-thread draw never
+    * reads a half-shifted g_hist, torn stats, or a mismatched
+    * g_cur_glu/g_cur_time. */
+   /* Resolve the source BEFORE taking hist_lock: this reads the driver and
+    * the registry, and the established lock order is driver -> reg -> hist.
+    */
    int src = src_for_link(driver_link());
    if (src < 0) {
-      /* No slot claims this link's address yet -- registration happens on the
-       * next 1 Hz reconcile, and requires have_reading, so the FIRST reading of
-       * any new sensor always lands here. g_cur_src belongs to some ALREADY
-       * REGISTERED sensor, so borrowing it is safe only when none exists (a
-       * fresh install, where g_cur_src is 0 = pre-registry legacy and therefore
-       * unambiguous). The threshold is >= 1, not > 1: with one sensor already
-       * registered, a second sensor's first reading was written to the
-       * append-only log carrying the FIRST sensor's id -- and if that sensor
-       * had reported within 150 s, hist_insert deduped it away entirely. Drop
-       * instead: the next sample arrives in ~5 minutes, by which time the
-       * sensor is registered. A wrong attribution is permanent; a missed
-       * sample is not. */
+      /* No slot claims this link's address yet -- registration happens on
+       * the next 1 Hz reconcile, and requires have_reading, so the FIRST
+       * reading of any new sensor always lands here. g_cur_src belongs to
+       * some ALREADY REGISTERED sensor, so borrowing it is safe only when
+       * none exists (a fresh install, where g_cur_src is 0 = pre-registry
+       * legacy and therefore unambiguous). The threshold is >= 1, not > 1:
+       * with one sensor already registered, a second sensor's first reading
+       * was written to the append-only log carrying the FIRST sensor's id --
+       * and if that sensor had reported within 150 s, hist_insert deduped it
+       * away entirely. Drop instead: the next sample arrives in ~5 minutes,
+       * by which time the sensor is registered. A wrong attribution is
+       * permanent; a missed sample is not. */
       if (cgm_slot_count() >= 1) {
          LOGI("glucose %d mg/dL from an unregistered link, deferred", mg_dl);
          return;
       }
       src = g_cur_src;
    }
-   /* RESCALE. Record the RAW value (for computing a future factor), then apply
-    * the active correction IF it belongs to this sensor and this reading's
-    * timestamp is at/after activation. From here mg_dl is the rescaled value,
-    * so history, stats, the alarm and the log all use it; the factor rpm is
-    * written to the log's `rescale` column so the raw stays recoverable. */
+   /* RESCALE. Record the RAW value (for computing a future factor), then
+    * apply the active correction IF it belongs to this sensor and this
+    * reading's timestamp is at/after activation. From here mg_dl is the
+    * rescaled value, so history, stats, the alarm and the log all use it;
+    * the factor rpm is written to the log's `rescale` column so the raw
+    * stays recoverable. */
    {
       int lk = driver_link();
       if (lk >= 0 && lk < LINK_MAX)
          g_link_raw[lk] = mg_dl;
    }
-   /* A rescale target was waiting for a reading to compute its factor: this is
-    * that reading -- BUT only if it is at most RESCALE_PEND_WINDOW_S newer than
-    * the request. Past that the fingerstick reference is stale, so EXPIRE it
-    * (visibly) rather than applying it to a much-later reading. Otherwise
-    * activate from THIS raw, effective from THIS timestamp, so the reference
-    * reading itself shows the entered value. */
+   /* A rescale target was waiting for a reading to compute its factor: this
+    * is that reading -- BUT only if it is at most RESCALE_PEND_WINDOW_S
+    * newer than the request. Past that the fingerstick reference is stale,
+    * so EXPIRE it (visibly) rather than applying it to a much-later reading.
+    * Otherwise activate from THIS raw, effective from THIS timestamp, so the
+    * reference reading itself shows the entered value. */
    /* Set when a rescale takes effect ON this reading: from here on mg_dl is
     * rescaled while the history is not, so any change computed against the
     * history is the calibration step, not the wearer's glucose moving. The
@@ -3943,7 +4527,8 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    int rescale_started = 0;
    if (g_rescale_pend_mgdl > 0 && g_rescale_pend_id == src) {
       if (t - g_rescale_pend_t > RESCALE_PEND_WINDOW_S) {
-         LOGI("pending rescale %d mg/dL EXPIRED (reading %ld s after request)",
+         LOGI("pending rescale %d mg/dL EXPIRED (reading %ld s after "
+              "request)",
               g_rescale_pend_mgdl, t - g_rescale_pend_t);
          g_rescale_expired    = 1;
          g_rescale_expired_id = src;
@@ -3960,18 +4545,23 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    if (rpm != 1000)
       mg_dl = rescale_apply(mg_dl, rpm);
    int prime = sensor_primary_id();
+   /* WARMUP readings are shown but never COUNTED -- uncalibrated values skew
+    * TIR and the average (see sensors.h). Resolved HERE, before hist_lock,
+    * because the lock order is registry -> history. */
+   int warm = sensor_in_warmup(src, t);
    hist_lock();
-   /* THIS sensor's previous value, captured BEFORE the insert (afterwards the
-    * newest sample from src is the one being added) and under the same lock
-    * that protects g_hist. Feeds the CHIRP pitch below; -1 means this source
-    * has no earlier sample, which chirps at the plain BEEP pitch. */
+   /* THIS sensor's previous value, captured BEFORE the insert (afterwards
+    * the newest sample from src is the one being added) and under the same
+    * lock that protects g_hist. Feeds the CHIRP pitch below; -1 means this
+    * source has no earlier sample, which chirps at the plain BEEP pitch. */
    int prev_glu = hist_prev_glu(t, src, t - CHIRP_MAX_GAP_S);
    int isnew    = hist_insert(t, mg_dl, trend, src, KIND_CGM);
    if (isnew) {
-      /* Any non-zero result, matching what store_append persists below -- see
-       * store.h. Gating on HIST_NEW alone made TIR and the average change
-       * across a restart. */
-      stat_add(t, mg_dl);
+      /* Any non-zero result, matching what store_append persists below --
+       * see store.h. Gating on HIST_NEW alone made TIR and the average
+       * change across a restart. */
+      if (!warm)
+         stat_add(t, mg_dl);
       if (has) {
          g_cur_rssi    = g_conn_rssi;
          g_cur_rssi_ok = 1;
@@ -3980,10 +4570,10 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    hist_refresh_current(prime);
    hist_unlock();
    /* Capture THIS CGM link's predicted value + time for the imminent-hypo
-    * (predicted-low) alarm. jni_notify holds driver_lock across this dispatch
-    * and has selected this link, so the session read is safe and refers to it.
-    * Stamped every reading (not just new ones) so the freshness gate in
-    * any_pred_low() tracks the live prediction. */
+    * (predicted-low) alarm. jni_notify holds driver_lock across this
+    * dispatch and has selected this link, so the session read is safe and
+    * refers to it. Stamped every reading (not just new ones) so the
+    * freshness gate in any_pred_low() tracks the live prediction. */
    {
       int lk = driver_link();
       if (lk >= 0 && lk < LINK_MAX && !g_link_meter[lk]) {
@@ -3994,13 +4584,14 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
       }
    }
    /* A reading just PROVED this sensor is streaming -- the ideal moment to
-    * flush any queued calibration for it. driver_lock is held (jni_notify) and
-    * the driver is selected to this link, exactly what calq_try_locked needs.
+    * flush any queued calibration for it. driver_lock is held (jni_notify)
+    * and the driver is selected to this link, exactly what calq_try_locked
+    * needs.
     */
    if (g_calq_mgdl > 0 && src == g_calq_id)
       calq_try_locked();
-   /* Persist on HIST_OLD as well: the log is the lifetime record and NHIST is
-    * only how much of it fits on screen. File I/O outside the lock -- it
+   /* Persist on HIST_OLD as well: the log is the lifetime record and NHIST
+    * is only how much of it fits on screen. File I/O outside the lock -- it
     * touches no draw-shared state. */
    if (isnew) {
       store_append(t, mg_dl, trend, g_conn_rssi, has, src, t, g_tz_off,
@@ -4011,25 +4602,26 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    }
    LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
-   /* NEW DATAPOINT alert: a genuinely new sample from the PRIMARY CGM only, so
-    * a secondary sensor or a backfilled/duplicate reading stays silent.
+   /* NEW DATAPOINT alert: a genuinely new sample from the PRIMARY CGM only,
+    * so a secondary sensor or a backfilled/duplicate reading stays silent.
     *
     * CHIRP pitches on the change since THIS sensor's own previous sample.
     * Never against another CGM's: with two sensors worn at once their
     * difference is the calibration offset between two devices, and pitching
     * on it would announce swings the wearer never had. With no previous
-    * sample of its own (a fresh session) the delta is 0, which is exactly the
-    * BEEP tone -- the honest sound for "no change known yet". */
+    * sample of its own (a fresh session) the delta is 0, which is exactly
+    * the BEEP tone -- the honest sound for "no change known yet". */
    if (isnew && src == prime) {
       if (g_newdata_mode == ND_BEEP) {
          dexble_beep();
       } else if (g_newdata_mode == ND_CHIRP) {
-         /* A rescale that ACTIVATED on this very reading makes the comparison
-          * meaningless: mg_dl is already rescaled while every sample already
-          * in g_hist is not, so the "change" would be the calibration offset
-          * itself -- entering a 120 fingerstick against a sensor reading 100
-          * would chirp a full-cap rocket that never happened. Treat it as
-          * having no predecessor, which is the plain BEEP pitch. */
+         /* A rescale that ACTIVATED on this very reading makes the
+          * comparison meaningless: mg_dl is already rescaled while every
+          * sample already in g_hist is not, so the "change" would be the
+          * calibration offset itself -- entering a 120 fingerstick against a
+          * sensor reading 100 would chirp a full-cap rocket that never
+          * happened. Treat it as having no predecessor, which is the plain
+          * BEEP pitch. */
          int delta = (prev_glu >= 0 && !rescale_started) ? mg_dl - prev_glu : 0;
          dexble_chirp(chirp_semitone10(delta));
       }
@@ -4037,33 +4629,34 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
 
    /* Alarm evaluation is deliberately NOT done here.
     *
-    * This runs on a BLE binder thread with driver_lock held (jni_notify holds
-    * it across the whole notify dispatch), and raising an alarm calls
+    * This runs on a BLE binder thread with driver_lock held (jni_notify
+    * holds it across the whole notify dispatch), and raising an alarm calls
     * Alarm.trigger -> RingtoneManager + MediaPlayer.setDataSource/prepare/
     * start: media-server IPC, routinely hundreds of milliseconds. Holding a
-    * SPIN lock across that makes the main looper burn a core in sched_yield on
-    * its next snap_drivers() or watchdog tick.
+    * SPIN lock across that makes the main looper burn a core in sched_yield
+    * on its next snap_drivers() or watchdog tick.
     *
     * disc_reeval() on the 1 Hz main-thread timer already recomputes the zone
-    * from a consistent current_reading() and calls alarm_apply, so the alarm is
-    * raised within one second regardless -- immaterial against a 5-minute
-    * sample interval. Leaving alarm_apply to a single thread also removes the
-    * raise/silence ordering races entirely: every caller is now the main
+    * from a consistent current_reading() and calls alarm_apply, so the alarm
+    * is raised within one second regardless -- immaterial against a 5-minute
+    * sample interval. Leaving alarm_apply to a single thread also removes
+    * the raise/silence ordering races entirely: every caller is now the main
     * thread. */
    /* Rendering is deferred to the main-thread 1 Hz timer (see on_main); just
     * mark the screen and notification dirty. */
    g_ui_dirty     = 1;
    g_notify_dirty = 1;
 
-   /* Read the sensor's serial / firmware / software strings. Deferred to here
-    * (after the first reading) so it runs post-auth, when the reads succeed.
-    * The sensor closes the cycle within a few seconds, often before all three
-    * reads land, so we retry each reconnect until we have them all -- throttled
-    * to at most once a minute, and stopping entirely once complete. */
+   /* Read the sensor's serial / firmware / software strings. Deferred to
+    * here (after the first reading) so it runs post-auth, when the reads
+    * succeed. The sensor closes the cycle within a few seconds, often before
+    * all three reads land, so we retry each reconnect until we have them all
+    * -- throttled to at most once a minute, and stopping entirely once
+    * complete. */
    /* Gate on THIS LINK's strings, not the process-global ones. Keying on the
-    * globals meant that once any sensor had filled them -- and they persist to
-    * disk -- DIS was never re-read for any sensor again, so every later sensor
-    * was minted carrying the first one's model and firmware. */
+    * globals meant that once any sensor had filled them -- and they persist
+    * to disk -- DIS was never re-read for any sensor again, so every later
+    * sensor was minted carrying the first one's model and firmware. */
    int dlink = driver_link();
    if (dlink >= 0 && dlink < LINK_MAX &&
        (!g_model_l[dlink][0] || !g_fw_l[dlink][0] || !g_mfr[0]) &&
@@ -4073,10 +4666,10 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    }
 
    int did_bf = 0;
-   /* Backward fill, at most once per launch: pull history back to the start of
-    * the available window = min(24h, session age). Gating on session duration
-    * means a young session stops re-requesting once we hold its whole span,
-    * instead of forever chasing a 24h it can never reach. */
+   /* Backward fill, at most once per launch: pull history back to the start
+    * of the available window = min(24h, session age). Gating on session
+    * duration means a young session stops re-requesting once we hold its
+    * whole span, instead of forever chasing a 24h it can never reach. */
    int bflink = driver_link();
    if (bflink < 0 || bflink >= LINK_MAX)
       bflink = LINK_CGM;
@@ -4089,10 +4682,10 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
       long target = 24L * 3600;
       if (s.have_reading && (long)s.session_seconds < target)
          target = (long)s.session_seconds;
-      /* Oldest sample FROM THIS SENSOR. g_hist[g_nhist-1] is the oldest across
-       * all sources, so after store_load restored a week of merged history this
-       * test was always false and the once-per-launch fill never ran at all --
-       * while g_startup_bf had already been latched. */
+      /* Oldest sample FROM THIS SENSOR. g_hist[g_nhist-1] is the oldest
+       * across all sources, so after store_load restored a week of merged
+       * history this test was always false and the once-per-launch fill
+       * never ran at all -- while g_startup_bf had already been latched. */
       long oldest = t;
       hist_lock();
       for (int i = g_nhist - 1; i >= 0; i--)
@@ -4105,32 +4698,34 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
       if (target > 600 && realtime_s() - oldest < target - 300) {
          LOGI("backward fill: %ld s backfill (have %ld s of %ld s window)",
               target, realtime_s() - oldest, target);
-         driver_lock(); /* recursive: normally already held by the callback */
+         driver_lock(); /* recursive: normally already held by the callback
+                         */
          driver_request_backfill(target);
          driver_unlock();
          did_bf = 1;
       }
    }
-   /* Ongoing: recover ANY interior hole in this sensor's recent buffer window,
-    * retried until it is filled.
+   /* Ongoing: recover ANY interior hole in this sensor's recent buffer
+    * window, retried until it is filled.
     *
-    * The old rule keyed the gap off `prev` (the newest reading before this one)
-    * and fired at most once per gap. That stranded interior holes: the moment a
-    * single reading lands past a gap -- which the very next reconnect after an
-    * outage delivers -- `prev` advances past it, every later span is a normal
-    * 5-minute step, and the missing block is never requested again. The
-    * once-per-launch backward fill above does not save it either: it is gated
-    * off whenever we already span the window. A ~15-minute reinstall gap was
-    * lost permanently this way even though the sensor still held the records.
+    * The old rule keyed the gap off `prev` (the newest reading before this
+    * one) and fired at most once per gap. That stranded interior holes: the
+    * moment a single reading lands past a gap -- which the very next
+    * reconnect after an outage delivers -- `prev` advances past it, every
+    * later span is a normal 5-minute step, and the missing block is never
+    * requested again. The once-per-launch backward fill above does not save
+    * it either: it is gated off whenever we already span the window. A
+    * ~15-minute reinstall gap was lost permanently this way even though the
+    * sensor still held the records.
     *
     * Instead: scan this sensor's samples across the sensor's buffer window
     * (min 24h, session age) for the OLDEST >450 s hole, and request backfill
-    * covering from there to now. Delivered records dedupe on insert, so a wide
-    * re-request is harmless; the request is throttled per link and, because it
-    * is driven by the presence of a hole rather than a one-shot event, it
-    * simply repeats each cycle -- shrinking the span as records arrive -- until
-    * no hole remains. This survives the short (~4 s) per-cycle connect window,
-    * which a single one-shot request does not. */
+    * covering from there to now. Delivered records dedupe on insert, so a
+    * wide re-request is harmless; the request is throttled per link and,
+    * because it is driven by the presence of a hole rather than a one-shot
+    * event, it simply repeats each cycle -- shrinking the span as records
+    * arrive -- until no hole remains. This survives the short (~4 s)
+    * per-cycle connect window, which a single one-shot request does not. */
    if (!did_bf && isnew) {
       struct dex_session s;
       driver_lock();
@@ -4157,8 +4752,8 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
          newer = ts;
       }
       hist_unlock();
-      /* Throttle so a persistent hole (records genuinely gone from the sensor)
-       * is retried at a sane cadence, not on every reading. */
+      /* Throttle so a persistent hole (records genuinely gone from the
+       * sensor) is retried at a sane cadence, not on every reading. */
       if (gap_from > 0 && now - g_gap_bf_at[bflink] > 120) {
          g_gap_bf_at[bflink] = now;
          long span = (now - gap_from) + 300; /* cover the hole plus a margin */
@@ -4172,17 +4767,31 @@ void pancra_glucose(int mg_dl, int trend, int age_s)
    }
 }
 
-/* live connection signal strength from readRemoteRssi (no sensor-battery cost)
+/* live connection signal strength from readRemoteRssi (no sensor-battery
+ * cost)
  */
 void pancra_rssi(int rssi)
 {
+   /* PER LINK. jni_rssi knows which link the measurement came from, but this
+    * used to drop it into globals that fill_sensor then stamped onto EVERY
+    * CGM slot -- so with a Stelo and a G7 both worn, each device screen could
+    * show the other's signal, which is the one number on that row the user
+    * cannot sanity-check. The globals stay for the main screen's single
+    * readout; the per-link copy is what the per-device row reads. */
+   int lk = driver_link();
+   if (lk >= 0 && lk < LINK_MAX) {
+      g_link_rssi[lk]    = rssi;
+      g_link_rssi_ok[lk] = 1;
+      g_link_rssi_t[lk]  = realtime_s();
+   }
    g_conn_rssi   = rssi;
    g_conn_rssi_t = realtime_s();
-   /* Latch the CGM's last signal strength the MOMENT it is measured on connect,
-    * exactly like pancra_meter_rssi does for a meter -- not gated behind a
-    * fresh datapoint. Otherwise the Stelo's SIGNAL row drops to "--" whenever
-    * readings lag, while a meter (which latches on connect) keeps showing its
-    * last value. This is a retained "last known" display, so it never expires.
+   /* Latch the CGM's last signal strength the MOMENT it is measured on
+    * connect, exactly like pancra_meter_rssi does for a meter -- not gated
+    * behind a fresh datapoint. Otherwise the Stelo's SIGNAL row drops to
+    * "--" whenever readings lag, while a meter (which latches on connect)
+    * keeps showing its last value. This is a retained "last known" display,
+    * so it never expires.
     */
    g_cur_rssi    = rssi;
    g_cur_rssi_ok = 1;
@@ -4190,16 +4799,17 @@ void pancra_rssi(int rssi)
    draw(g_win);
 }
 
-/* Meter link RSSI, read once per sync connection (the meter has no continuous
- * link). Stored separately from the CGM RSSI so the meter's SIGNAL row shows
- * its own last-sync strength. */
+/* Meter link RSSI, read once per sync connection (the meter has no
+ * continuous link). Stored separately from the CGM RSSI so the meter's
+ * SIGNAL row shows its own last-sync strength. */
 void pancra_meter_rssi(int rssi)
 {
    g_meter_rssi    = rssi;
    g_meter_rssi_ok = 1;
    g_meter_rssi_t  = realtime_s();
-   /* Record against THIS meter so its SIGNAL row shows its own last value, and
-    * refresh its sync time -- RSSI is read on connect, i.e. an actual sync. */
+   /* Record against THIS meter so its SIGNAL row shows its own last value,
+    * and refresh its sync time -- RSSI is read on connect, i.e. an actual
+    * sync. */
    struct meter_rt *rt = (g_meter_src > 0) ? meter_rt_get(g_meter_src, 1) : 0;
    if (rt) {
       rt->rssi    = rssi;
@@ -4218,17 +4828,17 @@ void pancra_meter_rssi(int rssi)
  * sensors.csv as bare %s fields -- no quoting, no escaping. A model or
  * firmware value containing a COMMA shifts every following field on parse
  * (activation and paired times land in the wrong columns); one containing a
- * NEWLINE splits the row in two, and sensor_mint documents exactly where that
- * leads: an unparseable row hides an id from the loader, maxid goes backwards,
- * and the next mint REISSUES A LIVE ID -- the one failure the whole provenance
- * design exists to make impossible, and it is permanent because the file is
- * never rewritten.
+ * NEWLINE splits the row in two, and sensor_mint documents exactly where
+ * that leads: an unparseable row hides an id from the loader, maxid goes
+ * backwards, and the next mint REISSUES A LIVE ID -- the one failure the
+ * whole provenance design exists to make impossible, and it is permanent
+ * because the file is never rewritten.
  *
- * The value is attacker-controlled by anything that can present the locked MAC,
- * and merely quirky vendor firmware could do it by accident. Substitute rather
- * than truncate: an empty firmware field is itself meaningful (it marks the row
- * stale and drives the re-mint pass), so dropping characters could turn a
- * hostile string into a silent re-mint loop. */
+ * The value is attacker-controlled by anything that can present the locked
+ * MAC, and merely quirky vendor firmware could do it by accident. Substitute
+ * rather than truncate: an empty firmware field is itself meaningful (it
+ * marks the row stale and drives the re-mint pass), so dropping characters
+ * could turn a hostile string into a silent re-mint loop. */
 static void devinfo_copy(char *dst, const char *src)
 {
    int k = 0;
@@ -4253,10 +4863,25 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
    if (ulen < 8)
       return;
    /* A meter's identity must not land in the CGM's globals: each sensor's
-    * model/firmware is part of its permanent provenance, and mixing them would
-    * attribute readings to hardware that never produced them. */
+    * model/firmware is part of its permanent provenance, and mixing them
+    * would attribute readings to hardware that never produced them. */
+   /* READ THE ROUTING BIT UNDER THE LOCK. link_set_meter's comment claims
+    * this function is one of the binder-thread readers that "already hold
+    * it" -- the premise the writer's own locking rests on -- and it did not.
+    * The write lands on the main thread in meter_sync_start/commit_pair
+    * immediately before the connect, and this read arrives on a binder
+    * thread just after it, so a stale value is exactly the ordering the
+    * lock's barrier exists to prevent. Snapshot and release: the rest of the
+    * function takes sensors_lock, and driver -> reg is the documented order,
+    * but there is no reason to hold both. */
+   int is_meter = 0;
+   if (link >= 0 && link < LINK_MAX) {
+      driver_lock();
+      is_meter = g_link_meter[link];
+      driver_unlock();
+   }
    char *dst = 0;
-   if (link >= 0 && link < LINK_MAX && g_link_meter[link]) {
+   if (is_meter) {
       if (strncmp(uuid + 4, "2a24", 4) == 0)
          dst = g_meter_model;
       else if (strncmp(uuid + 4, "2a26", 4) == 0)
@@ -4270,25 +4895,37 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
    } else if (strncmp(uuid + 4, "2a29", 4) == 0) {
       dst = g_mfr; /* manufacturer name */
    }
-   /* Keep a PER-LINK copy as well. g_model/g_fw are process-global and shared
-    * by every CGM link, and the devinfo re-read is skipped once they are
-    * non-empty (and they persist to disk), so a second sensor was minted with
-    * the FIRST sensor's model and firmware -- written into an append-only
-    * provenance file that is never rewritten, and used as part of the id-reuse
-    * key. Pair a G7 after a Stelo and its permanent record claimed Stelo
-    * hardware. Minting reads the per-link copy. */
+   /* Keep a PER-LINK copy as well. g_model/g_fw are process-global and
+    * shared by every CGM link, and the devinfo re-read is skipped once they
+    * are non-empty (and they persist to disk), so a second sensor was minted
+    * with the FIRST sensor's model and firmware -- written into an
+    * append-only provenance file that is never rewritten, and used as part
+    * of the id-reuse key. Pair a G7 after a Stelo and its permanent record
+    * claimed Stelo hardware. Minting reads the per-link copy. */
    /* THE PER-LINK COPY IS THE MINT INPUT, so it is what needs the lock.
     *
     * An earlier version locked only the process-global g_model/g_fw below,
-    * which are display-only -- the arrays sensor_mint actually reads were left
-    * written byte-by-byte with no lock at all, so the fix was inert. A torn
-    * read (terminator not yet written, so "1.4" over "1.2.3" reads as
+    * which are display-only -- the arrays sensor_mint actually reads were
+    * left written byte-by-byte with no lock at all, so the fix was inert. A
+    * torn read (terminator not yet written, so "1.4" over "1.2.3" reads as
     * "1.4.3") matches no stored row, mints a NEW id and rebinds the slot,
     * permanently splitting one physical sensor into two identities in an
     * append-only file. Readers hold the same lock: sensor_mint takes it
     * internally, and the reconcile passes copy under it. */
+   /* REUSE THE SNAPSHOT -- do not re-read g_link_meter here.
+    *
+    * This read was under sensors_lock, which is the wrong lock for that
+    * variable (link_set_meter writes it under driver_lock), and taking
+    * driver_lock inside sensors_lock would invert the documented
+    * driver -> reg order. But the deeper problem is that it was a SECOND,
+    * independent read of a bit already decided above: link_set_meter landing
+    * between the two makes this function pick the meter branch for `dst` and
+    * the CGM branch for the per-link copy. Since the per-link copy is the
+    * mint input, that writes a METER's model into the array sensor_mint
+    * reads, in an append-only provenance file that is never rewritten. One
+    * snapshot, one decision. */
    sensors_lock();
-   if (link >= 0 && link < LINK_MAX && !g_link_meter[link]) {
+   if (link >= 0 && link < LINK_MAX && !is_meter) {
       char *ld = 0;
       if (strncmp(uuid + 4, "2a24", 4) == 0)
          ld = g_model_l[link];
@@ -4308,7 +4945,8 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
    draw(g_win);
 }
 
-/* --- settings-menu system ops via Ble.java (main thread; g_act->env valid) ---
+/* --- settings-menu system ops via Ble.java (main thread; g_act->env valid)
+ * ---
  */
 static void sys_set_orientation(int mode)
 {
@@ -4318,7 +4956,8 @@ static void sys_set_orientation(int mode)
    (*e)->CallStaticVoidMethod(e, g_ble, m_set_orient, g_act->clazz, (jint)mode);
 }
 
-/* EXPORT DATA: Java builds the combined CSV and opens the system share sheet.
+/* EXPORT DATA: Java builds the combined CSV and opens the system share
+ * sheet.
  */
 static void sys_export_data(void)
 {
@@ -4395,8 +5034,8 @@ static int sys_standby_bucket(void)
 }
 
 /* Sample the system states the settings screen shows into the g_sys_* cache.
- * MAIN THREAD ONLY (JNI via the activity env): call on menu-open and after an
- * action, never from a render -- build_model just copies the cache. */
+ * MAIN THREAD ONLY (JNI via the activity env): call on menu-open and after
+ * an action, never from a render -- build_model just copies the cache. */
 static void sys_refresh(void)
 {
    for (int i = 0; i < NPERMS; i++)
@@ -4406,9 +5045,9 @@ static void sys_refresh(void)
    g_sys_bg     = sys_call_bool(m_bg_restricted);
 }
 
-/* Close the keypad/device-list back to wherever pairing was launched from: the
- * settings menu (g_kp_return==MENU_SETTINGS) or the main screen (MENU_NONE,
- * restoring the chosen orientation). */
+/* Close the keypad/device-list back to wherever pairing was launched from:
+ * the settings menu (g_kp_return==MENU_SETTINGS) or the main screen
+ * (MENU_NONE, restoring the chosen orientation). */
 static void keypad_close(void)
 {
    g_menu = g_kp_return;
@@ -4416,10 +5055,10 @@ static void keypad_close(void)
       sys_set_orientation(g_orient);
 }
 
-/* Begin collecting pairing candidates WITHOUT disturbing the current sensor: a
- * passive scan only (the existing bond keeps reconnecting by MAC on its own).
- * g_smart_pairing suppresses the first-DX auto-pair so nothing is touched until
- * the user commits to a specific sensor. */
+/* Begin collecting pairing candidates WITHOUT disturbing the current sensor:
+ * a passive scan only (the existing bond keeps reconnecting by MAC on its
+ * own). g_smart_pairing suppresses the first-DX auto-pair so nothing is
+ * touched until the user commits to a specific sensor. */
 static void pair_scan_start(void)
 {
    g_smart_pairing = 1;
@@ -4430,7 +5069,8 @@ static void pair_scan_start(void)
       start_scan(g_act);
 }
 
-/* Abandon pairing: stop the candidate scan; the existing bond is untouched. */
+/* Abandon pairing: stop the candidate scan; the existing bond is untouched.
+ */
 static void pair_cancel(void)
 {
    g_smart_pairing = 0;
@@ -4441,8 +5081,8 @@ static void pair_cancel(void)
 /* Choose which scanned sensor to pair:
  *   0 found  -> -1 (show the list; it fills as the scan continues)
  *   1 found  -> that one
- *   >1 found -> the strongest IF it beats the next by >= 20 dB (clearly the one
- *               on your body); otherwise -1 (ambiguous -> let the user pick).
+ *   >1 found -> the strongest IF it beats the next by >= 20 dB (clearly the
+ * one on your body); otherwise -1 (ambiguous -> let the user pick).
  */
 static int select_candidate(void)
 {
@@ -4457,7 +5097,8 @@ static int select_candidate(void)
    int map[MAX_DEVS];
    int n    = 0;
    long now = realtime_s();
-   devlist_lock(); /* consistent (count, rssi[]) vs the binder-thread writer */
+   devlist_lock(); /* consistent (count, rssi[]) vs the binder-thread writer
+                    */
    int nd = g_ndevs < MAX_DEVS ? g_ndevs : MAX_DEVS;
    for (int i = 0; i < nd; i++) {
       if (g_devs[i].seen_t > 0 && now - g_devs[i].seen_t > 60)
@@ -4488,26 +5129,51 @@ static int fresh_candidates(void)
    return n;
 }
 
+/* LAND ON THE NEW DEVICE after a successful pairing commit, instead of
+ * dropping the user back where they started.
+ *
+ * Pairing used to end by simply closing the keypad, which returned to the
+ * DEVICES list or the main screen with nothing to show for it -- the tap read
+ * as having done nothing even though it had worked, because a fresh CGM has no
+ * reading for its whole warmup hour. The per-device screen is where that hour
+ * is legible: it carries the WARMUP countdown, the session state and the
+ * pairing outcome, so the flow ends looking at the thing it just created.
+ *
+ * Call AFTER keypad_close(): that leaves g_menu at the flow's own return
+ * target, and THAT is the origin recorded for the X -- never a hardcoded
+ * screen. Backing out of the new device therefore lands exactly where the add
+ * flow would have, which is the same record-the-origin rule MA_SENSOR follows.
+ */
+static void open_new_device(int slot)
+{
+   if (slot < 0 || slot >= g_nslot)
+      return;
+   g_sensor_from = g_menu;
+   g_sel         = slot;
+   g_menu        = MENU_SENSOR;
+}
+
 /* Commit to a specific sensor: NOW drop the old bond and pair the chosen MAC
- * with the entered code. Only reached after the code is in and a candidate is
- * chosen (auto or from the list). */
+ * with the entered code. Only reached after the code is in and a candidate
+ * is chosen (auto or from the list). */
 static void commit_pair(const char *mac)
 {
    /* PAIRING MODE ENDS HERE, on every path.
     *
-    * g_smart_pairing was cleared only on the two success paths, so any of the
-    * four early returns below (meter busy, mint failed, slots full, no free
-    * link) left it latched at 1 forever. jni_on_advert gates the whole
+    * g_smart_pairing was cleared only on the two success paths, so any of
+    * the four early returns below (meter busy, mint failed, slots full, no
+    * free link) left it latched at 1 forever. jni_on_advert gates the whole
     * advert-driven reconnect on !g_smart_pairing, and the on_timer scan
     * self-heal is gated on it too -- so a single failed pairing attempt
     * stopped every already-paired CGM from ever reconnecting again, with
-    * nothing on screen to say so: the advert counter keeps climbing while the
-    * reading quietly stops ageing forward. The user has committed to a device
-    * by the time we are called; whether it works out does not change that. */
+    * nothing on screen to say so: the advert counter keeps climbing while
+    * the reading quietly stops ageing forward. The user has committed to a
+    * device by the time we are called; whether it works out does not change
+    * that. */
    g_smart_pairing = 0;
    g_pend_pairing  = 0; /* any commit supersedes an armed pending pairing */
-   /* A meter has no key exchange: it bonds at the OS level (the meter shows a
-    * passkey, Android prompts for it) the first time we touch its GATT. So
+   /* A meter has no key exchange: it bonds at the OS level (the meter shows
+    * a passkey, Android prompts for it) the first time we touch its GATT. So
     * "pairing" one is just registering it and connecting -- the bond happens
     * as a side effect of the sync, and a refused connection reports back as
     * METER: NOT PAIRED rather than failing silently. */
@@ -4516,17 +5182,17 @@ static void commit_pair(const char *mac)
        *
        * The advert path gates on !g_meter_busy; this one did not, and it
        * resets the SAME otble statics. A user in ADD SENSOR -> ONETOUCH is
-       * there precisely because a scan is running and adverts are flowing, so
-       * meter A can be walking records on a binder thread when they tap meter
-       * B here. The main thread then runs ot_init() concurrently -- phase to
-       * P_IDLE mid-walk, last_index replaced, g_meter_src repointed -- and
-       * three things break permanently: A's remaining fingersticks are written
-       * to readings.csv under B's id (append-only, never rewritten);
-       * meter_index_save stores A's walk position under B's id, which is the
-       * cross-meter corruption the per-meter index file exists to prevent; and
-       * the interrupted sync sends no ack, wedging until the 90 s watchdog.
-       * The sync is seconds long and self-clears, so refusing costs the user a
-       * retry and nothing else. */
+       * there precisely because a scan is running and adverts are flowing,
+       * so meter A can be walking records on a binder thread when they tap
+       * meter B here. The main thread then runs ot_init() concurrently --
+       * phase to P_IDLE mid-walk, last_index replaced, g_meter_src repointed
+       * -- and three things break permanently: A's remaining fingersticks
+       * are written to readings.csv under B's id (append-only, never
+       * rewritten); meter_index_save stores A's walk position under B's id,
+       * which is the cross-meter corruption the per-meter index file exists
+       * to prevent; and the interrupted sync sends no ack, wedging until the
+       * 90 s watchdog. The sync is seconds long and self-clears, so refusing
+       * costs the user a retry and nothing else. */
       if (g_meter_busy) {
          LOGI("refusing to pair a meter while another is mid-sync");
          set_status("METER BUSY, RETRY");
@@ -4547,8 +5213,9 @@ static void commit_pair(const char *mac)
       }
       g_meter_src = id;
       /* Seed THIS meter's stored index. Without it the driver kept whatever
-       * last_index the previously synced meter left in its static state, so a
-       * newly paired meter with a higher counter had its oldest records skipped
+       * last_index the previously synced meter left in its static state, so
+       * a newly paired meter with a higher counter had its oldest records
+       * skipped
        * -- and ot_drv_done then persisted that skipped index under the new
        * meter's id, making the loss permanent. */
       /* otble's statics are otherwise only touched under driver_lock, from
@@ -4564,30 +5231,65 @@ static void commit_pair(const char *mac)
       str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
       /* The new meter's own link, by the same allocation as every other
        * device -- link_for_slot binds it to this slot's address. */
-      int mlink = link_for_slot(idx);
-      if (mlink < 0) {
+      int mlink = meter_alloc_link();
+      /* BOTH bounds, as meter_sync_start does. Only the lower one was
+       * checked here, and g_link_armed is indexed by this below. */
+      if (mlink < 0 || mlink >= LINK_MAX) {
          set_status("NO FREE LINK");
          keypad_close();
          return;
       }
       link_set_meter(mlink, 1);
+      /* ARM THE TABLE -- the same discipline as meter_sync_start, and for
+       * the same reason. pancra_meter_connected identifies the meter ONLY
+       * from g_link_armed[link]; with the entry empty it finds "no
+       * registered meter there" and REFUSES the very connection this path
+       * just issued. Pairing then only completed by accident: an unarmed
+       * link also makes meter_armed() false, so the 1 Hz tick called
+       * meter_sync_start, which allocated the same meter a SECOND link and
+       * armed that one properly. The pairing worked and a link leaked every
+       * time. Armed before the connect, because the callback lands on a
+       * binder thread and a meter this close answers in milliseconds. */
+      driver_lock();
+      str_snapshot(g_link_armed[mlink], sizeof g_link_armed[mlink], mac);
+      driver_unlock();
       g_meter_link  = mlink;
       g_meter_busy  = 1;
       g_meter_start = realtime_s();
+      /* Ask for the OS bond NOW rather than letting the first GATT touch
+       * trigger it minutes from now: the meter shows a passkey and Android
+       * prompts for it, and a prompt that arrives while the user is still
+       * looking at this screen is one they can actually answer. */
+      dexble_create_bond(mac);
       set_status("METER: PAIRING");
       LOGI("registered meter id=%d mac=%s on link %d; connecting to bond", id,
            mac, mlink);
+      /* Release on every path that does not leave a connect outstanding, or
+       * the link stays armed with nothing behind it -- and armed is exactly
+       * what stops the tick from ever retrying it. */
+      int connected = 0;
       if (g_act) {
          g_scan_hold_until = realtime_s() + 20; /* quiet radio to bond */
          stop_scan(g_act);
-         dexble_meter_connect(mlink, mac);
+         connected = dexble_meter_connect(mlink, mac);
+      }
+      if (!connected) {
+         LOGI("meter %s: pairing connect did not reach the transport", mac);
+         meter_release_link(mlink);
+         g_meter_busy = 0;
+         g_meter_link = -1;
+         set_status("METER: NOT PAIRED");
       }
       keypad_close();
+      /* Even on a failed connect: the slot IS registered, and its own screen
+       * is where the failure is stated and retried. Returning to the list
+       * would hide the one row that explains what happened. */
+      open_new_device(idx);
       return;
    }
 
-   /* A new sensor pairs on the first free CGM link, so pairing a second sensor
-    * neither disturbs nor replaces one that is already streaming. */
+   /* A new sensor pairs on the first free CGM link, so pairing a second
+    * sensor neither disturbs nor replaces one that is already streaming. */
    int link = link_for_slot(g_nslot);
    if (link < 0) {
       set_status("NO FREE SENSOR LINK");
@@ -4598,11 +5300,12 @@ static void commit_pair(const char *mac)
    /* Register the sensor NOW, before the radio work: the user has committed
     * to this device, and the DEVICES list must say so immediately -- waiting
     * for the first reading (a minute or more) reads as the tap having done
-    * nothing. The row is minted BARE (activation unknown, no DIS strings yet);
-    * sensor_reconcile completes those attributes in place once they arrive
-    * (sensor_complete), so nothing wrong is ever written to the append-only
-    * file -- only nothing-yet. Registration BEFORE driver_forget below, so a
-    * refusal here leaves the existing bond untouched. */
+    * nothing. The row is minted BARE (activation unknown, no DIS strings
+    * yet); sensor_reconcile completes those attributes in place once they
+    * arrive (sensor_complete), so nothing wrong is ever written to the
+    * append-only file -- only nothing-yet. Registration BEFORE driver_forget
+    * below, so a refusal here leaves the existing bond untouched. */
+   int newslot = -1;
    {
       int cgm_type =
           (sensor_kind(g_add_type) == KIND_CGM) ? g_add_type : SENSOR_STELO;
@@ -4618,18 +5321,7 @@ static void commit_pair(const char *mac)
          keypad_close();
          return;
       }
-      /* The user pre-armed "this sensor takes the big number when it
-       * lands" from the choose-primary screen while the pairing was still
-       * pending: honour it now that the slot exists. */
-      if (g_pend_primary) {
-         g_pend_primary = 0;
-         sensor_set_primary(sidx);
-         int prime = sensor_primary_id();
-         hist_lock();
-         hist_refresh_current(prime);
-         hist_unlock();
-         g_notify_dirty = 1;
-      }
+      newslot = sidx; /* the screen this flow ends on -- see open_new_device */
       LOGI("registered sensor id=%d type=%s mac=%s at pairing commit", id,
            sensor_type_name(cgm_type), mac);
    }
@@ -4646,16 +5338,31 @@ static void commit_pair(const char *mac)
       stop_scan(g_act);
    }
    set_status("PAIRING");
+   /* Ask for the OS bond BEFORE the GATT work, for the same reason as the
+    * meter above: the dialog then belongs to the tap that caused it.
+    *
+    * Safe against the J-PAKE that follows. Ble.createBond returns immediately
+    * when the device is already BONDED or already BONDING, so this cannot
+    * restart a bond mid-flight; when it is neither, the request goes out and
+    * dexble_pair's connectGatt (autoConnect=true) attaches to the same device.
+    * The sensor asks for security itself a few seconds into the connection
+    * anyway -- an HCI capture shows the full LE Secure Connections exchange
+    * completing seven seconds before the first EGV -- so this only moves the
+    * prompt earlier, it does not add one that was not going to happen. */
+   dexble_create_bond(mac);
    if (g_act)
       dexble_pair(link, mac, g_code_str);
    keypad_close();
+   /* The whole point: a fresh CGM shows nothing for an hour, so end the flow
+    * on the screen that counts that hour down. */
+   open_new_device(newslot);
    LOGI("pair new sensor %s with code %s on link %d", mac, g_code_str, link);
 }
 
-/* Apply the SCREEN setting. FLAG_KEEP_SCREEN_ON is what overrides the display
- * timeout while the app is open; clearing it hands the screen back to the OS.
- * Only the window flag changes -- the BLE wakelock in PancraService is
- * separate, so readings keep arriving either way. */
+/* Apply the SCREEN setting. FLAG_KEEP_SCREEN_ON is what overrides the
+ * display timeout while the app is open; clearing it hands the screen back
+ * to the OS. Only the window flag changes -- the BLE wakelock in
+ * PancraService is separate, so readings keep arriving either way. */
 static void apply_screen_on(void)
 {
    if (!g_act)
@@ -4667,10 +5374,11 @@ static void apply_screen_on(void)
 }
 
 /* Point the driver at the sensor whose screen is open. Calibration reads and
- * writes go to the selected link, and the 1 Hz reconcile moves that selection
- * constantly -- without this the user could calibrate a different sensor from
- * the one named on screen, which for the most consequential write in the app is
- * not an acceptable failure. Returns 0 if the selection is not usable. */
+ * writes go to the selected link, and the 1 Hz reconcile moves that
+ * selection constantly -- without this the user could calibrate a different
+ * sensor from the one named on screen, which for the most consequential
+ * write in the app is not an acceptable failure. Returns 0 if the selection
+ * is not usable. */
 static int cal_select(void)
 {
    /* Takes driver_lock() on success -- the caller MUST driver_unlock() after
@@ -4678,10 +5386,11 @@ static int cal_select(void)
     * another thread before the write goes out. */
    if (g_sel < 0 || g_sel >= g_nslot)
       return 0;
-   /* Under the registry lock: srec_push memmoves g_srec from a binder thread,
-    * and this decides whether a CALIBRATION -- the most consequential write in
-    * the app -- is permitted. A torn read of the type could permit one against
-    * the wrong sensor. Copy the answer out; hold no pointer. */
+   /* Under the registry lock: srec_push memmoves g_srec from a binder
+    * thread, and this decides whether a CALIBRATION -- the most
+    * consequential write in the app -- is permitted. A torn read of the type
+    * could permit one against the wrong sensor. Copy the answer out; hold no
+    * pointer. */
    sensors_lock();
    const struct sensor_rec *r = sensor_rec_by_id(g_slot[g_sel].id);
    int is_cgm                 = (r && sensor_kind(r->type) == KIND_CGM);
@@ -4778,10 +5487,11 @@ static void calq_load(void)
    }
 }
 
-/* Attempt the queued calibration NOW. driver_lock must be held and the driver
- * selected to the queued sensor's link (true inside pancra_glucose, which is
- * the ideal moment -- a reading just proved the sensor is streaming). A refusal
- * is not a loss: the value stays queued and the next stream tries again. */
+/* Attempt the queued calibration NOW. driver_lock must be held and the
+ * driver selected to the queued sensor's link (true inside pancra_glucose,
+ * which is the ideal moment -- a reading just proved the sensor is
+ * streaming). A refusal is not a loss: the value stays queued and the next
+ * stream tries again. */
 static void calq_try_locked(void)
 {
    if (g_calq_mgdl <= 0)
@@ -4789,14 +5499,15 @@ static void calq_try_locked(void)
    struct dex_cal c;
    driver_get_cal(&c);
    /* The sensor answered and does NOT permit calibration at all (a factory-
-    * calibrated Stelo, say). Distinct from a value the sensor REJECTS: this is
-    * "the device does not support calibration", so say NOT SUPPORTED. Fail
-    * VISIBLY at once rather than leaving it PENDING until the window lapses.
-    * This only drops the queued value -- it does NOT lock calibration out: a
-    * later user-initiated calibration re-queues and re-probes permission
-    * afresh. */
+    * calibrated Stelo, say). Distinct from a value the sensor REJECTS: this
+    * is "the device does not support calibration", so say NOT SUPPORTED.
+    * Fail VISIBLY at once rather than leaving it PENDING until the window
+    * lapses. This only drops the queued value -- it does NOT lock
+    * calibration out: a later user-initiated calibration re-queues and
+    * re-probes permission afresh. */
    if (c.have && !c.permitted) {
-      LOGI("calibration not permitted by this sensor; queued %d mg/dL not sent",
+      LOGI("calibration not permitted by this sensor; queued %d mg/dL not "
+           "sent",
            g_calq_mgdl);
       g_lastcal_mgdl  = g_calq_mgdl;
       g_lastcal_t     = realtime_s();
@@ -4812,11 +5523,11 @@ static void calq_try_locked(void)
     * streaming, so the calibration could otherwise never proceed. The write
     * itself goes on the next stream once the reply sets cal.permitted.
     *
-    * BE GENTLE with a sensor that may not want calibrations: throttle the probe
-    * to at most once a minute (cal.asked is when we last asked), so a Stelo
-    * that never answers is nudged only a handful of times before the window
-    * lapses and it FAILS -- never hammered. A sensor that answers "no" is
-    * caught by the fast-fail above and never probed again. */
+    * BE GENTLE with a sensor that may not want calibrations: throttle the
+    * probe to at most once a minute (cal.asked is when we last asked), so a
+    * Stelo that never answers is nudged only a handful of times before the
+    * window lapses and it FAILS -- never hammered. A sensor that answers
+    * "no" is caught by the fast-fail above and never probed again. */
    if (!c.have) {
       if (c.asked == 0 || realtime_s() - c.asked >= 60) {
          driver_cal_bounds();
@@ -4826,10 +5537,10 @@ static void calq_try_locked(void)
       }
       return;
    }
-   /* Permitted: send the calibration, but only if we are not already awaiting a
-    * reply from a recent send (calq_tick clears g_calq_sent after 60 s of
-    * silence). One 0x34 per minute at most -- gentle, and the sensor's reply
-    * normally resolves it on the first try. */
+   /* Permitted: send the calibration, but only if we are not already
+    * awaiting a reply from a recent send (calq_tick clears g_calq_sent after
+    * 60 s of silence). One 0x34 per minute at most -- gentle, and the
+    * sensor's reply normally resolves it on the first try. */
    if (g_calq_sent > 0 && realtime_s() - g_calq_sent < 60)
       return;
    if (driver_calibrate(g_calq_mgdl)) {
@@ -4852,9 +5563,9 @@ static void calq_tick(void)
       g_calq_sent = 0; /* no reply in a minute: allow another attempt */
    if (now - g_calq_t > CALQ_WINDOW_S) {
       (void)snprintf(g_calq_status, sizeof g_calq_status, "FAILED - RE-ENTER");
-      LOGI(
-          "calibration %d mg/dL never accepted within %ld s; giving up VISIBLY",
-          g_calq_mgdl, CALQ_WINDOW_S);
+      LOGI("calibration %d mg/dL never accepted within %ld s; giving up "
+           "VISIBLY",
+           g_calq_mgdl, CALQ_WINDOW_S);
       g_lastcal_mgdl  = g_calq_mgdl;
       g_lastcal_t     = now;
       g_lastcal_state = CAL_ST_FAILED;
@@ -4880,9 +5591,10 @@ void pancra_cal_result(int result)
       g_lastcal_state = CAL_ST_APPLIED;
       calq_clear();
    } else {
-      /* The sensor actively rejected the value -- resending it will not help,
-       * so surface it (LAST CAL shows REJECTED) rather than looping or dropping
-       * it silently. No beep: the official app is silent on a rejection too. */
+      /* The sensor actively rejected the value -- resending it will not
+       * help, so surface it (LAST CAL shows REJECTED) rather than looping or
+       * dropping it silently. No beep: the official app is silent on a
+       * rejection too. */
       LOGI("calibration %d mg/dL REJECTED by the sensor (result=0x%02x)",
            g_calq_mgdl, result);
       (void)snprintf(g_calq_status, sizeof g_calq_status, "REJECTED %d",
@@ -4893,8 +5605,9 @@ void pancra_cal_result(int result)
    g_ui_dirty = 1;
 }
 
-/* Is the old device in slot idx already past its wear + grace? Reconnecting a
- * pre-expiry disconnect is sensible; a post-expiry one is confirmed first. */
+/* Is the old device in slot idx already past its wear + grace? Reconnecting
+ * a pre-expiry disconnect is sensible; a post-expiry one is confirmed first.
+ */
 static int old_slot_expired(int idx)
 {
    if (idx < 0 || idx >= g_nslot)
@@ -4971,7 +5684,8 @@ static int wt_action(int action)
       g_wt_t      = realtime_s();
       g_wt_tenths = (g_nwt > 0) ? wt_to_tenths(g_wt[g_nwt - 1].g, g_wunits)
                                 : wt_to_tenths(70000L, g_wunits);
-      g_wt_edit   = -1; /* a NEW entry, not an edit */
+      g_wt_edit   = -1;     /* a NEW entry, not an edit */
+      g_wt_from   = g_menu; /* ADD menu, or a main-screen shortcut */
       g_menu      = MENU_WEIGHT;
    } else if (action >= MA_WTLOG_EDIT && action < MA_WTLOG_EDIT + NWT) {
       /* A row in the table opens that entry in the EDIT WEIGHT form. Keep a
@@ -5004,9 +5718,10 @@ static int wt_action(int action)
       g_ui_dirty = 1;
    } else if (action == MA_WTLOG_OPEN) {
       g_wtlog_page = 0;
+      g_wtlog_from = g_menu; /* ADD menu, or a main-screen shortcut */
       g_menu       = MENU_WTLOG;
    } else if (action == MA_WTLOG_BACK) {
-      g_menu = MENU_ADD;
+      g_menu = g_wtlog_from;
    } else if (action == MA_WTLOG_PREV) {
       if (g_wtlog_page > 0)
          g_wtlog_page--;
@@ -5022,7 +5737,8 @@ static int wt_action(int action)
       g_kp_return = MENU_WEIGHT;
       g_entrylen  = 0;
    } else if (action == MA_WT_CONFIRM) {
-      /* The one write, on the explicit CONFIRM only (the calibration rule). */
+      /* The one write, on the explicit CONFIRM only (the calibration rule).
+       */
       if (g_menu == MENU_WEIGHT) {
          long g = wt_from_tenths(g_wt_tenths, g_wunits);
          int rc = -1;
@@ -5034,8 +5750,9 @@ static int wt_action(int action)
             LOGI("weight %s: %ld g at %ld", ed ? "edited" : "logged", g,
                  g_wt_t);
             set_status(ed ? "WEIGHT EDITED" : "WEIGHT LOGGED");
-            /* An EDIT returns to the log it was opened from; a NEW entry is a
-             * completed task and lands on the main screen (the insulin rule).
+            /* An EDIT returns to the log it was opened from; a NEW entry is
+             * a completed task and lands on the main screen (the insulin
+             * rule).
              */
             g_menu    = ed ? MENU_WTLOG : MENU_NONE;
             g_wt_edit = -1;
@@ -5047,9 +5764,10 @@ static int wt_action(int action)
          g_ui_dirty = 1;
       }
    } else if (action == MA_WT_DISCARD) {
-      /* Back where it came from: the log for an edit, the ADD menu for a new
-       * entry (the record-the-origin rule). */
-      g_menu    = (g_wt_edit >= 0) ? MENU_WTLOG : MENU_ADD;
+      /* Back where it came from: the log for an edit, otherwise the screen
+       * the form was opened from (the record-the-origin rule -- which this
+       * line only claimed to follow while it named a fixed menu). */
+      g_menu    = (g_wt_edit >= 0) ? MENU_WTLOG : g_wt_from;
       g_wt_edit = -1;
    } else if (action == MA_WUNITS) {
       /* Display only: the file is grams, so this re-renders history rather
@@ -5078,8 +5796,10 @@ static int ins_action(int action)
       g_ins_t -= g_ins_t % 60;
       int lu      = insulin_last_units(g_ins_type);
       g_ins_units = (lu > 0) ? lu : 1;
-      g_ins_from  = MENU_ADD; /* these buttons live on the ADD menu */
-      g_menu      = MENU_INSULIN;
+      /* The screen the tap came from: the ADD menu, or the main screen when
+       * this action is one of its shortcut buttons. */
+      g_ins_from = g_menu;
+      g_menu     = MENU_INSULIN;
    } else if (action == MA_INS_TYPE) {
       g_ins_type = (g_ins_type == INS_FAST) ? INS_SLOW : INS_FAST;
       /* A NEW dose's amount follows the type (each has its own habitual
@@ -5090,6 +5810,7 @@ static int ins_action(int action)
       }
    } else if (action == MA_INSLOG_OPEN) {
       g_inslog_page = 0;
+      g_inslog_from = g_menu; /* ADD menu, or a main-screen shortcut */
       g_menu        = MENU_INSLOG;
    } else if (action == MA_INSLOG_PREV) {
       if (g_inslog_page > 0)
@@ -5184,9 +5905,9 @@ static int ins_action(int action)
 }
 
 /* Every SUBMENU navigation/config action -- ALARM (and its two threshold-
- * keypad openers), EXPORT DATA, REMOTE, PERMISSIONS, DISPLAY, OLD DEVICES --
- * split out of menu_action so it stays under the size gate (the ins_action
- * pattern). Returns 1 when `action` was one of ours. */
+ * keypad openers), EXPORT DATA, REMOTE, PERMISSIONS, DISPLAY, DEVICES, OLD
+ * DEVICES -- split out of menu_action so it stays under the size gate (the
+ * ins_action pattern). Returns 1 when `action` was one of ours. */
 static int submenu_action(int action)
 {
    if (action == MA_ALARM_LOW || action == MA_ALARM_HIGH ||
@@ -5256,6 +5977,54 @@ static int submenu_action(int action)
       g_kp_mode   = 5;
       g_kp_return = MENU_REMOTE;
       g_entrylen  = 0;
+   } else if (action == MA_DEVICES_OPEN) {
+      /* Two doors lead here -- the main screen's big number and the SETTINGS
+       * row -- so RECORD which one, never infer it: MA_DEVICES_BACK returns
+       * exactly there. Capture only on external entry; OLD DEVICES and the
+       * pairing flow re-enter MENU_DEVICES on their own way back and must not
+       * overwrite the origin. */
+      if (g_menu == MENU_NONE || g_menu == MENU_SETTINGS) {
+         g_devices_from = g_menu;
+         g_dev_page     = 0; /* a fresh entry always opens on page 1 */
+      }
+      g_menu = MENU_DEVICES;
+   } else if (action >= MA_SCTOGGLE &&
+              action < MA_SCTOGGLE + ui_shortcut_count()) {
+      /* Toggle a main-screen shortcut. The list is kept DENSE -- removing the
+       * middle one closes the gap -- because the main screen walks it and an
+       * empty slot between two live ones would draw a hole in the row.
+       *
+       * At SC_MAX the extra tap is REFUSED rather than evicting something: the
+       * user picked those three, and silently dropping one to make room for a
+       * fourth is the kind of helpfulness that loses a setting. The status line
+       * says why, so the tap is not simply inert. */
+      int code = ui_shortcut_code(action - MA_SCTOGGLE);
+      int at   = -1;
+      int n    = 0;
+      for (int i = 0; i < SC_MAX; i++) {
+         if (g_shortcut[i] == code)
+            at = i;
+         if (g_shortcut[i] > 0)
+            n++;
+      }
+      if (at >= 0) {
+         for (int i = at; i < SC_MAX - 1; i++)
+            g_shortcut[i] = g_shortcut[i + 1];
+         g_shortcut[SC_MAX - 1] = 0;
+         settings_save();
+      } else if (n < SC_MAX) {
+         g_shortcut[n] = code;
+         settings_save();
+      } else {
+         set_status("3 SHORTCUTS MAX");
+      }
+   } else if (action == MA_DEVPAGE_PREV) {
+      if (g_dev_page > 0)
+         g_dev_page--;
+   } else if (action == MA_DEVPAGE_NEXT) {
+      g_dev_page++; /* render clamps to the last page */
+   } else if (action == MA_DEVICES_BACK) {
+      g_menu = g_devices_from;
    } else if (action == MA_OLDDEV_OPEN) {
       g_old_page = 0; /* always open on the first page */
       g_menu     = MENU_OLDDEV;
@@ -5264,10 +6033,12 @@ static int submenu_action(int action)
          g_old_page--;
    } else if (action == MA_OLDPAGE_NEXT) {
       g_old_page++; /* render clamps to the last page */
-   } else if (action == MA_PERMS_BACK || action == MA_OLDDEV_BACK ||
-              action == MA_REMOTE_BACK || action == MA_DISPLAY_BACK ||
-              action == MA_EXP_BACK) {
-      /* All five submenus were opened FROM settings; their X returns
+   } else if (action == MA_OLDDEV_BACK) {
+      /* OLD DEVICES hangs off the DEVICES screen, not off settings. */
+      g_menu = MENU_DEVICES;
+   } else if (action == MA_PERMS_BACK || action == MA_REMOTE_BACK ||
+              action == MA_DISPLAY_BACK || action == MA_EXP_BACK) {
+      /* All four submenus were opened FROM settings; their X returns
        * there. (The ALARM submenu is the exception -- also reachable from
        * the main screen, so its back goes through g_alarm_from above.) */
       g_menu = MENU_SETTINGS;
@@ -5277,185 +6048,14 @@ static int submenu_action(int action)
    return 1;
 }
 
-static void menu_action(int action)
+/* Per-device STYLING: marker shape, size, colour, and the rename keypad.
+ * Split out of menu_action for the same reason ins_action and wt_action were
+ * -- that function is the app's single largest, and the size gate is what
+ * stops it growing without bound. Returns 1 when `action` was one of ours.
+ */
+static int style_action(int action)
 {
-   if (action == 0) {
-      g_orient = (int)(((unsigned)g_orient + 1U) & 3U);
-      settings_save();
-   } /* applied on close */
-   else if (action == 1) {
-      g_sound_on = !g_sound_on;
-      settings_save();
-      alarm_reactuate(); /* an alarm may be latched but inaudible -- see there
-                          */
-   } else if (action == 2) {
-      g_vib_on = !g_vib_on;
-      settings_save();
-      alarm_reactuate();
-   } else if (action == 3) {
-      g_units = !g_units;
-      settings_save();
-      /* The notification renders the value in DISPLAY units (title AND the
-       * status-bar icon) but is only rebuilt on a new datapoint -- without
-       * an explicit refresh the bar keeps showing the OLD units' rendering
-       * (e.g. "9.4" beside a big number reading 169) for up to a full CGM
-       * cadence after the toggle. */
-      g_notify_dirty = 1;
-      pancra_notify_refresh();
-   } else if (action == 4) {
-      g_disc = (int)(((unsigned)g_disc + 1U) & 3U);
-      settings_save();
-   } else if (action == 5) {
-      g_screen_on = !g_screen_on;
-      settings_save();
-      apply_screen_on(); /* takes effect immediately, not on menu close */
-   } else if (action == MA_NEWDATA) {
-      /* OFF -> BEEP -> CHIRP -> OFF. A cycle, not a toggle, since CHIRP
-       * joined: the row shows which of the three is active. */
-      g_newdata_mode = (g_newdata_mode + 1) % 3;
-      settings_save();
-   }
-   /* --- sensor registry --- */
-   else if (action >= MA_SENSOR && action < MA_SENSOR + MAX_SLOTS) {
-      /* Remember the origin so MA_SENSOR_BACK returns there -- but ONLY on a
-       * genuine EXTERNAL entry (from the main screen or the DEVICES list). The
-       * marker/colour/label/cal sub-screens also re-enter MENU_SENSOR via
-       * MA_SENSOR, and capturing the origin then would clobber it with the
-       * sub-screen's menu. So capture only when arriving from MENU_NONE (main)
-       * or MENU_SETTINGS; any other current menu is an internal round-trip and
-       * leaves the origin untouched. */
-      if (g_menu == MENU_NONE || g_menu == MENU_SETTINGS ||
-          g_menu == MENU_OLDDEV)
-         g_sensor_from = g_menu;
-      g_sel  = action - MA_SENSOR;
-      g_menu = (g_sel < g_nslot) ? MENU_SENSOR : MENU_SETTINGS;
-   } else if (action == MA_SENSOR_BACK) {
-      g_menu = g_sensor_from; /* back to where it was opened from */
-      g_sel  = -1;
-   } else if (action == MA_ADDSENSOR) {
-      /* The ADD DEVICE type picker shares MA_SENSOR_BACK for its X, so record
-       * where it was opened from -- ONLY on external entry (the DEVICES list in
-       * settings, the main-screen '+' ADD menu, or a main-screen entry point).
-       * METERHELP re-enters this to go back to the picker and must NOT reset
-       * the origin. */
-      if (g_menu == MENU_NONE || g_menu == MENU_SETTINGS || g_menu == MENU_ADD)
-         g_sensor_from = g_menu;
-      g_menu = MENU_SENSTYPE;
-   } else if (action >= MA_TYPE && action < MA_TYPE + SENSOR_NTYPES) {
-      /* The ADD menu's DEVICES section enters here DIRECTLY (no
-       * MA_ADDSENSOR hop records the origin), so record it now: the flow
-       * must fall back to the MAIN screen, not into settings. */
-      if (g_menu == MENU_ADD)
-         g_sensor_from = MENU_ADD;
-      /* Every abort inside the pairing flow (keypad X, device-list
-       * cancel) returns to the EXACT screen the type was tapped on. */
-      g_pair_from = (g_menu == MENU_ADD) ? MENU_ADD : MENU_SENSTYPE;
-      g_add_type  = action - MA_TYPE;
-      /* A CGM pairs with a code on the keypad; a meter bonds at the OS level,
-       * so it only has to be discovered. */
-      /* Where the flow lands when it finishes (or is closed): back into
-       * SETTINGS only if that is where it was entered from -- an ADD-menu or
-       * main-screen entry must fall back to the MAIN screen, not into a
-       * settings menu the user never opened. */
-      int kp_ret = (g_sensor_from == MENU_SETTINGS) ? MENU_SETTINGS : MENU_NONE;
-      if (sensor_kind(g_add_type) == KIND_CGM) {
-         g_menu      = MENU_KEYPAD;
-         g_kp_mode   = 0;
-         g_kp_return = kp_ret;
-         g_entrylen  = 0;
-         pair_scan_start();
-      } else {
-         /* A meter must be woken and put into pairing mode by hand first, so
-          * show instructions and DON'T scan yet -- the Scan button there starts
-          * the scan (MA_METERSCAN). */
-         g_menu      = MENU_METERHELP;
-         g_kp_return = kp_ret;
-      }
-   } else if (action == MA_METERSCAN) {
-      g_menu = MENU_DEVLIST;
-      g_kp_return =
-          (g_sensor_from == MENU_SETTINGS) ? MENU_SETTINGS : MENU_NONE;
-      pair_scan_start();
-   } else if (action == MA_PRIMARY) {
-      if (g_sel >= 0 && g_sel < g_nslot) {
-         sensor_set_primary(g_sel);
-         /* Re-bind the big number NOW, not on the next reading (up to 5 min
-          * away): the primary owns it by contract, and if the new primary has
-          * no data yet the display must clear rather than keep the previous
-          * primary's value. Resolve the id before hist_lock (reg -> hist). */
-         int prime = sensor_primary_id();
-         hist_lock();
-         hist_refresh_current(prime);
-         hist_unlock();
-         g_notify_dirty = 1; /* the notification mirrors the big number */
-      }
-   } else if (action >= MA_PRIM_PICK && action < MA_PRIM_PICK + MAX_SLOTS) {
-      /* Choose-primary screen: the row tap IS the switch, and closing back to
-       * the main screen with the big number re-bound is the feedback.
-       * sensor_set_primary re-validates the index and refuses a BGM, so a
-       * slot table that shifted since the render cannot promote a meter. */
-      if (g_menu == MENU_PRIMPICK) {
-         sensor_set_primary(action - MA_PRIM_PICK);
-         int prime = sensor_primary_id();
-         hist_lock();
-         hist_refresh_current(prime);
-         hist_unlock();
-         g_notify_dirty = 1;
-         g_menu         = MENU_NONE;
-      }
-   } else if (action == MA_RECONNECT) {
-      /* Direct revive if the sensor was pulled BEFORE expiry; otherwise a
-       * confirmation, since reconnecting a dead sensor just waits forever. */
-      if (g_sel >= 0 && g_sel < g_nslot) {
-         if (old_slot_expired(g_sel))
-            g_menu = MENU_RECONF;
-         else
-            do_reconnect(g_sel);
-      }
-   } else if (action == MA_RECON_YES) {
-      do_reconnect(g_sel);
-   } else if (action == MA_PEND_CANCEL) {
-      if (g_pend_pairing) {
-         LOGI("pending pairing cancelled by user");
-         g_pend_pairing = 0;
-         g_pend_primary = 0;
-         set_status("PAIRING CANCELLED");
-      }
-   } else if (action == MA_PRIM_PEND) {
-      /* Pre-arm: when the pending pairing commits, that sensor takes the
-       * big number (commit_pair honours this). The picker closes with the
-       * choice made -- same feel as picking a live sensor. */
-      if (g_menu == MENU_PRIMPICK && g_pend_pairing) {
-         g_pend_primary = 1;
-         g_menu         = MENU_NONE;
-      }
-   } else if (action == MA_WEAR) {
-      /* Cycle this device's wear budget: AUTO -> 10 D -> 15 D -> AUTO.
-       *
-       * THREE STATES, NOT TWO, AND AUTO MUST BE REACHABLE. This was a
-       * 10 <-> 15 toggle, so the first tap wrote an explicit override and
-       * NOTHING could ever remove it again: sensor_wear_seconds gives a pin
-       * absolute priority, which permanently disabled the model resolution
-       * for that device. A G7 paired on 2026-07-23 -- one day before the
-       * SW14758 (G7 15 Day) model rule existed -- carried a pin of 10 from
-       * that era, so once the rule landed the app went on counting a 10-day
-       * budget for a sensor it could now positively identify as 15-day,
-       * declaring it nearly finished with five days left. One accidental tap
-       * on a full-width row was enough to cause it, and there was no way
-       * back. Preferences only -- no radio, no provenance. */
-      if (g_sel >= 0 && g_sel < g_nslot) {
-         sensors_lock();
-         int w = g_slot[g_sel].wear_days;
-         if (w == 10)
-            g_slot[g_sel].wear_days = 15;
-         else if (w == 15)
-            g_slot[g_sel].wear_days = 0; /* back to the model/type rule */
-         else
-            g_slot[g_sel].wear_days = 10;
-         slots_save();
-         sensors_unlock();
-      }
-   } else if (action == MA_MARKER) {
+   if (action == MA_MARKER) {
       if (g_sel >= 0 && g_sel < g_nslot) {
          g_markpick_ins = -1; /* this picker edits the SENSOR's styling */
          g_menu         = MENU_MARKPICK;
@@ -5472,8 +6072,8 @@ static void menu_action(int action)
          slots_save();
          sensors_unlock();
       }
-      /* stay on the combined MARKER menu so shape/size/colour can be adjusted
-       * together; the title-row X returns to the device menu */
+      /* stay on the combined MARKER menu so shape/size/colour can be
+       * adjusted together; the title-row X returns to the device menu */
    } else if (action >= MA_SIZE_PICK &&
               action <= MA_SIZE_PICK + MARK_SIZE_MAX) {
       int sz = action - MA_SIZE_PICK; /* 1..MARK_SIZE_MAX */
@@ -5530,6 +6130,182 @@ static void menu_action(int action)
          sensors_unlock();
       }
       /* stay on the combined MARKER menu (see MA_MARK_PICK) */
+   } else {
+      return 0; /* not ours */
+   }
+   return 1;
+}
+
+static void menu_action(int action)
+{
+   if (action == 0) {
+      g_orient = (int)(((unsigned)g_orient + 1U) & 3U);
+      settings_save();
+   } /* applied on close */
+   else if (action == 1) {
+      g_sound_on = !g_sound_on;
+      settings_save();
+      alarm_reactuate(); /* an alarm may be latched but inaudible -- see
+                          * there
+                          */
+   } else if (action == 2) {
+      g_vib_on = !g_vib_on;
+      settings_save();
+      alarm_reactuate();
+   } else if (action == 3) {
+      g_units = !g_units;
+      settings_save();
+      /* The notification renders the value in DISPLAY units (title AND the
+       * status-bar icon) but is only rebuilt on a new datapoint -- without
+       * an explicit refresh the bar keeps showing the OLD units' rendering
+       * (e.g. "9.4" beside a big number reading 169) for up to a full CGM
+       * cadence after the toggle. */
+      g_notify_dirty = 1;
+      pancra_notify_refresh();
+   } else if (action == 4) {
+      g_disc = (int)(((unsigned)g_disc + 1U) & 3U);
+      settings_save();
+   } else if (action == 5) {
+      g_screen_on = !g_screen_on;
+      settings_save();
+      apply_screen_on(); /* takes effect immediately, not on menu close */
+   } else if (action == MA_NEWDATA) {
+      /* OFF -> BEEP -> CHIRP -> OFF. A cycle, not a toggle, since CHIRP
+       * joined: the row shows which of the three is active. */
+      g_newdata_mode = (g_newdata_mode + 1) % 3;
+      settings_save();
+   }
+   /* --- sensor registry --- */
+   else if (action >= MA_SENSOR && action < MA_SENSOR + MAX_SLOTS) {
+      /* Remember the origin so MA_SENSOR_BACK returns there -- but ONLY on a
+       * genuine EXTERNAL entry (the DEVICES list, the OLD DEVICES list, or
+       * the main screen's info-block shortcut). The marker/colour/label/cal
+       * sub-screens also re-enter MENU_SENSOR via MA_SENSOR, and capturing
+       * the origin then would clobber it with the sub-screen's menu. So
+       * capture only on those three; any other current menu is an internal
+       * round-trip and leaves the origin untouched. */
+      if (g_menu == MENU_NONE || g_menu == MENU_DEVICES ||
+          g_menu == MENU_OLDDEV)
+         g_sensor_from = g_menu;
+      g_sel  = action - MA_SENSOR;
+      g_menu = (g_sel < g_nslot) ? MENU_SENSOR : MENU_DEVICES;
+   } else if (action == MA_SENSOR_BACK) {
+      g_menu = g_sensor_from; /* back to where it was opened from */
+      g_sel  = -1;
+   } else if (action == MA_ADDSENSOR) {
+      /* The ADD DEVICE type picker shares MA_SENSOR_BACK for its X, so
+       * record where it was opened from -- ONLY on external entry (the
+       * DEVICES screen, the main-screen '+' ADD menu, or a main-screen entry
+       * point). METERHELP re-enters this to go back to the picker and must
+       * NOT reset the origin. */
+      if (g_menu == MENU_NONE || g_menu == MENU_DEVICES || g_menu == MENU_ADD)
+         g_sensor_from = g_menu;
+      g_menu = MENU_SENSTYPE;
+   } else if (action >= MA_TYPE && action < MA_TYPE + SENSOR_NTYPES) {
+      /* The ADD menu's DEVICES section enters here DIRECTLY (no
+       * MA_ADDSENSOR hop records the origin), so record it now: the flow
+       * must fall back to the MAIN screen, not into settings. */
+      if (g_menu == MENU_ADD)
+         g_sensor_from = MENU_ADD;
+      /* Every abort inside the pairing flow (keypad X, device-list
+       * cancel) returns to the EXACT screen the type was tapped on. */
+      g_pair_from = (g_menu == MENU_ADD) ? MENU_ADD : MENU_SENSTYPE;
+      g_add_type  = action - MA_TYPE;
+      /* A CGM pairs with a code on the keypad; a meter bonds at the OS
+       * level, so it only has to be discovered. */
+      /* Where the flow lands when it finishes (or is closed): back into the
+       * DEVICES screen only if that is where it was entered from -- an
+       * ADD-menu or main-screen entry must fall back to the MAIN screen, not
+       * into a menu the user never opened. */
+      int kp_ret = (g_sensor_from == MENU_DEVICES) ? MENU_DEVICES : MENU_NONE;
+      if (sensor_kind(g_add_type) == KIND_CGM) {
+         g_menu      = MENU_KEYPAD;
+         g_kp_mode   = 0;
+         g_kp_return = kp_ret;
+         g_entrylen  = 0;
+         pair_scan_start();
+      } else {
+         /* A meter must be woken and put into pairing mode by hand first, so
+          * show instructions and DON'T scan yet -- the Scan button there
+          * starts the scan (MA_METERSCAN). */
+         g_menu      = MENU_METERHELP;
+         g_kp_return = kp_ret;
+      }
+   } else if (action == MA_METERSCAN) {
+      g_menu      = MENU_DEVLIST;
+      g_kp_return = (g_sensor_from == MENU_DEVICES) ? MENU_DEVICES : MENU_NONE;
+      pair_scan_start();
+   } else if (action == MA_PRIMARY) {
+      if (g_sel >= 0 && g_sel < g_nslot) {
+         sensor_set_primary(g_sel);
+         /* Re-bind the big number NOW, not on the next reading (up to 5 min
+          * away): the primary owns it by contract, and if the new primary
+          * has no data yet the display must clear rather than keep the
+          * previous primary's value. Resolve the id before hist_lock (reg ->
+          * hist). */
+         int prime = sensor_primary_id();
+         hist_lock();
+         hist_refresh_current(prime);
+         hist_unlock();
+         g_notify_dirty = 1; /* the notification mirrors the big number */
+      }
+   } else if (action >= MA_PRIM_PICK && action < MA_PRIM_PICK + MAX_SLOTS) {
+      /* The DEVICES screen's PRIMARY checkbox: the tap IS the switch, and the
+       * box filling in is the feedback -- the screen STAYS open, unlike the
+       * per-device PRIMARY row, because picking from a column invites
+       * comparing before committing. sensor_set_primary re-validates the index
+       * and refuses a meter or an old device, so a slot table that shifted
+       * since the render cannot promote one. */
+      sensor_set_primary(action - MA_PRIM_PICK);
+      int prime = sensor_primary_id();
+      hist_lock();
+      hist_refresh_current(prime);
+      hist_unlock();
+      g_notify_dirty = 1; /* the notification mirrors the big number */
+   } else if (action == MA_RECONNECT) {
+      /* Direct revive if the sensor was pulled BEFORE expiry; otherwise a
+       * confirmation, since reconnecting a dead sensor just waits forever.
+       */
+      if (g_sel >= 0 && g_sel < g_nslot) {
+         if (old_slot_expired(g_sel))
+            g_menu = MENU_RECONF;
+         else
+            do_reconnect(g_sel);
+      }
+   } else if (action == MA_RECON_YES) {
+      do_reconnect(g_sel);
+   } else if (action == MA_PEND_CANCEL) {
+      if (g_pend_pairing) {
+         LOGI("pending pairing cancelled by user");
+         g_pend_pairing = 0;
+         set_status("PAIRING CANCELLED");
+      }
+   } else if (action == MA_WEAR) {
+      /* Cycle this device's wear budget: AUTO -> 10 D -> 15 D -> AUTO.
+       *
+       * THREE STATES, NOT TWO, AND AUTO MUST BE REACHABLE. This was a
+       * 10 <-> 15 toggle, so the first tap wrote an explicit override and
+       * NOTHING could ever remove it again: sensor_wear_seconds gives a pin
+       * absolute priority, which permanently disabled the model resolution
+       * for that device. A G7 paired on 2026-07-23 -- one day before the
+       * SW14758 (G7 15 Day) model rule existed -- carried a pin of 10 from
+       * that era, so once the rule landed the app went on counting a 10-day
+       * budget for a sensor it could now positively identify as 15-day,
+       * declaring it nearly finished with five days left. One accidental tap
+       * on a full-width row was enough to cause it, and there was no way
+       * back. Preferences only -- no radio, no provenance. */
+      if (g_sel >= 0 && g_sel < g_nslot) {
+         sensors_lock();
+         int w = g_slot[g_sel].wear_days;
+         if (w == 10)
+            g_slot[g_sel].wear_days = 15;
+         else if (w == 15)
+            g_slot[g_sel].wear_days = 0; /* back to the model/type rule */
+         else
+            g_slot[g_sel].wear_days = 10;
+         slots_save();
+         sensors_unlock();
+      }
    } else if (action == MA_FORGET) {
       if (g_sel >= 0 && g_sel < g_nslot)
          g_menu = MENU_FORGET; /* confirm first; this action changes nothing */
@@ -5546,46 +6322,87 @@ static void menu_action(int action)
           * SURVIVING sensor's bond. */
          const struct sensor_rec *fr = sensor_rec_by_id(g_slot[g_sel].id);
          int flink                   = link_for_slot(g_sel);
-         if (fr && flink >= 0) {
+         /* BOTH bounds: flink indexes driver contexts and g_model_l below,
+          * and the DIS block a few lines down already checks both. */
+         if (fr && flink >= 0 && flink < LINK_MAX) {
             driver_lock();
             driver_select(flink);
             driver_forget();
             driver_select(LINK_CGM);
             driver_unlock();
             dexble_link_close(flink);
-            /* Clear this link's cached DIS strings. Nothing else does, and the
-             * re-read gate is "already non-empty -> never ask again" -- so the
-             * NEXT sensor to claim this link (there are only 4, and replacing a
-             * sensor every 15 days forces reuse) would be minted carrying the
-             * FORGOTTEN sensor's model and firmware, in a provenance row that
-             * is never rewritten and whose fields are part of the id-reuse
-             * key. */
+            /* Clear this link's cached DIS strings. Nothing else does, and
+             * the re-read gate is "already non-empty -> never ask again" --
+             * so the NEXT sensor to claim this link (there are only 4, and
+             * replacing a sensor every 15 days forces reuse) would be minted
+             * carrying the FORGOTTEN sensor's model and firmware, in a
+             * provenance row that is never rewritten and whose fields are
+             * part of the id-reuse key. */
             if (flink >= 0 && flink < LINK_MAX) {
                sensors_lock(); /* same lock the DIS callback writes under */
                g_model_l[flink][0] = 0;
                g_fw_l[flink][0]    = 0;
                sensors_unlock();
             }
+            /* GIVE THE LINK BACK. Nothing else here did, and for a METER
+             * that leaked the link permanently: the armed table kept the
+             * forgotten meter's MAC and the routing bit stayed set, which
+             * excludes the link from BOTH pools -- meter_alloc_link skips
+             * any link with g_link_armed set, free_cgm_link skips
+             * g_link_armed || g_link_meter. Nothing ever cleared them,
+             * because the only thing that does is meter_release_link on the
+             * disconnect callback, and dexble_link_close on a connect that
+             * is merely PENDING (a meter is switched off between
+             * fingersticks, so that is the normal state) never produces one.
+             * Every meter retired therefore burned one of LINK_MAX links for
+             * the life of the process.
+             *
+             * UN-ARM, DO NOT RELEASE. An earlier version called
+             * meter_release_link here, which clears the routing bit -- and a
+             * disconnect callback still in flight (the meter really was
+             * connected when forgotten) then landed in the CGM branch and
+             * posted a spurious CONNECTION ERROR. The split exists for
+             * exactly this: un-arm frees the meter pool now, the routing bit
+             * stays until the callback lands (pancra_meter_disconnected
+             * releases fully), and if no callback is coming -- the normal
+             * case, a PENDING connect on a switched-off meter -- the
+             * teardown stamp below lets the stranded-link recovery in
+             * meter_sync_watchdog give the link back after
+             * METER_TEARDOWN_MAX. A 3-minute bounded hold instead of a
+             * permanent leak, and no misrouting either way.
+             *
+             * The tick cannot re-arm meanwhile: it skips retired slots, and
+             * this slot is retired two lines down.
+             *
+             * For a CGM all of this is a no-op: the armed entry is empty,
+             * the meter bit is 0, and the stamp is gated on that bit. */
+            meter_unarm_link(flink);
+            driver_lock();
+            int fmeter = g_link_meter[flink];
+            driver_unlock();
+            if (fmeter)
+               g_link_idle_t[flink] = realtime_s();
          }
-         /* RETIRE, do not delete: the slot is kept (marker, label, prefs) and
-          * flagged old, so it moves to OLD DEVICES with its full per-device
-          * menu intact. sensor_retire_slot reassigns the primary to the first
-          * live CGM left. */
+         /* RETIRE, do not delete: the slot is kept (marker, label, prefs)
+          * and flagged old, so it moves to OLD DEVICES with its full
+          * per-device menu intact. sensor_retire_slot reassigns the primary
+          * to the first live CGM left. */
          sensor_retire_slot(g_sel);
-         /* Re-bind the big number to the new owner immediately, clearing it if
-          * no eligible live sample exists -- the disconnected sensor's value
-          * must not stay latched on screen. */
+         /* Re-bind the big number to the new owner immediately, clearing it
+          * if no eligible live sample exists -- the disconnected sensor's
+          * value must not stay latched on screen. */
          int prime = sensor_primary_id();
          hist_lock();
          hist_refresh_current(prime);
          hist_unlock();
          g_notify_dirty = 1;
          g_sel          = -1;
-         /* Return to WHERE THE SENSOR SCREEN WAS OPENED FROM, not a hardcoded
-          * SETTINGS: the detail screen is reachable from the main-screen
-          * STATE/SESSION table (g_sensor_from == MENU_NONE) as well as from
-          * the settings DEVICES list, and disconnecting from the former must
-          * land back on the main screen, not somewhere the user never was. */
+         /* Return to WHERE THE SENSOR SCREEN WAS OPENED FROM, not a
+          * hardcoded SETTINGS: the detail screen is reachable from the
+          * main-screen STATE/SESSION table (g_sensor_from == MENU_NONE) as
+          * well as from the settings DEVICES list, and disconnecting from
+          * the former must land back on the main screen, not somewhere the
+          * user never was. */
          g_menu = g_sensor_from;
       }
    } else if (action == MA_SYNC) {
@@ -5595,16 +6412,16 @@ static void menu_action(int action)
        *
        *   - it cleared g_meter_last_sync "so the next advertisement syncs
        *     immediately", but the per-meter throttle refactor moved the gate
-       *     to meter_rt.sync_t and left that global read by NOTHING. Grep it:
-       *     one declaration, one write here, one write on completion, zero
+       *     to meter_rt.sync_t and left that global read by NOTHING. Grep
+       * it: one declaration, one write here, one write on completion, zero
        *     reads. The throttle it claimed to clear was untouched.
        *   - it called start_scan, which early-returns whenever g_scanning is
        *     set -- always, while the UI is up. See scan_restart.
-       *   - and it never attempted a connection at all. The whole design waits
-       *     passively for an advertisement, so with the meter switched on but
-       *     between advertising bursts, the one control the user has to force
-       *     a sync did literally nothing, silently, however many times it was
-       *     pressed. Confirmed from an HCI capture on 2026-08-03: 26 minutes
+       *   - and it never attempted a connection at all. The whole design
+       * waits passively for an advertisement, so with the meter switched on
+       * but between advertising bursts, the one control the user has to
+       * force a sync did literally nothing, silently, however many times it
+       * was pressed. Confirmed from an HCI capture on 2026-08-03: 26 minutes
        *     of taps with no radio traffic to the meter at all, then a sync
        *     1.3 s after the first advertisement finally arrived.
        *
@@ -5659,8 +6476,8 @@ static void menu_action(int action)
       if (pend) {
          g_menu = MENU_CALPEND;
       } else {
-         /* Straight to the value keypad (like PLOT MAX); cancel returns to the
-          * device menu. The old read-only bounds panel is gone. */
+         /* Straight to the value keypad (like PLOT MAX); cancel returns to
+          * the device menu. The old read-only bounds panel is gone. */
          g_menu        = MENU_KEYPAD;
          g_kp_mode     = 2;
          g_kp_return   = MENU_SENSOR;
@@ -5708,16 +6525,18 @@ static void menu_action(int action)
       rescale_save();
       g_menu = MENU_SENSOR;
    } else if (action == MA_RESCALE_ENTER) {
-      /* CONFIRM: compute the factor from the entered true value over the live
-       * RAW reading, clamp to +-25%, activate for this sensor from NOW. If
-       * there is NO live reading yet, HOLD the target (persisted) -- the next
-       * reading for this sensor computes the factor. It is never silently lost.
+      /* CONFIRM: compute the factor from the entered true value over the
+       * live RAW reading, clamp to +-25%, activate for this sensor from NOW.
+       * If there is NO live reading yet, HOLD the target (persisted) -- the
+       * next reading for this sensor computes the factor. It is never
+       * silently lost.
        */
       if (g_rescale_entry > 0 && g_sel >= 0 && g_sel < g_nslot) {
          int id   = g_slot[g_sel].id;
          int link = link_for_slot(g_sel);
          int raw  = (link >= 0 && link < LINK_MAX) ? g_link_raw[link] : 0;
-         /* A fresh attempt supersedes any prior rejection / expiry notice. */
+         /* A fresh attempt supersedes any prior rejection / expiry notice.
+          */
          g_rescale_reject  = 0;
          g_rescale_expired = 0;
          if (raw > 0) {
@@ -5729,9 +6548,9 @@ static void menu_action(int action)
             g_rescale_pend_mgdl = g_rescale_entry;
             g_rescale_pend_id   = id;
             g_rescale_pend_t    = realtime_s(); /* for the freshness window */
-            LOGI(
-                "rescale %d mg/dL queued: awaiting a reading to compute factor",
-                g_rescale_entry);
+            LOGI("rescale %d mg/dL queued: awaiting a reading to compute "
+                 "factor",
+                 g_rescale_entry);
          }
          rescale_save();
       }
@@ -5747,12 +6566,13 @@ static void menu_action(int action)
          driver_unlock();
       }
    } else if (action == MA_CAL_ENTER) {
-      /* CONFIRM: QUEUE the calibration durably (persisted), then try once now.
-       * It is NOT dropped if the sensor is not streaming this instant -- it
-       * stays queued and every subsequent reading retries it (see
+      /* CONFIRM: QUEUE the calibration durably (persisted), then try once
+       * now. It is NOT dropped if the sensor is not streaming this instant
+       * -- it stays queued and every subsequent reading retries it (see
        * calq_try_locked in pancra_glucose) until the sensor accepts or the
-       * freshness window lapses, and the outcome is always shown. This is the
-       * fix for a confirmed calibration being silently lost to a reconnect gap.
+       * freshness window lapses, and the outcome is always shown. This is
+       * the fix for a confirmed calibration being silently lost to a
+       * reconnect gap.
        */
       if (g_cal_pending > 0 && g_sel >= 0 && g_sel < g_nslot) {
          g_calq_mgdl = g_cal_pending;
@@ -5764,7 +6584,8 @@ static void menu_action(int action)
          calq_save();
          LOGI("calibration QUEUED: %d mg/dL (slot %d, id %d)", g_calq_mgdl,
               g_sel, g_calq_id);
-         if (cal_select()) { /* opportunistic first attempt while we are here */
+         if (cal_select()) { /* opportunistic first attempt while we are here
+                              */
             calq_try_locked();
             driver_select(LINK_CGM);
             driver_unlock();
@@ -5783,7 +6604,7 @@ static void menu_action(int action)
       sys_open_settings();
       sys_refresh();
    } /* bg-exec: change in settings */
-   else if (action >= 10 && action < 10 + NPERMS) {
+   else if (action >= MA_PERM && action < MA_PERM + NPERMS) {
       /* denied -> request dialog; granted -> app settings (only place to
        * revoke) */
       if (g_sys_perm[action - 10])
@@ -5807,15 +6628,15 @@ static void menu_action(int action)
       g_kp_mode   = 1;
       g_kp_return = MENU_DISPLAY; /* PLOT MAX now lives on DISPLAY */
       g_entrylen  = 0;
-   } else if (action >= 100 && action <= 109) { /* digit */
+   } else if (action >= MA_DIGIT && action < MA_DIGIT + 10) { /* digit */
       int cap = ui_kp_slots(g_kp_mode);
       if (g_entrylen < cap)
          g_entry[g_entrylen++] = (char)('0' + (action - 100));
    } else if (action == MA_DOT) {
       /* '.' exists on the remote-IP keypad and, in mmol/L mode only, on the
-       * four threshold keypads -- ALARM LOW/HIGH and NUDGE LOW/HIGH (one dot,
-       * one decimal digit -- "5.5"). The guard keeps a stale tap (racing a
-       * repaint) from injecting one into any other numeric entry.
+       * four threshold keypads -- ALARM LOW/HIGH and NUDGE LOW/HIGH (one
+       * dot, one decimal digit -- "5.5"). The guard keeps a stale tap
+       * (racing a repaint) from injecting one into any other numeric entry.
        *
        * The RANGE must match ui.c's kp_thresh(). Left at 10/11 the renderer
        * drew a dot key on the NUDGE keypads that this branch then ignored --
@@ -5841,9 +6662,9 @@ static void menu_action(int action)
    else if (action == 113) {
       /* ONLY the pairing keypad backs out to the ADD DEVICE type picker. The
        * label editor and the plot-max / calibration keypads share this close
-       * code -- gate on the actual menu, or renaming a device (MENU_LABEL) and
-       * cal/plot-max entry wrongly landed on ADD DEVICE instead of their own
-       * return target. */
+       * code -- gate on the actual menu, or renaming a device (MENU_LABEL)
+       * and cal/plot-max entry wrongly landed on ADD DEVICE instead of their
+       * own return target. */
       int was_pairing = (g_menu == MENU_KEYPAD && g_kp_mode == 0);
       if (g_smart_pairing)
          pair_cancel(); /* abandon pairing, keep the old bond */
@@ -5855,18 +6676,21 @@ static void menu_action(int action)
    else if (action == 199) { /* device list: cancel -> where pairing began */
       pair_cancel();
       g_menu = g_pair_from;
-   } else if (action >= 200 &&
-              action < 200 + MAX_DEVS) { /* device list: pick */
-      /* Only honour a device-pick while the list is actually open and the index
-       * is a real device. The hit-box array is rebuilt by draw() (which can run
-       * on a BLE thread), so a tap racing a repaint could otherwise map to a
-       * phantom pick and commit_pair -> driver_forget would drop the live bond.
+   } else if (action >= MA_DEV_PICK &&
+              action < MA_DEV_PICK + MAX_DEVS) { /* device list: pick */
+      /* Only honour a device-pick while the list is actually open and the
+       * index is a real device. The hit-box array is rebuilt by draw()
+       * (which can run on a BLE thread), so a tap racing a repaint could
+       * otherwise map to a phantom pick and commit_pair -> driver_forget
+       * would drop the live bond.
        */
-      /* A pick PROPOSES; only the PAIRCONF YES commits. The list is ordered by
-       * live RSSI, so rows can reorder under the finger -- pairing on the raw
-       * tap let one mis-press register the wrong device and drop a bond. */
+      /* A pick PROPOSES; only the PAIRCONF YES commits. The list is ordered
+       * by live RSSI, so rows can reorder under the finger -- pairing on the
+       * raw tap let one mis-press register the wrong device and drop a bond.
+       */
       int idx = action - 200;
-      devlist_lock(); /* consistent (mac, name) vs the binder-thread writer */
+      devlist_lock(); /* consistent (mac, name) vs the binder-thread writer
+                       */
       if (g_menu == MENU_DEVLIST && idx >= 0 && idx < g_ndevs) {
          str_snapshot(g_pend_mac, sizeof g_pend_mac, g_devs[idx].mac);
          str_snapshot(g_pend_name, sizeof g_pend_name, g_devs[idx].name);
@@ -5874,9 +6698,9 @@ static void menu_action(int action)
       }
       devlist_unlock();
    } else if (action == MA_PAIR_YES) {
-      /* THE consequential step, reached only from an explicit YES. Gate on the
-       * menu still being open, like the pick itself: a tap racing a repaint
-       * must not commit twice or from nowhere. */
+      /* THE consequential step, reached only from an explicit YES. Gate on
+       * the menu still being open, like the pick itself: a tap racing a
+       * repaint must not commit twice or from nowhere. */
       if (g_menu == MENU_PAIRCONF && g_pend_mac[0]) {
          char macbuf[sizeof g_pend_mac];
          str_snapshot(macbuf, sizeof macbuf, g_pend_mac);
@@ -5890,9 +6714,13 @@ static void menu_action(int action)
          g_pend_name[0] = 0;
          g_menu = MENU_DEVLIST; /* nothing committed: back to the list */
       }
-   } else if (action == MA_ADD_OPEN || action == MA_INSLOG_BACK) {
-      /* both land on the ADD menu (the log's X returns where it opened) */
+   } else if (action == MA_ADD_OPEN) {
       g_menu = MENU_ADD;
+   } else if (action == MA_INSLOG_BACK) {
+      /* The log's X returns where it opened -- which is the ADD menu, OR the
+       * main screen when a shortcut button opened it. The comment here always
+       * claimed "where it opened" while the code named one fixed menu. */
+      g_menu = g_inslog_from;
    } else if (action == MA_STATBAR || action == MA_LOCKSCR ||
               action == MA_NOTIF_REOPEN) {
       if (action == MA_STATBAR)
@@ -5906,7 +6734,7 @@ static void menu_action(int action)
        * action (a swiped-away notification returns on notify()). */
       g_notify_dirty = 1;
       pancra_notify_refresh();
-   } else if (ins_action(action) || wt_action(action) ||
+   } else if (ins_action(action) || wt_action(action) || style_action(action) ||
               submenu_action(action)) {
       /* handled by a split-out family (see them above menu_action):
        * LOG/EDIT INSULIN + dose log + marker picker (ins_action), or the
@@ -5920,7 +6748,8 @@ static void menu_action(int action)
             for (; k < g_entrylen && k < (int)sizeof g_slot[0].label - 1; k++)
                g_slot[g_sel].label[k] = g_entry[k];
             g_slot[g_sel].label[k] = 0;
-            /* an all-blank name would make the row unreadable, so fall back */
+            /* an all-blank name would make the row unreadable, so fall back
+             */
             if (k == 0)
                (void)snprintf(g_slot[g_sel].label, sizeof g_slot[0].label,
                               "SENSOR %d", g_slot[g_sel].id);
@@ -5933,29 +6762,32 @@ static void menu_action(int action)
          if (g_entrylen > 0) {
             /* Conversion and bound live in alarmlogic.c so `make check` can
              * fail on them; this branch only actuates. */
-            /* mmol/L is entered as tenths (e.g. "78" = 7.8), so scale back to
-             * mg/dL the same way the plot-max entry does. */
+            /* mmol/L is entered as tenths (e.g. "78" = 7.8), so scale back
+             * to mg/dL the same way the plot-max entry does. */
             int mgdl = cal_entry_mgdl(g_entry, g_entrylen, g_units);
-            /* Out of range: refuse VISIBLY. Do NOT clamp -- silently altering
-             * a calibration value the user typed is worse than not accepting
-             * it. Previously the driver refused with only a log line while the
-             * keypad closed and SCR_CAL still showed the PREVIOUS result, so a
-             * rejected entry looked exactly like a successful one. Staying on
-             * the keypad with the entry cleared is the feedback: nothing was
-             * submitted, retype it. Easy to hit in mmol/L (2.2 -> 39 mg/dL). */
+            /* Out of range: refuse VISIBLY. Do NOT clamp -- silently
+             * altering a calibration value the user typed is worse than not
+             * accepting it. Previously the driver refused with only a log
+             * line while the keypad closed and SCR_CAL still showed the
+             * PREVIOUS result, so a rejected entry looked exactly like a
+             * successful one. Staying on the keypad with the entry cleared
+             * is the feedback: nothing was submitted, retype it. Easy to hit
+             * in mmol/L (2.2 -> 39 mg/dL). */
             if (mgdl < 0) {
-               LOGI("calibration %d mg/dL out of range 40..400, not submitted",
+               LOGI("calibration %d mg/dL out of range 40..400, not "
+                    "submitted",
                     mgdl);
                g_entrylen = 0;
                g_ui_dirty = 1;
-               return; /* stay on the keypad: the cleared entry IS the feedback
+               return; /* stay on the keypad: the cleared entry IS the
+                        * feedback
                         */
             }
             /* The single most consequential write in the app, so it happens
              * only here: a digit typed by the user, then an explicit OK. */
-            /* Do NOT write yet -- stash the value and show a confirmation. The
-             * actual (consequential) calibration write happens only on the
-             * explicit CONFIRM (MA_CAL_ENTER). */
+            /* Do NOT write yet -- stash the value and show a confirmation.
+             * The actual (consequential) calibration write happens only on
+             * the explicit CONFIRM (MA_CAL_ENTER). */
             g_entrylen    = 0;
             g_cal_pending = mgdl;
             keypad_close();
@@ -5969,7 +6801,8 @@ static void menu_action(int action)
                LOGI("rescale %d mg/dL out of range, not submitted", mgdl);
                g_entrylen = 0;
                g_ui_dirty = 1;
-               return; /* stay on the keypad: cleared entry is the feedback */
+               return; /* stay on the keypad: cleared entry is the feedback
+                        */
             }
             g_entrylen      = 0;
             g_rescale_entry = mgdl; /* factor computed on CONFIRM */
@@ -5985,8 +6818,8 @@ static void menu_action(int action)
           * reading and a past-the-scale HIGH above any, each threshold's
           * deliberate OFF switch. Refuse VISIBLY (stay on the keypad, entry
           * cleared) a malformed entry, an out-of-range value, or one that
-          * would invert ITS OWN pair -- a silent clamp would move a threshold
-          * the user never typed. Equal is allowed.
+          * would invert ITS OWN pair -- a silent clamp would move a
+          * threshold the user never typed. Equal is allowed.
           *
           * The two pairs are checked against THEMSELVES only, never against
           * each other. A nudge inside the alarm band is pointless but
@@ -6021,7 +6854,15 @@ static void menu_action(int action)
             int lo = isnudge ? g_nudge_low : g_alarm_low;
             int hi = isnudge ? g_nudge_high : g_alarm_high;
             alarm_unlock();
-            if (bad || mgdl > AL_ENTRY_MAX || (islow ? mgdl > hi : mgdl < lo)) {
+            /* A HIGH of 0 is refused outright, even when LOW is parked at
+             * its documented 0 off-switch. `mgdl < lo` alone accepted it,
+             * and HIGH=0 means every reading is above the threshold: a
+             * continuous alarm the user has to work out how to undo. Loud
+             * rather than silent, but the entry path is documented to refuse
+             * values it cannot honour, and this is one. LOW=0 stays legal --
+             * that is the off switch. */
+            if (bad || mgdl > AL_ENTRY_MAX || (!islow && mgdl <= 0) ||
+                (islow ? mgdl > hi : mgdl < lo)) {
                LOGI("%s %s %d mg/dL refused (0..%d, low<=high)",
                     isnudge ? "nudge" : "alarm", islow ? "low" : "high", mgdl,
                     AL_ENTRY_MAX);
@@ -6031,8 +6872,9 @@ static void menu_action(int action)
             }
             /* Under alarm_lock: the pair is READ under it by the alarm
              * evaluators, and a mixed old/new pair can invert the range for
-             * one tick (see the old alarm_adjust's rationale). The nudge pair
-             * is read there too, on the same tick, so it takes the same lock.
+             * one tick (see the old alarm_adjust's rationale). The nudge
+             * pair is read there too, on the same tick, so it takes the same
+             * lock.
              */
             alarm_lock();
             if (isnudge && islow)
@@ -6055,13 +6897,14 @@ static void menu_action(int action)
             int v = 0;
             for (int i = 0; i < g_entrylen; i++)
                v = (v * 10) + (g_entry[i] - '0');
-            /* TENTHS of mmol/L, matching how the row is DISPLAYED: ui.c renders
-             * plot max through fmt_glu, which prints one decimal in mmol mode
-             * (300 mg/dL shows as "16.7"). Treating the entry as whole mmol
-             * made the shown value impossible to re-enter -- typing 167 gave
-             * 3006 mg/dL (silently clamped to 400) and typing 16 gave 288, not
-             * 300. The calibration entry below already scales this way; this
-             * is the one that disagreed with its own display. */
+            /* TENTHS of mmol/L, matching how the row is DISPLAYED: ui.c
+             * renders plot max through fmt_glu, which prints one decimal in
+             * mmol mode (300 mg/dL shows as "16.7"). Treating the entry as
+             * whole mmol made the shown value impossible to re-enter --
+             * typing 167 gave 3006 mg/dL (silently clamped to 400) and
+             * typing 16 gave 288, not 300. The calibration entry below
+             * already scales this way; this is the one that disagreed with
+             * its own display. */
             int mgdl = g_units ? (v * 18) / 10 : v;
             if (mgdl < 100)
                mgdl = 100;
@@ -6085,8 +6928,9 @@ static void menu_action(int action)
                ip[i] = g_entry[i];
             ip[n] = 0;
             /* Malformed: refuse VISIBLY, like calibration -- staying on the
-             * keypad with the entry cleared is the feedback. Silently storing
-             * a bad address would point every future push at nothing. */
+             * keypad with the entry cleared is the feedback. Silently
+             * storing a bad address would point every future push at
+             * nothing. */
             if (!remote_ip_valid(ip)) {
                LOGI("remote IP '%s' malformed, not saved", ip);
                g_entrylen = 0;
@@ -6113,7 +6957,8 @@ static void menu_action(int action)
                LOGI("remote port %d out of range, not saved", v);
                g_entrylen = 0;
                g_ui_dirty = 1;
-               return; /* stay on the keypad: cleared entry is the feedback */
+               return; /* stay on the keypad: cleared entry is the feedback
+                        */
             }
             g_remote_port = v;
             remote_save();
@@ -6152,8 +6997,8 @@ static void menu_action(int action)
             }
             int tenths = (ip * 10) + fd;
             /* Validate by CONVERTING: wt_from_tenths returns 0 outside the
-             * stored range, so an impossible weight is refused VISIBLY rather
-             * than silently clamped into the log. */
+             * stored range, so an impossible weight is refused VISIBLY
+             * rather than silently clamped into the log. */
             if (bad || ip > 999 || wt_from_tenths(tenths, g_wunits) <= 0) {
                LOGI("weight %d.%d %s refused (out of range)", tenths / 10,
                     tenths % 10, wt_unit_name(g_wunits));
@@ -6301,8 +7146,8 @@ static void menu_action(int action)
       draw(g_win);
 }
 
-/* The menu_action code this screen's own title-row X emits -- the system back
- * gesture is a second finger on the SAME target, so navigation stays
+/* The menu_action code this screen's own title-row X emits -- the system
+ * back gesture is a second finger on the SAME target, so navigation stays
  * single-sourced in menu_action and every recorded g_*_from origin keeps
  * working. Returns -1 when there is nothing to close (the main screen: back
  * deliberately does nothing there). KEEP IN STEP with the add_hit(...,
@@ -6311,9 +7156,10 @@ static int menu_back_code(void)
 {
    switch (g_menu) {
       case MENU_SETTINGS:
-      case MENU_ADD:
-      case MENU_PRIMPICK: return MA_CLOSE;
-      case MENU_KEYPAD: /* menu_action gates on kp_mode, exactly like the X */
+      case MENU_ADD: return MA_CLOSE;
+      case MENU_DEVICES: return MA_DEVICES_BACK;
+      case MENU_KEYPAD: /* menu_action gates on kp_mode, exactly like the X
+                         */
       case MENU_LABEL: return MA_KP_CLOSE;
       case MENU_DEVLIST: return MA_DEV_CANCEL;
       case MENU_SENSOR:
@@ -6345,7 +7191,8 @@ static int menu_back_code(void)
    }
 }
 
-/* ---- act-on-release helpers (state at g_arm_*; policy comment there) ---- */
+/* ---- act-on-release helpers (state at g_arm_*; policy comment there) ----
+ */
 
 /* DOWN on a control: arm it and repaint so the pressed shade shows. */
 static void press_arm(int kind, int arg, int x, int y)
@@ -6404,8 +7251,8 @@ static int press_release(int up, int x, int y)
    return fire;
 }
 
-/* Plot rectangle recorded by the last render (the ACT_SCRUB target), so a drag
- * can resolve to a datapoint even after the finger leaves the plot. */
+/* Plot rectangle recorded by the last render (the ACT_SCRUB target), so a
+ * drag can resolve to a datapoint even after the finger leaves the plot. */
 static int plot_rect(int *x, int *y, int *w, int *h)
 {
    for (int i = 0; i < g_hits.n; i++)
@@ -6425,23 +7272,26 @@ static int plot_rect(int *x, int *y, int *w, int *h)
  * evaluators read it under alarm_lock, and a mixed old/new pair can invert
  * the range for one tick.) */
 
-/* an older reading recovered via backfill: store it, place it in history, but
- * don't disturb the current value unless it turns out to be the newest */
+/* an older reading recovered via backfill: store it, place it in history,
+ * but don't disturb the current value unless it turns out to be the newest
+ */
 /* The meter's own record index, persisted so a reconnect never re-reads what
  * we already hold -- the meter has no idea what we have kept. */
 
 /* Per-meter record index, keyed by SENSOR ID.
  *
- * A single shared index cannot serve two meters: their counters are unrelated,
- * so each sync looked like the other meter's counter had gone backwards
+ * A single shared index cannot serve two meters: their counters are
+ * unrelated, so each sync looked like the other meter's counter had gone
+ * backwards
  * ("memory cleared"), reset to -1, re-imported, and saved its own value --
  * leaving the pair oscillating forever. One meter never reached its own new
  * records again, so every fingerstick it took was silently lost, while the
  * other re-imported records it already had (re-appending them to the log,
- * since they are outside the in-memory dedup window) and held each meter awake
- * for a full walk on every advert.
+ * since they are outside the in-memory dedup window) and held each meter
+ * awake for a full walk on every advert.
  *
- * Stored as "id,index" lines, rewritten whole -- it is at most MAX_SLOTS rows.
+ * Stored as "id,index" lines, rewritten whole -- it is at most MAX_SLOTS
+ * rows.
  */
 static void meter_index_save(int id, int idx)
 {
@@ -6459,19 +7309,20 @@ static void meter_index_save(int id, int idx)
       ids[at] = id;
    }
    if (at < 0) {
-      /* Full. Rows are never pruned -- every id a meter has ever carried keeps
-       * one -- so silently skipping the write meant this meter's index was
-       * NEVER persisted again, and every later advert re-walked OT_MAX_WALK
-       * records, re-appending weeks-old fingersticks to the lifetime log.
+      /* Full. Rows are never pruned -- every id a meter has ever carried
+       * keeps one -- so silently skipping the write meant this meter's index
+       * was NEVER persisted again, and every later advert re-walked
+       * OT_MAX_WALK records, re-appending weeks-old fingersticks to the
+       * lifetime log.
        *
        * Evict a row NO LIVE SLOT REFERENCES. This used to drop ids[0] with a
-       * comment claiming it "belongs to a superseded id that nothing reads" --
-       * an assumption the code did not check. Rows sit in the order they were
-       * first written, so the oldest row is the FIRST meter ever registered,
-       * and if that meter is still in use its index was the one thrown away:
-       * its next sync sees no stored index, re-walks, and re-appends
-       * fingersticks that are weeks old and therefore outside the dedup
-       * window -- double-counted in the stats, permanently. */
+       * comment claiming it "belongs to a superseded id that nothing reads"
+       * -- an assumption the code did not check. Rows sit in the order they
+       * were first written, so the oldest row is the FIRST meter ever
+       * registered, and if that meter is still in use its index was the one
+       * thrown away: its next sync sees no stored index, re-walks, and
+       * re-appends fingersticks that are weeks old and therefore outside the
+       * dedup window -- double-counted in the stats, permanently. */
       int victim = -1;
       sensors_lock();
       for (int i = 0; i < n && victim < 0; i++) {
@@ -6497,12 +7348,13 @@ static void meter_index_save(int id, int idx)
    }
    vals[at] = idx;
 
-   /* Write a fresh file and rename over the old one, rather than truncating in
-    * place. O_TRUNC destroys the stored indices BEFORE the new ones are
-    * written, so a crash in that window left the file empty and the next sync
-    * re-imported -- those fingersticks are typically weeks old, i.e. outside
-    * the dedup window, so they were appended a second time and double-counted
-    * in the stats. rename() is atomic: old values or new, never nothing. */
+   /* Write a fresh file and rename over the old one, rather than truncating
+    * in place. O_TRUNC destroys the stored indices BEFORE the new ones are
+    * written, so a crash in that window left the file empty and the next
+    * sync re-imported -- those fingersticks are typically weeks old, i.e.
+    * outside the dedup window, so they were appended a second time and
+    * double-counted in the stats. rename() is atomic: old values or new,
+    * never nothing. */
    char tmp[300];
    int tn = snprintf(tmp, sizeof tmp, "%s.tmp", g_meter_path);
    if (tn <= 0 || tn >= (int)sizeof tmp)
@@ -6549,10 +7401,11 @@ static int meter_index_all(int *ids, int *vals, int cap)
       int neg = 0;
       /* Digit-capped: unbounded accumulation is UB and happens during
        * parsing, before the `id > 0` test can reject anything. This file is
-       * ours, but surviving a corrupt or hand-edited row is a parser's job --
-       * and every sibling parser (store.c, stats.c, sensors.c, settings.c)
-       * received this hardening. The advance stays OUTSIDE the cap, which is
-       * what a sibling fix got wrong and turned into a launch-time hang. */
+       * ours, but surviving a corrupt or hand-edited row is a parser's job
+       * -- and every sibling parser (store.c, stats.c, sensors.c,
+       * settings.c) received this hardening. The advance stays OUTSIDE the
+       * cap, which is what a sibling fix got wrong and turned into a
+       * launch-time hang. */
       int nid = 0;
       while (*p >= '0' && *p <= '9') {
          if (nid < 9) {
@@ -6604,14 +7457,14 @@ static int meter_index_load(int id)
    if (n > 0)
       return -1; /* new-format file, but this meter is not in it yet */
 
-   /* MIGRATION: an install from before this file was keyed by sensor id holds
-    * a bare integer. Parsing it as "id,index" yields nothing, so the index
-    * would look unset and the meter would re-import its recent window --
-    * records typically weeks old, i.e. outside the in-memory dedup window, so
-    * they would be appended to the lifetime log a second time. Adopt the old
-    * value for whichever meter asks first; that is exactly right, because the
-    * old format could only ever describe one meter. The next save rewrites the
-    * file in the new format. */
+   /* MIGRATION: an install from before this file was keyed by sensor id
+    * holds a bare integer. Parsing it as "id,index" yields nothing, so the
+    * index would look unset and the meter would re-import its recent window
+    * -- records typically weeks old, i.e. outside the in-memory dedup
+    * window, so they would be appended to the lifetime log a second time.
+    * Adopt the old value for whichever meter asks first; that is exactly
+    * right, because the old format could only ever describe one meter. The
+    * next save rewrites the file in the new format. */
    int fd = open(g_meter_path, O_RDONLY, 0);
    if (fd < 0)
       return -1;
@@ -6633,9 +7486,9 @@ static int meter_index_load(int id)
 }
 
 /* ---- OneTouch meter driver hooks (otble.h) ----
- * A meter is not a CGM, so its readings take a different path into the store:
- * KIND_BGM (never deduped against a CGM sample, never the big number) and a
- * timestamp that has to be converted rather than trusted. */
+ * A meter is not a CGM, so its readings take a different path into the
+ * store: KIND_BGM (never deduped against a CGM sample, never the big number)
+ * and a timestamp that has to be converted rather than trusted. */
 
 /* The transport's drv_write/drv_subscribe are already UUID-generic, so the
  * meter needs no transport of its own -- only its own protocol. */
@@ -6655,49 +7508,68 @@ void ot_drv_subscribe(void)
    dexble_request_devinfo_link(g_meter_link);
 }
 
-/* Re-arm the standing connect on the meter we just finished with.
+/* The protocol exchange is over. Ask for the link to close and drop the busy
+ * latch -- but DO NOT un-arm, and do not treat this as the meter being gone.
  *
- * The meter has powered itself off by now, so this connect simply sits in the
- * controller's whitelist until the NEXT fingerstick -- which is the whole
- * mechanism. Without it every sync would be the last one that worked without
- * the user opening the app, because nothing else re-establishes the pending
- * connect. Gated on having a meter and no sync in flight, so it cannot loop
- * against a meter that is still connected. */
+ * This used to call meter_unarm_link here, justified by the claim that "the
+ * meter has powered itself off by now" and a gate that was described in the
+ * comment but never actually written. An HCI capture falsified both. A Verio
+ * stays awake about THIRTY-FIVE SECONDS after a fingerstick (observed:
+ * connected 07:07:50, supervision timeout 07:08:25), and un-arming while it
+ * is still connected makes meter_armed() false -- so the 1 Hz tick calls
+ * meter_sync_start again, reconnects, and re-runs the whole exchange. The
+ * capture shows 29 complete syncs in 29 seconds inside ONE connection, each
+ * re-writing the CCCD and re-reading model, firmware and manufacturer. The
+ * close never even reached the controller (no HCI Disconnect appears for
+ * that address at all), so the un-arm was this function's only lasting
+ * effect, and its only effect was to start the next lap.
+ *
+ * The link is released where the link actually dies: pancra_meter_disconnected,
+ * on the real GATT disconnect -- whether that comes from the close below or,
+ * as it usually does, from the meter powering itself off. Only then does the
+ * tick re-arm the standing connect, which is what makes the NEXT fingerstick
+ * catchable without the user touching the phone.
+ *
+ * A second fingerstick taken during the same power-on is therefore not picked
+ * up until the meter cycles. Nothing is lost: the walk is index-based, so the
+ * next sync reads both records. */
 void ot_drv_disconnect(void)
 {
    if (g_meter_link >= 0)
       dexble_link_close(g_meter_link);
-   g_meter_busy = 0;
-   /* Releasing the link is what ASKS for the re-arm: meter_armed reads the
-    * link binding, dexble_link_close cleared it, so the next tick sees this
-    * meter unarmed and connects again. Deliberately not re-armed inline --
-    * this runs from the driver's own callback, and closing a link then
-    * immediately reconnecting on it races Ble.java's teardown of the same
-    * GATT client. One second later from the timer is early enough (the meter
-    * has powered off by then anyway) and costs none of that risk. */
+   /* Stamp the completion BEFORE clearing g_meter_link -- meter_rt is keyed
+    * by registry id, but the cooldown that keeps a still-awake meter from
+    * being re-synced is read off this. */
+   struct meter_rt *rt = (g_meter_src > 0) ? meter_rt_get(g_meter_src, 1) : 0;
+   if (rt)
+      rt->synced_t = realtime_s();
+   /* Mark the link as waiting on its teardown, so the watchdog can tell a
+    * legitimate wait from a lost callback. */
    if (g_meter_link >= 0 && g_meter_link < LINK_MAX)
-      g_link_armed[g_meter_link][0] = 0; /* un-armed: the tick re-arms it */
+      g_link_idle_t[g_meter_link] = realtime_s();
+   g_meter_busy = 0;
    g_meter_link = -1;
 }
 
 void ot_drv_status(const char *s)
 {
    set_status(s);
-   /* Record the driver's live phase text against the meter that currently owns
-    * the sync, so its per-device STATE row can show a descriptive step
+   /* Record the driver's live phase text against the meter that currently
+    * owns the sync, so its per-device STATE row can show a descriptive step
     * ("COUNT", "READING", "NOTHING NEW") instead of a flat "SYNCING". The
-    * "METER: " prefix is stripped -- the row is already known to be a meter. */
+    * "METER: " prefix is stripped -- the row is already known to be a meter.
+    */
    struct meter_rt *rt = (g_meter_src > 0) ? meter_rt_get(g_meter_src, 1) : 0;
    if (rt) {
       const char *p = s;
       if (strncmp(p, "METER: ", 7) == 0)
          p += 7;
       str_snapshot(rt->stat, sizeof rt->stat, p);
-      /* Any driver phase means we CONNECTED to this meter (the first is "HELLO"
-       * on connect), so this IS a sync -- stamp LAST SYNC here, not only when a
-       * datapoint or an RSSI read lands. A meter that connects but yields no
-       * new record (e.g. the record read was refused) otherwise stayed "OFF /
-       * NEVER" despite plainly having synced. */
+      /* Any driver phase means we CONNECTED to this meter (the first is
+       * "HELLO" on connect), so this IS a sync -- stamp LAST SYNC here, not
+       * only when a datapoint or an RSSI read lands. A meter that connects
+       * but yields no new record (e.g. the record read was refused)
+       * otherwise stayed "OFF / NEVER" despite plainly having synced. */
       rt->sync_t = realtime_s();
    }
 }
@@ -6707,24 +7579,25 @@ static long meter_tz_for(long naive);
 int ot_drv_reading(long naive, int mg_dl)
 {
    /* The meter's clock is naive local time with no zone, so the offset in
-    * force AT IMPORT is what makes it an absolute instant -- and it is stored
-    * alongside the raw value so a wrong conversion stays repairable. Without
-    * this the reading lands 7-8 hours off, which is exactly the discrepancy
-    * the capture showed. */
+    * force AT IMPORT is what makes it an absolute instant -- and it is
+    * stored alongside the raw value so a wrong conversion stays repairable.
+    * Without this the reading lands 7-8 hours off, which is exactly the
+    * discrepancy the capture showed. */
    long tz = meter_tz_for(naive);
    long t  = naive + OT_EPOCH - tz;
    /* THE EXACT timestamp bound lives here, not in otble.c: this is the first
     * point at which `t` is a true instant rather than a naive local clock
     * reading. A future-dated record sorts to the head of the history
-    * permanently and is re-admitted on every restart, which is what the meter
-    * clock is capable of producing. One hour of slack absorbs a DST edge. */
+    * permanently and is re-admitted on every restart, which is what the
+    * meter clock is capable of producing. One hour of slack absorbs a DST
+    * edge. */
    /* Generous, because this is measured against the PHONE's clock, which can
-    * legitimately be wrong (a flat battery before NTP, a dead RTC, a hand-set
-    * date). A tight bound here rejected perfectly good records whenever the
-    * phone was slow -- and otble.c used to persist its walk past the
-    * rejection, so those fingersticks were destroyed permanently. It no longer
-    * does, but the bound should still only catch records wrong by more than
-    * any plausible clock skew or timezone. */
+    * legitimately be wrong (a flat battery before NTP, a dead RTC, a
+    * hand-set date). A tight bound here rejected perfectly good records
+    * whenever the phone was slow -- and otble.c used to persist its walk
+    * past the rejection, so those fingersticks were destroyed permanently.
+    * It no longer does, but the bound should still only catch records wrong
+    * by more than any plausible clock skew or timezone. */
    if (t <= 0 || t > realtime_s() + (15L * 3600)) {
       LOGI("meter reading at %ld (raw %ld) implausible, rejected", t, naive);
       return 0; /* the driver must not persist its walk past this */
@@ -6744,32 +7617,35 @@ int ot_drv_reading(long naive, int mg_dl)
 
 void ot_drv_done(int new_records)
 {
-   /* The meter is first registered with nothing but its address -- DIS has not
-    * answered yet at pair time. Once it has, re-mint: identical fields reuse
-    * the id, and a genuine difference mints a new one, which is exactly the
-    * rule that keeps an id pinned to one (device, firmware) pair for good.
-    * Readings taken before we knew the firmware keep citing the older id,
-    * which is the truthful record of what we knew then. */
-   /* BOTH, not either. The two DIS reads are separate serialized GATT ops and a
-    * sync commonly ends after one round trip, so "model present, fw still
-    * empty" is the normal intermediate state -- and minting against
-    * (model, "") does not match the stored (model, fw), producing a NEW id and
-    * a rebind, which the next complete sync mints straight back. The meter
-    * oscillated between ids, appending a provenance row per flip and splitting
-    * its fingerstick history across them in a file that is never rewritten. */
+   /* The meter is first registered with nothing but its address -- DIS has
+    * not answered yet at pair time. Once it has, re-mint: identical fields
+    * reuse the id, and a genuine difference mints a new one, which is
+    * exactly the rule that keeps an id pinned to one (device, firmware) pair
+    * for good. Readings taken before we knew the firmware keep citing the
+    * older id, which is the truthful record of what we knew then. */
+   /* BOTH, not either. The two DIS reads are separate serialized GATT ops
+    * and a sync commonly ends after one round trip, so "model present, fw
+    * still empty" is the normal intermediate state -- and minting against
+    * (model, "") does not match the stored (model, fw), producing a NEW id
+    * and a rebind, which the next complete sync mints straight back. The
+    * meter oscillated between ids, appending a provenance row per flip and
+    * splitting its fingerstick history across them in a file that is never
+    * rewritten. */
    if (g_meter_src && g_meter_model[0] && g_meter_fw[0]) {
-      int id = sensor_mint(SENSOR_ONETOUCH, g_meter_mac, "", g_meter_model,
-                           g_meter_fw, 0);
-      /* Atomic rebind: this runs on a BINDER thread while the main thread can
-       * be inside sensor_forget_slot's shift-down. Only adopt the new id if a
-       * slot actually took it -- otherwise g_meter_src would name an id no
-       * slot references, and sensor_reconcile would reset it to the old one on
-       * the next 1 Hz tick, oscillating forever. */
-      if (id > 0 && id != g_meter_src && sensor_rebind_slot(g_meter_src, id)) {
-         LOGI("meter provenance updated: id %d -> %d (%s / %s)", g_meter_src,
-              id, g_meter_model, g_meter_fw);
-         g_meter_src = id;
-      }
+      /* COMPLETE the row, do not re-mint it.
+       *
+       * This used to mint with the model/fw filled in and rebind the slot if
+       * the id came back different -- but a device is identified by (type,
+       * MAC) ALONE, so the mint always returns the id we already have and
+       * `id != g_meter_src` was never true. The rebind was dead code and a
+       * meter's provenance row kept its empty model and firmware forever,
+       * exactly contrary to what this block claims to do -- and the
+       * reconcile completion pass walks CGM links, so nothing else filled
+       * them either. sensor_complete is the mechanism the CGM path already
+       * uses: it fills only what is missing and cannot fork an id. */
+      if (sensor_complete(g_meter_src, "", g_meter_model, g_meter_fw, 0))
+         LOGI("meter provenance completed: id %d (%s / %s)", g_meter_src,
+              g_meter_model, g_meter_fw);
    }
    meter_index_save(g_meter_src, ot_last_index());
    LOGI("meter sync complete: %d new record(s), index now %d", new_records,
@@ -6784,8 +7660,8 @@ void pancra_backfill(int mg_dl, int trend, int age_s)
       return;
    }
    long t = realtime_s() - age_s;
-   /* Same per-link attribution as the live path (see src_for_link): a backfill
-    * arrives on the link of the sensor that buffered it. */
+   /* Same per-link attribution as the live path (see src_for_link): a
+    * backfill arrives on the link of the sensor that buffered it. */
    int src = src_for_link(driver_link());
    if (src < 0) {
       if (cgm_slot_count() >= 1) {
@@ -6794,18 +7670,24 @@ void pancra_backfill(int mg_dl, int trend, int age_s)
       }
       src = g_cur_src; /* single CGM: the global is unambiguous */
    }
-   /* RESCALE, timestamp-gated: a backfilled point is only rescaled if ITS OWN
-    * timestamp is at/after activation. An older buffered point (t < activation)
-    * predates the correction and keeps its raw value -- this is the backfill
-    * care the feature calls for. g_link_raw is NOT touched here: the factor is
-    * computed from the LIVE reading, not a historical one. */
+   /* RESCALE, timestamp-gated: a backfilled point is only rescaled if ITS
+    * OWN timestamp is at/after activation. An older buffered point (t <
+    * activation) predates the correction and keeps its raw value -- this is
+    * the backfill care the feature calls for. g_link_raw is NOT touched
+    * here: the factor is computed from the LIVE reading, not a historical
+    * one. */
    int rpm = rescale_pm_for(src, t);
    if (rpm != 1000)
       mg_dl = rescale_apply(mg_dl, rpm);
    int prime = sensor_primary_id();
+   /* Backfill reaches back across the warmup hour on a fresh sensor, so it
+    * needs the same gate as the live path -- and before hist_lock, per the
+    * registry -> history lock order (sensors.h). */
+   int warm = sensor_in_warmup(src, t);
    hist_lock();
    int isnew = hist_insert(t, mg_dl, trend, src, KIND_CGM);
-   if (isnew) /* any non-zero: the log and the stats must agree (store.h) */
+   if (isnew && !warm) /* any non-zero: the log and the stats must agree
+                        * (store.h), minus uncalibrated warmup */
       stat_add(t, mg_dl);
    hist_refresh_current(prime);
    hist_unlock();
@@ -6842,9 +7724,10 @@ static void start_scan(struct ANativeActivity *a)
       /* NULL-check (OOM leaves an exception pending), and DELETE the ref.
        * These run on the native looper thread, not inside a JNI method
        * invocation, so there is no frame pop to reclaim local refs -- they
-       * accumulate for the life of the process against the ~512 ceiling, which
-       * aborts when exceeded. The self-heal calls start_scan every 30 s while
-       * scanning is failing, which is exactly when this path runs. */
+       * accumulate for the life of the process against the ~512 ceiling,
+       * which aborts when exceeded. The self-heal calls start_scan every 30
+       * s while scanning is failing, which is exactly when this path runs.
+       */
       const char *e = (*env)->GetStringUTFChars(env, err, NULL);
       if (e) {
          LOGI("scan: %s", e);
@@ -6858,9 +7741,9 @@ static void start_scan(struct ANativeActivity *a)
    }
    g_scanning = 1;
    LOGI("scanning (receive-only)");
-   /* only surface SCANNING before we're operational; once paired/streaming the
-    * driver's own status (WAITING/CONNECTED/...) is the meaningful one and the
-    * background scan must not mask it */
+   /* only surface SCANNING before we're operational; once paired/streaming
+    * the driver's own status (WAITING/CONNECTED/...) is the meaningful one
+    * and the background scan must not mask it */
    struct dex_session s;
    driver_lock();
    /* SELECT explicitly. The ambient selection is left wherever the last GATT
@@ -6891,17 +7774,18 @@ static void stop_scan(struct ANativeActivity *a)
    }
    /* Only believe the scan is down if Java confirmed it. Clearing g_scanning
     * unconditionally, while Ble still held a registered callback it could no
-    * longer cancel, let the on_timer self-heal register a SECOND scan client --
-    * duplicate adverts, and eventually Android's scan-throttle block. Leaving
-    * g_scanning set means the self-heal will not stack another one, and the
-    * next stop_scan retries the cancel. */
+    * longer cancel, let the on_timer self-heal register a SECOND scan client
+    * -- duplicate adverts, and eventually Android's scan-throttle block.
+    * Leaving g_scanning set means the self-heal will not stack another one,
+    * and the next stop_scan retries the cancel. */
    if (!stopped) {
       /* Mark it for RETRY. Leaving g_scanning set is right -- it stops the
-       * self-heal stacking a second scan client on top of one Ble still holds
+       * self-heal stacking a second scan client on top of one Ble still
+       * holds
        * -- but on its own it was a permanent latch: g_scanning is cleared in
        * exactly one place, reachable only from a LATER successful stop_scan,
-       * and the self-heal that exists so the user need not background the app
-       * is itself gated on !g_scanning. So the one mechanism that could
+       * and the self-heal that exists so the user need not background the
+       * app is itself gated on !g_scanning. So the one mechanism that could
        * recover was structurally excluded, and nothing anywhere notices that
        * adverts have stopped arriving. The 1 Hz timer retries until Java
        * confirms. */
@@ -6911,38 +7795,38 @@ static void stop_scan(struct ANativeActivity *a)
    }
    g_scan_stop_pending = 0;
    g_scanning          = 0;
-   /* don't surface "PAUSED": stopping the background scan is an internal detail
-    * (it happens on pause and on every orientation flip); the driver's own
-    * connection status stays the meaningful thing to show */
+   /* don't surface "PAUSED": stopping the background scan is an internal
+    * detail (it happens on pause and on every orientation flip); the
+    * driver's own connection status stays the meaningful thing to show */
 }
 
 /* Tear the scan down and bring it back up.
  *
- * WHY THIS EXISTS, and it is the bug that made SYNC NOW useless: start_scan is
- * idempotent on g_scanning, so calling it while a scan is already registered
- * does NOTHING. That is right for the self-heal -- stacking a second scan
- * client is how the app used to hit Android's scan-throttle block -- but it
- * meant the app had no way at all to REFRESH a scan that was still registered
- * yet no longer delivering.
+ * WHY THIS EXISTS, and it is the bug that made SYNC NOW useless: start_scan
+ * is idempotent on g_scanning, so calling it while a scan is already
+ * registered does NOTHING. That is right for the self-heal -- stacking a
+ * second scan client is how the app used to hit Android's scan-throttle
+ * block -- but it meant the app had no way at all to REFRESH a scan that was
+ * still registered yet no longer delivering.
  *
  * And Android degrades scans behind our back with no callback: send the
  * activity to the background and the stack quietly demotes SCAN_MODE_LOW_
  * LATENCY towards opportunistic, so results only arrive when some other app
  * happens to scan. Measured on 2026-08-03: ~20 advertisements a minute from
  * 3 devices while degraded, versus ~14000 a minute from 140 devices once
- * genuinely restarted -- a 700x difference, with g_scanning reading 1 and the
- * app believing all was well the entire time. A OneTouch meter that advertises
- * in short bursts is invisible in that state, which is exactly how a meter
- * switched on and sitting next to the phone went 26 minutes without syncing
- * while the user pressed SYNC NOW.
+ * genuinely restarted -- a 700x difference, with g_scanning reading 1 and
+ * the app believing all was well the entire time. A OneTouch meter that
+ * advertises in short bursts is invisible in that state, which is exactly
+ * how a meter switched on and sitting next to the phone went 26 minutes
+ * without syncing while the user pressed SYNC NOW.
  *
  * on_pause/on_resume was the ONLY path that produced a real restart, so the
  * user's workaround was to leave the app and come back. An explicit request
  * must not require that.
  *
- * If Java cannot confirm the stop, stop_scan leaves g_scanning set on purpose
- * and start_scan will no-op -- deliberately, so we never stack a second
- * client; the 1 Hz retry finishes the job. */
+ * If Java cannot confirm the stop, stop_scan leaves g_scanning set on
+ * purpose and start_scan will no-op -- deliberately, so we never stack a
+ * second client; the 1 Hz retry finishes the job. */
 static void scan_restart(struct ANativeActivity *a)
 {
    if (!a || !a->env)
@@ -6954,8 +7838,9 @@ static void scan_restart(struct ANativeActivity *a)
 /* --- input: drain the queue so the ANR watchdog stays fed --- */
 
 /* reprogram the shared timer: first tick after `first_ms`, then every
- * `repeat_ms`. Used to switch between the 1 Hz repaint cadence and the hold-to-
- * repeat cadence -- which waits before repeating so a quick tap doesn't repeat.
+ * `repeat_ms`. Used to switch between the 1 Hz repaint cadence and the
+ * hold-to- repeat cadence -- which waits before repeating so a quick tap
+ * doesn't repeat.
  */
 static void timer_set(long first_ms, long repeat_ms)
 {
@@ -6969,29 +7854,30 @@ static void timer_set(long first_ms, long repeat_ms)
    timerfd_settime(g_timerfd, 0, &its, 0);
 }
 
-/* Push the live value + a 3H plot into the ongoing notification (lock screen /
- * shade). Main thread only (uses g_act->env). The plot is grayscale (white dots
- * on dark), so the ARGB bitmap needs no colour swizzle. Called from on_timer
- * when a new reading has arrived, so we rebuild the bitmap at most once a
- * cycle, not every second. */
+/* Push the live value + a 3H plot into the ongoing notification (lock screen
+ * / shade). Main thread only (uses g_act->env). The plot is grayscale (white
+ * dots on dark), so the ARGB bitmap needs no colour swizzle. Called from
+ * on_timer when a new reading has arrived, so we rebuild the bitmap at most
+ * once a cycle, not every second. */
 static uint32_t g_notify_px[NOTIFY_W * NOTIFY_H];
 
 /* Serialises notify_update against itself.
  *
- * It is now driven from BOTH the activity's 1 Hz timer and the service's tick
- * thread, and it fills two file-static buffers (g_notify_px and the plot-point
- * array). Two threads inside it at once would interleave those. Try-lock, not
- * spin: this is an idempotent refresh, so skipping one is free -- the same
- * reasoning draw() uses for its frame guard. */
+ * It is now driven from BOTH the activity's 1 Hz timer and the service's
+ * tick thread, and it fills two file-static buffers (g_notify_px and the
+ * plot-point array). Two threads inside it at once would interleave those.
+ * Try-lock, not spin: this is an idempotent refresh, so skipping one is free
+ * -- the same reasoning draw() uses for its frame guard. */
 static volatile int g_notify_busy;
 
 static void notify_update(void)
 {
    /* Context and env from the transport, NOT from g_act. g_act is NULL once
     * the activity is destroyed, and this used to return early on that -- so
-    * after a back-press or task-swipe the notification froze at whatever value
-    * was current at that instant, while readings kept arriving. In that state
-    * the notification is the ONLY glucose display the user has. */
+    * after a back-press or task-swipe the notification froze at whatever
+    * value was current at that instant, while readings kept arriving. In
+    * that state the notification is the ONLY glucose display the user has.
+    */
    JNIEnv *e    = dexble_env();
    jobject jctx = dexble_ctx();
    if (!e || !jctx || !m_show_glucose || !g_ble)
@@ -7004,10 +7890,10 @@ static void notify_update(void)
     * uses. hist_refresh_current stores the three separately, so reading them
     * unlocked can pair a NEW glucose with the PREVIOUS timestamp -- which
     * evaluates as stale and renders "no recent reading" at the moment a hypo
-    * lands -- or the mirror, a stale in-range value stamped with a fresh time.
-    * Once the activity is destroyed this notification is the only glucose
-    * display the user has. The alarm path already had current_reading() for
-    * exactly this; the notification path did not. */
+    * lands -- or the mirror, a stale in-range value stamped with a fresh
+    * time. Once the activity is destroyed this notification is the only
+    * glucose display the user has. The alarm path already had
+    * current_reading() for exactly this; the notification path did not. */
    hist_lock();
    int cur_glu   = g_cur_glu;
    int cur_trend = g_cur_trend;
@@ -7015,7 +7901,7 @@ static void notify_update(void)
    hist_unlock();
    /* Value, trend AND time all on the TITLE line, leaving the content-text
     * line empty so the BigPicture plot below gets that vertical space. */
-   int stale = realtime_s() - cur_time > 360;
+   int stale = realtime_s() - cur_time > AL_FRESH_S;
    text[0]   = 0;
    /* val is the bare display value for the STATUS-BAR icon; EMPTY on
     * stale/no data, which is Java's cue to fall back to the app glyph --
@@ -7044,10 +7930,10 @@ static void notify_update(void)
    static struct plot_pt pts[NHIST];
 
    /* Per-device styling, SNAPSHOTTED before hist_lock: the plot must colour
-    * each source with the marker/colour the user chose, exactly like the main
-    * screen -- but the registry lock is taken BEFORE hist (driver->reg->hist),
-    * so resolve styles here, then apply them under hist_lock without nesting
-    * the two. */
+    * each source with the marker/colour the user chose, exactly like the
+    * main screen -- but the registry lock is taken BEFORE hist
+    * (driver->reg->hist), so resolve styles here, then apply them under
+    * hist_lock without nesting the two. */
    struct notif_sty {
       int id, marker, color, size;
    };
@@ -7055,8 +7941,8 @@ static void notify_update(void)
    int nsty = 0;
    sensors_lock();
    /* Every slot -- LIVE and OLD (disconnected) alike -- carries its own
-    * marker/colour, so one pass over the slots styles the whole plot the same
-    * way the main screen does. */
+    * marker/colour, so one pass over the slots styles the whole plot the
+    * same way the main screen does. */
    for (int i = 0; i < g_nslot && nsty < (int)(sizeof sty / sizeof sty[0]); i++)
       sty[nsty++] = (struct notif_sty){g_slot[i].id, g_slot[i].marker,
                                        g_slot[i].color, g_slot[i].size};
@@ -7064,9 +7950,10 @@ static void notify_update(void)
 
    hist_lock();
    /* The notification plot mirrors the MAIN screen's plot EXACTLY: every
-    * datapoint from every source -- CGM traces AND meter (BGM) fingersticks --
-    * each styled with that device's own marker and colour (a HIDE-marked
-    * device is dropped, just as on the main plot), so the two read the same. */
+    * datapoint from every source -- CGM traces AND meter (BGM) fingersticks
+    * -- each styled with that device's own marker and colour (a HIDE-marked
+    * device is dropped, just as on the main plot), so the two read the same.
+    */
    int np = 0;
    for (int i = 0; i < g_nhist; i++) {
       int src      = g_hist[i].src;
@@ -7085,9 +7972,10 @@ static void notify_update(void)
                hide = 1;
             break;
          }
-      /* An unstyled fingerstick (or any forgotten source) still needs to be a
-       * distinct MARKER, not a value-palette line vertex reading as CGM data:
-       * give it the orphan look. src 0 is legacy CGM and keeps the default. */
+      /* An unstyled fingerstick (or any forgotten source) still needs to be
+       * a distinct MARKER, not a value-palette line vertex reading as CGM
+       * data: give it the orphan look. src 0 is legacy CGM and keeps the
+       * default. */
       if (!found && (src != 0 || g_hist[i].kind == KIND_BGM)) {
          if (src != 0) {
             mk  = MARK_CROSS;
@@ -7105,7 +7993,8 @@ static void notify_update(void)
    }
    hist_unlock();
    plot_render(g_notify_px, NOTIFY_W, NOTIFY_W, NOTIFY_H, 0, 0, NOTIFY_W,
-               NOTIFY_H, pts, np, realtime_s(), 3, 3, white_color, -1, 0);
+               NOTIFY_H, pts, np, realtime_s(), 3, 3, white_color, -1, 0,
+               g_tz_off);
    /* plot_render writes the SCREEN's pixel convention -- raw u32 on a
     * little-endian RGBA surface, i.e. 0xAABBGGRR -- but
     * Bitmap.createBitmap(..., ARGB_8888) reads each int as 0xAARRGGBB.
@@ -7121,8 +8010,9 @@ static void notify_update(void)
    jstring js    = (*e)->NewStringUTF(e, text);
    jstring jv    = (*e)->NewStringUTF(e, val);
    jintArray arr = (*e)->NewIntArray(e, NOTIFY_W * NOTIFY_H);
-   /* On OOM any of these is NULL with an exception pending; SetIntArrayRegion
-    * on a NULL array aborts the VM, so bail and clean up instead. */
+   /* On OOM any of these is NULL with an exception pending;
+    * SetIntArrayRegion on a NULL array aborts the VM, so bail and clean up
+    * instead. */
    if (jt && js && jv && arr) {
       (*e)->SetIntArrayRegion(e, arr, 0, NOTIFY_W * NOTIFY_H,
                               (const jint *)g_notify_px);
@@ -7143,15 +8033,50 @@ static void notify_update(void)
    __atomic_store_n(&g_notify_busy, 0, __ATOMIC_SEQ_CST);
 }
 
+/* GOING STALE IS AN EVENT, and nothing else reports it.
+ *
+ * notify_update decides staleness at render time, but every route into it is
+ * gated on g_notify_dirty -- which is set by new data and by menu actions,
+ * and by NOTHING that fires as time passes. So on a sensor dropout with the
+ * activity destroyed (precisely what the foreground service exists for) the
+ * last number stayed on the status bar and lock screen indefinitely, and the
+ * service's own 5-minute wake re-posted that cached value. The in-app screen
+ * blanks at AL_FRESH_S; the only glucose display left did not, which is the
+ * exact lie the app is written not to tell -- and with the DISCONNECT alarm
+ * off by default nothing else warned.
+ *
+ * Marking the TRANSITION rather than refreshing unconditionally keeps the
+ * battery argument below intact: this costs two loads and a compare per
+ * tick, and re-renders once, when the state actually changes.
+ *
+ * last_stale is deliberately plain: the two callers run on different
+ * threads, and the worst a race can do is set the flag twice or one tick
+ * late, both self-correcting. */
+static void notify_stale_check(void)
+{
+   static volatile int last_stale = -1;
+   hist_lock(); /* released before notify_update, which takes it again */
+   int cur_glu   = g_cur_glu;
+   long cur_time = g_cur_time;
+   hist_unlock();
+   int stale = (cur_glu < 0) || (realtime_s() - cur_time > AL_FRESH_S);
+   if (stale != last_stale) {
+      last_stale     = stale;
+      g_notify_dirty = 1;
+   }
+}
+
 /* Public entry: the service heartbeat's route to the notification.
  *
- * DIRTY-DRIVEN, exactly like the on_timer path. Refreshing unconditionally on
- * every 20 s tick would re-render the plot bitmap and re-post the notification
- * when nothing had changed -- pure battery and CPU cost on a 24/7 app, for a
- * display that only moves when a reading lands. g_notify_dirty is set by
- * pancra_glucose, so this fires within one tick of each new reading. */
+ * DIRTY-DRIVEN, exactly like the on_timer path. Refreshing unconditionally
+ * on every 20 s tick would re-render the plot bitmap and re-post the
+ * notification when nothing had changed -- pure battery and CPU cost on a
+ * 24/7 app, for a display that only moves when a reading lands.
+ * g_notify_dirty is set by pancra_glucose, so this fires within one tick of
+ * each new reading, and by notify_stale_check when it goes stale. */
 void pancra_notify_refresh(void)
 {
+   notify_stale_check();
    if (!__atomic_exchange_n(&g_notify_dirty, 0, __ATOMIC_SEQ_CST))
       return;
    notify_update();
@@ -7163,16 +8088,18 @@ static int on_timer(int fd, int events, void *data)
    g_where = "on_timer";
    (void)events;
    (void)data;
-   /* on_timer IS the render thread; reaffirm g_main_tid here so on_main() can
-    * never be wrong about who may draw -- guarantees the 1 Hz repaint always
-    * runs even if the onCreate capture were somehow off, so the UI can't wedge.
+   /* on_timer IS the render thread; reaffirm g_main_tid here so on_main()
+    * can never be wrong about who may draw -- guarantees the 1 Hz repaint
+    * always runs even if the onCreate capture were somehow off, so the UI
+    * can't wedge.
     */
    g_main_tid     = gettid();
    uint64_t ticks = 0;
    read(fd, &ticks, sizeof ticks); /* single read clears the expiration count */
-   /* Covers both the stale-data alarm (which depends on elapsed time) and any
-    * glucose alarm a reading raised on a binder thread: the zone is
-    * recomputed here, so this single main-thread caller owns every transition.
+   /* Covers both the stale-data alarm (which depends on elapsed time) and
+    * any glucose alarm a reading raised on a binder thread: the zone is
+    * recomputed here, so this single main-thread caller owns every
+    * transition.
     */
    disc_reeval();
    /* One REMOTE step per tick: read the server's cursor, or send the next
@@ -7181,9 +8108,9 @@ static int on_timer(int fd, int events, void *data)
     * so a backlog drains at the server's own pace instead of being lost. */
    pancra_remote_sync();
    calq_tick(); /* retry / expire any durably-queued calibration */
-   /* Expire a pending rescale that no reading answered within the window, even
-    * if no datapoint arrives at all (a disconnected CGM). Surfaced, never
-    * dropped. */
+   /* Expire a pending rescale that no reading answered within the window,
+    * even if no datapoint arrives at all (a disconnected CGM). Surfaced,
+    * never dropped. */
    if (g_rescale_pend_mgdl > 0 &&
        realtime_s() - g_rescale_pend_t > RESCALE_PEND_WINDOW_S) {
       LOGI("pending rescale %d mg/dL EXPIRED (no reading within window)",
@@ -7197,9 +8124,10 @@ static int on_timer(int fd, int events, void *data)
       g_ui_dirty = 1;
    }
    /* Refresh the UTC offset periodically. It used to be read once in
-    * onCreate, but the foreground service is designed to outlive the activity
-    * for days -- so across a DST transition every displayed timestamp, and
-    * every subsequent meter import, stayed an hour off until a cold start. */
+    * onCreate, but the foreground service is designed to outlive the
+    * activity for days -- so across a DST transition every displayed
+    * timestamp, and every subsequent meter import, stayed an hour off until
+    * a cold start. */
    if (g_act && g_act->env && realtime_s() - g_tz_checked > 300) {
       g_tz_checked = realtime_s();
       init_tz_offset(g_act->env);
@@ -7209,8 +8137,8 @@ static int on_timer(int fd, int events, void *data)
    /* SELF-HEAL THE SCAN.
     *
     * Three paths tear the scan down -- pair_cancel(), and both branches of
-    * commit_pair() -- and NOTHING brought it back while the app stayed in the
-    * foreground; only on_resume did, i.e. the user had to background and
+    * commit_pair() -- and NOTHING brought it back while the app stayed in
+    * the foreground; only on_resume did, i.e. the user had to background and
     * foreground the app. Every CGM's advert-driven reconnect runs off this
     * scan, so pairing a meter, or merely CANCELLING a pairing, silently
     * stopped every already-paired sensor from ever reconnecting for the rest
@@ -7224,11 +8152,12 @@ static int on_timer(int fd, int events, void *data)
     *
     * THROTTLED to once every 30 s, not every tick. start_scan() sets
     * g_scanning only on success, so a persistent failure (Bluetooth off,
-    * BLUETOOTH_SCAN revoked, the LE scanner unavailable) leaves the condition
-    * true forever -- retrying at 1 Hz would re-enter JNI and rewrite the status
-    * line every second, and repeated startScan calls are exactly what trips
-    * Android's "app scanning too frequently" block (5 starts in 30 s), which
-    * would turn a recoverable failure into a sticky one. */
+    * BLUETOOTH_SCAN revoked, the LE scanner unavailable) leaves the
+    * condition true forever -- retrying at 1 Hz would re-enter JNI and
+    * rewrite the status line every second, and repeated startScan calls are
+    * exactly what trips Android's "app scanning too frequently" block (5
+    * starts in 30 s), which would turn a recoverable failure into a sticky
+    * one. */
    /* Retry a stop Java could not confirm, so g_scanning cannot latch. */
    if (g_scan_stop_pending && g_act)
       stop_scan(g_act);
@@ -7278,11 +8207,13 @@ static int on_timer(int fd, int events, void *data)
    }
    /* Same atomic test-and-clear the service path uses: whichever consumer
     * wins renders it, and the other does not double-render. */
+   notify_stale_check();
    if (__atomic_exchange_n(&g_notify_dirty, 0, __ATOMIC_SEQ_CST))
       notify_update();
-   /* Rebuild the text lines here (BLE-thread updates only marked g_ui_dirty),
-    * then repaint unconditionally so AGE / stale state stay live. Both run on
-    * the main thread, so the hit-box geometry can't race on_input. */
+   /* Rebuild the text lines here (BLE-thread updates only marked
+    * g_ui_dirty), then repaint unconditionally so AGE / stale state stay
+    * live. Both run on the main thread, so the hit-box geometry can't race
+    * on_input. */
    g_ui_dirty = 0;
    update_screen();
    if (g_win)
@@ -7307,28 +8238,29 @@ static int on_input(int fd, int events, void *data)
          int tx     = (int)AMotionEvent_getX(ev, 0);
          int ty     = (int)AMotionEvent_getY(ev, 0);
          /* A sounding alarm is silenced by ANY press anywhere in the app --
-          * main screen, settings, keypad, gate -- and that press does nothing
-          * else. Checked before every modal handler so it always wins. */
-         /* Re-test UNDER the lock, not just before it: alarm_apply on a binder
-          * thread writes g_alarm_sounding, so an unsynchronized test could
-          * swallow a tap meant for the UI (alarm cleared meanwhile) or let a
-          * tap fall through to menu_action and toggle a setting instead of
-          * silencing (alarm raised meanwhile). */
+          * main screen, settings, keypad, gate -- and that press does
+          * nothing else. Checked before every modal handler so it always
+          * wins. */
+         /* Re-test UNDER the lock, not just before it: alarm_apply on a
+          * binder thread writes g_alarm_sounding, so an unsynchronized test
+          * could swallow a tap meant for the UI (alarm cleared meanwhile) or
+          * let a tap fall through to menu_action and toggle a setting
+          * instead of silencing (alarm raised meanwhile). */
          /* Acknowledge entirely INSIDE the lock -- test, clear, and silence.
           *
           * Silencing outside it is the mirror of the alarm_apply hazard: a
-          * binder thread could raise a NEW level (say LOW -> HIGH) between the
-          * unlock and the silence call, and this silence would then kill the
-          * alarm that had just legitimately started. g_alarm_want would already
-          * be HIGH, so no later alarm_apply would re-raise it -- a silently
-          * lost alarm. Raise and silence must be mutually exclusive end to end
-          * on BOTH sides.
+          * binder thread could raise a NEW level (say LOW -> HIGH) between
+          * the unlock and the silence call, and this silence would then kill
+          * the alarm that had just legitimately started. g_alarm_want would
+          * already be HIGH, so no later alarm_apply would re-raise it -- a
+          * silently lost alarm. Raise and silence must be mutually exclusive
+          * end to end on BOTH sides.
           *
           * g_alarm_want is deliberately LEFT set: it records "this level has
-          * already been announced", so the next alarm_apply at the same level
-          * is a no-op and the alarm stays acknowledged. Clearing it would make
-          * the very next reading re-chime what the user just dismissed; a
-          * genuine change of level still re-fires. */
+          * already been announced", so the next alarm_apply at the same
+          * level is a no-op and the alarm stays acknowledged. Clearing it
+          * would make the very next reading re-chime what the user just
+          * dismissed; a genuine change of level still re-fires. */
          /* (The old mid-gesture "touch swallow" is gone: actions now fire on
           * the RELEASE, so a menu can no longer change under a still-held
           * finger -- and the back key, the one remaining way it can, cancels
@@ -7344,7 +8276,8 @@ static int on_input(int fd, int events, void *data)
                } else {
                   /* Java was not reached, so the tone may still be playing.
                    * Leave `sounding` set so the next tap tries again rather
-                   * than falling through to the UI with an alarm still on. */
+                   * than falling through to the UI with an alarm still on.
+                   */
                   LOGI("alarm: silence failed; leaving the gesture armed");
                   was_sounding = 0;
                }
@@ -7387,9 +8320,9 @@ static int on_input(int fd, int events, void *data)
          if (g_menu) {
             /* The WEIGHT LOG plot scrubs. It lives on a MENU screen, where
              * every other target is press-arm/release, so it is handled here
-             * rather than in the main screen's gesture code: a press picks the
-             * nearest point and a drag keeps picking, using the plot rect the
-             * last render recorded. */
+             * rather than in the main screen's gesture code: a press picks
+             * the nearest point and a drag keeps picking, using the plot
+             * rect the last render recorded. */
             if (g_menu == MENU_WTLOG &&
                 (action == AMOTION_EVENT_ACTION_DOWN ||
                  (action == AMOTION_EVENT_ACTION_MOVE && g_wt_scrubbing))) {
@@ -7423,9 +8356,9 @@ static int on_input(int fd, int events, void *data)
             if (action == AMOTION_EVENT_ACTION_UP ||
                 action == AMOTION_EVENT_ACTION_CANCEL) {
                /* Scrubbing lasts only while a finger is down, as on the
-                * glucose plot: the readout borrows the tab row, so leaving it
-                * up would hide the span tabs indefinitely and leave a stale
-                * value on screen with nothing touching it. */
+                * glucose plot: the readout borrows the tab row, so leaving
+                * it up would hide the span tabs indefinitely and leave a
+                * stale value on screen with nothing touching it. */
                if (g_wt_scrubbing) {
                   g_wt_scrubbing = 0;
                   g_wt_scrub     = -1;
@@ -7446,11 +8379,12 @@ static int on_input(int fd, int events, void *data)
                int aarg = g_arm_arg; /* press_release clears it */
                if (press_release(action == AMOTION_EVENT_ACTION_UP, tx, ty)) {
                   menu_action(aarg);
-                  /* GENERAL rule (so no menu needs special-casing): the moment
-                   * a menu action lands back on the MAIN screen, restore its
-                   * chosen orientation -- menus render portrait, main follows
-                   * g_orient. Without this, closing a menu left the main screen
-                   * stuck in the portrait the menu-open had forced. */
+                  /* GENERAL rule (so no menu needs special-casing): the
+                   * moment a menu action lands back on the MAIN screen,
+                   * restore its chosen orientation -- menus render portrait,
+                   * main follows g_orient. Without this, closing a menu left
+                   * the main screen stuck in the portrait the menu-open had
+                   * forced. */
                   if (g_menu == MENU_NONE)
                      sys_set_orientation(g_orient);
                }
@@ -7461,9 +8395,10 @@ static int on_input(int fd, int events, void *data)
          /* main screen: resolve the tap against the targets recorded by the
           * last ui_render(), then run the shell-side gesture/timer state. */
          struct action act = ui_hit(&g_hits, tx, ty);
-         /* A drag begins on a press inside the plot; once begun, keep scrubbing
-          * for every MOVE -- even when the finger leaves the plot rectangle --
-          * using its X position (plot_hit picks by time/X only). */
+         /* A drag begins on a press inside the plot; once begun, keep
+          * scrubbing for every MOVE -- even when the finger leaves the plot
+          * rectangle -- using its X position (plot_hit picks by time/X
+          * only). */
          int begin =
              (action == AMOTION_EVENT_ACTION_DOWN && act.kind == ACT_SCRUB);
          int cont = (action == AMOTION_EVENT_ACTION_MOVE && g_scrubbing);
@@ -7475,7 +8410,8 @@ static int on_input(int fd, int events, void *data)
             g_scrubbing = 1;
             press_cancel(); /* scrubbing is exempt; no arm may linger */
             /* Average the current sample with the batched historical ones so
-             * the pick tracks the centre of the contact, not a jittery edge. */
+             * the pick tracks the centre of the contact, not a jittery edge.
+             */
             unsigned long hs = AMotionEvent_getHistorySize(ev);
             long ax          = tx;
             long ay          = ty;
@@ -7487,18 +8423,18 @@ static int on_input(int fd, int events, void *data)
             }
             int fx = (int)(ax / n);
             int fy = (int)(ay / n);
-            static struct plot_pt pts[PLOT_LONG_MAX + NINS];
+            static struct plot_pt pts[UI_PTS_MAX];
             /* SIZED FOR THE SAME LOOP AS pts, not for the live window.
              * This was left at NHIST when pts grew to hold a long span, so
              * scrubbing 7D or 30D wrote up to PLOT_LONG_MAX ints into a
              * 5040-int array -- 176 kB straight through the statics that
              * follow it, which is what silently emptied the stats ring
              * minutes after every restart. */
-            static int psrc[PLOT_LONG_MAX + NINS];
+            static int psrc[UI_PTS_MAX];
             /* Under hist_lock: hist_insert memmoves g_hist from a BLE binder
-             * thread, so an unlocked copy here reads a half-shifted array and
-             * the scrub lands on a datapoint that was never there. Every other
-             * reader takes the lock; this one was missed. */
+             * thread, so an unlocked copy here reads a half-shifted array
+             * and the scrub lands on a datapoint that was never there. Every
+             * other reader takes the lock; this one was missed. */
             int nlong2                    = 0;
             const struct ui_point *plong2 = plot_source_from(
                 g_store_path, realtime_s(), g_plot_hours, &nlong2);
@@ -7529,10 +8465,11 @@ static int on_input(int fd, int events, void *data)
                }
                hist_unlock();
             }
-            /* A HIDDEN device (marker OFF) is off the plot, so its points must
-             * not be scrub-selectable either. plot_hit skips pts[].hidden. Pull
-             * the (few) hidden-marker device ids in ONE locked call, then flag
-             * matching points -- no per-point registry lock. */
+            /* A HIDDEN device (marker OFF) is off the plot, so its points
+             * must not be scrub-selectable either. plot_hit skips
+             * pts[].hidden. Pull the (few) hidden-marker device ids in ONE
+             * locked call, then flag matching points -- no per-point
+             * registry lock. */
             int hid[MAX_SLOTS];
             int nhid = sensor_hidden_ids(hid, MAX_SLOTS);
             for (int i = 0; nhid > 0 && i < np; i++)
@@ -7544,7 +8481,7 @@ static int on_input(int fd, int events, void *data)
             /* Insulin doses ride along, in the SAME order the model
              * appends them, so the returned index maps onto m->hist. */
             int np_glu = np;
-            for (int i = 0; i < g_nins && np < PLOT_LONG_MAX + NINS; i++) {
+            for (int i = 0; i < g_nins && np < UI_PTS_MAX; i++) {
                pts[np].t      = g_ins[i].t;
                pts[np].glu    = 60; /* the renderer's fixed insulin y */
                pts[np].marker = 0;
@@ -7554,6 +8491,22 @@ static int on_input(int fd, int events, void *data)
                    (g_ins_marker[g_ins[i].type == INS_FAST ? INS_FAST
                                                            : INS_SLOW] ==
                     MARK_HIDE);
+               np++;
+            }
+            /* WEIGHTS, in the SAME order build_model appends them (glucose,
+             * doses, weights) so the index plot_hit returns maps onto
+             * m->hist. Missing here, they were drawn on the plot and could
+             * not be scrubbed: this array -- not the model's -- is what the
+             * hit test walks. They share the doses' y, so they fall inside
+             * the same bottom band and the aiming rule below picks them up
+             * without any extra case. */
+            for (int i = 0; i < g_nwt && np < UI_PTS_MAX; i++) {
+               pts[np].t      = g_wt[i].t;
+               pts[np].glu    = 60; /* the renderer's fixed bottom-line y */
+               pts[np].marker = 0;
+               pts[np].col    = 0;
+               pts[np].size   = 0;
+               pts[np].hidden = 0; /* weights have no hide toggle */
                np++;
             }
             /* plot_hit picks by TIME alone, which would leave a dose
@@ -7617,8 +8570,8 @@ static int on_input(int fd, int events, void *data)
             }
             handled = 1;
          } else if (action == AMOTION_EVENT_ACTION_DOWN) {
-            if (act.kind == ACT_OPEN_SETTINGS || act.kind == ACT_PICK_PRIMARY ||
-                act.kind == ACT_MENU || act.kind == ACT_PLOT_TAB) {
+            if (act.kind == ACT_OPEN_SETTINGS || act.kind == ACT_MENU ||
+                act.kind == ACT_PLOT_TAB) {
                /* Every real main-screen action arms here and fires on the
                 * release back on the same control (press_release below). */
                press_arm(act.kind, act.arg, tx, ty);
@@ -7649,21 +8602,10 @@ static int on_input(int fd, int events, void *data)
                   sys_set_orientation(0);
                   if (g_win)
                      draw(g_win);
-               } else if (akind == ACT_PICK_PRIMARY) {
-                  /* Releasing on the big number ALWAYS opens the CHOOSE
-                   * PRIMARY screen -- with several CGMs to pick between,
-                   * with one (to see/confirm which owns the number), or
-                   * with none (the screen states there is no CGM and offers
-                   * the pending one if a pairing is armed). A consistent
-                   * affordance beats a tap that silently does nothing. */
-                  sys_refresh();
-                  g_menu = MENU_PRIMPICK;
-                  sys_set_orientation(0);
-                  if (g_win)
-                     draw(g_win);
                } else if (akind == ACT_MENU) {
-                  /* Main-screen shortcut into a menu action (the info/stats
-                   * block taps straight to the primary CGM's device menu). */
+                  /* Main-screen shortcut into a menu action: the info/stats
+                   * block taps straight to the primary CGM's device menu, and
+                   * the big number itself opens the DEVICES screen. */
                   sys_refresh();
                   sys_set_orientation(0);
                   menu_action(aarg);
@@ -7680,10 +8622,11 @@ static int on_input(int fd, int events, void *data)
                  AKeyEvent_getKeyCode(ev) == AKEYCODE_BACK) {
          /* The system back gesture/button, acting exactly like a tap on the
           * current screen's title-row X. ALWAYS claimed (handled = 1), even
-          * when it does nothing: unhandled it falls through to NativeActivity,
-          * which finishes the activity -- so on the main screen and the gate
-          * "no effect" still has to eat the event. Act on UP, the OS's own
-          * back-on-release semantics; the DOWN is claimed silently. */
+          * when it does nothing: unhandled it falls through to
+          * NativeActivity, which finishes the activity -- so on the main
+          * screen and the gate "no effect" still has to eat the event. Act
+          * on UP, the OS's own back-on-release semantics; the DOWN is
+          * claimed silently. */
          if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP && !g_gate) {
             /* Same contract as a touch: a sounding alarm is silenced by ANY
              * press, and that press does nothing else (see the DOWN handler
@@ -7713,20 +8656,22 @@ static int on_input(int fd, int events, void *data)
 
 /* --- activity callbacks --- */
 
-/* The activity can be destroyed (back-press) while the foreground service keeps
- * the process alive. Without this, the 1 Hz timer keeps firing and derefs the
- * freed g_act (watchdog / notify_update) -- a use-after-free. Remove and close
- * the timer fd and clear g_act/g_win so nothing touches the dead activity; the
- * one-time init is guarded so a later relaunch re-runs onCreate cleanly. */
+/* The activity can be destroyed (back-press) while the foreground service
+ * keeps the process alive. Without this, the 1 Hz timer keeps firing and
+ * derefs the freed g_act (watchdog / notify_update) -- a use-after-free.
+ * Remove and close the timer fd and clear g_act/g_win so nothing touches the
+ * dead activity; the one-time init is guarded so a later relaunch re-runs
+ * onCreate cleanly. */
 static void on_destroy(struct ANativeActivity *a)
 {
    /* END PAIRING MODE. It is cleared only from menu_action, i.e. only with a
     * live activity, and it gates the ENTIRE advert-driven reconnect
-    * (jni_on_advert) plus the scan self-heal. Leaving the pair keypad open and
-    * backgrounding the app therefore killed every paired CGM's fast reconnect
-    * for the whole background lifetime -- the exact window the foreground
-    * service exists to cover -- recoverable only by the 700 s stall watchdog
-    * against a 300 s sensor cycle, with nothing on screen to say so. */
+    * (jni_on_advert) plus the scan self-heal. Leaving the pair keypad open
+    * and backgrounding the app therefore killed every paired CGM's fast
+    * reconnect for the whole background lifetime -- the exact window the
+    * foreground service exists to cover -- recoverable only by the 700 s
+    * stall watchdog against a 300 s sensor cycle, with nothing on screen to
+    * say so. */
    g_smart_pairing = 0;
    (void)a;
    if (g_looper && g_timerfd >= 0)
@@ -7761,11 +8706,12 @@ static void on_resume(struct ANativeActivity *a)
     * on_pause's stop_scan leaves g_scanning SET when Java cannot confirm the
     * cancel (deliberately -- it stops the self-heal stacking a second scan
     * client). start_scan then early-returns on that same flag, so the resume
-    * silently failed to bring the scan back and the app went on believing one
-    * was running. Coming back to the foreground is the user's own recovery
-    * gesture and the only path that ever produced a real restart; it must not
-    * be the one that no-ops. In the healthy case the stop below is itself a
-    * no-op (on_pause already cleared g_scanning), so this costs nothing. */
+    * silently failed to bring the scan back and the app went on believing
+    * one was running. Coming back to the foreground is the user's own
+    * recovery gesture and the only path that ever produced a real restart;
+    * it must not be the one that no-ops. In the healthy case the stop below
+    * is itself a no-op (on_pause already cleared g_scanning), so this costs
+    * nothing. */
    scan_restart(a);
    sys_refresh();        /* a permission/settings dialog may have returned */
    if (g_want_battery) { /* first-boot: chain the battery-opt prompt once */
@@ -7791,7 +8737,8 @@ static void on_window_created(struct ANativeActivity *a,
    __atomic_store_n(&g_win, win, __ATOMIC_SEQ_CST);
    g_nlines = 0;
    update_screen();
-   draw(win); /* force the first frame; update_screen's throttle may skip it */
+   draw(win); /* force the first frame; update_screen's throttle may skip it
+               */
 }
 
 static void on_window_destroyed(struct ANativeActivity *a,
@@ -7802,8 +8749,8 @@ static void on_window_destroyed(struct ANativeActivity *a,
    /* Stop new draws targeting this surface, then wait for any in-flight draw
     * (possibly on a BLE thread) to finish before we return -- the framework
     * frees the struct ANativeWindow once this callback returns, so returning
-    * while a draw_impl still holds it would be a use-after-free. draw_impl does
-    * no blocking work, so this spin is sub-millisecond. */
+    * while a draw_impl still holds it would be a use-after-free. draw_impl
+    * does no blocking work, so this spin is sub-millisecond. */
    __atomic_store_n(&g_win, NULL, __ATOMIC_SEQ_CST);
    while (__atomic_load_n(&g_draw_busy, __ATOMIC_SEQ_CST))
       ;
@@ -7850,14 +8797,14 @@ static void crash_puts(char *b, int cap, int *pos, const volatile char *s,
       b[(*pos)++] = s[i];
 }
 
-/* native crash logger: append signal + a little app context, then re-raise so
- * the OS still records its tombstone (its tombstone carries the timestamp).
- * Retrieve with run-as cat files/crash.log.
+/* native crash logger: append signal + a little app context, then re-raise
+ * so the OS still records its tombstone (its tombstone carries the
+ * timestamp). Retrieve with run-as cat files/crash.log.
  *
  * Everything here is async-signal-safe: the pure helpers above plus open /
- * write / close / signal / raise. NO snprintf (locale/heap) and no non-trivial
- * libc wrappers -- a signal handler may run at any instant, including
- * mid-malloc. */
+ * write / close / signal / raise. NO snprintf (locale/heap) and no
+ * non-trivial libc wrappers -- a signal handler may run at any instant,
+ * including mid-malloc. */
 static void crash_handler(int sig)
 {
    char b[200];
@@ -7920,8 +8867,8 @@ static long tz_offset_at(JNIEnv *env, long at)
       if (tz) /* getDefault can return null; don't call getOffset on it */
          off = (*env)->CallIntMethod(env, tz, get_off, when) / 1000;
       /* Release the local refs. This runs on the per-fingerstick hot path,
-       * twice per record, inside jni_notify's frame -- three refs a call adds
-       * up even though the frame pop eventually reclaims them. */
+       * twice per record, inside jni_notify's frame -- three refs a call
+       * adds up even though the frame pop eventually reclaims them. */
       if (tz)
          (*env)->DeleteLocalRef(env, tz);
    }
@@ -7934,29 +8881,32 @@ static long tz_offset_at(JNIEnv *env, long at)
    return off;
 }
 
-/* The offset that was in force when a meter record was TAKEN, not when it was
- * imported. The meter stores naive local time and backfills weeks of records,
- * so using the import-time offset put every pre-transition record exactly one
- * hour out across a DST boundary. Converting needs an instant, and the instant
- * needs the offset, so resolve iteratively: guess with the current offset, ask
- * what the offset was then, and re-derive. Converges in one step except inside
- * the ambiguous repeated hour. */
+/* The offset that was in force when a meter record was TAKEN, not when it
+ * was imported. The meter stores naive local time and backfills weeks of
+ * records, so using the import-time offset put every pre-transition record
+ * exactly one hour out across a DST boundary. Converting needs an instant,
+ * and the instant needs the offset, so resolve iteratively: guess with the
+ * current offset, ask what the offset was then, and re-derive. Converges in
+ * one step except inside the ambiguous repeated hour. */
 static long meter_tz_for(long naive)
 {
-   /* dexble_env(), NOT g_act->env. This runs on a BLE BINDER thread (jni_notify
+   /* dexble_env(), NOT g_act->env. This runs on a BLE BINDER thread
+    * (jni_notify
     * -> ot_on_notify -> ot_drv_reading), and a JNIEnv is valid only on the
-    * thread that produced it; g_act->env belongs to the main looper. Using it
-    * here aborts under CheckJNI and corrupts the main thread's local-ref frame
-    * otherwise -- on the hot path of every single fingerstick import. */
+    * thread that produced it; g_act->env belongs to the main looper. Using
+    * it here aborts under CheckJNI and corrupts the main thread's local-ref
+    * frame otherwise -- on the hot path of every single fingerstick import.
+    */
    JNIEnv *env = dexble_env();
    if (!env)
       return g_tz_off;
-   /* Seed from a FIXED guess, not from g_tz_off: the conversion must be a pure
-    * function of `naive`, or the same meter record converts to two different
-    * instants depending on when it was imported (g_tz_off drifts across a DST
-    * change, and is stale entirely while the activity is destroyed). BGM dedup
-    * requires an EXACT timestamp match, so a non-deterministic conversion means
-    * a re-imported record does not dedup even well inside the display window.
+   /* Seed from a FIXED guess, not from g_tz_off: the conversion must be a
+    * pure function of `naive`, or the same meter record converts to two
+    * different instants depending on when it was imported (g_tz_off drifts
+    * across a DST change, and is stale entirely while the activity is
+    * destroyed). BGM dedup requires an EXACT timestamp match, so a
+    * non-deterministic conversion means a re-imported record does not dedup
+    * even well inside the display window.
     */
    long off = tz_offset_at(env, naive + OT_EPOCH);
    return tz_offset_at(env, naive + OT_EPOCH - off);
@@ -7967,9 +8917,9 @@ static void init_tz_offset(JNIEnv *env)
    g_tz_off = tz_offset_at(env, 0);
 }
 
-/* NDK entry point: resolved by name by the Android runtime when the .so loads.
- * Explicitly exported (we build -fvisibility=hidden); it is external by
- * necessity, which is also why it cannot be given internal linkage. */
+/* NDK entry point: resolved by name by the Android runtime when the .so
+ * loads. Explicitly exported (we build -fvisibility=hidden); it is external
+ * by necessity, which is also why it cannot be given internal linkage. */
 __attribute__((visibility("default"))) void
 ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                          size_t saved_size)
@@ -7980,18 +8930,18 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
 
    /* This runs on the main/UI looper thread; record it so
     * draw()/update_screen() can tell it apart from BLE binder threads (see
-    * on_main). The looper callbacks (on_timer/on_input) are registered on this
-    * same thread below. */
+    * on_main). The looper callbacks (on_timer/on_input) are registered on
+    * this same thread below. */
    g_main_tid = gettid();
    g_act      = activity;
    /* Stale-alarm grace starts at PROCESS start, not at every onCreate.
     *
-    * Re-arming it on each activity launch meant that opening the app to see why
-    * the alarm was sounding silenced it: the next heartbeat recomputed
+    * Re-arming it on each activity launch meant that opening the app to see
+    * why the alarm was sounding silenced it: the next heartbeat recomputed
     * grace = 1, dropped g_disc_alarmed, and alarm_apply issued a silence --
-    * then refused to re-raise for the whole threshold (up to 60 min) with the
-    * sensor still dead. The service keeps running across activity destruction,
-    * so the grace period must not restart with the UI. */
+    * then refused to re-raise for the whole threshold (up to 60 min) with
+    * the sensor still dead. The service keeps running across activity
+    * destruction, so the grace period must not restart with the UI. */
    if (!g_launch_t)
       g_launch_t = realtime_s();
    crash_install(activity->internalDataPath ? activity->internalDataPath
@@ -8010,10 +8960,11 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    activity->callbacks->onInputQueueDestroyed      = on_queue_destroyed;
    activity->callbacks->onDestroy                  = on_destroy;
 
-   /* Process-wide, one-time setup: JNI globals, the BLE driver, and the loaded
-    * history/settings. The foreground service can outlive the activity, so a
-    * relaunch re-enters onCreate in the same process -- guard this so we don't
-    * leak the g_ble global ref, re-register natives, or reload the history. */
+   /* Process-wide, one-time setup: JNI globals, the BLE driver, and the
+    * loaded history/settings. The foreground service can outlive the
+    * activity, so a relaunch re-enters onCreate in the same process -- guard
+    * this so we don't leak the g_ble global ref, re-register natives, or
+    * reload the history. */
    if (!g_inited) {
       jclass ble = find_app_class(activity, "com.jk.pancra.Ble");
       if (!ble) {
@@ -8023,8 +8974,8 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       }
       g_ble = (*env)->NewGlobalRef(env, ble);
 
-      /* char[] (not literals) so the char* JNINativeMethod fields need no const
-       * cast */
+      /* char[] (not literals) so the char* JNINativeMethod fields need no
+       * const cast */
       static char nm_advert[] = "onAdvert";
       static char sg_advert[] = "(Ljava/lang/String;Ljava/lang/String;I)V";
       static const JNINativeMethod methods[] = {
@@ -8099,21 +9050,22 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          LOGI("dexble_register failed");
 
       /* Robust reconnect: if we hold a key (bonded) but have no saved sensor
-       * MAC -- e.g. after an app update that added MAC persistence, or if the
-       * saved MAC was lost -- resolve the sensor's address from the system bond
-       * list (reliable names) and lock onto it, so we never fall back to
-       * guessing from adverts (whose local name is usually absent).
+       * MAC -- e.g. after an app update that added MAC persistence, or if
+       * the saved MAC was lost -- resolve the sensor's address from the
+       * system bond list (reliable names) and lock onto it, so we never fall
+       * back to guessing from adverts (whose local name is usually absent).
        *
-       * The name prefix comes from the registry, i.e. from the family the user
-       * actually paired, so this can never latch onto a bonded sensor they did
-       * not choose. */
+       * The name prefix comes from the registry, i.e. from the family the
+       * user actually paired, so this can never latch onto a bonded sensor
+       * they did not choose. */
       /* Alarm class must come through the app's own classloader (see
        * find_app_class) */
       dexble_set_alarm(env, find_app_class(activity, "com.jk.pancra.Alarm"));
 
       /* persistent reading log: remember our own datapoints across restarts.
        * Internal storage; the app is debuggable, so retrieve with
-       *   adb shell run-as com.jk.pancra cat files/readings.csv > readings.csv
+       *   adb shell run-as com.jk.pancra cat files/readings.csv >
+       * readings.csv
        */
       {
          const char *dir = activity->internalDataPath
@@ -8133,6 +9085,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          data_path(g_meter_path, sizeof g_meter_path, dir, "/meter.idx");
          data_path(g_metersync_path, sizeof g_metersync_path, dir,
                    "/meter.sync");
+         data_path(g_sess_path, sizeof g_sess_path, dir, "/session.cache");
          data_path(g_calq_path, sizeof g_calq_path, dir, "/cal.q");
          data_path(g_rescale_path, sizeof g_rescale_path, dir, "/rescale.cfg");
          data_path(g_remote_path, sizeof g_remote_path, dir, "/remote.cfg");
@@ -8144,21 +9097,22 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          sensors_load(); /* before store_load: readings resolve through it */
          /* Bonded-MAC recovery runs HERE, after sensors_load().
           *
-          * It asks the OS bond list for a device whose name matches the primary
-          * sensor's family prefix -- but it used to run before the registry was
-          * read, so g_nslot was always 0, the primary always resolved to -1,
-          * and the prefix was always "DX01". A G7-only user's bonded device was
-          * therefore never found and could never reconnect; a user with both
-          * got LINK_CGM locked onto the Stelo's address while the Stelo already
-          * owned its own link, leaving two links reporting the same MAC and
-          * collapsing the address-based routing. */
+          * It asks the OS bond list for a device whose name matches the
+          * primary sensor's family prefix -- but it used to run before the
+          * registry was read, so g_nslot was always 0, the primary always
+          * resolved to -1, and the prefix was always "DX01". A G7-only
+          * user's bonded device was therefore never found and could never
+          * reconnect; a user with both got LINK_CGM locked onto the Stelo's
+          * address while the Stelo already owned its own link, leaving two
+          * links reporting the same MAC and collapsing the address-based
+          * routing. */
          {
             struct dex_session s;
             driver_lock();
-            /* Select explicitly rather than trusting the ambient link (the GATT
-             * callbacks select and never restore). Getting this wrong here
-             * would let a second sensor's session suppress the primary's MAC
-             * recovery entirely. */
+            /* Select explicitly rather than trusting the ambient link (the
+             * GATT callbacks select and never restore). Getting this wrong
+             * here would let a second sensor's session suppress the
+             * primary's MAC recovery entirely. */
             driver_select(LINK_CGM);
             driver_get_session(&s);
             driver_unlock();
@@ -8175,17 +9129,17 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                jstring jm   = (*env)->CallStaticObjectMethod(
                    env, g_ble, m_bonded_stelo, activity->clazz, jpfx);
                /* getBondedDevices() throws SecurityException if
-                * BLUETOOTH_CONNECT was revoked after pairing; clear it so the
-                * next JNI call (find_app_class for the Alarm class) is not made
-                * with an exception pending. */
+                * BLUETOOTH_CONNECT was revoked after pairing; clear it so
+                * the next JNI call (find_app_class for the Alarm class) is
+                * not made with an exception pending. */
                if ((*env)->ExceptionCheck(env))
                   (*env)->ExceptionClear(env);
                if (jm) {
                   const char *bm = (*env)->GetStringUTFChars(env, jm, NULL);
                   if (bm && bm[0]) {
                      LOGI("locked to bonded sensor %s (%s)", bm, want);
-                     /* dexble_register() has already run, so GATT callbacks can
-                      * be firing; drv_mac_save resolves its path via
+                     /* dexble_register() has already run, so GATT callbacks
+                      * can be firing; drv_mac_save resolves its path via
                       * driver_link(). */
                      driver_lock();
                      driver_select(LINK_CGM);
@@ -8201,15 +9155,25 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                   (*env)->DeleteLocalRef(env, jpfx);
             }
          }
-         /* Seeded per meter at CONNECT time (see the advert handler); this is
-          * just a safe initial state before any meter is selected. */
+         /* Seeded per meter at CONNECT time (see the advert handler); this
+          * is just a safe initial state before any meter is selected. */
          ot_init(-1);
+         /* UNDER hist_lock: store_load rewrites g_hist wholesale, and this
+          * runs AFTER dexble_register, whose own comment notes GATT
+          * callbacks can already be firing. Today the first reading cannot
+          * realistically land inside the load window (scan, timer and
+          * service tick all start later), so this was latent rather than
+          * live -- but store.h states the contract and relying on startup
+          * ordering to satisfy it is exactly the kind of reasoning that goes
+          * stale when the ordering changes. */
+         hist_lock();
          store_load();
+         hist_unlock();
          /* MIGRATION: any source that has readings on the plot but no slot
           * (a device forgotten before slot-retention existed) becomes an OLD
-          * device -- a retired slot -- so it gets the full per-device menu and
-          * consistent styling like everything else. Bounded by the readings
-          * window and MAX_SLOTS. */
+          * device -- a retired slot -- so it gets the full per-device menu
+          * and consistent styling like everything else. Bounded by the
+          * readings window and MAX_SLOTS. */
          {
             hist_lock();
             int orphans[NHIST];
@@ -8258,17 +9222,18 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          calq_load();       /* resume any durably-queued calibration */
          rescale_load();    /* restore active rescale factor */
          meter_sync_load(); /* restore per-meter last-sync times */
+         sess_load();       /* PRED + session clock survive the restart */
          code_load();
          sys_set_orientation(g_orient); /* restore last-chosen orientation */
          g_stored = store_count();
          LOGI("reading log: %s (%d in memory, %d stored)", g_store_path,
               g_nhist, g_stored);
-         /* store_load restored g_cur_glu/g_cur_time -- the big number shows it
-          * immediately, so the ongoing notification must too. It is
+         /* store_load restored g_cur_glu/g_cur_time -- the big number shows
+          * it immediately, so the ongoing notification must too. It is
           * dirty-driven off new readings, which have not arrived yet at cold
-          * start, so mark it dirty here to seed the notification text from the
-          * restored reading rather than leaving it "no recent reading" until
-          * the first live sample. */
+          * start, so mark it dirty here to seed the notification text from
+          * the restored reading rather than leaving it "no recent reading"
+          * until the first live sample. */
          if (g_cur_glu >= 0)
             g_notify_dirty = 1;
       }
@@ -8311,17 +9276,18 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    if (!has_ble_permissions(activity)) {
       g_gate = 1;
       /* Force portrait, exactly as opening any other modal screen does. The
-       * gate's fixed 15-line body is laid out at a width-derived scale, so in
-       * landscape its CONTINUE button falls below the buffer -- and that button
-       * is the screen's ONLY hit target, with on_input swallowing every other
-       * press while g_gate is set. The result was an unrecoverable dead screen.
+       * gate's fixed 15-line body is laid out at a width-derived scale, so
+       * in landscape its CONTINUE button falls below the buffer -- and that
+       * button is the screen's ONLY hit target, with on_input swallowing
+       * every other press while g_gate is set. The result was an
+       * unrecoverable dead screen.
        *
-       * This is reachable well beyond first run: g_gate is armed whenever the
-       * BLE permissions are missing, including Android's automatic revocation
-       * for unused apps, and the persisted orientation is restored just above.
-       * A user who had chosen LANDSCAPE would relaunch straight into the wedge,
-       * and rotating the phone could not help because the app requests the
-       * orientation itself. */
+       * This is reachable well beyond first run: g_gate is armed whenever
+       * the BLE permissions are missing, including Android's automatic
+       * revocation for unused apps, and the persisted orientation is
+       * restored just above. A user who had chosen LANDSCAPE would relaunch
+       * straight into the wedge, and rotating the phone could not help
+       * because the app requests the orientation itself. */
       sys_set_orientation(0);
    }
 }

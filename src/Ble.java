@@ -25,8 +25,14 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -132,9 +138,26 @@ public final class Ble {
 
     /* One background thread with a small BOUNDED queue. Pushes must never block
      * the BLE binder thread that decoded the reading (it holds the driver lock),
-     * and an unreachable server must not accumulate work without bound -- when
-     * the queue fills, the OLDEST pending push is dropped: the server's page
-     * shows recent data, so the newest points are the ones worth keeping. */
+     * and an unreachable server must not accumulate work without bound.
+     *
+     * THE QUEUE NEVER HOLDS MORE THAN ONE TASK, and that is a load-bearing
+     * invariant, not an accident: all three submitters (remoteRange,
+     * remoteCursor, remoteBatch) are `static synchronized` AND gated on
+     * `sBusy != 0`, so at most one is ever in flight or queued. The capacity
+     * and the discard policy below are therefore unreachable today.
+     *
+     * ANY NEW SUBMITTER MUST TAKE THE SAME sBusy GATE. Each of the three
+     * clears sBusy in a `finally` INSIDE the submitted Runnable, and
+     * DiscardOldestPolicy drops a task SILENTLY -- no exception, so the
+     * submitting method's catch never runs. A fourth, ungated submitter that
+     * filled the queue could therefore discard the Runnable carrying the
+     * sBusy clear, wedging every future push for the life of the process
+     * with nothing logged.
+     *
+     * (The old design pushed each datapoint individually, which is what the
+     * bounded queue and "drop the oldest, the newest points matter most"
+     * rationale were for. The cursor protocol below replaced it; nothing
+     * re-reads that reasoning now.) */
     private static final java.util.concurrent.ThreadPoolExecutor pushExec =
         new java.util.concurrent.ThreadPoolExecutor(0, 1, 30,
             java.util.concurrent.TimeUnit.SECONDS,
@@ -546,6 +569,9 @@ public final class Ble {
     static native void onTick();
     /* Push worker -> native: the remote server acknowledged a datapoint. */
     static native void onRemoteOk();
+    /* OS bond state changed for `mac`: BOND_NONE 10, BOND_BONDING 11,
+     * BOND_BONDED 12 (the framework's own constants, passed through). */
+    static native void onBondState(String mac, int state);
 
     private static BluetoothLeScanner scanner;
     private static ScanCallback scanCb;
@@ -699,6 +725,148 @@ public final class Ble {
         }
         scanCb = null;
         return true;
+    }
+
+    /* ---- OS-level bonding ------------------------------------------------
+     *
+     * THE PROBLEM THIS SOLVES. Android bonds implicitly: the stack starts
+     * pairing when a GATT operation returns insufficient-authentication, which
+     * is whenever the sensor next connects and the driver first touches an
+     * encrypted characteristic. That is somewhere between seconds and ten
+     * minutes after the user tapped anything, so the system pairing dialog
+     * arrives unannounced, long after the moment it belongs to, and a user who
+     * is not staring at the screen simply misses it. Missing it leaves the
+     * device registered but never bonded, with nothing on screen to say so.
+     *
+     * Doing it EXPLICITLY at commit time makes the dialog a consequence of the
+     * tap: the request goes out while the user is still looking at the screen
+     * they tapped on.
+     *
+     * WHAT IS NOT POSSIBLE: auto-accepting. setPairingConfirmation() and
+     * setPin() are guarded by BLUETOOTH_PRIVILEGED, which is
+     * signature|privileged -- system-image apps only. A normal app can choose
+     * WHEN the prompt appears and can SEE how it resolves; it cannot answer it.
+     * Do not add an ACTION_PAIRING_REQUEST auto-confirm path; it silently does
+     * nothing outside a system build. */
+    private static final String BOND_CH = "pancra-bond";
+    private static final int BOND_NID = 3; /* != Alarm's NID, != the service's 1 */
+    private static BroadcastReceiver bondRx;
+
+    /* Start watching bond state. Registered ONCE, at native init, not lazily at
+     * createBond(): the sensor can also start pairing on its own (that is the
+     * implicit path above, which still happens on a reconnect after a bond is
+     * cleared), and those transitions are exactly the ones the user needs told
+     * about. Registering only around our own createBond would miss them. */
+    public static synchronized void bondWatch(Context ctx) {
+        if (bondRx != null) return;
+        try {
+            final Context app = ctx.getApplicationContext();
+            bondRx = new BroadcastReceiver() {
+                @Override public void onReceive(Context c, Intent i) {
+                    try {
+                        BluetoothDevice d = i.getParcelableExtra(
+                            BluetoothDevice.EXTRA_DEVICE);
+                        if (d == null) return;
+                        int st = i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE,
+                                               BluetoothDevice.BOND_NONE);
+                        String mac = d.getAddress();
+                        Log.i(TAG, "bond state " + mac + " -> " + st);
+                        /* Tell the user WHILE the dialog is up, not after. The
+                         * app may be backgrounded or the screen off -- which is
+                         * precisely when the prompt goes unanswered -- so this
+                         * is a heads-up notification, not an in-app string. The
+                         * in-app string is native's job (onBondState). */
+                        if (st == BluetoothDevice.BOND_BONDING)
+                            bondNotify(app, mac);
+                        else
+                            bondCancelNotify(app);
+                        onBondState(mac, st);
+                    } catch (Throwable t) { Log.i(TAG, "bond rx: " + t); }
+                }
+            };
+            IntentFilter f =
+                new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+            /* RECEIVER_NOT_EXPORTED says nothing outside the OS may forge this
+             * at us, and API 34 REQUIRES a flag on any exported-capable
+             * registration. But that three-argument overload only exists from
+             * API 33, and minSdk here is 29 -- calling it on 29..32 throws
+             * NoSuchMethodError, which the catch below would swallow into
+             * "bond watching silently does nothing" on exactly the older
+             * phones least likely to be tested. So: try the flagged form,
+             * fall back to the plain one. */
+            try {
+                app.registerReceiver(bondRx, f, Context.RECEIVER_NOT_EXPORTED);
+            } catch (Throwable pre33) {
+                app.registerReceiver(bondRx, f);
+            }
+        } catch (Throwable t) {
+            bondRx = null;
+            Log.i(TAG, "bondWatch: " + t);
+        }
+    }
+
+    /* Ask the OS to bond NOW. Returns null when the request was accepted (or
+     * the device is already bonded, which is success as far as the caller is
+     * concerned), otherwise a short reason that fits a status row. */
+    public static String createBond(Context ctx, String mac) {
+        try {
+            BluetoothManager bm =
+                (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+            BluetoothAdapter ad = (bm == null) ? null : bm.getAdapter();
+            if (ad == null) return "NO BLUETOOTH";
+            BluetoothDevice dev = ad.getRemoteDevice(mac);
+            int st = dev.getBondState();
+            if (st == BluetoothDevice.BOND_BONDED) return null;
+            /* Already prompting: a second createBond() while one is in flight
+             * is refused by the stack and would report a spurious failure. */
+            if (st == BluetoothDevice.BOND_BONDING) return null;
+            return dev.createBond() ? null : "PAIR REFUSED";
+        } catch (Throwable t) {
+            /* SecurityException when BLUETOOTH_CONNECT has been revoked -- the
+             * app's own permissions screen can do that. */
+            return shortErr(t);
+        }
+    }
+
+    private static void bondNotify(Context app, String mac) {
+        try {
+            NotificationManager nm =
+                app.getSystemService(NotificationManager.class);
+            if (nm == null) return;
+            if (nm.getNotificationChannel(BOND_CH) == null) {
+                /* IMPORTANCE_HIGH so it heads-up over whatever is in front.
+                 * The whole point is to catch a user who is NOT in the app. */
+                NotificationChannel c = new NotificationChannel(
+                    BOND_CH, "Pairing", NotificationManager.IMPORTANCE_HIGH);
+                c.setDescription("Android is asking you to confirm a pairing");
+                nm.createNotificationChannel(c);
+            }
+            Intent open = new Intent(app, android.app.NativeActivity.class);
+            open.setAction(Intent.ACTION_MAIN);
+            open.addCategory(Intent.CATEGORY_LAUNCHER);
+            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                          | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(app, 0, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification n = new Notification.Builder(app, BOND_CH)
+                .setContentTitle("Confirm pairing")
+                .setContentText("Android is asking to pair " + mac
+                                + " — open the notification shade and accept")
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setCategory(Notification.CATEGORY_STATUS)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build();
+            nm.notify(BOND_NID, n);
+        } catch (Throwable t) { Log.i(TAG, "bondNotify: " + t); }
+    }
+
+    private static void bondCancelNotify(Context app) {
+        try {
+            NotificationManager nm =
+                app.getSystemService(NotificationManager.class);
+            if (nm != null) nm.cancel(BOND_NID);
+        } catch (Throwable t) { Log.i(TAG, "bondCancelNotify: " + t); }
     }
 
     /* ---- connect / GATT ---- */

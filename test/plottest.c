@@ -12,7 +12,8 @@
  * so keeping one is not a loss; anything more IS.
  */
 #include "plotdata.h"
-#include "ui.h" /* struct ui_point, in full */
+#include "sensors.h" /* KIND_CGM / KIND_BGM */
+#include "ui.h"      /* struct ui_point, in full */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,6 +162,41 @@ int main(void)
       ck(left2 > 1000, "...and a log that overflows the buffer still draws "
                        "the older half");
       ck(n2 <= 768 * 40, "the point count stays inside the fixed buffer");
+   }
+
+   /* KIND IS NORMALISED, not taken from the file.
+    *
+    * plot_store_row is the SECOND reader of readings.csv (hist_insert is the
+    * other, which had the same gap). Its return guard bounds t and glu and
+    * used to let any digit run through as a kind: a fuzz of it accepted 9,
+    * 15, 149, 363 and 2312. That kind is copied into the ui_point handed to
+    * the long-span plot, and ui.c draws kind == KIND_INS along the bottom
+    * edge -- so a corrupt 2 renders as an insulin dose that never happened,
+    * and anything else is not KIND_BGM so it draws as a CGM line vertex.
+    * readings.csv is append-only, so one bad row is redrawn at every launch. */
+   {
+      long t   = 0;
+      int glu  = 0;
+      int src  = 0;
+      int kind = 0;
+      ck(plot_store_row("1700000000,120,0,-70,3,7,0,0,2,\n", &t, &glu, &src,
+                        &kind) == 1 &&
+             kind == KIND_CGM,
+         "a KIND_INS row parses with kind normalised to KIND_CGM");
+      ck(plot_store_row("1700000000,120,0,-70,3,7,0,0,2312,\n", &t, &glu, &src,
+                        &kind) == 1 &&
+             kind == KIND_CGM,
+         "an out-of-range kind becomes KIND_CGM");
+      /* A real fingerstick must survive: forcing everything to CGM would
+       * silently redraw every meter reading as a line vertex. */
+      ck(plot_store_row("1700000000,120,0,-70,3,7,0,0,1,\n", &t, &glu, &src,
+                        &kind) == 1 &&
+             kind == KIND_BGM,
+         "KIND_BGM is preserved");
+      ck(plot_store_row("1700000000,120,0,-70,3,7,0,0,0,\n", &t, &glu, &src,
+                        &kind) == 1 &&
+             kind == KIND_CGM,
+         "KIND_CGM is preserved");
    }
 
    printf(fail ? "plottest: FAIL\n" : "ALL PLOT TESTS PASSED\n");

@@ -31,6 +31,13 @@ struct dex_egv {
 };
 
 int dexdata_record(const uint8_t rec[9], struct dex_record *out);
+/* Most 9-byte records one notification can carry: the JNI layer clamps a
+ * notification to 256 bytes (dexble.c jni_notify), so 256/9 = 28. Callers
+ * size their arrays from this rather than a literal, because decoding fewer
+ * than arrive drops backfill points permanently -- a re-request returns the
+ * same frame and truncates identically. */
+#define DEX_MAX_RECORDS 28
+
 int dexdata_records(const uint8_t *buf, size_t len, struct dex_record *out,
                     int max);
 int dexdata_egv(const uint8_t *p, size_t len, struct dex_egv *out);

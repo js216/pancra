@@ -136,3 +136,7 @@ const uint8_t icon_nolink[7] = {0x00, 0x0E, 0x13, 0x15, 0x19, 0x0E, 0x00};
 /* Checkbox, empty and checked (an X filling the interior). */
 const uint8_t icon_box[7]   = {0x00, 0x1F, 0x11, 0x11, 0x11, 0x1F, 0x00};
 const uint8_t icon_boxck[7] = {0x00, 0x1F, 0x1B, 0x15, 0x1B, 0x1F, 0x00};
+/* Checkbox, SOLID. The PRIMARY column is a radio choice, not a set of
+ * independent options, so its "on" state is a filled square rather than the
+ * crossed box -- the two read as different kinds of answer at a glance. */
+const uint8_t icon_boxfill[7] = {0x00, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x00};

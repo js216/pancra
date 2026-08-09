@@ -53,8 +53,12 @@ static void rdsep(const char **p, const char *e)
       (*p)++;
 }
 
-/* Keep the newest NINS rows: on overflow drop the OLDEST, which is the only
- * safe choice for a chronological log (the file still has everything). */
+/* Overflow drops the FIRST ROW IN THE TAIL, which is the oldest by ARRIVAL,
+ * not necessarily the oldest by time: rows are pushed in file order and the
+ * sort runs afterwards, so a backdated entry loaded near the end of the file
+ * can evict a row older than itself. Display-only -- the file keeps
+ * everything and the next launch re-reads it -- but the tail is a window on
+ * arrival order, which is what the file is, not a strict time window. */
 static void ins_push(const struct ins_rec *r)
 {
    if (g_nins == NINS) {

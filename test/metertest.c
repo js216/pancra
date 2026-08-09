@@ -377,6 +377,20 @@ int main(void)
          "...so the next session moves past the refused block");
    }
 
+   printf("== a FIRST sync reaches the newest record ==\n");
+   /* The walk fetches at most OT_MAX_WALK records INCLUSIVE of its start, so
+    * a first-sync window of top - OT_MAX_WALK spanned 21 records and the cap
+    * stopped one short of top -- the newest record, i.e. the fingerstick
+    * that prompted the pairing, arrived only on the NEXT power-on. */
+   begin(-1);
+   feed_count(100);
+   for (int i = 0; i < OT_MAX_WALK; i++)
+      feed_record(naive_now() - ((long)i * 60), 100 + i, 0, 0);
+   ck(n_readings == OT_MAX_WALK, "a fresh pairing fills its whole window");
+   ck(ot_last_index() == 100,
+      "...and the window ENDS at the newest record, not one short of it");
+   ck(n_done == 1, "the session finishes at the cap, not before");
+
    printf("\n%s\n", all ? "ALL METER TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;
 }

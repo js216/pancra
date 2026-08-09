@@ -28,5 +28,6 @@ extern const uint8_t icon_dot[7];     /* NEW DATAPOINT beep indicator */
 extern const uint8_t icon_nolink[7];  /* DISCONNECT (stale-data) alarm */
 extern const uint8_t icon_box[7];     /* checkbox, empty */
 extern const uint8_t icon_boxck[7];   /* checkbox, checked */
+extern const uint8_t icon_boxfill[7]; /* checkbox, solid (the PRIMARY pick) */
 
 #endif

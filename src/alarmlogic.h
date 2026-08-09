@@ -27,8 +27,17 @@
 #define AL_HIGH  2
 #define AL_STALE 3
 
-/* How old a reading may be and still count as current, in seconds. */
-#define AL_FRESH_S 360
+/* How old a reading may be and still count as current, in seconds.
+ *
+ * A CGM samples every 5 minutes, so 360 s (two cycles minus jitter) blanked
+ * the screen after a SINGLE missed sample -- routine on a phone that has
+ * wandered out of range for a minute. 660 s tolerates two missed samples and
+ * still calls the data stale well before a third would have arrived.
+ *
+ * THE ONE PLACE THIS LIVES. Every display, notification and connected-dot
+ * check reads it from here; when it was open-coded as 360 in five files, a
+ * change like this one silently left some of them behind. */
+#define AL_FRESH_S 660
 
 /* ---- NEW DATAPOINT alert modes (g_newdata_mode, persisted) ----
  *   ND_OFF    silent
@@ -143,13 +152,19 @@ int alarm_stale(int glu, long glu_t, long now, long launch_t, long disc_s);
  *
  * This exists because the two rules above compose into an actively dangerous
  * result in the default configuration. alarm_zone un-latches at AL_FRESH_S
- * (6 min) so that a stale zone cannot mask the DISCONNECT alarm -- sound
+ * (11 min) so that a stale zone cannot mask the DISCONNECT alarm -- sound
  * reasoning, but it assumes the DISCONNECT alarm is there to take over. It is
  * OFF by default (g_disc == 0 => alarm_stale is unconditionally 0), so with a
  * sensor dropping out on a hypo the zone decayed to nothing, alarm_want
  * returned AL_NONE, and alarm_apply called dexble_alarm_silence() -- ACTIVELY
  * STOPPING a ringing hypo alarm after two missed CGM cycles, while the user
  * was still low and nothing knew otherwise.
+ *
+ * The hand-off only works while every DISCONNECT threshold is longer than
+ * AL_FRESH_S: a zone that is still fresh outranks AL_STALE, so a shorter
+ * threshold would fire into a zone that has not decayed yet and the label
+ * would lag its own setting. disc_min[] (main.c) starts at 15 min for that
+ * reason -- raising AL_FRESH_S means checking that table.
  *
  * Treating that as a stale-data alarm keeps a sound going instead of killing
  * one. It cannot mask anything (it IS the stale alarm), it cannot fire while
