@@ -7,7 +7,7 @@
  * out-of-range reading) and calls trigger()/silence() via dexble.c.
  *
  * The alert loops (sound + vibration) until silenced, so a single missed beep
- * can't be the difference — silence() stops everything at once. We play the
+ * can't be the difference -- silence() stops everything at once. We play the
  * sound ourselves (looping MediaPlayer, USAGE_ALARM) rather than via the
  * notification channel, because channel sounds play once and can't be stopped
  * on demand; the notification is kept silent and used only for the heads-up
@@ -342,7 +342,7 @@ public final class Alarm {
             Notification n = new Notification.Builder(app, CH)
                 .setContentTitle(kind == 2 ? "Sensor disconnected"
                                : kind == 1 ? "Glucose HIGH" : "Glucose LOW")
-                .setContentText(kind == 2 ? "No recent readings — tap to open"
+                .setContentText(kind == 2 ? "No recent readings - tap to open"
                                           : "Open the app to silence")
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setCategory(Notification.CATEGORY_ALARM)

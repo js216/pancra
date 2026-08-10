@@ -5,7 +5,7 @@ STRIP     := /usr/lib/llvm-19/bin/llvm-strip
 TARGET    := aarch64-linux-android29
 JNI_INC   := -Isrc -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/include/linux
 # Every warning on, warnings are errors. Keep this list in sync with what the
-# code actually satisfies — the rule is to fix the cause, never to silence.
+# code actually satisfies -- the rule is to fix the cause, never to silence.
 WARN      := -Werror -Wall -Wextra -Wshadow -Wpointer-arith -Wstrict-prototypes \
              -Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Wundef \
              -Wdouble-promotion -Wcast-qual -Wswitch-enum -Wredundant-decls
@@ -19,7 +19,7 @@ JAVACFLAGS := -Xlint:-options -source 8 -target 8 -bootclasspath tmp/tools/andro
 APK  := build/pancra.apk
 LIB  := build/apk/lib/arm64-v8a/libpancra.so
 DEX  := build/apk/classes.dex
-# kept OUTSIDE build/ so `make clean` can't wipe it — a regenerated key changes
+# kept OUTSIDE build/ so `make clean` can't wipe it -- a regenerated key changes
 # the APK signature and blocks in-place updates (forcing an uninstall/data loss)
 KEY  := tmp/debug.keystore
 
@@ -47,18 +47,32 @@ SRC := src/main.c src/font.c src/plot.c src/util.c src/stats.c src/store.c src/s
        src/alarmlogic.c src/scanlogic.c src/insulin.c src/weight.c src/plotdata.c \
        src/sensors.c src/otble.c \
        src/dexble.c src/dexdriver.c \
-       src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
+       src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c \
+       src/sync.c src/syncjni.c
 
-# Headers are prerequisites too: the whole app is one clang invocation, so
-# there is no incremental build to lose, and without this a header-only edit
-# (this tree changed three struct layouts) silently relinks nothing and ships
-# the previous .so.
 HDR := $(wildcard src/*.h)
 
-$(LIB): $(SRC) $(HDR) $(STUBS)
+# ONE OBJECT PER SOURCE, not one clang invocation over all of them. The single
+# invocation could not be parallelised -- `make -j4` had exactly one recipe to
+# run -- and could not be incremental, so a one-line edit to ui.c recompiled
+# main.c's nine thousand lines with it.
+#
+# Header dependencies come from -MMD, which is STRICTER than the old trick of
+# listing every header as a prerequisite of everything: that rebuilt the world
+# on any header edit (correct but slow), and would have missed a header nobody
+# remembered to add to HDR. Now each object knows exactly which headers it
+# read.
+OBJ := $(patsubst src/%.c,build/obj/%.o,$(SRC))
+DEP := $(OBJ:.o=.d)
+
+build/obj/%.o: src/%.c
 	@mkdir -p $(@D)
-	$(CLANG) --target=$(TARGET) $(CFLAGS) -shared -nostdlib -fuse-ld=lld \
-	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(SRC)
+	$(CLANG) --target=$(TARGET) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(LIB): $(OBJ) $(STUBS)
+	@mkdir -p $(@D)
+	$(CLANG) --target=$(TARGET) -shared -nostdlib -fuse-ld=lld \
+	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(OBJ)
 	$(STRIP) $@
 
 build/classes/com/jk/pancra/Ble.class: src/Ble.java src/PancraService.java src/Alarm.java src/PancraFiles.java
@@ -137,7 +151,7 @@ clean:
 # ---------------------
 # `make check` runs the same gate offline: no CRLF, ASCII-only, clang-format
 # clean, and clang-tidy clean (rules in .clang-tidy, warnings-as-errors). No
-# compilation database is needed — the whole app is one clang invocation, so we
+# compilation database is needed -- the whole app is one clang invocation, so we
 # hand clang-tidy the exact compile flags after `--`.
 # test/ IS the behavioural gate, so it gets the same formatting and encoding
 # checks as src/. It was excluded, which meant the ~1400 lines that decide
@@ -158,7 +172,7 @@ TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 # one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
 # whole alarm actuation end (Alarm.java, PancraService.java, Ble.java)
 # unchecked by anything.
-check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest weighttest done
+check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest plottest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest insulintest weighttest interoptest done
 
 format:
 	grep -rlP '\r' --exclude='.*' src test res Makefile AndroidManifest.xml \
@@ -361,10 +375,25 @@ registrytest:
 # last thing standing between a corrupt file and a hypo alarm that cannot fire
 # (an out-of-range low disables it; low > high latches both) -- while still
 # accepting low == high, which alarm_step legitimately produces.
+# The two implementations against each other. SKIPS when glucoserve is not
+# built, so pancra still builds on a machine that has never seen it.
+interoptest:
+	@mkdir -p build/test
+	cc -iquote src $(TESTWARN) test/interoptest.c src/sync.c src/util.c \
+	    src/dexauth.c src/p256.c src/sha256.c src/aes.c \
+	    -o build/test/interoptest
+	@./test/interop.sh > build/test/interoptest.log 2>&1 \
+	    || { cat build/test/interoptest.log; exit 1; }
+	@if grep -q "ALL INTEROP TESTS PASSED" build/test/interoptest.log; then \
+	    printf '\033[1;32minteroptest\033[0m: pancra <-> glucoserve agree\n'; \
+	 elif grep -q "SKIP" build/test/interoptest.log; then \
+	    printf '\033[1;33minteroptest\033[0m: skipped (glucoserve not built)\n'; \
+	 else cat build/test/interoptest.log; exit 1; fi
+
 settingstest:
 	@mkdir -p build/test
-	cc -iquote src $(TESTWARN) test/settingstest.c src/settings.c src/util.c \
-	    -o build/test/settingstest
+	cc -iquote src $(JVM_INC) $(TESTWARN) test/settingstest.c src/settings.c \
+	    src/util.c -o build/test/settingstest
 	@./build/test/settingstest > build/test/settingstest.log 2>&1 \
 	    && grep -q "ALL SETTINGS TESTS PASSED" build/test/settingstest.log \
 	    && printf '\033[1;32msettingstest\033[0m: settings persistence OK\n' \

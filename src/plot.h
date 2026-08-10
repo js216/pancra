@@ -62,11 +62,23 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
                  int hours, int radius, uint32_t (*color)(int glu), int hi_idx,
                  uint32_t hi_color, long tz);
 
+/* Candidates the column split (see `split` below) will consider. Sized for the
+ * whole insulin + weight logs at once (NINS + NWT), which is every marker the
+ * doses line can ever hold; past it the split is skipped, never the points. */
+#define PLOT_SPLIT_MAX 512
+
 /* Return the index into pts of the in-window point nearest to pixel (tx,ty),
  * using the same mapping as plot_render, or -1 if there are no in-window
- * points. Lets the caller resolve a touch to a datapoint. */
+ * points. Lets the caller resolve a touch to a datapoint.
+ *
+ * `split` deals markers that share one pixel column out to adjacent free
+ * columns FOR THE PICK ONLY -- nothing moves on screen -- so two logged at the
+ * same minute are both reachable instead of one shadowing the other. Pass it
+ * for a SPARSE series (the doses line: insulin and weights), never for the
+ * glucose trace, where hundreds of samples legitimately share a column on a
+ * multi-day span and the pick must stay a plain nearest-in-time. */
 int plot_hit(int x, int y, int w, int h, const struct plot_pt *pts, int npts,
-             long now, int hours, int tx, int ty);
+             long now, int hours, int tx, int ty, int split);
 
 /* Draw a single marker glyph at (cx,cy), half-width r, for menu previews. Shape
  * codes match sensors.h MARK_* (HIDE is not a drawable shape). */

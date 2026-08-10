@@ -328,35 +328,67 @@ int main(void)
 
    printf("== remote push config round-trips ==\n");
    g_remote_on = 1;
-   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "192.168.1.42");
+   (void)snprintf(g_remote_server, sizeof g_remote_server, "192.168.1.42");
    g_remote_port = 8080;
    remote_save();
    g_remote_on    = 0;
-   g_remote_ip[0] = 0;
+   g_remote_server[0] = 0;
    g_remote_port  = 80;
    remote_load();
-   ck(g_remote_on == 1 && strcmp(g_remote_ip, "192.168.1.42") == 0 &&
+   ck(g_remote_on == 1 && strcmp(g_remote_server, "192.168.1.42") == 0 &&
           g_remote_port == 8080,
       "what was saved is what comes back");
    /* An UNSET address must round-trip as unset (the "-" marker), not clobber
     * itself into a literal dash the validator would then refuse forever. */
    g_remote_on    = 0;
-   g_remote_ip[0] = 0;
+   g_remote_server[0] = 0;
    remote_save();
-   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "10.0.0.1");
+   (void)snprintf(g_remote_server, sizeof g_remote_server, "10.0.0.1");
    remote_load();
-   ck(g_remote_ip[0] == 0, "an unset address stays unset across a reload");
+   ck(g_remote_server[0] == 0, "an unset address stays unset across a reload");
+
+   printf("== the account survives a reload when NOT paired ==\n");
+   /* The email used to be read from a fixed offset past the uid, which is
+    * only correct when a 32-character key is there. Unpaired, the saver
+    * writes "-" for the key, the offset landed in the wrong field, and the
+    * address the user had typed silently vanished on the next launch. */
+   g_remote_on = 1;
+   (void)snprintf(g_remote_server, sizeof g_remote_server, "pancra.org");
+   g_remote_port = 443;
+   (void)snprintf(g_sync_email, sizeof g_sync_email, "a.b@example.com");
+   g_sync_uid = 0;
+   remote_save();
+   g_sync_email[0] = 0;
+   remote_load();
+   ck(strcmp(g_sync_email, "a.b@example.com") == 0,
+      "an UNPAIRED account email round-trips");
+   ck(g_sync_uid == 0, "...and it is still unpaired");
+   {
+      unsigned char k[16];
+      for (int i = 0; i < 16; i++)
+         k[i] = (unsigned char)(i + 1);
+      sync_key_save(7, k);
+      g_sync_email[0] = 0;
+      g_sync_uid      = 0;
+      remote_load();
+      ck(g_sync_uid == 7 && strcmp(g_sync_email, "a.b@example.com") == 0,
+         "a PAIRED identity and the email round-trip together");
+      ck(g_sync_key[0] == 1 && g_sync_key[15] == 16, "...and so does the key");
+   }
 
    printf("== a corrupt remote file keeps the prior values ==\n");
    /* Half-applying a corrupt file could silently re-point the push at the
     * wrong host, so the loader must commit all three fields or none. */
    g_remote_on = 1;
-   (void)snprintf(g_remote_ip, sizeof g_remote_ip, "10.0.0.9");
+   (void)snprintf(g_remote_server, sizeof g_remote_server, "10.0.0.9");
    g_remote_port = 8080;
-   put(g_remote_path, "1 999.168.1.1 80\n");
+   /* "999.168.1.1" would once have been the malformed case; it is a perfectly
+    * good host NAME, so the malformed one is now a name no resolver could
+    * accept. */
+   put(g_remote_path, "1 -bad.org 80\n");
    remote_load();
-   ck(strcmp(g_remote_ip, "10.0.0.9") == 0 && g_remote_port == 8080,
-      "an out-of-range octet is rejected whole");
+   ck(strcmp(g_remote_server, "10.0.0.9") == 0 && g_remote_port == 8080,
+      "a malformed host is rejected whole");
    put(g_remote_path, "1 10.0.0.5 0\n");
    remote_load();
    ck(g_remote_port == 8080, "port 0 is rejected whole");
@@ -365,7 +397,7 @@ int main(void)
    ck(g_remote_port == 8080, "a port above 65535 is rejected whole");
    put(g_remote_path, "garbage\n");
    remote_load();
-   ck(g_remote_on == 1 && strcmp(g_remote_ip, "10.0.0.9") == 0,
+   ck(g_remote_on == 1 && strcmp(g_remote_server, "10.0.0.9") == 0,
       "non-numeric changes nothing");
    put(g_remote_path, "");
    remote_load();
@@ -374,21 +406,35 @@ int main(void)
    remote_load();
    ck(g_remote_on == 1, "a missing file changes nothing");
 
-   printf("== remote_ip_valid: the keypad's whole defence ==\n");
-   /* The IP keypad offers only digits and dots, so this predicate is the ONLY
-    * thing standing between a mistyped entry and a push aimed at nothing. */
-   ck(remote_ip_valid("192.168.1.1"), "a normal LAN address passes");
-   ck(remote_ip_valid("255.255.255.255"), "all-255 passes");
-   ck(remote_ip_valid("0.0.0.0"), "all-zero is well-formed (if useless)");
-   ck(!remote_ip_valid(""), "empty fails");
-   ck(!remote_ip_valid("1.2.3"), "three octets fail");
-   ck(!remote_ip_valid("1.2.3.4.5"), "five octets fail");
-   ck(!remote_ip_valid("256.1.1.1"), "an octet above 255 fails");
-   ck(!remote_ip_valid("1..2.3"), "an empty octet fails");
-   ck(!remote_ip_valid(".1.2.3"), "a leading dot fails");
-   ck(!remote_ip_valid("1.2.3."), "a trailing dot fails");
-   ck(!remote_ip_valid("1111.2.3.4"), "a four-digit octet fails before it "
-                                      "can wrap");
+   printf("== remote_server_valid: the editor's whole defence ==\n");
+   /* The SERVER field is free text from an alphanumeric editor, so this
+    * predicate is the ONLY thing standing between a mistyped entry and a sync
+    * aimed at nothing. It accepts host NAMES now, not just dotted quads --
+    * the server acquired a name the moment it stopped being a box on the LAN.
+    */
+   ck(remote_server_valid("192.168.1.1"), "a LAN address still passes");
+   ck(remote_server_valid("pancra.org"), "a host name passes");
+   ck(remote_server_valid("duo"), "a bare host name passes");
+   ck(remote_server_valid("my-server.example.co.uk"), "hyphens and depth pass");
+   ck(!remote_server_valid(""), "empty fails");
+   ck(!remote_server_valid("."), "a lone dot fails");
+   ck(!remote_server_valid(".pancra.org"), "a leading dot fails");
+   ck(!remote_server_valid("pancra.org."), "a trailing dot fails");
+   ck(!remote_server_valid("pancra..org"), "an empty label fails");
+   ck(!remote_server_valid("-pancra.org"), "a label starting with - fails");
+   ck(!remote_server_valid("pancra-.org"), "a label ending with - fails");
+   ck(!remote_server_valid("pancra.org "), "a trailing space fails");
+   ck(!remote_server_valid("panc ra.org"), "an embedded space fails");
+   ck(!remote_server_valid("http://pancra.org"), "a scheme fails: this is a "
+                                                 "host, not a URL");
+   {
+      /* Longer than the field can hold must fail rather than be truncated
+       * into some OTHER host that happens to resolve. */
+      char toolong[128];
+      memset(toolong, 'a', sizeof toolong);
+      toolong[sizeof toolong - 1] = 0;
+      ck(!remote_server_valid(toolong), "a name past the field length fails");
+   }
 
    /* EVERY VALUE THE PICKER OFFERS MUST SURVIVE A RESTART.
     *

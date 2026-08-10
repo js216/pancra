@@ -76,6 +76,13 @@ void *malloc(size_t n)
    return 0;
 }
 
+void *realloc(void *p, size_t n)
+{
+   (void)p;
+   (void)n;
+   return 0;
+}
+
 void *calloc(size_t nmemb, size_t size)
 {
    (void)nmemb;

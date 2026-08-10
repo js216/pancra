@@ -13,6 +13,7 @@
  * global and reused from another. Driver state is serialised by driver_lock().
  */
 #include "dexdriver.h"
+#include "syncjni.h"
 #include "dexlibc.h"
 #include "otble.h"
 #include "pancra.h"
@@ -829,6 +830,12 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    static char s7[]                 = "()V";
    static char n8[]                 = "onBondState";
    static char s8[]                 = "(Ljava/lang/String;I)V";
+   /* The sync client's two entry points. They BLOCK for several round trips,
+    * so Java only ever calls them on its push worker -- never here. */
+   static char n9[]                 = "syncRun";
+   static char s9[]                 = "()I";
+   static char n10[]                = "syncPair";
+   static char s10[] = "(Ljava/lang/String;Ljava/lang/String;)I";
    static const JNINativeMethod m[] = {
        {n0, s0, (void *)jni_connected   },
        {n1, s1, (void *)jni_disconnected},
@@ -839,6 +846,8 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n6, s6, (void *)jni_tick        },
        {n7, s7, (void *)jni_remote_ok   },
        {n8, s8, (void *)jni_bond_state  },
+       {n9, s9, (void *)syncjni_run     },
+       {n10, s10, (void *)syncjni_pair  },
    };
    /* The COUNT, not a literal that has to be remembered: registering 8 of 9
     * leaves onBondState unbound, and the first bond transition then takes the
@@ -880,6 +889,8 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
       (*e)->CallStaticVoidMethod(e, g_ble, m_startsvc,
                                  g_ctx); /* keep alive in bg */
    (*e)->GetJavaVM(e, &g_vm);
+   /* The sync transport rides the same class and the same VM. */
+   syncjni_wire(e, ble);
    /* Every id we will later call, not just most of them: a missing
     * m_disconnect would leave dexble_link_close a silent no-op, holding a
     * meter awake past its own power-off -- the one thing otble.h says must

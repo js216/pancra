@@ -9,7 +9,7 @@
 #include "ndk.h"
 #include "plotdata.h" /* PLOT_LONG_MAX: how many points a long span yields */
 #include "sensors.h"  /* sensor types/kinds the model and renderer share */
-#include "settings.h" /* SC_MAX: the main-screen shortcut slots */
+#include "settings.h" /* SC_MAX: the main-screen PIN slots */
 #include "weight.h"   /* struct wt_rec: the WEIGHT LOG table rows */
 #include <stdint.h>
 
@@ -62,12 +62,12 @@ void fmt_dur(long seconds, char *out, int n);
 #define UI_MIN_SLOTS 3
 
 /* Rows the DEVICES screen consumes ABOVE (and below) the device entries:
- * title (2), the five-line P explainer plus its trailing air (~3), the P
- * column header (1), the armed-pairing "PENDING..." row (1), the page-nav row
- * (1), the blank line above OLD DEVICES (1), the "OLD DEVICES (n)" row (1),
- * the blank line below it (1), the separator before the button (1) and the ADD
- * NEW DEVICE button itself (25*sc, i.e. ~1.6 rows -> 2). Keep in step with
- * render_devices.
+ * title (2), the five-line primary-box explainer plus its trailing air (~3),
+ * the blank row under it (1), the armed-pairing "PENDING..." row (1), the
+ * page-nav row (1), the blank line above OLD DEVICES (1), the "OLD DEVICES (n)"
+ * row (1), the blank line below it (1), the separator before the button (1) and
+ * the ADD NEW DEVICE button itself (25*sc, i.e. ~1.6 rows -> 2). Keep in step
+ * with render_devices.
  *
  * The explainer is five glyph lines at gh + 2*sc each, which is under three
  * 16*sc rows -- counted as 3, rounding UP, because rounding down here is
@@ -147,11 +147,12 @@ int ui_label_nchars(void);
 /* Keypad modes: 0 is the pairing code, 1..UI_KP_MODES-1 are the named value
  * entries. Bounds BOTH the title table and the slot table in ui.c, so a mode
  * cannot be added to one and forgotten in the other. */
-#define UI_KP_MODES 15
+#define UI_KP_MODES 16
 int ui_kp_slots(int mode);
 
-/* THE SHORTCUT TABLE: which ADD-menu actions may be promoted to the main
- * screen, in ADD-menu order. Exported because the shell has to turn a tapped
+/* THE PINNABLE-ACTION TABLE: which ADD-menu actions the PIN column may pin to
+ * the main screen, in ADD-menu order. Exported because the shell has to turn a
+ * tapped
  * checkbox (MA_SCTOGGLE + slot) into the MA_* code it persists, and deriving
  * that mapping twice is how the stored code and the drawn row drift apart.
  * `abbrev` gives the short label the main screen falls back to when two or
@@ -313,7 +314,17 @@ struct screen {
    const char *status;              /* top status text */
    const char *mac, *model, *fw, *mfr, *code; /* device-info strings */
    const char *entry;                         /* keypad digits typed so far */
-   const char *remote_ip; /* remote-push server address; "" = not set */
+   const char *remote_server; /* sync server, name or IP; "" = not set */
+   const char *sync_email;    /* the account being paired to; "" = not set */
+   /* Which field the text editor is editing: 0 sensor name, 1 server,
+    * 2 account. The editor is shared, and a title that always said NAME made
+    * the server and account screens look like the wrong screen. */
+   int label_field;
+   int sync_paired;           /* 1 once an app identity is stored */
+   int sync_active;           /* 1 while a sync is in flight */
+   int sync_permille;         /* 0..1000, ALREADY SMOOTHED by main.c so the
+                               * renderer stays a pure function of this struct
+                               * (uitest renders it deterministically) */
    /* What the last sync attempt actually got back ("200 STORED 3 OF 3",
     * "409 TOO FAR BEHIND", "TIMEOUT"...). Empty = nothing attempted yet.
     * Failures were previously invisible outside logcat. */
@@ -510,9 +521,12 @@ enum ui_menu {
    MA_PLOTMAX       = 31,
    MA_REMOTE_OPEN   = 32, /* settings: open the REMOTE submenu */
    MA_REMOTE_TOGGLE = 33, /* remote menu: enable/disable the push */
-   MA_REMOTE_IP     = 34, /* remote menu: edit the server IP (keypad) */
+   MA_REMOTE_IP     = 34, /* remote menu: edit the SERVER (text editor) */
    MA_REMOTE_PORT   = 35, /* remote menu: edit the server port (keypad) */
    MA_REMOTE_BACK   = 36, /* remote menu: back to settings */
+   MA_SYNC_EMAIL    = 37, /* remote menu: edit the account email (text) */
+   MA_SYNC_PAIR     = 38, /* remote menu: enter the 6-digit pairing code */
+   MA_SYNC_UNPAIR   = 39, /* remote menu: forget the paired identity */
    /* Rebased from 40 when MAX_SLOTS grew to 10: the old base had only 8
     * values of room before MA_SENSOR_BACK. These are runtime touch codes,
     * never persisted, so the move is safe; the assert below now guards the
@@ -567,7 +581,7 @@ enum ui_menu {
    MA_OLDPAGE_NEXT = 98, /* OLD DEVICES: next page */
    MA_DEVPAGE_PREV = 71, /* DEVICES: previous page of the live list */
    MA_DEVPAGE_NEXT = 72, /* DEVICES: next page of the live list */
-   /* + a slot index into the ui_shortcut_* table: the SHORTCUT checkbox on
+   /* + a slot index into the ui_shortcut_* table: the PIN checkbox on
     * the ADD menu. Reserves 37..47, which bounds the table at 11 entries. */
    MA_SCTOGGLE  = 37,
    MA_RECONNECT = 96, /* old device: revive it (direct if not yet expired,

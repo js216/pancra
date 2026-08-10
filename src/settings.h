@@ -33,7 +33,7 @@ extern int g_plot_max;      /* plot vertical-scale top, mg/dL */
 extern int g_ins_marker[2]; /* MARK_* per insulin type (INS_SLOW/FAST) */
 extern int g_ins_color[2];  /* ui palette index per insulin type */
 extern int g_ins_size[2];   /* marker size 1..MARK_SIZE_MAX per type */
-/* MAIN-SCREEN SHORTCUTS: up to three ADD-menu actions promoted onto the main
+/* MAIN-SCREEN PINS: up to three ADD-menu actions pinned onto the main
  * screen, beside the big '+'. Stored as the MA_* action codes themselves, not
  * as positions in the ADD menu -- that menu's order is presentation and has
  * changed before, and a stored position would silently start launching a
@@ -45,8 +45,16 @@ extern int g_statbar_val;    /* 1 = status bar shows the value, 0 = icon */
 extern int g_lockscr_val;    /* 1 = notification visible on lock screen */
 extern char g_code_str[16];  /* runtime pairing code (PAIR NEW SENSOR) */
 extern int g_remote_on;      /* 1 = push each new datapoint to the server */
-extern char g_remote_ip[16]; /* dotted-quad server address; "" = not set */
+extern char g_remote_server[64]; /* hostname or IP; "" = not set */
 extern int g_remote_port;    /* server TCP port, 1..65535 */
+/* The paired identity, stored in the SAME file as the server -- which is one
+ * of the files that must never be synced (see sync.h): it is the secret that
+ * authenticates this phone to the server. 0 = not paired. */
+extern long g_sync_uid;
+extern unsigned char g_sync_key[16];
+extern char g_sync_email[64]; /* the account being synced into; "" = not set */
+/* Remember a completed pairing, durably. */
+void sync_key_save(long uid, const unsigned char key[16]);
 extern char g_info_path[256], g_alarm_path[256], g_settings_path[256],
     g_code_path[256], g_remote_path[256];
 
@@ -75,6 +83,6 @@ void remote_load(void);
 #define SET_NCOLORS 7
 
 /* 1 iff s is a well-formed dotted quad (four octets, each 0..255). Pure. */
-int remote_ip_valid(const char *s);
+int remote_server_valid(const char *s);
 
 #endif

@@ -24,6 +24,8 @@
 #include "scanlogic.h"
 #include "sensors.h"
 #include "settings.h"
+#include "sync.h"
+#include "syncjni.h"
 #include "stats.h"
 #include "store.h"
 #include "ui.h"
@@ -173,10 +175,7 @@ static jmethodID m_show_glucose; /* push value+plot to the notification */
 static jmethodID
     m_bonded_stelo; /* resolve the bonded Stelo's MAC from bond list */
 /* REMOTE sync: cursor read, batch push, and the in-flight/backoff gate. */
-static jmethodID m_remote_cursor, m_remote_batch, m_remote_busy,
-    m_remote_cur_glu, m_remote_cur_ins, m_remote_forget, m_remote_ack_glu,
-    m_remote_ack_ins, m_remote_status, m_remote_range, m_remote_range_body,
-    m_remote_range_ack;
+
 static char g_remote_status[24]; /* last attempt's reply, for the UI */
 /* Set on a BLE binder thread, consumed by BOTH the activity's 1 Hz timer and
  * the service tick thread -- so the test-and-clear must be atomic, or a
@@ -319,7 +318,7 @@ static int g_markpick_ins = -1; /* INS_SLOW/INS_FAST being styled; -1 =
 /* WHERE THE FOUR LOGGING SCREENS WERE OPENED FROM.
  *
  * They used to hardcode MENU_ADD, which was true while the ADD menu was their
- * only door. The main screen's SHORTCUT buttons are a second door, so a
+ * only door. The main screen's PIN buttons are a second door, so a
  * hardcoded return drops the user into a menu they never opened -- the exact
  * failure the record-the-origin rule exists to prevent, and one this codebase
  * has now hit on the devices screen, the sensor screen and the pairing flow.
@@ -406,9 +405,19 @@ static const char *perms[] = {"android.permission.BLUETOOTH_SCAN",
  * main thread (menu open / after an action) and build_model just copies them.
  */
 static int g_sys_perm[NPERMS], g_sys_batt, g_sys_bucket, g_sys_bg;
-static char g_entry[24]; /* keypad digits, or a sensor name being typed */
+/* 64: the widest thing typed here is an email address or a host name, both of
+ * which are 63-byte fields. It was 24, which silently truncated an address at
+ * 23 characters -- and the truncation only became visible when pairing failed
+ * against an account that did not exist. */
+static char g_entry[64];
 static int g_entrylen;   /* keypad entry buffer */
 static int g_kp_mode;    /* keypad: 0 = pair code, 1 = plot max, 2 = cal */
+/* THREE fields share the alphanumeric editor -- a sensor name, the sync
+ * server and the account email -- and they commit to different places, so
+ * which one opened it has to be recorded rather than guessed from the menu. */
+enum { LABEL_SENSOR = 0, LABEL_SERVER = 1, LABEL_EMAIL = 2 };
+static int g_label_field;
+static int g_prog_shown; /* the eased sync fraction, per mille */
 static int
     g_cal_pending; /* calibration value awaiting CONFIRM, mg/dL; 0 = none */
 /* DURABLE calibration queue: a CONFIRMED calibration that has not yet been
@@ -2070,7 +2079,35 @@ static void build_model(struct screen *m)
    m->screen_on      = g_screen_on;
    m->newdata_mode   = g_newdata_mode;
    m->remote_on      = g_remote_on;
-   m->remote_ip      = g_remote_ip; /* global, so the borrow is stable */
+   m->remote_server  = g_remote_server; /* global: the borrow is stable */
+   m->sync_email     = g_sync_email;
+   m->sync_paired    = g_sync_uid > 0;
+   m->label_field    = g_label_field;
+   /* SMOOTHED HERE, not in the renderer. The sync reports whole buckets, so
+    * the raw fraction steps; easing it toward the target gives a bar that
+    * moves continuously without ever claiming more progress than was made
+    * (it only ever approaches the true value, never passes it). Keeping the
+    * easing on this side leaves render_remote a pure function of the struct,
+    * which is what uitest depends on. */
+   {
+      int pdone = 0, ptotal = 0;
+      int act   = sync_progress(&pdone, &ptotal);
+      int target = (ptotal > 0) ? (int)(((long)pdone * 1000) / ptotal) : 0;
+      if (!act) {
+         g_prog_shown = 0;
+      } else if (g_prog_shown < target) {
+         int step = (target - g_prog_shown) / 4;
+         g_prog_shown += step > 0 ? step : 1;
+         if (g_prog_shown > target)
+            g_prog_shown = target;
+      }
+      m->sync_active   = act;
+      m->sync_permille = g_prog_shown;
+      /* Keep frames coming while it runs, or the bar would freeze between
+       * whatever else happens to repaint the screen. */
+      if (act)
+         g_ui_dirty = 1;
+   }
    m->remote_status  = g_remote_status;
    m->remote_port    = g_remote_port;
    m->remote_last_ok = g_remote_last_ok;
@@ -3697,528 +3734,46 @@ void pancra_remote_ok(void)
    g_remote_last_ok = realtime_s();
 }
 
-/* ---- REMOTE sync: an OUTBOX over the app's own append-only log ----
+/* The app's own log is the outbox now.
  *
- * The first design tracked what the SERVER had, as one newest timestamp, and
- * sent whatever was newer. A scalar cannot express a HOLE, so anything
- * missing behind that timestamp was invisible and stayed missing forever --
- * which is exactly how a reading vanished when a manual import overwrote it.
+ * There used to be one here: a byte offset into readings.csv that the
+ * server had confirmed, a second one for the live tail, an in-flight
+ * marker for each, and the same again for doses -- all of it bookkeeping
+ * about what the server already had. The replica protocol asks the server
+ * that question directly and gets an exact answer, so the only thing still
+ * worth knowing locally is whether the log has GROWN since the last look,
+ * which is one number. */
+/* (ob_log_size is gone: syncjni_state_stamp covers every synced file, not
+ * just the readings log, and that is what decides whether to sync.) */
+
+/* (The PULL direction is gone. It existed because the server held far more
+ * history than the phone and the phone wanted it back; under the replica
+ * protocol the server holds exactly what the phone gave it, so there is
+ * nothing there to import that is not already here.) */
+
+/* WHEN TO SYNC AT ALL.
  *
- * So track what WE have sent instead. readings.csv is already the perfect
- * queue: every reading the app accepts is appended to it, in ARRIVAL order,
- * by all three paths (live, meter, backfill), and it is never rewritten. A
- * reading backfilled an hour late is appended NOW, at the end, so it takes
- * its turn like any other.
+ * Only when something changed. This used to fire every ten seconds forever:
+ * with nothing to send it still cost a TLS handshake, a request to the
+ * server, and a full local pass over every log to hash it -- several times a
+ * minute, on a phone battery, against a single-core board. That is not a
+ * sync, it is a slow denial of service against your own server.
  *
- * One persisted byte offset says how far into that file the server has
- * CONFIRMED. The next batch is simply the next unsent lines, and the offset
- * advances only when the server acknowledges that exact batch (the tag
- * echoed back through Ble.remoteAckGlu). A failure, a timeout, a lost reply,
- * a killed process -- all leave the offset alone, so those same lines are
- * the first thing retried. A reading cannot fall through a crack: the crack
- * would have to be a line in a file the offset has not passed.
- *
- * Delivery is at-least-once; the server's dedup makes it exactly-once in
- * effect. Doses take the simpler road below -- their file IS rewritten (an
- * edit or delete rewrites it), so a byte offset would be a lie, and the
- * whole log is small enough to re-offer wholesale. */
-#define REMOTE_BATCH 100 /* the server's per-request cap */
+ * So: the sizes of the synced files are the trigger. A reading, a dose, an
+ * edit or a deletion changes one of them; nothing else does. On top of that
+ * there is a rare safety net, because the server could have been restored
+ * from an older backup while the phone had nothing new to say, and a
+ * BACKOFF, because a failing sync must keep retrying without becoming the
+ * ten-second loop again. */
+#define REMOTE_MIN_GAP  60L          /* never more often than this */
+#define REMOTE_SAFETY   (6L * 3600)  /* re-check even with nothing new */
+#define REMOTE_FAIL_MIN 60L          /* first retry after a failure */
+#define REMOTE_FAIL_MAX (30L * 60)   /* ...doubling up to here */
 
-static long g_ob_pos;    /* bytes of readings.csv the server confirmed */
-static long g_ob_flight; /* offset the in-flight batch would advance to */
-/* The LIVE tail, sent ahead of the backlog. The outbox walks the log from
- * the front for completeness, which can be a long way behind after an
- * import or an outage -- and a reading taken NOW must not wait for that to
- * finish. So each pass offers the newest lines first, out of order, and the
- * sequential walk still delivers everything in its own time. Duplicates
- * cost nothing (the server skips them), so the overlap is free. */
-static long g_ob_live; /* log size as of the last acknowledged live push */
-static long g_ob_lflight;
-static long g_ins_flight; /* dose index the in-flight chunk would reach */
-static char g_ob_path[256];
-
-/* Atomic: temp file then rename, so a crash cannot leave a half-written
- * position -- which would either resend a lot or, far worse, skip. */
-static void ob_save(void)
-{
-   char tmp[sizeof g_ob_path + 4];
-   if (snprintf(tmp, sizeof tmp, "%s.t", g_ob_path) >= (int)sizeof tmp)
-      return;
-   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (fd < 0)
-      return;
-   char b[32];
-   int n = snprintf(b, sizeof b, "%ld\n", g_ob_pos);
-   if (n > 0 && write(fd, b, (size_t)n) == n) {
-      close(fd);
-      (void)rename(tmp, g_ob_path);
-      return;
-   }
-   close(fd);
-   (void)unlink(tmp);
-}
-
-static void ob_load(void)
-{
-   int fd = open(g_ob_path, O_RDONLY, 0);
-   if (fd < 0)
-      return;
-   char b[32];
-   long n = read(fd, b, sizeof b - 1);
-   close(fd);
-   if (n <= 0)
-      return;
-   b[n]   = 0;
-   long v = 0;
-   int nd = 0;
-   for (int i = 0; b[i] >= '0' && b[i] <= '9'; i++)
-      if (nd++ < 18)
-         v = (v * 10) + (b[i] - '0');
-   if (nd > 0)
-      g_ob_pos = v;
-}
-
-static long ob_log_size(void)
-{
-   int fd = open(g_store_path, O_RDONLY, 0);
-   if (fd < 0)
-      return 0;
-   long n = lseek(fd, 0, SEEK_END);
-   close(fd);
-   return n < 0 ? 0 : n;
-}
-
-/* The start of the line containing byte `at`: a batch must never begin
- * mid-record, or the first line would be a truncation. */
-static long ob_line_start(long at)
-{
-   if (at <= 0)
-      return 0;
-   int fd = open(g_store_path, O_RDONLY, 0);
-   if (fd < 0)
-      return 0;
-   if (lseek(fd, at, SEEK_SET) != at) {
-      close(fd);
-      return 0;
-   }
-   char rd[512];
-   long got = read(fd, rd, sizeof rd);
-   close(fd);
-   for (long i = 0; i < got; i++)
-      if (rd[i] == '\n')
-         return at + i + 1;
-   /* No newline in 512 bytes, or the read failed: `at` is NOT known to be a
-    * line start, and returning it would have the caller parse from the
-    * middle of a record -- the tail of one line reads as a plausible
-    * "<epoch>,<mg/dL>" and gets PUSHED to the server as a reading that was
-    * never taken. 0 is the safe answer: the caller floors it at g_ob_pos,
-    * which is always a line boundary, so the live shortcut is skipped and
-    * the outbox sends the same data correctly a moment later. */
-   return 0;
-}
-
-/* Fill `buf` with up to REMOTE_BATCH datapoint lines starting at byte `from`
- * of readings.csv. *end receives the offset just past the last COMPLETE line
- * consumed -- the tag the server must acknowledge before that ground is
- * given up. Returns how many lines went into the body.
- *
- * Header, malformed and implausible lines are STEPPED OVER (they advance
- * *end without being sent): they are not data the server wants, and leaving
- * them in front of the offset would wedge the queue forever. */
-static int ob_fill(char *buf, size_t cap, long from, long *end, int *full)
-{
-   *end   = from;
-   *full  = 0;
-   int fd = open(g_store_path, O_RDONLY, 0);
-   if (fd < 0)
-      return 0;
-   if (lseek(fd, from, SEEK_SET) != from) {
-      close(fd);
-      return 0;
-   }
-   size_t used = 0;
-   int n       = 0;
-   long at     = from;
-   char rd[1024];
-   char line[256];
-   int llen = 0;
-   /* Bytes this line REALLY occupies, which is not llen once a line overruns
-    * `line`: llen stops at 255 while the file keeps going. The offset we
-    * hand back is a byte position in the file, so counting the truncation
-    * instead of the line would leave every later offset short by the
-    * difference -- the next batch would resume mid-line and the queue would
-    * mis-parse or skip exactly the records this offset exists to protect. */
-   long rawlen = 0;
-   int over    = 0; /* over-long line: step past it, never parse a truncation */
-   long got    = 0;
-   while (n < REMOTE_BATCH && (got = read(fd, rd, sizeof rd)) > 0) {
-      for (long i = 0; i < got && n < REMOTE_BATCH; i++) {
-         if (rd[i] != '\n') {
-            rawlen++;
-            if (llen < (int)sizeof line - 1)
-               line[llen++] = rd[i];
-            else
-               over = 1;
-            continue;
-         }
-         line[llen]    = '\0';
-         long consumed = rawlen + 1; /* the line and its newline */
-         long t        = 0;
-         int glu       = 0;
-         int ty        = 0; /* wire type: 0 = CGM, 1 = fingerstick */
-         int ok        = 0;
-         if (!over && line[0] >= '0' && line[0] <= '9') {
-            /* "<epoch>,<mg/dL>,..." -- the first two fields, plus the kind
-             * column further along (see g_store_hdr in store.c) */
-            const char *p = line;
-            /* CAP THE DIGITS: signed overflow is UB and happens during
-             * parsing, before `ok` can reject anything -- and a wrapped
-             * value here would ship a FABRICATED point to the remote
-             * server. Same idiom as rdfield in store.c. */
-            int nt = 0;
-            while (*p >= '0' && *p <= '9') {
-               if (nt < 18) {
-                  t = (t * 10) + (*p - '0');
-                  nt++;
-               }
-               p++;
-            }
-            if (nt >= 18)
-               t = 0; /* fails `t > 0` below */
-            if (*p == ',') {
-               p++;
-               int v = 0;
-               int d = 0;
-               while (*p >= '0' && *p <= '9') {
-                  if (d < 9)
-                     v = (v * 10) + (*p - '0');
-                  else
-                     v = 16777216; /* saturate: fails `v < 2000` below */
-                  p++;
-                  d++;
-               }
-               if (d > 0 && (*p == ',' || *p == '\0'))
-                  ok = t > 0 && v > 0 && v < 2000;
-               glu = v;
-               /* Field 9 is `kind` (KIND_CGM/KIND_BGM): 7 commas further on.
-                * A shorter (v1) row simply has none, and defaults to CGM --
-                * exactly what every v1 row was. */
-               int nc = 0;
-               while (*p && nc < 7)
-                  if (*p++ == ',')
-                     nc++;
-               if (nc == 7 && *p >= '0' && *p <= '9')
-                  ty = ((*p - '0') == KIND_BGM) ? 1 : 0;
-            }
-         }
-         llen   = 0;
-         rawlen = 0;
-         over   = 0;
-         if (ok) {
-            int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, glu, ty);
-            if (w <= 0 || (size_t)w >= cap - used) {
-               /* CUT THE PARTIAL ROW OFF. snprintf has already written as
-                * much of it as fitted and terminated THAT at buf[cap-1], so
-                * the buffer no longer ends where `used` says it does -- and
-                * the caller hands this to NewStringUTF, which reads to the
-                * first NUL. Without this the batch ships a half-written
-                * final row on top of the good ones.
-                *
-                * It is not a rare path: `body` is REMOTE_BATCH*24 = 2400
-                * bytes, a row is about 17 with a ten-digit timestamp, and
-                * nothing breaks the loop on REMOTE_BATCH -- that test only
-                * runs after EOF. So the byte cap is what ends every catch-up
-                * batch, and every one of them carried the partial row.
-                *
-                * The cursor is safe either way: this returns before
-                * `at`/`*end` advance, so the row is re-sent whole next time.
-                * used < cap, so the write is in bounds. */
-               buf[used] = 0;
-               *full     = 1;
-               close(fd);
-               return n; /* body full: the rest rides the next batch */
-            }
-            used += (size_t)w;
-            n++;
-         }
-         at += consumed;
-         *end = at;
-      }
-   }
-   close(fd);
-   if (n >= REMOTE_BATCH)
-      *full = 1;
-   return n;
-}
-
-/* Doses: the file is REWRITTEN on an edit or a delete, so a byte offset
- * would describe a file that no longer exists. The log is tiny (a hundred
- * records over months), so offer it whole, in chunks, and start a fresh
- * cycle whenever the file changes. Complete by construction, no
- * bookkeeping to get wrong. */
-static int g_ins_send_i;    /* next dose index to offer */
-static long g_ins_sent_len; /* insulin.csv size when the last cycle ended */
-
-static long ins_file_size(void)
-{
-   int fd = open(g_ins_path, O_RDONLY, 0);
-   if (fd < 0)
-      return 0;
-   long n = lseek(fd, 0, SEEK_END);
-   close(fd);
-   return n < 0 ? 0 : n;
-}
-
-static int ob_fill_ins(char *buf, size_t cap, int from, int *nsent)
-{
-   size_t used = 0;
-   int n       = 0;
-   int i       = from;
-   for (; i < g_nins && n < REMOTE_BATCH; i++) {
-      long t = g_ins[i].t;
-      int u  = g_ins[i].units;
-      int ty = (g_ins[i].type == INS_FAST) ? 1 : 0;
-      if (t <= 0 || u <= 0 || u > 300)
-         continue;
-      int w = snprintf(buf + used, cap - used, "%ld %d %d\n", t, ty, u);
-      if (w <= 0 || (size_t)w >= cap - used) {
-         /* Same cut as ob_fill: snprintf has already written the part that
-          * fitted and terminated it at buf[cap-1], and the caller passes
-          * this buffer to NewStringUTF, which reads to the first NUL. Break
-          * alone would ship a half-written dose. The cursor is unaffected --
-          * `i` still names the row that did not fit, so *nsent resumes on
-          * it. Reached less often than in ob_fill (the loop here DOES stop
-          * at REMOTE_BATCH, so the row cap normally bites first), but the
-          * defect is identical and so is the fix. */
-         buf[used] = 0;
-         break;
-      }
-      used += (size_t)w;
-      n++;
-   }
-   *nsent = i;
-   return n;
-}
-
-/* ---- the PULL direction: import what the server has and we do not ----
- *
- * The server keeps months; the phone keeps NHIST readings. After the push is
- * caught up, walk BACKWARDS through the server a day at a time and import
- * anything missing, so the rolling stats (30D, 90D) can be filled from
- * history the phone never saw -- a fresh install, or a phone that joined
- * after the log did.
- *
- * Imported readings carry no provenance: data.txt stores a time and a value,
- * nothing about which sensor produced it. Attributing them to a live device
- * would be a lie, so they get their own synthetic one -- UNKNOWN -- which is
- * registered as an OLD (disconnected) device: it appears in OLD DEVICES with
- * its fields blank, it can be styled and hidden like any other, and it can
- * never be picked as primary or reconnected. */
-#define PULL_WINDOW (24L * 3600)  /* server history fetched per request */
-#define PULL_DEPTH  (95L * 86400) /* how far back to go: past the 90D stat */
-
-static long g_pull_from;   /* oldest instant imported so far; 0 = not begun */
-static long g_pull_flight; /* window end awaiting its reply */
-static int g_pull_done;    /* reached PULL_DEPTH: nothing left to fetch */
-static char g_pull_path[256];
-static int g_unknown_id = -1; /* the synthetic device, minted on first use */
-
-static void pull_save(void)
-{
-   int fd = open(g_pull_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (fd < 0)
-      return;
-   char b[32];
-   int n = snprintf(b, sizeof b, "%ld\n", g_pull_from);
-   if (n > 0)
-      (void)!write(fd, b, (size_t)n);
-   close(fd);
-}
-
-static void pull_load(void)
-{
-   int fd = open(g_pull_path, O_RDONLY, 0);
-   if (fd < 0)
-      return;
-   char b[32];
-   long n = read(fd, b, sizeof b - 1);
-   close(fd);
-   if (n <= 0)
-      return;
-   b[n]   = 0;
-   long v = 0;
-   int nd = 0;
-   for (int i = 0; b[i] >= '0' && b[i] <= '9'; i++)
-      if (nd++ < 18)
-         v = (v * 10) + (b[i] - '0');
-   if (nd > 0)
-      g_pull_from = v;
-}
-
-/* The UNKNOWN device: minted once, kept as an OLD slot forever. */
-static int unknown_id(void)
-{
-   if (g_unknown_id >= 0)
-      return g_unknown_id;
-   sensors_lock();
-   /* "identity" is the reuse key, so a fixed string means one row for life
-    * however many times this is called. */
-   int id = sensor_mint(SENSOR_STELO, "IMPORTED", "", "", "", 0);
-   if (id >= 0) {
-      struct sensor_slot *sl = sensor_slot_by_id(id);
-      if (!sl) {
-         int si = sensor_claim_slot(id, SENSOR_STELO, "IMPORTED");
-         if (si >= 0)
-            sl = &g_slot[si];
-      }
-      if (sl) {
-         (void)snprintf(sl->label, sizeof sl->label, "UNKNOWN");
-         sl->old     = 1; /* never live: it is history, not a sensor */
-         sl->primary = 0;
-         slots_save();
-      }
-   }
-   sensors_unlock();
-   g_unknown_id = id;
-   return id;
-}
-
-/* The value rule every ingestion path shares (defined with the live-reading
- * handler below; declared here because the import must not invent its own).
- */
-static int glucose_plausible(int mg_dl);
-
-/* Import one window's worth of "<epoch> <mg/dL> [<type>]" lines (type 1 =
- * fingerstick, absent or 0 = CGM). Returns how many were new. hist_insert
- * dedups, so re-importing costs nothing. */
-static int pull_import(const char *body)
-{
-   int src   = unknown_id();
-   int added = 0;
-   if (src < 0)
-      return 0;
-   /* One cutoff for the whole batch, sampled once: a per-line clock read
-    * would let the acceptance boundary drift mid-import, so two identical
-    * lines could be judged differently in the same response. */
-   long horizon  = realtime_s() + 3600;
-   const char *p = body;
-   while (*p) {
-      long t  = 0;
-      int glu = 0;
-      while (*p == ' ' || *p == '\n' || *p == '\r')
-         p++;
-      if (!*p)
-         break;
-      if (*p < '0' || *p > '9') { /* skip a line we cannot read */
-         while (*p && *p != '\n')
-            p++;
-         continue;
-      }
-      /* CAP THE DIGITS, exactly as rdfield/stat_load_chunk/ob_load/pull_load
-       * do. Signed overflow is undefined behaviour and it happens HERE,
-       * during parsing, before any range check below can reject the value --
-       * and this is the one parser in the app fed bytes from off the device,
-       * so a 10-digit field like 4294967396 wrapped to a perfectly plausible
-       * 100 and was written to the log as a reading that was never taken. */
-      int nd = 0;
-      while (*p >= '0' && *p <= '9') {
-         if (nd++ < 18) {
-            t = (t * 10) + (*p++ - '0');
-         } else {
-            t = 4102444800L; /* 2100-01-01: fails the future bound below */
-            p++;
-         }
-      }
-      while (*p == ' ')
-         p++;
-      nd = 0;
-      while (*p >= '0' && *p <= '9') {
-         if (nd++ < 6) {
-            glu = (glu * 10) + (*p++ - '0');
-         } else {
-            glu = 1000000; /* ditto: fails glucose_plausible below */
-            p++;
-         }
-      }
-      /* The optional third field is the wire type: 1 = fingerstick. A
-       * 2-field line (the old server) reads as CGM, as it always did. */
-      int kind = KIND_CGM;
-      while (*p == ' ')
-         p++;
-      if (*p == '1' &&
-          (p[1] == '\n' || p[1] == '\r' || p[1] == ' ' || p[1] == '\0'))
-         kind = KIND_BGM;
-      while (*p && *p != '\n')
-         p++;
-      /* BOUND THE TIMESTAMP AT BOTH ENDS, and judge the value by the same
-       * rule every other ingestion path uses.
-       *
-       * This accepted any t > 0, and a FUTURE-dated point is not merely a
-       * wrong dot on the plot: hist_insert has no time bound either, so
-       * future points sort to the head of g_hist and evict the oldest entry
-       * on every insert. Once NHIST of them are in, g_hist[NHIST-1].t is
-       * itself in the future, so every genuine live reading fails
-       * hist_insert's `t <= g_hist[NHIST-1].t` test and returns HIST_OLD --
-       * logged, but never re-entered into memory. alarm_gather then finds no
-       * sample for any live CGM (the synthetic IMPORTED source is flagged
-       * old and is not in its id set), ns stays 0, and zone stays 0: a real
-       * hypo can no longer raise AL_LOW for the rest of the process
-       * lifetime. A remote server whose clock ran ahead is enough to do it
-       * -- no hostility required. store_load_chunk already bounds its replay
-       * this way.
-       *
-       * glucose_plausible is the 20..600 rule pancra_glucose,
-       * pancra_backfill and both loaders enforce; this path used its
-       * own 1..1999, which let values no sensor can produce into the log and
-       * the statistics. */
-      if (t <= 0 || t > horizon || !glucose_plausible(glu))
-         continue;
-      int prime = sensor_primary_id();
-      /* BEFORE hist_lock: the lock order is registry -> history (see
-       * sensors.h), and sensor_in_warmup takes the registry lock. */
-      int warm = sensor_in_warmup(src, t);
-      hist_lock();
-      /* ONLY what we do not already hold, from ANY source. Imported data
-       * has no provenance, so adding a point the phone already recorded
-       * under its real sensor would not "restate" it -- hist_insert dedups
-       * per-source, so it would sit BESIDE it as a second reading, double
-       * counting the stats and drawing a synthetic dot over a real one.
-       * The identity is the (timestamp, value) PAIR. */
-      int isnew = 0;
-      if (!hist_have_point(t, glu))
-         isnew = hist_insert(t, glu, 127, src, kind);
-      /* NOT fingersticks -- the same rule stat_load_chunk enforces on replay
-       * (stats.c: `kind != KIND_BGM`). Since this import learned to carry a
-       * type, an imported meter reading would otherwise be counted in the
-       * live hour buckets now and skipped when the log is replayed at next
-       * launch, so TIR, AVG and A1C would show one set of numbers today and
-       * different ones after a restart from the identical log -- the exact
-       * drift the comment in stats.c records having been fixed twice
-       * already. The live meter path (ot_drv_reading) does not call stat_add
-       * either. */
-      if (isnew && kind != KIND_BGM && !warm)
-         stat_add(t, glu);
-      hist_refresh_current(prime);
-      hist_unlock();
-      if (isnew) {
-         /* Durable, so the stats survive a restart -- stat_load rebuilds
-          * them from this very file. */
-         store_append(t, glu, 127, 0, 0, src, t, g_tz_off, kind, 1000);
-         added++;
-      }
-   }
-   return added;
-}
-
-/* When to even TRY. A datapoint arrives every few minutes, so polling the
- * server on every tick was pointless traffic -- and during a catch-up it
- * became a request per second, which is no way to treat a server you own.
- * Fire on a NEW DATAPOINT (the log grew); otherwise only often enough to
- * work through a backlog, and not at all when there is nothing to do. */
-#define REMOTE_GAP 10L /* seconds between attempts while catching up */
-
-static long g_rem_next; /* earliest next attempt */
-static long g_rem_seen; /* log size when we last looked */
+static long g_rem_next;    /* earliest next attempt */
+static long g_rem_seen;    /* the state stamp when we last synced */
+static long g_rem_backoff; /* current failure backoff, seconds */
+static long g_rem_safety;  /* when to look again with nothing new */
 
 static int g_sync_busy; /* single-flight guard; see pancra_remote_sync */
 static void remote_sync_locked(void);
@@ -4239,7 +3794,7 @@ static void remote_sync_locked(void);
  * exception.
  *
  * Skipping rather than waiting is right: the loser has nothing to
- * contribute, and the next tick is at most REMOTE_GAP away. */
+ * contribute, and the next tick is at most a minute away. */
 void pancra_remote_sync(void)
 {
    if (__atomic_exchange_n(&g_sync_busy, 1, __ATOMIC_SEQ_CST))
@@ -4250,183 +3805,71 @@ void pancra_remote_sync(void)
 
 static void remote_sync_locked(void)
 {
-   if (!g_remote_on || !g_remote_ip[0] || !g_ble || !m_remote_busy)
+   /* Ask JAVA to run a sync on its worker; the protocol itself is in sync.c.
+    *
+    * This used to BE the protocol -- cursors, outbox positions, per-set
+    * batches, acknowledgement tags. All of that existed to make a
+    * fire-and-forget push lossless. The replica protocol does not need any of
+    * it: the phone and the server compare hashes and the phone pushes whole
+    * buckets, so "what has the server already got" is answered by the server,
+    * exactly, every time, instead of being tracked here and hoped for. */
+   if (!g_remote_on || !g_remote_server[0] || !g_sync_uid)
       return;
-   {
-      long now   = realtime_s();
-      long sz    = ob_log_size();
-      int fresh  = (sz != g_rem_seen); /* a datapoint just landed */
-      g_rem_seen = sz;
-      if (!fresh && now < g_rem_next)
-         return;
-      g_rem_next = now + REMOTE_GAP;
-   }
-   JNIEnv *e = dexble_env();
-   if (!e)
-      return;
-   /* A request in flight, or a backoff after a failure/rate cap. */
-   if ((*e)->CallStaticIntMethod(e, g_ble, m_remote_busy) != 0)
-      return;
-   if ((*e)->ExceptionCheck(e)) {
-      (*e)->ExceptionClear(e);
-      return;
-   }
-
-   /* Commit ground the server has confirmed. ONLY here does the offset
-    * move, and only to a tag the server itself echoed back. */
-   long ack = (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_ack_glu);
-   if (g_ob_flight > g_ob_pos && ack == g_ob_flight) {
-      g_ob_pos    = g_ob_flight;
-      g_ob_flight = 0;
-      ob_save();
-   }
-   /* A live push acknowledges with a NEGATIVE tag, so it can never be
-    * mistaken for outbox ground and advance the offset past unsent lines. */
-   if (g_ob_lflight > 0 && ack == -g_ob_lflight) {
-      g_ob_live    = g_ob_lflight;
-      g_ob_lflight = 0;
-   }
-   long acki = (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_ack_ins);
-   if (g_ins_flight > 0 && acki == g_ins_flight) {
-      g_ins_send_i = (int)g_ins_flight;
-      g_ins_flight = 0;
-      if (g_ins_send_i >= g_nins) { /* a full cycle: every dose offered */
-         g_ins_send_i   = 0;
-         g_ins_sent_len = ins_file_size();
-      }
-   }
-
-   jstring ip = (*e)->NewStringUTF(e, g_remote_ip);
-   if (!ip)
-      return;
-
-   static char body[REMOTE_BATCH * 24];
-   long end = 0;
-   int full = 0;
-   int n    = 0;
-   int ins  = 0;
-   long tag = 0;
-
-   /* FRESHNESS FIRST: anything appended since the last live push. Starting
-    * a little before the file end keeps this to one small batch even if
-    * several readings landed at once. */
-   long fsz = ob_log_size();
-   if (fsz > g_ob_live && fsz > g_ob_pos) {
-      long from = g_ob_live;
-      if (from < fsz - 4096)
-         from = ob_line_start(fsz - 4096);
-      if (from < g_ob_pos)
-         from = g_ob_pos;
-      long lend = 0;
-      n         = ob_fill(body, sizeof body, from, &lend, &full);
-      if (n > 0) {
-         tag  = -fsz; /* negative: a live push, not outbox ground */
-         full = 0;    /* a couple of readings: no need to pace */
-      }
-   }
-   if (n == 0)
-      n = ob_fill(body, sizeof body, g_ob_pos, &end, &full);
-   if (n > 0 && tag == 0)
-      tag = end;
-   if (n == 0) {
-      /* Glucose is caught up. Offer doses: a chunk of the log, and a new
-       * cycle whenever the file has changed since the last one finished. */
-      if (g_ins_send_i > 0 || ins_file_size() != g_ins_sent_len) {
-         int upto = 0;
-         n        = ob_fill_ins(body, sizeof body, g_ins_send_i, &upto);
-         ins      = 1;
-         tag      = upto;
-         full     = (n >= REMOTE_BATCH);
-         if (n == 0) { /* nothing sendable left in this cycle */
-            g_ins_send_i   = 0;
-            g_ins_sent_len = ins_file_size();
-         }
-      }
-   }
-   if (n == 0 && !g_pull_done) {
-      /* Nothing to send: spend the pass PULLING instead. First collect a
-       * window that arrived, then ask for the next one further back. */
-      long rack =
-          (long)(*e)->CallStaticLongMethod(e, g_ble, m_remote_range_ack);
-      if (g_pull_flight > 0 && rack == g_pull_flight) {
-         jstring rb =
-             (*e)->CallStaticObjectMethod(e, g_ble, m_remote_range_body);
-         if (rb) {
-            const char *cs = (*e)->GetStringUTFChars(e, rb, NULL);
-            if (cs) {
-               int got = pull_import(cs);
-               (*e)->ReleaseStringUTFChars(e, rb, cs);
-               LOGI("remote pull: %ld..%ld imported %d",
-                    g_pull_flight - PULL_WINDOW, g_pull_flight, got);
-            }
-            (*e)->DeleteLocalRef(e, rb);
-         }
-         g_pull_from   = g_pull_flight - PULL_WINDOW;
-         g_pull_flight = 0;
-         pull_save();
-         g_ui_dirty = 1;
-      }
-      if (g_pull_flight == 0) {
-         long to = g_pull_from > 0 ? g_pull_from : realtime_s();
-         if (to <= realtime_s() - PULL_DEPTH) {
-            g_pull_done = 1; /* the whole stats horizon is in */
-         } else {
-            g_pull_flight = to;
-            (*e)->CallStaticVoidMethod(e, g_ble, m_remote_range, ip,
-                                       (jint)g_remote_port,
-                                       (jlong)(to - PULL_WINDOW), (jlong)to);
-         }
-      }
-   }
-   if (n > 0) {
-      jstring b = (*e)->NewStringUTF(e, body);
-      if (b) {
-         if (ins)
-            g_ins_flight = tag;
-         else if (tag < 0)
-            g_ob_lflight = -tag;
-         else
-            g_ob_flight = tag;
-         (*e)->CallStaticVoidMethod(e, g_ble, m_remote_batch, ip,
-                                    (jint)g_remote_port, (jboolean)ins, b,
-                                    (jlong)tag, (jboolean)full);
-         (*e)->DeleteLocalRef(e, b);
-      }
-   }
-   /* Cache what the last attempt reported, for the REMOTE screen. */
-   if (m_remote_status) {
-      jstring st = (*e)->CallStaticObjectMethod(e, g_ble, m_remote_status);
-      if (st) {
-         const char *cs = (*e)->GetStringUTFChars(e, st, NULL);
-         if (cs) {
-            str_snapshot(g_remote_status, sizeof g_remote_status, cs);
-            (*e)->ReleaseStringUTFChars(e, st, cs);
-         }
-         (*e)->DeleteLocalRef(e, st);
-      }
-   }
-   if ((*e)->ExceptionCheck(e))
-      (*e)->ExceptionClear(e); /* a push must never take the reading down */
-   (*e)->DeleteLocalRef(e, ip);
+   long now  = realtime_s();
+   long sz   = syncjni_state_stamp();
+   int fresh = (sz != g_rem_seen);
+   if (now < g_rem_next)
+      return; /* too soon whatever happened: the floor is absolute */
+   if (!fresh && now < g_rem_safety)
+      return; /* nothing new, and the safety net is not due */
+   g_rem_seen   = sz;
+   g_rem_next   = now + REMOTE_MIN_GAP;
+   g_rem_safety = now + REMOTE_SAFETY;
+   syncjni_sync_request();
 }
+
 
 /* The configured server changed: the cursors describe the OLD one, so drop
  * them rather than measure this server's history against another's. */
-static void remote_forget_cursor(void)
+/* Called from the sync worker thread (see syncjni.h). Only touches values the
+ * renderer reads whole, and sets the dirty flag last. */
+void sync_report(int ok, const char *what)
 {
-   if (!g_ble || !m_remote_forget)
-      return;
-   JNIEnv *e = dexble_env();
-   if (!e)
-      return;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_remote_forget);
-   if ((*e)->ExceptionCheck(e))
-      (*e)->ExceptionClear(e);
+   long now = realtime_s();
+   if (ok) {
+      g_remote_last_ok = now;
+      g_rem_backoff    = 0;
+   } else {
+      /* Retry, but slower each time: a server that is down must not be asked
+       * once a minute for ever. */
+      g_rem_backoff = g_rem_backoff ? g_rem_backoff * 2 : REMOTE_FAIL_MIN;
+      if (g_rem_backoff > REMOTE_FAIL_MAX)
+         g_rem_backoff = REMOTE_FAIL_MAX;
+      g_rem_next = now + g_rem_backoff;
+      /* A failed sync has NOT caught up, so the next attempt must not be
+       * skipped for lack of new data. */
+      g_rem_seen = -1;
+   }
+   str_snapshot(g_remote_status, sizeof g_remote_status, what);
+   g_ui_dirty = 1;
 }
 
-/* (The per-datapoint remote_push is gone: every point now leaves through
- * remote_sync_step's cursor-driven batches, which cannot silently drop one.
- * The server keeps its single-point "/" route for older clients.) */
+/* The configured server changed. There is no cursor to forget any more --
+ * the next sync asks the NEW server what it has and finds out exactly -- but
+ * the paired identity belongs to the old one and must not be offered to
+ * another server. */
+static void remote_forget_cursor(void)
+{
+   g_sync_uid = 0;
+   for (int i = 0; i < 16; i++)
+      g_sync_key[i] = 0;
+   remote_save();
+   sync_set_key(0, g_sync_key);
+}
+
+/* (Nothing pushes a single datapoint. Everything the phone holds reaches the
+ * server as whole buckets whose hashes are compared first, so there is no
+ * per-point path that could drop one.) */
 
 /* Is this a usable glucose value?
  *
@@ -5685,8 +5128,20 @@ static int wt_action(int action)
       g_wt_tenths = (g_nwt > 0) ? wt_to_tenths(g_wt[g_nwt - 1].g, g_wunits)
                                 : wt_to_tenths(70000L, g_wunits);
       g_wt_edit   = -1;     /* a NEW entry, not an edit */
-      g_wt_from   = g_menu; /* ADD menu, or a main-screen shortcut */
-      g_menu      = MENU_WEIGHT;
+      g_wt_from   = g_menu; /* ADD menu, or a main-screen PIN button */
+      /* STRAIGHT TO THE KEYPAD, not to the form. Logging a weight is one
+       * number, and every door into this action -- the ADD menu button, the
+       * pinned main-screen button -- already says which number. The form in
+       * between existed only to be tapped once, on the row this opens.
+       *
+       * The hop is skipped, not removed: g_kp_return is the WEIGHT form, so
+       * OK and X both land there with the date/time rows still editable, and
+       * the form's own exits still use g_wt_from. Nothing infers an origin.
+       */
+      g_menu      = MENU_KEYPAD;
+      g_kp_mode   = 14;
+      g_kp_return = MENU_WEIGHT;
+      g_entrylen  = 0;
    } else if (action >= MA_WTLOG_EDIT && action < MA_WTLOG_EDIT + NWT) {
       /* A row in the table opens that entry in the EDIT WEIGHT form. Keep a
        * COPY as the rewrite's match key -- see g_wt_orig. */
@@ -5718,7 +5173,7 @@ static int wt_action(int action)
       g_ui_dirty = 1;
    } else if (action == MA_WTLOG_OPEN) {
       g_wtlog_page = 0;
-      g_wtlog_from = g_menu; /* ADD menu, or a main-screen shortcut */
+      g_wtlog_from = g_menu; /* ADD menu, or a main-screen PIN button */
       g_menu       = MENU_WTLOG;
    } else if (action == MA_WTLOG_BACK) {
       g_menu = g_wtlog_from;
@@ -5967,11 +5422,51 @@ static int submenu_action(int action)
    } else if (action == MA_REMOTE_TOGGLE) {
       g_remote_on = !g_remote_on;
       remote_save();
-   } else if (action == MA_REMOTE_IP) {
-      g_menu      = MENU_KEYPAD;
-      g_kp_mode   = 4;
+   } else if (action == MA_SYNC_EMAIL) {
+      g_entrylen    = 0;
+      g_label_field = LABEL_EMAIL;
+      for (int i = 0; g_sync_email[i] && g_entrylen < (int)sizeof g_entry - 1;
+           i++) {
+         char c = g_sync_email[i];
+         if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+         g_entry[g_entrylen++] = c;
+      }
+      g_menu      = MENU_LABEL;
       g_kp_return = MENU_REMOTE;
-      g_entrylen  = 0;
+   } else if (action == MA_SYNC_PAIR) {
+      /* Both halves must exist first: a code is meaningless without a server
+       * to send it to and an account to send it for. */
+      if (g_remote_server[0] && g_sync_email[0]) {
+         g_menu      = MENU_KEYPAD;
+         g_kp_mode   = 15;
+         g_kp_return = MENU_REMOTE;
+         g_entrylen  = 0;
+      }
+   } else if (action == MA_SYNC_UNPAIR) {
+      /* Forget the identity, not the server: re-pairing is the normal way to
+       * move this phone to a different account, and it needs a fresh code
+       * from the server anyway. */
+      g_sync_uid = 0;
+      for (int i = 0; i < 16; i++)
+         g_sync_key[i] = 0;
+      remote_save();
+      sync_set_key(0, g_sync_key);
+   } else if (action == MA_REMOTE_IP) {
+      /* The LABEL editor, not the keypad: a server is "pancra.org" now, not a
+       * dotted quad, and the numeric pad cannot type a letter. Seeded with the
+       * current value so a small correction is a small amount of typing. */
+      g_entrylen    = 0;
+      g_label_field = LABEL_SERVER;
+      for (int i = 0; g_remote_server[i] && g_entrylen < (int)sizeof g_entry - 1;
+           i++) {
+         char c = g_remote_server[i];
+         if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A'); /* the editor's charset is upper case */
+         g_entry[g_entrylen++] = c;
+      }
+      g_menu      = MENU_LABEL;
+      g_kp_return = MENU_REMOTE;
    } else if (action == MA_REMOTE_PORT) {
       g_menu      = MENU_KEYPAD;
       g_kp_mode   = 5;
@@ -5990,7 +5485,7 @@ static int submenu_action(int action)
       g_menu = MENU_DEVICES;
    } else if (action >= MA_SCTOGGLE &&
               action < MA_SCTOGGLE + ui_shortcut_count()) {
-      /* Toggle a main-screen shortcut. The list is kept DENSE -- removing the
+      /* Toggle a main-screen PIN. The list is kept DENSE -- removing the
        * middle one closes the gap -- because the main screen walks it and an
        * empty slot between two live ones would draw a hole in the row.
        *
@@ -6016,7 +5511,7 @@ static int submenu_action(int action)
          g_shortcut[n] = code;
          settings_save();
       } else {
-         set_status("3 SHORTCUTS MAX");
+         set_status("3 PINS MAX");
       }
    } else if (action == MA_DEVPAGE_PREV) {
       if (g_dev_page > 0)
@@ -6106,11 +5601,17 @@ static int style_action(int action)
               g_slot[g_sel].label[i] && g_entrylen < (int)sizeof g_entry - 1;
               i++)
             g_entry[g_entrylen++] = g_slot[g_sel].label[i];
-         g_menu      = MENU_LABEL;
-         g_kp_return = MENU_SENSOR;
+         g_menu        = MENU_LABEL;
+         g_label_field = LABEL_SENSOR;
+         g_kp_return   = MENU_SENSOR;
       }
    } else if (action >= MA_CHAR && action < MA_CHAR + ui_label_nchars()) {
+      /* Two fields share this editor: a sensor label and the sync SERVER. */
       int cap = (int)sizeof g_slot[0].label - 1;
+      if (g_label_field == LABEL_SERVER)
+         cap = (int)sizeof g_remote_server - 1;
+      else if (g_label_field == LABEL_EMAIL)
+         cap = (int)sizeof g_sync_email - 1;
       if (cap > (int)sizeof g_entry - 1)
          cap = (int)sizeof g_entry - 1;
       if (g_entrylen < cap)
@@ -6642,9 +6143,7 @@ static void menu_action(int action)
        * drew a dot key on the NUDGE keypads that this branch then ignored --
        * a visible, tappable, DEAD key, and with it no way to enter a nudge
        * threshold at all in mmol/L. */
-      if (g_menu == MENU_KEYPAD && g_kp_mode == 4 && g_entrylen < 15) {
-         g_entry[g_entrylen++] = '.';
-      } else if (g_menu == MENU_KEYPAD &&
+      if (g_menu == MENU_KEYPAD &&
                  ((g_units && g_kp_mode >= 10 && g_kp_mode <= 13) ||
                   g_kp_mode == 14) &&
                  g_entrylen < ui_kp_slots(g_kp_mode)) {
@@ -6741,7 +6240,70 @@ static void menu_action(int action)
        * ALARM / EXPORT DATA / REMOTE / PERMISSIONS / DISPLAY / OLD DEVICES
        * submenus (submenu_action) */
    } else if (action == MA_OK) {
-      if (g_menu == MENU_LABEL) {
+      if (g_menu == MENU_LABEL && g_label_field == LABEL_EMAIL) {
+         /* The account email. Lower-cased for the same reason as the server,
+          * and required to look like an address at all -- a typo here fails
+          * pairing with a message about the code, which is the wrong thing to
+          * go looking at. */
+         char em[sizeof g_sync_email];
+         int n = g_entrylen < (int)sizeof em - 1 ? g_entrylen
+                                                 : (int)sizeof em - 1;
+         int at = 0, dot_after_at = 0;
+         for (int i = 0; i < n; i++) {
+            char c = g_entry[i];
+            em[i]  = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+            if (em[i] == '@')
+               at++;
+            else if (em[i] == '.' && at)
+               dot_after_at = 1;
+         }
+         em[n] = 0;
+         if (n < 5 || at != 1 || !dot_after_at || em[0] == '@' ||
+             em[n - 1] == '@' || em[n - 1] == '.') {
+            LOGI("account '%s' does not look like an address, not saved", em);
+            g_entrylen = 0;
+            g_ui_dirty = 1;
+            return;
+         }
+         for (int i = 0;; i++) {
+            g_sync_email[i] = em[i];
+            if (!em[i])
+               break;
+         }
+         remote_save();
+         g_entrylen = 0;
+         g_menu     = MENU_REMOTE;
+      } else if (g_menu == MENU_LABEL && g_label_field == LABEL_SERVER) {
+         /* SERVER. Lower-cased because the editor can only type upper case and
+          * a host name reads wrong shouted. Malformed input refuses VISIBLY --
+          * the entry is cleared and the editor stays open -- because silently
+          * storing a bad server would point every future sync at nothing. */
+         char host[sizeof g_remote_server];
+         int n = g_entrylen < (int)sizeof host - 1 ? g_entrylen
+                                                   : (int)sizeof host - 1;
+         for (int i = 0; i < n; i++) {
+            char c  = g_entry[i];
+            host[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+         }
+         host[n] = 0;
+         if (!remote_server_valid(host)) {
+            LOGI("server '%s' malformed, not saved", host);
+            g_entrylen = 0;
+            g_ui_dirty = 1;
+            return;
+         }
+         for (int i = 0;; i++) {
+            g_remote_server[i] = host[i];
+            if (!host[i])
+               break;
+         }
+         remote_save();
+         /* A DIFFERENT server holds a different record: whatever we knew about
+          * what it already had is meaningless now. */
+         remote_forget_cursor();
+         g_entrylen = 0;
+         g_menu     = MENU_REMOTE;
+      } else if (g_menu == MENU_LABEL) {
          if (g_sel >= 0 && g_sel < g_nslot) {
             int k = 0;
             sensors_lock();
@@ -6919,32 +6481,17 @@ static void menu_action(int action)
             g_notify_dirty = 1;
             pancra_notify_refresh();
          }
-      } else if (g_kp_mode == 4) { /* REMOTE IP: a dotted quad */
-         if (g_entrylen > 0) {
-            char ip[sizeof g_remote_ip];
-            int n = g_entrylen < (int)sizeof ip - 1 ? g_entrylen
-                                                    : (int)sizeof ip - 1;
-            for (int i = 0; i < n; i++)
-               ip[i] = g_entry[i];
-            ip[n] = 0;
-            /* Malformed: refuse VISIBLY, like calibration -- staying on the
-             * keypad with the entry cleared is the feedback. Silently
-             * storing a bad address would point every future push at
-             * nothing. */
-            if (!remote_ip_valid(ip)) {
-               LOGI("remote IP '%s' malformed, not saved", ip);
-               g_entrylen = 0;
-               g_ui_dirty = 1;
-               return;
-            }
-            for (int i = 0;; i++) {
-               g_remote_ip[i] = ip[i];
-               if (!ip[i])
-                  break;
-            }
-            remote_save();
-            remote_forget_cursor(); /* a DIFFERENT server: its history is
-                                     * not this one's -- re-ask the cursor */
+      } else if (g_kp_mode == 15) { /* SYNC: the server's 6-digit code */
+         if (g_entrylen == 6) {
+            char code[8];
+            for (int i = 0; i < 6; i++)
+               code[i] = g_entry[i];
+            code[6] = 0;
+            /* Handed to Java's worker: pairing is four round trips and must
+             * not run on the UI thread. The result arrives as a changed
+             * PAIRED row, because the only thing the user can do about a
+             * failure is ask the server for a fresh code. */
+            syncjni_pair_request(g_sync_email, code);
             g_entrylen = 0;
             keypad_close();
          }
@@ -7179,6 +6726,14 @@ static int menu_back_code(void)
       case MENU_PAIRCONF: return MA_PAIR_NO;
       case MENU_INSULIN: return MA_INS_DISCARD;
       case MENU_INSDEL: return MA_INSDEL_NO;
+      /* The three WEIGHT screens, missing since they were added: default
+       * returns -1, and the caller CLAIMS the key handled either way, so back
+       * was silently dead on all of them and the X was the only way out. The
+       * LOG WEIGHT form is now what the weight keypad returns to, which puts
+       * it in the middle of the shortest path in the app. */
+      case MENU_WEIGHT: return MA_WT_DISCARD;
+      case MENU_WTLOG: return MA_WTLOG_BACK;
+      case MENU_WTDEL: return MA_WTDEL_NO;
       case MENU_ALARM: return MA_ALARM_BACK;
       case MENU_EXPORT: return MA_EXP_BACK;
       case MENU_INSLOG: return MA_INSLOG_BACK;
@@ -8562,8 +8117,15 @@ static int on_input(int fd, int events, void *data)
             for (int i = np_glu; i < np; i++)
                if (!aim_ins)
                   pts[i].hidden = 1;
+            /* SPLIT the doses line's shared columns, never the glucose
+             * trace's: a dose and a weight logged in the same sitting sit on
+             * one pixel, and without this only one of the two could ever be
+             * scrubbed. On the glucose series a shared column is the normal
+             * state of a multi-day span, and the plain nearest-in-time pick is
+             * what keeps a drag to the left edge landing on the oldest sample.
+             */
             int idx = plot_hit(rx, ry, rw, rh, pts, np, realtime_s(),
-                               g_plot_hours, fx, fy);
+                               g_plot_hours, fx, fy, aim_ins);
             if (idx != g_scrub_idx) {
                g_scrub_idx = idx;
                draw(g_win);
@@ -9017,31 +8579,9 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       m_bonded_stelo = (*env)->GetStaticMethodID(
           env, g_ble, "bondedSensor",
           "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
-      m_remote_cursor = (*env)->GetStaticMethodID(env, g_ble, "remoteCursor",
-                                                  "(Ljava/lang/String;I)V");
-      m_remote_batch  = (*env)->GetStaticMethodID(
-          env, g_ble, "remoteBatch",
-          "(Ljava/lang/String;IZLjava/lang/String;JZ)V");
-      m_remote_busy =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteBusy", "()I");
-      m_remote_cur_glu =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteCursorGlu", "()J");
-      m_remote_cur_ins =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteCursorIns", "()J");
-      m_remote_forget =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteForget", "()V");
-      m_remote_ack_glu =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteAckGlu", "()J");
-      m_remote_ack_ins =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteAckIns", "()J");
-      m_remote_status = (*env)->GetStaticMethodID(env, g_ble, "remoteStatus",
-                                                  "()Ljava/lang/String;");
-      m_remote_range  = (*env)->GetStaticMethodID(env, g_ble, "remoteRange",
-                                                  "(Ljava/lang/String;IJJ)V");
-      m_remote_range_body = (*env)->GetStaticMethodID(
-          env, g_ble, "remoteRangeBody", "()Ljava/lang/String;");
-      m_remote_range_ack =
-          (*env)->GetStaticMethodID(env, g_ble, "remoteRangeAck", "()J");
+      /* (No remote* ids: the sync client's two entry points are registered
+       * as NATIVES on the Ble class by dexble_register, and its transport is
+       * looked up in syncjni_wire.) */
 
       /* wire up the BLE protocol driver (registers its own Ble callbacks) */
       dexble_init(activity->internalDataPath ? activity->internalDataPath
@@ -9072,9 +8612,6 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                                ? activity->internalDataPath
                                : "/data/local/tmp";
          data_path(g_store_path, sizeof g_store_path, dir, "/readings.csv");
-         /* The outbox position lives beside the log it indexes. */
-         data_path(g_ob_path, sizeof g_ob_path, dir, "/remote.pos");
-         data_path(g_pull_path, sizeof g_pull_path, dir, "/remote.pull");
          data_path(g_info_path, sizeof g_info_path, dir, "/stelo.info");
          data_path(g_alarm_path, sizeof g_alarm_path, dir, "/alarm.cfg");
          data_path(g_settings_path, sizeof g_settings_path, dir,
@@ -9214,10 +8751,11 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
             }
          }
          stat_load(g_store_path);
-         ob_load();   /* how far the server has confirmed our log */
-         pull_load(); /* how far back we have imported ITS history */
          info_load();
          alarm_load();
+         /* The paired identity survives a restart; without this the first
+          * sync after every launch would be unsigned and refused. */
+         sync_set_key(g_sync_uid, g_sync_key);
          settings_load();
          calq_load();       /* resume any durably-queued calibration */
          rescale_load();    /* restore active rescale factor */

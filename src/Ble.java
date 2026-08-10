@@ -164,7 +164,14 @@ public final class Ble {
             new java.util.concurrent.ArrayBlockingQueue<Runnable>(64),
             new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
 
-    /* ---- REMOTE sync: cursor-driven, so nothing is lost ----
+    /* (The old cursor-driven push lived here: a cursor from GET /api/last,
+     * then chronological batches to /glucose and /units with acknowledgement
+     * tags so a lost reply could not double-write. All of it existed to make a
+     * fire-and-forget push lossless; the replica protocol below asks the
+     * server what it has and replaces whole buckets, so there is nothing left
+     * to track.)
+     *
+     * ---- what remains of the old banner ----
      *
      * The old design pushed each new datapoint once and dropped it on any
      * failure -- every reading taken while the server was unreachable was
@@ -178,193 +185,19 @@ public final class Ble {
      * the driver lock). Native drives one step per tick and reads the
      * state back through the three getters below -- no callbacks into C
      * from arbitrary threads beyond the existing onRemoteOk. */
-    private static volatile long sCurGlu = -1; /* server cursors; -1 = not */
-    private static volatile long sCurIns = -1; /* yet asked */
     /* The tag of the last batch the server CONFIRMED, per set. Native passes
      * its outbox position as the tag and advances only when it comes back
      * here -- so a batch that failed, timed out, or whose reply was lost
      * leaves the position untouched and is simply resent. */
-    private static volatile long sAckGlu = -1;
-    private static volatile long sAckIns = -1;
     /* What the LAST attempt actually got back. Failures used to be visible
      * only in logcat, so a server quietly refusing every batch looked
      * exactly like a working link that had nothing to send. */
-    private static volatile String sStatus = "";
 
-    public static String remoteStatus() { return sStatus; }
 
     /* ---- the PULL direction ----
-     * The server holds far more history than the phone (months of it), so
-     * after the push is caught up the app walks backwards through it a
-     * window at a time and imports whatever it does not already have.
-     * Reads are not rate limited -- the cap exists to bound what a stranger
-     * can WRITE -- so this is only as slow as the network. */
-    private static volatile String sRange = "";  /* the last window's body */
-    private static volatile long sRangeAck = 0;  /* the window it belongs to */
+     * (The pull direction went with it: the server holds exactly what this
+     * phone gave it, so there is nothing there to import.) */
 
-    public static String remoteRangeBody() { return sRange; }
-    public static long remoteRangeAck() { return sRangeAck; }
-
-    public static synchronized void remoteRange(final String ip, final int port,
-                                                final long from, final long to) {
-        if (sBusy != 0) return;
-        sBusy = 1;
-        try {
-            pushExec.execute(new Runnable() { @Override public void run() {
-                java.net.HttpURLConnection c = null;
-                try {
-                    c = (java.net.HttpURLConnection) new java.net.URL(
-                        "http", ip, port,
-                        "/api/range?from=" + from + "&to=" + to)
-                        .openConnection();
-                    c.setConnectTimeout(5000);
-                    c.setReadTimeout(15000);
-                    int code = c.getResponseCode();
-                    if (code / 100 != 2) {
-                        status(String.valueOf(code));
-                        backoff();
-                        return;
-                    }
-                    java.io.BufferedReader r = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(c.getInputStream()));
-                    StringBuilder b = new StringBuilder();
-                    String ln;
-                    /* Bounded: one window is a day of readings, and native
-                     * refuses to parse more than it has room for anyway. */
-                    while ((ln = r.readLine()) != null && b.length() < 65536)
-                        b.append(ln).append('\n');
-                    r.close();
-                    sRange    = b.toString();
-                    sRangeAck = to;
-                    status(String.valueOf(code));
-                    onRemoteOk();
-                } catch (Throwable e) {
-                    Log.i(TAG, "remote range: " + e);
-                    status(shortErr(e));
-                    backoff();
-                } finally {
-                    if (c != null) c.disconnect();
-                    sBusy = 0;
-                }
-            }});
-        } catch (Throwable e) { sBusy = 0; backoff(); }
-    }
-
-    /* Short, uppercase, and only characters the app's 5x7 font can draw. */
-    private static void status(String s) {
-        StringBuilder b = new StringBuilder();
-        String u = s.toUpperCase();
-        for (int i = 0; i < u.length() && b.length() < 20; i++) {
-            char c = u.charAt(i);
-            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-                || c == ' ' || c == '-' || c == '.' || c == '/' || c == ':')
-                b.append(c);
-        }
-        sStatus = b.toString();
-    }
-    private static volatile int sBusy;         /* a request is in flight */
-    private static volatile long sReadyAt;     /* elapsedRealtime() gate */
-
-    private static final long BACKOFF_MS = 61000; /* > the server's 60 s
-                                                   * rate window */
-
-    /* 1 while a request is in flight OR we are waiting out a backoff. */
-    public static int remoteBusy() {
-        if (sBusy != 0) return 1;
-        return android.os.SystemClock.elapsedRealtime() < sReadyAt ? 1 : 0;
-    }
-    public static long remoteCursorGlu() { return sCurGlu; }
-    public static long remoteCursorIns() { return sCurIns; }
-    public static long remoteAckGlu() { return sAckGlu; }
-    public static long remoteAckIns() { return sAckIns; }
-    /* Forget the cursors: native calls this when the server address changes,
-     * so points are never measured against another server's history. */
-    public static void remoteForget() {
-        sCurGlu = -1; sCurIns = -1; sAckGlu = -1; sAckIns = -1; sReadyAt = 0;
-    }
-
-    private static void backoff() {
-        sReadyAt = android.os.SystemClock.elapsedRealtime() + BACKOFF_MS;
-    }
-
-    /* GET /api/last -> "glucose <t>\ninsulin <t>". */
-    /* synchronized: the activity timer AND the service tick both drive
-     * this, so the check-then-set of sBusy has to be atomic or two requests
-     * could go out at once. */
-    public static synchronized void remoteCursor(final String ip, final int port) {
-        if (sBusy != 0) return;
-        sBusy = 1;
-        try {
-            pushExec.execute(new Runnable() { @Override public void run() {
-                java.net.HttpURLConnection c = null;
-                try {
-                    c = (java.net.HttpURLConnection) new java.net.URL(
-                        "http", ip, port, "/api/last").openConnection();
-                    c.setConnectTimeout(5000);
-                    c.setReadTimeout(5000);
-                    int rc = c.getResponseCode();
-                    if (rc / 100 != 2) {
-                        status(String.valueOf(rc));
-                        backoff();
-                        return;
-                    }
-                    java.io.BufferedReader r = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(c.getInputStream()));
-                    long g = -1, i = -1;
-                    String ln;
-                    /* BOUNDED, like remoteRange's body read. The cursor reply
-                     * is two lines.
-                     *
-                     * setReadTimeout(5000) above already covers an endpoint
-                     * that answers and then goes SILENT: readLine() blocks,
-                     * throws SocketTimeoutException, and the finally clears
-                     * sBusy. What it cannot cover is an endpoint that keeps
-                     * EMITTING -- a wrong address landing on an event stream
-                     * or a log tail -- because every line resets the per-read
-                     * timer. That held this loop forever and sBusy with it, so
-                     * remoteBusy() stayed 1 for the life of the process: no
-                     * cursor, no batches, no pull, and nothing to clear it,
-                     * not even toggling REMOTE off and on. */
-                    int nl = 0;
-                    while (nl++ < 64 && (ln = r.readLine()) != null) {
-                        String[] f = ln.trim().split("\\s+");
-                        if (f.length != 2) continue;
-                        try {
-                            /* The dose set is called "units" on the wire --
-                             * naming it anything else here silently strands
-                             * the cursor at -1, which stops ALL syncing, not
-                             * just the doses. That is exactly what happened
-                             * when the endpoint was renamed. */
-                            if (f[0].equals("glucose")) g = Long.parseLong(f[1]);
-                            else if (f[0].equals("units")) i = Long.parseLong(f[1]);
-                        } catch (NumberFormatException e) { /* skip the line */ }
-                    }
-                    r.close();
-                    if (g < 0 || i < 0) {
-                        status("BAD REPLY");
-                        /* Loud, because the symptom is silence: no cursor
-                         * means no push, and the only visible sign is
-                         * LAST SYNC never advancing. */
-                        Log.i(TAG, "remote cursor: unparsable reply "
-                                   + "(glucose=" + g + " units=" + i + ")");
-                        backoff();
-                        return;
-                    }
-                    sCurGlu = g;
-                    sCurIns = i;
-                    status("200");
-                    onRemoteOk();
-                } catch (Throwable e) {
-                    Log.i(TAG, "remote cursor: " + e);
-                    status(shortErr(e));
-                    backoff();
-                } finally {
-                    if (c != null) c.disconnect();
-                    sBusy = 0;
-                }
-            }});
-        } catch (Throwable e) { sBusy = 0; backoff(); }
-    }
 
     /* A word that fits the row, instead of a Java class name. */
     private static String shortErr(Throwable e) {
@@ -374,95 +207,6 @@ public final class Ble {
         if (n.contains("Connect")) return "REFUSED";
         if (n.contains("NoRoute")) return "NO ROUTE";
         return "ERROR";
-    }
-
-    /* POST one batch. `tag` is opaque here and echoed into sAckGlu/sAckIns
-     * ONLY on a 2xx -- that is the whole delivery guarantee: native treats an
-     * unacknowledged batch as unsent. `full` means native filled the batch to
-     * the cap, so more is waiting and the server's per-minute cap would
-     * refuse an immediate follow-up; pace instead of earning a 429. */
-    public static synchronized void remoteBatch(final String ip, final int port,
-                                   final boolean insulin, final String body,
-                                   final long tag, final boolean full) {
-        if (sBusy != 0) return;
-        sBusy = 1;
-        try {
-            pushExec.execute(new Runnable() { @Override public void run() {
-                java.net.HttpURLConnection c = null;
-                try {
-                    c = (java.net.HttpURLConnection) new java.net.URL(
-                        "http", ip, port,
-                        /* "/units", not "/insulin": that is the name the
-                         * server uses. Posting to a route it does not have
-                         * fell through to its single-point handler, which
-                         * answered 400 to every dose batch -- and the 61 s
-                         * backoff after each failure then starved the
-                         * glucose push as well. */
-                        insulin ? "/units" : "/glucose").openConnection();
-                    c.setConnectTimeout(5000);
-                    c.setReadTimeout(5000);
-                    c.setRequestMethod("POST");
-                    c.setDoOutput(true);
-                    byte[] b = body.getBytes("UTF-8");
-                    c.setFixedLengthStreamingMode(b.length);
-                    java.io.OutputStream os = c.getOutputStream();
-                    os.write(b);
-                    os.close();
-                    int code = c.getResponseCode();
-                    if (code / 100 == 2) {
-                        if (insulin) sAckIns = tag; else sAckGlu = tag;
-                        onRemoteOk();
-                        /* The reply says "stored N of M". A batch that stored
-                         * NOTHING was all duplicates, so it consumed none of
-                         * the server's per-minute budget and must not cost us
-                         * a minute of waiting either -- that is what lets a
-                         * full re-offer of the whole log run at speed while
-                         * genuinely new data still paces itself. */
-                        int stored = -1;
-                        try {
-                            java.io.BufferedReader rr =
-                                new java.io.BufferedReader(
-                                    new java.io.InputStreamReader(
-                                        c.getInputStream()));
-                            String rl = rr.readLine();
-                            rr.close();
-                            if (rl != null && rl.startsWith("stored "))
-                                stored = Integer.parseInt(
-                                    rl.substring(7).split("\\s+")[0]);
-                            status(String.valueOf(code));
-                        } catch (Throwable ignored) { /* pace conservatively */ }
-                        if (full && stored != 0) backoff();
-                    } else {
-                        /* 429 (rate cap) or anything else: keep the cursor
-                         * where it was and come back -- the same points get
-                         * resent, which is exactly what the contract allows. */
-                        Log.i(TAG, "remote batch: HTTP " + code);
-                        String why = "";
-                        try {
-                            java.io.InputStream es = c.getErrorStream();
-                            if (es != null) {
-                                java.io.BufferedReader er =
-                                    new java.io.BufferedReader(
-                                        new java.io.InputStreamReader(es));
-                                String el = er.readLine();
-                                er.close();
-                                if (el != null) why = " " + el;
-                            }
-                        } catch (Throwable ignored) { /* code alone will do */ }
-                        if (why.length() > 0) Log.i(TAG, "remote:" + why);
-                        status(String.valueOf(code));
-                        backoff();
-                    }
-                } catch (Throwable e) {
-                    Log.i(TAG, "remote batch: " + e);
-                    status(shortErr(e));
-                    backoff();
-                } finally {
-                    if (c != null) c.disconnect();
-                    sBusy = 0;
-                }
-            }});
-        } catch (Throwable e) { sBusy = 0; backoff(); }
     }
 
     /* (The old one-point-per-reading push is gone: the cursor-driven sync
@@ -552,6 +296,108 @@ public final class Ble {
                                    String value,
                                    int[] px, int w, int h, int lockscr) {
         PancraService.showGlucose(ctx, title, text, value, px, w, h, lockscr);
+    }
+
+    /* ---- cloud sync: this class only moves bytes ----
+     *
+     * The protocol lives in native (src/sync.c); Java is here because the
+     * platform's TLS is free and a C TLS stack would cost about a megabyte of
+     * library in a 143 kB app. So: native decides every byte on the wire and
+     * calls syncHttp to post it.
+     *
+     * syncRun/syncPair BLOCK -- they make several round trips -- so they are
+     * only ever called on pushExec, never on a binder or UI thread. syncHttp
+     * is then called back FROM that same worker thread, which is why nothing
+     * here touches the main looper.
+     */
+    private static volatile int sSyncCode = -1;
+    private static volatile boolean sSyncBusy;
+
+    static native int syncRun();
+    static native int syncPair(String email, String code);
+
+    /* The status of the LAST syncHttp call, read by native straight after. */
+    static int syncCode() { return sSyncCode; }
+
+    /* Called FROM native on the sync worker. Returns the response body, or
+     * null; the status goes in sSyncCode, because a JNI call that returns two
+     * things needs two calls and this is the cheaper pair. */
+    static byte[] syncHttp(String server, int port, String method, String path,
+                           String hdr, byte[] body) {
+        sSyncCode = -1;
+        java.net.HttpURLConnection c = null;
+        try {
+            /* https, always: the session this signs is not the only thing on
+             * the wire -- the record itself is. The platform supplies the TLS,
+             * so this costs nothing but the scheme. */
+            c = (java.net.HttpURLConnection) new java.net.URL(
+                    "https", server, port, path).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(20000);
+            c.setRequestMethod(method);
+            c.setUseCaches(false);
+            if (hdr != null) {
+                /* "Name: value\r\n" lines, exactly as native built them. */
+                for (String line : hdr.split("\r\n")) {
+                    int colon = line.indexOf(':');
+                    if (colon > 0)
+                        c.setRequestProperty(line.substring(0, colon),
+                                             line.substring(colon + 1).trim());
+                }
+            }
+            if (body != null && body.length > 0) {
+                c.setDoOutput(true);
+                c.setFixedLengthStreamingMode(body.length);
+                c.getOutputStream().write(body);
+            }
+            sSyncCode = c.getResponseCode();
+            java.io.InputStream in = (sSyncCode / 100 == 2)
+                    ? c.getInputStream() : c.getErrorStream();
+            if (in == null)
+                return new byte[0];
+            java.io.ByteArrayOutputStream out =
+                new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0)
+                out.write(buf, 0, n);
+            return out.toByteArray();
+        } catch (Throwable t) {
+            /* Any failure is "the request did not happen": native retries the
+             * whole sync later, and a partial answer must never look like a
+             * complete one. */
+            sSyncCode = -1;
+            return null;
+        } finally {
+            /* NOT disconnect(): that tears the socket down, and the socket is
+             * the expensive part. A TLS handshake to the server costs 100-600
+             * ms and the request itself costs 5, so a sync that reconnects per
+             * bucket spends all its time shaking hands. Leaving the connection
+             * in the pool lets the whole sync ride one handshake. */
+        }
+    }
+
+    /* Ask for a sync. Coalesced: a second request while one is running is
+     * dropped rather than queued, because a sync always sends whatever is
+     * current -- running it twice back to back would achieve nothing. */
+    static void syncSoon() {
+        if (sSyncBusy)
+            return;
+        sSyncBusy = true;
+        pushExec.execute(new Runnable() {
+            public void run() {
+                try { syncRun(); } catch (Throwable t) { /* reported native */ }
+                finally { sSyncBusy = false; }
+            }
+        });
+    }
+
+    /* Pairing is user-initiated and its result is shown on screen, so it runs
+     * on the same worker but reports through onSyncPaired. */
+    static void syncPairSoon(final String email, final String code) {
+        pushExec.execute(new Runnable() {
+            public void run() { syncPair(email, code); }
+        });
     }
 
     /* ---- Java -> C callbacks (bound via RegisterNatives in dexble.c) ---- */

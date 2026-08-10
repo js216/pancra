@@ -32,6 +32,19 @@ static void ck(int cond, const char *what)
       all = 0;
 }
 
+/* The append-only property is checked by SIZE: an edit that shrank or held
+ * the file steady would mean the log had been rewritten. */
+static long fsize(const char *path)
+{
+   FILE *f = fopen(path, "rb");
+   if (!f)
+      return -1;
+   (void)fseek(f, 0, SEEK_END);
+   long n = ftell(f);
+   fclose(f);
+   return n;
+}
+
 static void fresh(void)
 {
    (void)snprintf(g_ins_path, sizeof g_ins_path, "build/test/rt-insulin.csv");
@@ -92,7 +105,7 @@ int main(void)
    ck(g_ins[g_nins - 1].units == 7 && g_ins[g_nins - 1].type == INS_SLOW,
       "...and it parsed correctly");
 
-   printf("== edit / delete rewrite exactly one content-matched row ==\n");
+   printf("== edit / delete append an assertion for one matched dose ==\n");
    fresh();
    (void)insulin_append(t0, INS_SLOW, 10, 0);
    (void)insulin_append(t0 + 100, INS_FAST, 5, 0);
@@ -114,14 +127,38 @@ int main(void)
       ck(g_nins == 2, "...and the delete is durable on disk");
    }
 
-   printf("== an over-long row cannot overflow the rewrite buffer ==\n");
+   printf("== the log is APPEND-ONLY: an edit adds history, never removes ==\n");
    {
-      /* ins_rewrite's pass-2 line buffer is 256 bytes and appends its newline
-       * UNCONDITIONALLY, so a row of exactly 256 characters used to write one
-       * byte past the array (ASan: stack-buffer-overflow at insulin.c:254) and
-       * hand write() a 257-byte length. The row is unparseable either way; the
-       * contract is that the rewrite REFUSES rather than corrupting the stack.
-       * Run this under ASan to see the regression, not just the return code. */
+      /* The whole point of schema v2. An edit used to rewrite the file in
+       * place, which made this the one log a bug could shorten, and threw
+       * away what the dose used to be. Now the file only ever grows, and a
+       * past day's rows never change -- which is also what lets the sync
+       * protocol treat old buckets as frozen. */
+      fresh();
+      ck(insulin_append(t0, INS_SLOW, 6, 0) == 0, "a dose is logged");
+      long after_add = fsize(g_ins_path);
+      struct ins_rec orig = {t0, INS_SLOW, 6};
+      ck(insulin_update(&orig, t0, INS_SLOW, 4, 0) == 0, "it is corrected");
+      long after_edit = fsize(g_ins_path);
+      ck(after_edit > after_add, "...the file GREW: the correction is a new row");
+      ck(g_nins == 1, "...but there is still exactly one dose");
+      ck(insulin_last_units(INS_SLOW) == 4, "...showing the new value");
+      insulin_load();
+      ck(g_nins == 1 && insulin_last_units(INS_SLOW) == 4,
+         "...and replay agrees after a reload");
+
+      struct ins_rec now4 = {t0, INS_SLOW, 4};
+      ck(insulin_delete(&now4) == 0, "it is then retracted");
+      ck(fsize(g_ins_path) > after_edit, "...which also only appends");
+      insulin_load();
+      ck(g_nins == 0, "...and replay leaves no dose");
+   }
+
+   printf("== an over-long row is skipped, and blocks nothing ==\n");
+   {
+      /* There is no rewrite buffer left to overflow. A corrupt or over-long
+       * row is simply not an assertion: load skips it, and an edit to a
+       * perfectly good dose is unaffected by its presence. */
       fresh();
       ck(insulin_append(t0, INS_SLOW, 10, 0) == 0, "a normal dose to edit");
       FILE *f = fopen(g_ins_path, "ab");
@@ -129,18 +166,18 @@ int main(void)
       if (f) {
          char pad[257];
          memset(pad, '9', sizeof pad);
-         /* 16 characters of plausible row, padded to exactly 256 */
          fprintf(f, "1700001200,0,7,0");
          fwrite(pad, 1, 256 - 16, f);
          fputc('\n', f);
          fclose(f);
       }
-      struct ins_rec orig = {t0, INS_SLOW, 10};
-      ck(insulin_update(&orig, t0, INS_SLOW, 11, 0) < 0,
-         "an edit past a 256-char row refuses instead of overflowing");
       insulin_load();
-      ck(insulin_last_units(INS_SLOW) == 10,
-         "...and the refused edit changed nothing");
+      ck(g_nins == 1, "the over-long row does not load as a dose");
+      struct ins_rec orig = {t0, INS_SLOW, 10};
+      ck(insulin_update(&orig, t0, INS_SLOW, 11, 0) == 0,
+         "an edit past it succeeds");
+      insulin_load();
+      ck(insulin_last_units(INS_SLOW) == 11, "...and is durable");
    }
 
    printf("== the tail stays bounded; the newest rows win ==\n");

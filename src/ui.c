@@ -144,6 +144,34 @@ static void fill_rect(uint32_t *px, const struct ANativeWindow_Buffer *buf,
          px[((y + j) * buf->stride) + x + i] = c;
 }
 
+/* A CHECKBOX AT AN ARBITRARY SIZE, with a border `th` thick.
+ *
+ * The 5x7 icon_box glyph could not do this job. Drawn at the body scale it is
+ * a box the size of one letter with a one-unit outline, and next to a SOLID
+ * green one it disappeared: on the DEVICES list the unticked PRIMARY boxes
+ * read as empty space, so the explainer's "TAP A BOX TO SWITCH" pointed at
+ * nothing visible. Size is what makes a control look like a control, and a
+ * glyph cannot be sized independently of the text around it.
+ *
+ * The tick is an INSET SOLID square rather than a check mark: it stays legible
+ * at every size the two callers use, and it matches icon_boxfill, which is the
+ * shape the PRIMARY column already spoke in. */
+static void draw_checkbox(uint32_t *px, const struct ANativeWindow_Buffer *buf,
+                          int x, int y, int side, int th, int on, uint32_t c)
+{
+   if (th < 1)
+      th = 1;
+   if (side < 4 * th)
+      return; /* nothing legible fits; fill_rect would only count clips */
+   fill_rect(px, buf, x, y, side, th, c);
+   fill_rect(px, buf, x, y + side - th, side, th, c);
+   fill_rect(px, buf, x, y, th, side, c);
+   fill_rect(px, buf, x + side - th, y, th, side, c);
+   if (on)
+      fill_rect(px, buf, x + (2 * th), y + (2 * th), side - (4 * th),
+                side - (4 * th), c);
+}
+
 void fmt_glu(int mgdl, int units, char *out, int n)
 {
    /* Clamp to a displayable range. Callers pass sensor values that are already
@@ -817,7 +845,12 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    if (m->t <= 0 ||
        !m->has_cgm) /* no live CGM (or no reading): blank the age */
       (void)snprintf(agestr, sizeof agestr, "--");
-   else if (a < 600)
+   else if (a < 1000)
+      /* Seconds for as long as three digits can hold them. A CGM reports
+       * every five minutes, so the number people actually watch is "how long
+       * since the last one" -- and rounding 599 seconds to "9 M" throws away
+       * exactly the resolution that answers it. 1000 is the switch because
+       * that is where the field would need a fourth digit. */
       (void)snprintf(agestr, sizeof agestr, "%ld S", a);
    else
       (void)snprintf(agestr, sizeof agestr, "%ld M", a / 60);
@@ -1639,7 +1672,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
          air = 0;
       int pyy = y + (2 * sc) + air;
       draw_str(px, fb, pxx, pyy, psc, "+", 0xFFCCCCCC);
-      /* SHORTCUT BUTTONS share this row, to the LEFT of the '+', which keeps
+      /* PINNED BUTTONS share this row, to the LEFT of the '+', which keeps
        * its corner. They divide whatever the row has left after the plus, so
        * one button is wide and three are narrow -- the row's edges never move
        * as shortcuts are added or removed.
@@ -2098,6 +2131,67 @@ static int cgm_expired(const struct ui_sensor *s)
    return s->session_seconds > s->wear_len + SENSOR_GRACE_S;
 }
 
+/* THE LIST'S STATE COLUMN, ABBREVIATED TO FOUR CHARACTERS.
+ *
+ * Every state a device can report is spelled here at one fixed width, so the
+ * column is a column: the eye reads down it instead of re-measuring each row,
+ * and the width it does NOT vary by is width the PRIM column can have. The
+ * long forms ran from three characters ("OFF") to fifteen ("CONFIRM PAIRING"),
+ * and the longest of them decided how far left everything else had to start.
+ *
+ * The full wording is not lost -- the per-device screen's STATE row still
+ * prints s->status verbatim, and that is the screen you open when a state
+ * needs explaining. This one is an overview.
+ *
+ * Mapped from the string rather than from a code because the string is what
+ * the model carries: main.c composes CGM states itself and passes the meter's
+ * through from the driver's own phase text. An unrecognised state falls back
+ * to its first four characters, so a new one is truncated, never blank.
+ *
+ * PAIR covers both "the bond dialog is waiting" (CGM) and "this meter is not
+ * bonded" (meter): in each case nothing proceeds until the user pairs it. */
+static const char *dev_state_abbrev(const char *st, char *out, int n)
+{
+   static const struct {
+      const char *full, *ab;
+   } tab[] = {
+       /* CGM */
+       {"CONFIRM PAIRING", "PAIR"},
+       {"CONNECTED",       "CONN"},
+       {"WAITING",         "WAIT"},
+       {"WARMUP",          "WARM"},
+       {"ENDED",           "OVER"},
+       /* meter: the driver's phase text, then its resting states */
+       {"HELLO",           "BUSY"},
+       {"COUNT",           "BUSY"},
+       {"SYNCING",         "BUSY"},
+       {"SYNCED",          "SYNC"},
+       {"NOTHING NEW",     "SYNC"},
+       {"NOT PAIRED",      "PAIR"},
+       {"REFUSED",         "DENY"},
+       {"BAD DATA",        "JUNK"},
+       {"OFF",             "OFF" },
+   };
+
+   for (int i = 0; i < (int)(sizeof tab / sizeof tab[0]); i++) {
+      const char *a = st;
+      const char *b = tab[i].full;
+      while (*a && *a == *b) {
+         a++;
+         b++;
+      }
+      if (*a == 0 && *b == 0)
+         return tab[i].ab;
+   }
+   int k = 0;
+   while (k < 4 && k < n - 1 && st[k]) {
+      out[k] = st[k];
+      k++;
+   }
+   out[k] = 0;
+   return out;
+}
+
 static void render_devices(struct ANativeWindow_Buffer *fb,
                            const struct screen *m, struct hits *h)
 {
@@ -2117,15 +2211,41 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
    add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_DEVICES_BACK);
    y += 3 * lh; /* the DISPLAY menu's title gap -- the house style */
 
-   /* WHAT THE COLUMN IS FOR, before the column itself.
+   /* THE PRIMARY COLUMN'S GEOMETRY, settled before anything that has to keep
+    * clear of it: the row values below stop short of it.
     *
-    * A bare checkbox column headed "PRIMARY" told the user the word and
-    * nothing else: not what being primary does, not that it is a single
-    * choice rather than a set of independent toggles, and not why a meter's
-    * row has no box at all (which reads as a bug until you know the rule).
-    * Three short lines up front cost less than the confusion did. */
-   /* WRAPPED AT RUNTIME to the width actually available -- from the left
-    * margin up to, but not including, the P column.
+    * NO HEADER. The column was headed "PRIMARY", then "P", then "PRIM", each
+    * time trying to make one word carry a rule that takes a sentence -- and
+    * the box is now big enough to read as a control on its own, which is what
+    * a header over a single column of checkboxes was really for. The
+    * paragraph above says what the boxes do; a word repeating a fragment of
+    * it is noise, and it cost the rows a column of width. So the column is
+    * exactly the box wide, and nothing else. */
+   int cbs  = 15 * sc; /* the box: a real square */
+   int colx = rx - cbs;
+   int cbx  = colx;
+   int cbh  = colx - (2 * sc); /* its tap target starts here */
+   /* A FULL CHARACTER CELL of air between the row's value and the box, on top
+    * of the 4*sc that only kept them from touching. The value ends in a unit
+    * letter ("119 S") and the box is a bright square: at four units apart the
+    * two read as one run, and the eye had to separate a countdown from a
+    * control. 6*sc is the same cell the rest of this screen spaces by. */
+   int vrx = colx - (4 * sc) - (6 * sc); /* right edge left to row values */
+
+   /* WHAT THE BOXES ARE FOR. This paragraph is now the column's ONLY label,
+    * so it has to answer all three questions on its own: when the choice
+    * matters (only with more than one CGM), what it changes (which reading is
+    * the big number), and what it does NOT change (the alarms, which watch
+    * every sensor whatever is picked -- without that line, choosing feels
+    * like a risk). The last sentence explains the rows with no box, which
+    * reads as a bug until you know the rule. */
+   /* WRAPPED AT RUNTIME to the FULL text width, margin to margin.
+    *
+    * Not to the box column: the paragraph sits entirely ABOVE the first row,
+    * so nothing is ever drawn beside it and there is nothing to keep clear
+    * of. Stopping it at the column cost five characters a line and bought
+    * nothing -- it was a habit picked up from the row layout below, where the
+    * boxes really are alongside.
     *
     * The lines were hand-broken against a guessed column budget, and the guess
     * was badly low: it assumed sc == w/(33*6) exactly, but that divide FLOORS,
@@ -2134,11 +2254,20 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
     * not need. Measuring beats guessing, and it self-corrects on any geometry
     * instead of being right on one. */
    {
+      /* FIVE LINES AT MOST, which is what UI_DEV_ABOVE budgets (see ui.h).
+       * The narrowest this ever wraps to is the width-bound case, sc =
+       * w/(33*6), where cols comes out 31 -- keep it inside five lines there
+       * or the ADD NEW DEVICE button pays for the sixth. */
+      /* "THE BOX AT THE RIGHT OF A ROW", not "a box". Every row carries TWO
+       * squares -- the coloured plot marker at the left and the checkbox at
+       * the right -- so "a box" makes the reader pick between them, and the
+       * marker is the one their eye lands on first. Naming the side settles
+       * it in four words. */
       static const char pexp[] =
-          "P PICKS THE PRIMARY CGM: THE ONE WHOSE READING IS SHOWN AS THE BIG "
-          "NUMBER. TAP A BOX TO SWITCH. NOT METERS OR OLD DEVICES.";
-      /* cbx is the P column's x; the text stops one cell short of it. */
-      int cols = ((rx - (5 * sc) - (2 * sc)) - x) / (6 * sc);
+          "WITH TWO OR MORE CGMS, TAP THE BOX AT THE RIGHT OF A ROW TO MAKE "
+          "IT THE BIG NUMBER. ALARMS WATCH THEM ALL ANYWAY. METERS AND ENDED "
+          "SESSIONS HAVE NO BOX.";
+      int cols = (rx - x) / (6 * sc);
       if (cols < 8)
          cols = 8; /* degenerate width: draw something rather than loop */
       int i = 0;
@@ -2153,7 +2282,11 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
                last = take;
             take++;
          }
-         if (pexp[i + take] && last > 0)
+         /* Back off ONLY when the cut would land mid-word. A line that ends
+          * exactly where a word does is already whole, and backing off there
+          * threw away a word that fitted -- "TO SWITCH." fell to the next
+          * line at 38 columns while measuring 38 columns wide. */
+         if (pexp[i + take] && pexp[i + take] != ' ' && last > 0)
             take = last;
          char ln[64];
          int n = take < (int)(sizeof ln) - 1 ? take : (int)(sizeof ln) - 1;
@@ -2169,21 +2302,16 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
       y += 2 * sc;
    }
 
-   /* The PRIMARY column: a checkbox per eligible CGM, at the right edge, under
-    * its own header. Rows keep their value text clear of it (vrx), so the two
-    * never overprint. Exactly one box is ever solid -- it is a radio choice
-    * spelled as checkboxes, because "which one owns the big number" reads
-    * better as a column than as a value buried on one row.
+   /* The row the column header used to occupy, kept EMPTY. It is the air that
+    * separates the paragraph from the first device, and the list read as one
+    * more line of prose without it. Kept as a row rather than shrunk to a gap
+    * so UI_DEV_ABOVE still counts exactly what the renderer spends.
     *
-    * The header is "P", not "PRIMARY". Seven characters needed 42*sc of width
-    * for a column one checkbox wide, so it ran back across the value text of
-    * the row beneath it; the explainer above now carries the meaning, which is
-    * what the long word was really there for. Centred over the box cell rather
-    * than right-aligned, so header and checkbox share one axis. */
-   int cbx = rx - (5 * sc);         /* the box glyph, same cell as chk_row */
-   int cbh = fb->width - (14 * sc); /* its tap target starts here */
-   int vrx = fb->width - (16 * sc); /* right edge available to row values */
-   draw_str(px, fb, cbx, y, sc, "P", 0xFF888888);
+    * Below it: a checkbox per eligible CGM at the right edge, with rows
+    * keeping their value text clear (vrx) so the two never overprint. Exactly
+    * one box is ever solid -- it is a radio choice spelled as checkboxes,
+    * because "which one owns the big number" reads better as a column than as
+    * a value buried on one row. */
    y += lh;
 
    int cap = ui_sensor_capacity(fb->width, fb->height);
@@ -2225,8 +2353,9 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
    for (int pi = first; pi < first + cap && pi < nlive_i; pi++) {
       const struct ui_sensor *s = &m->sensors[idxs[pi]];
       int i                     = idxs[pi];
-      char val[28]; /* status[12] + ' ' + ago[12], with room to spare */
+      char val[28]; /* state[4] + ' ' + ago[12], with room to spare */
       char ago[12];
+      char abbuf[8]; /* dev_state_abbrev's fallback scratch */
       /* For a meter the age is its last SYNC, never its last fingerstick -- so
        * "SYNCED 2 M" means synced 2 min ago, not a datapoint 2 min old. The
        * sync time is persisted, so it survives a restart; if a meter has
@@ -2243,16 +2372,20 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
           * the countdown says when data starts. With the sensor's own clock
           * it is exact to the second (matching the official reader); off the
           * pairing instant it is an estimate, and the '~' says so. */
+         /* WARM, like every other state here, then the countdown in the
+          * place the age occupies on the other rows -- so the column still
+          * lines up while warming up. */
          if (warm_clk) {
             long r = SENSOR_WARMUP_S - s->session_seconds;
-            (void)snprintf(val, sizeof val, "WARMUP %d:%02d", (int)(r / 60),
+            (void)snprintf(val, sizeof val, "WARM %d:%02d", (int)(r / 60),
                            (int)(r % 60));
          } else {
             long r = (s->paired + SENSOR_WARMUP_S - m->now) / 60;
-            (void)snprintf(val, sizeof val, "WARMUP ~%dM", (int)r);
+            (void)snprintf(val, sizeof val, "WARM ~%dM", (int)r);
          }
       } else {
-         (void)snprintf(val, sizeof val, "%s %s", s->status, ago);
+         (void)snprintf(val, sizeof val, "%s %s",
+                        dev_state_abbrev(s->status, abbuf, sizeof abbuf), ago);
       }
       /* Three leading spaces: the second cell holds this device's plot marker
        * (its shape, colour and size), so the list answers "which trace is
@@ -2272,10 +2405,19 @@ static void render_devices(struct ANativeWindow_Buffer *fb,
        * opens the device. A meter and an expired sensor get no box at all --
        * neither can own the big number, and sensor_set_primary refuses both,
        * so offering the control would be a lie. */
+      /* CENTRED ON THE ROW'S GLYPH, and drawn at row height rather than at
+       * letter height: the unticked box used to be a 5x7 outline in a grey
+       * that the eye simply skipped past, so the only box anyone could see was
+       * the ticked one -- and a radio column where only the current choice is
+       * visible offers no choice at all. */
       if (s->kind == KIND_CGM && !cgm_expired(s)) {
-         draw_icon(px, fb, cbx, y, sc, s->primary ? icon_boxfill : icon_box,
-                   s->primary ? 0xFF33FF88 : 0xFF888888);
-         add_hit(h, cbh, y - (3 * sc), fb->width - cbh, lh, ACT_MENU,
+         draw_checkbox(px, fb, cbx, y - ((cbs - gh) / 2), cbs, sc, s->primary,
+                       s->primary ? 0xFF33FF88 : 0xFFAAAAAA);
+         /* The target is the box's own rectangle, not a fixed line height:
+          * the box is taller than a line now, and a target that stopped short
+          * of it would leave its bottom edge dead. It still ends well above
+          * the next row's target (pitch 24*sc), so no row is stolen. */
+         add_hit(h, cbh, y - ((cbs - gh) / 2), fb->width - cbh, cbs, ACT_MENU,
                  MA_PRIM_PICK + i);
       }
       if (s->marker != MARK_HIDE) { /* hidden-from-plot draws no glyph */
@@ -2666,51 +2808,76 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
    add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_REMOTE_BACK);
    y += 3 * lh; /* the DISPLAY menu's title gap -- the house style */
 
-   const char *ip = (m->remote_ip && m->remote_ip[0]) ? m->remote_ip : 0;
-   /* PUSH reflects what will actually happen: enabling without an address set
-    * shows WAITING (amber), not ON -- nothing leaves the phone until the IP
+   const char *sv =
+       (m->remote_server && m->remote_server[0]) ? m->remote_server : 0;
+   /* PUSH reflects what will actually happen: enabling without a server set
+    * shows NO SERVER (amber), not ON -- nothing leaves the phone until one
     * exists, and pretending otherwise would be a silent lie. */
    const char *pv = "OFF";
    uint32_t pc    = 0xFFFFFFFF;
-   if (m->remote_on && ip) {
+   if (m->remote_on && sv) {
       pv = "ON";
       pc = 0xFF33FF88;
    } else if (m->remote_on) {
-      pv = "NO ADDRESS";
+      pv = "NO SERVER";
       pc = 0xFFAA8844;
    }
    /* Double pitch between the three setting rows: the blank line makes each
     * an easier touch target (menu_row's hit box spans its own row only). */
    menu_row(fb, h, y, sc, lh, "PUSH", pv, pc, MA_REMOTE_TOGGLE);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "IP ADDRESS", ip ? ip : "NOT SET",
-            ip ? 0xFFFFFFFF : 0xFFAAAAAA, MA_REMOTE_IP);
+   menu_row(fb, h, y, sc, lh, "SERVER", sv ? sv : "NOT SET",
+            sv ? 0xFFFFFFFF : 0xFFAAAAAA, MA_REMOTE_IP);
    y += 2 * lh;
    char pt[8];
    (void)snprintf(pt, sizeof pt, "%d", m->remote_port);
    menu_row(fb, h, y, sc, lh, "PORT", pt, 0xFFFFFFFF, MA_REMOTE_PORT);
+   y += 2 * lh;
+   /* The account this phone syncs into, and whether it has been paired with
+    * it yet. Both are needed before anything can be sent, so both are shown
+    * whether or not they are set -- a missing one must not be invisible. */
+   const char *em =
+       (m->sync_email && m->sync_email[0]) ? m->sync_email : 0;
+   menu_row(fb, h, y, sc, lh, "EMAIL", em ? em : "NOT SET",
+            em ? 0xFFFFFFFF : 0xFFAAAAAA, MA_SYNC_EMAIL);
+   y += 2 * lh;
+   if (m->sync_paired) {
+      menu_row(fb, h, y, sc, lh, "PAIRED", "YES", 0xFF33FF88, MA_SYNC_UNPAIR);
+   } else if (!sv) {
+      /* Name the ONE thing standing in the way, top to bottom, rather than
+       * "SET BOTH" -- which says something is missing without saying what,
+       * and is exactly as unhelpful when only one of them is. */
+      menu_row(fb, h, y, sc, lh, "PAIR", "(SET SERVER)", 0xFFAAAAAA,
+               MA_SYNC_PAIR);
+   } else if (!em) {
+      menu_row(fb, h, y, sc, lh, "PAIR", "(SET EMAIL)", 0xFFAAAAAA,
+               MA_SYNC_PAIR);
+   } else {
+      menu_row(fb, h, y, sc, lh, "PAIR", "ENTER CODE", 0xFFFFFFFF,
+               MA_SYNC_PAIR);
+   }
    y += 2 * lh;
    /* STATUS: when the server last ACKNOWLEDGED something. With push on,
     * this is the one row that says whether the link actually works --
     * "ON" above only means the app intends to send. Not tappable (code
     * -1): it reports, it does not act. */
    {
-      char sv[16];
+      char st[16];
       uint32_t scol = 0xFFAAAAAA;
       if (!m->remote_on) {
-         (void)snprintf(sv, sizeof sv, "--");
+         (void)snprintf(st, sizeof st, "--");
       } else if (m->remote_last_ok > 0) {
          char ago[12];
          fmt_ago(m->now, m->remote_last_ok, ago, sizeof ago);
-         (void)snprintf(sv, sizeof sv, "%s AGO", ago);
+         (void)snprintf(st, sizeof st, "%s AGO", ago);
          /* Fresh is green; a link that has not been acknowledged in over
           * ten minutes is amber, because that is a backlog building up. */
          scol = (m->now - m->remote_last_ok <= 600) ? 0xFF33FF88 : 0xFFAA8844;
       } else {
-         (void)snprintf(sv, sizeof sv, "NEVER");
+         (void)snprintf(st, sizeof st, "NEVER");
          scol = 0xFFAA8844;
       }
-      menu_row(fb, h, y, sc, lh, "LAST SYNC", sv, scol, -1);
+      menu_row(fb, h, y, sc, lh, "LAST SYNC", st, scol, -1);
       /* 2*lh like every other row pair on this screen. These two were the
        * only ones still butted together, which made them read as one
        * two-line row -- and they answer different questions (WHEN the last
@@ -2725,34 +2892,30 @@ static void render_remote(struct ANativeWindow_Buffer *fb,
       y += 2 * lh;
    }
 
-   draw_str(px, fb, x, y, sc, "Datapoints are sent to this", 0xFF888888);
-   y += lh;
-   draw_str(px, fb, x, y, sc, "server as plain, unencrypted", 0xFF888888);
-   y += lh;
-   /* The resume behaviour is the thing worth knowing: an unreachable
-    * server costs nothing, because the next sync starts from ITS cursor. */
-   draw_str(px, fb, x, y, sc, "HTTP, resuming after outages.", 0xFF888888);
-   y += 2 * lh;
-
-   /* The exact wire protocol, for anyone pointing their own server here
-    * (kept in step with glucoserve's store). Only glyphs the 5x7 font
-    * has: A-Z 0-9 - : . / ( ) , -- no quotes, and no < > (those glyphs
-    * are the backspace/marker arrows). */
-   static const char *const api[10] = {
-       "REST API:",
-       "",
-       "GET /API/LAST  - THE CURSOR:",
-       "  NEWEST STORED TIME, PER SET",
-       "POST /GLUCOSE  - PER LINE:",
-       "  (EPOCH) (MGDL) (TYPE)",
-       "  TYPE: 0 CGM, 1 FINGERSTICK",
-       "POST /UNITS  - PER LINE:",
-       "  (EPOCH) (0 SLOW/1 FAST) (U)",
-       "  100 LINES PER MINUTE, MAX",
-   };
-   for (int i = 0; i < 10; i++) {
-      draw_str(px, fb, x, y, sc, api[i], 0xFF888888);
+   /* A bar while a sync is running. It is the only thing on this screen that
+    * moves, and it exists because a sync is otherwise indistinguishable from
+    * a server that is quietly refusing everything: LAST SYNC only changes
+    * once, at the end, and only if the whole thing worked. */
+   if (m->sync_active) {
       y += lh;
+      int bar_x = 4 * sc;
+      int bar_w = fb->width - (8 * sc);
+      int bar_h = 3 * sc;
+      draw_frame(px, fb, bar_x, y, bar_w, bar_h, 0xFF555555);
+      int fill = ((bar_w - (2 * sc)) * m->sync_permille) / 1000;
+      if (fill < 0)
+         fill = 0;
+      if (fill > bar_w - (2 * sc))
+         fill = bar_w - (2 * sc);
+      for (int by = y + sc; by < y + bar_h - sc; by++)
+         for (int bxx = bar_x + sc; bxx < bar_x + sc + fill; bxx++)
+            px[(by * fb->stride) + bxx] = 0xFF33FF88;
+      y += bar_h + lh;
+      char pctxt[16];
+      (void)snprintf(pctxt, sizeof pctxt, "%d%%", m->sync_permille / 10);
+      draw_str(px, fb, bar_x, y, sc, "SYNCING", 0xFF888888);
+      draw_str(px, fb, fb->width - (4 * sc) - (str_len(pctxt) * 6 * sc), y, sc, pctxt,
+               0xFF888888);
    }
 }
 
@@ -3498,9 +3661,12 @@ static void render_pairconf(struct ANativeWindow_Buffer *fb,
 
 /* ---- ADD menu: the main-screen '+' lands here ---- */
 
-/* THE SHORTCUT TABLE, in ADD-menu order.
+/* THE PINNABLE-ACTION TABLE, in ADD-menu order.
  *
- * The device types are deliberately absent. A shortcut is for something done
+ * These are the actions the ADD menu's PIN column offers, and the ones the
+ * main screen draws as buttons when pinned.
+ *
+ * The device types are deliberately absent. A pin is for something done
  * often -- logging a dose, logging a weight, glancing at a log -- and adding a
  * device is done a handful of times in a sensor's life, from a menu that also
  * asks for a pairing code. Promoting it would spend one of three scarce slots
@@ -3597,25 +3763,33 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
     * margin at all; one row (16) clears by 8 and is the spacing the rest of
     * the menus already use. Recheck this if a button is ever added. */
    int gap = lh;
-   /* THE SHORTCUT COLUMN. A checkbox per promotable action at the right, under
-    * its own header, with the buttons shortened to make room -- a quarter of
-    * the old button width, which is enough for the header and a comfortable
-    * tap target without making the labels wrap.
+   /* THE PIN COLUMN. A checkbox per promotable action at the right, under its
+    * own header, with the buttons shortened to make room -- a quarter of the
+    * old button width, which is enough for the header and a comfortable tap
+    * target without making the labels wrap.
+    *
+    * Headed PIN, not SHORTCUT: the box does not create a shortcut somewhere
+    * else to be gone looking for, it PINS this action to the main screen, and
+    * the shorter word says the same thing in three characters.
     *
     * Only the LOG buttons get one (see ui_sc_tab), so the column header sits
     * over that section and the DEVICES buttons below keep the full width. */
    int scw = bw / 4;   /* the checkbox column */
    int lbw = bw - scw; /* what the LOG buttons keep */
    int scx = x + lbw + (2 * sc);
+   /* SQUARE, and as tall as the button it controls (menu_button's own 25*sc):
+    * a checkbox is the control for the thing beside it, so it should read as
+    * that thing's partner rather than as a mark of punctuation after it. The
+    * column always has room -- scw is bw/4, and ui_fit_scale bounds sc by
+    * width at w/(33*6), so bw/4 >= 47*sc. */
+   int cbs = 25 * sc;
+   int cbx = scx + (((scw - (2 * sc)) - cbs) / 2);
    draw_str(px, fb, x, y, sc, "LOG", 0xFF888888);
    {
-      /* Right-aligned over its column, so the word sits above the boxes
-       * rather than drifting left of them. */
-      int hw = ((str_len("SHORTCUT") * 6) - 1) * sc;
-      int hx = x + bw - hw;
-      if (hx < scx)
-         hx = scx;
-      draw_str(px, fb, hx, y, sc, "SHORTCUT", 0xFF888888);
+      /* Centred over the boxes, so header and column share one axis. */
+      int hw = ((str_len("PIN") * 6) - 1) * sc;
+      int hx = cbx + ((cbs - hw) / 2);
+      draw_str(px, fb, hx, y, sc, "PIN", 0xFF888888);
    }
    y += lh;
    /* The buttons NAME what they log. "FAST" and "SLOW" were only unambiguous
@@ -3628,15 +3802,13 @@ static void render_addmenu(struct ANativeWindow_Buffer *fb,
       int by   = y;
       y = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0), 0xFFFFFFFF,
                       code);
-      /* The box is vertically centred on the button it belongs to, and its
-       * TARGET is the whole column cell -- a bare glyph is a poor one-handed
-       * target, and this one sits right beside a button that logs a
-       * medication, so the two must not be easy to confuse. Recorded AFTER
-       * the button and inside its row: ui_hit_idx scans backwards, so the box
-       * wins its own rectangle while the rest of the row still logs. */
-      int cy = by + ((y - by - (7 * sc)) / 2);
-      draw_icon(px, fb, scx + ((scw - (5 * sc)) / 2), cy, sc,
-                on ? icon_boxfill : icon_box, on ? 0xFF33FF88 : 0xFF888888);
+      /* The box shares the button's top and bottom edge (they are the same
+       * height), and its TARGET is the whole column cell -- this one sits
+       * right beside a button that logs a medication, so the two must not be
+       * easy to confuse. Recorded AFTER the button and inside its row:
+       * ui_hit_idx scans backwards, so the box wins its own rectangle while
+       * the rest of the row still logs. */
+      draw_checkbox(px, fb, cbx, by, cbs, sc, on, on ? 0xFF33FF88 : 0xFFAAAAAA);
       add_hit(h, x + lbw, by, bw - lbw, y - by, ACT_MENU, MA_SCTOGGLE + i);
       y += gap;
    }
@@ -4689,7 +4861,10 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
  * look the same in a list), so this is a plain letter grid rather than a
  * digits-only keypad. 6 columns keeps every key a comfortable target. */
 
-const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
+/* The dot is here for host names (SERVER): without it "pancra.org" cannot
+ * be typed at all, and the at-sign for the account email. Sensor labels
+ * simply never use either. */
+const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -.@";
 #define UI_LABEL_COLS 6
 
 /* code = 4 digits; plot max / cal / rescale = 3; IP = a full dotted quad's
@@ -4704,8 +4879,11 @@ int ui_kp_slots(int mode)
     * would have silently become 4-when-it-should-be-something-else the moment
     * either changed. */
    /* mode 14 (WEIGHT) takes 5: "162.4" -- three digits, a dot and a tenth. */
+   /* Mode 15 is the SYNC pairing code: SIX digits, not four. The server shows
+    * six and burns the code after three attempts, so a field that could only
+    * hold four would make pairing impossible rather than merely awkward. */
    static const int slots_for[UI_KP_MODES] = {4, 3, 3, 3, 15, 5, 2, 4,
-                                              4, 4, 4, 4, 4,  4, 5};
+                                              4, 4, 4, 4, 4,  4, 5, 6};
    return slots_for[(mode >= 0 && mode < UI_KP_MODES) ? mode : 0];
 }
 
@@ -4733,13 +4911,24 @@ static void render_label(struct ANativeWindow_Buffer *fb,
    int y   = (fb->height / 20) + (8 * sc);
    int ty  = y;
 
-   draw_str(px, fb, x, y, tsc, "NAME", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc,
+            m->label_field == 1   ? "SERVER"
+            : m->label_field == 2 ? "EMAIL"
+                                  : "NAME",
+            0xFFFFFFFF);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
    y += 2 * lh;
 
-   /* what has been typed so far, with a caret so an empty name is still
-    * obviously an entry field */
-   char shown[16];
+   /* What has been typed so far, with a caret so an empty field is still
+    * obviously an entry field.
+    *
+    * WRAPPED, not shrunk. This used to be one line in a 16-byte buffer, which
+    * was fine for a sensor name and useless for an email address: anything
+    * past 15 characters simply was not shown. Shrinking the text to fit would
+    * make a long address unreadable exactly when the user most needs to check
+    * it letter by letter, so the text keeps its size and takes as many lines
+    * as it needs. */
+   char shown[80];
    const char *en = m->entry ? m->entry : "";
    int k          = 0;
    while (en[k] && k < (int)sizeof shown - 2) {
@@ -4749,9 +4938,23 @@ static void render_label(struct ANativeWindow_Buffer *fb,
    shown[k]     = '_';
    shown[k + 1] = 0;
    int dsc      = 2 * sc;
-   int dw       = str_len(shown) * 6 * dsc;
-   draw_str(px, fb, (fb->width - dw) / 2, y, dsc, shown, 0xFF33FF88);
-   y += (7 * dsc) + (8 * sc);
+   int percol   = fb->width / (6 * dsc);  /* characters that fit on one line */
+   if (percol < 8)
+      percol = 8;
+   int shownlen = str_len(shown);
+   for (int off = 0; off < shownlen; off += percol) {
+      char line[80];
+      int len = shownlen - off;
+      if (len > percol)
+         len = percol;
+      for (int i = 0; i < len; i++)
+         line[i] = shown[off + i];
+      line[len] = 0;
+      int dw    = len * 6 * dsc;
+      draw_str(px, fb, (fb->width - dw) / 2, y, dsc, line, 0xFF33FF88);
+      y += 7 * dsc;
+   }
+   y += 8 * sc;
    add_hit(h, 0, ty - (3 * sc), fb->width, y - (ty - (3 * sc)), ACT_MENU,
            MA_KP_CLOSE);
 
@@ -4928,7 +5131,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
        "PLOT MAX",    /* 1 */
        "CALIBRATION", /* 2 */
        "RESCALE",     /* 3 */
-       "REMOTE IP",   /* 4 */
+       "SERVER",      /* 4: unused since SERVER became a name */
        "REMOTE PORT", /* 5 */
        "UNITS",       /* 6 */
        "DATE (MMDD)", /* 7 */
@@ -4939,6 +5142,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
        "NUDGE LOW",   /* 12 */
        "NUDGE HIGH",  /* 13 */
        "WEIGHT",      /* 14 */
+       "PAIRING CODE",/* 15 */
    };
    uint32_t title_col = 0xFFFFFFFF;
    if (m->kp_mode == 0) {
@@ -5020,7 +5224,7 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
     * layout: the dot takes 0's old cell, 0 and DEL shift right, and OK
     * becomes a full-width bottom row (which also makes the confirm harder to
     * fat-finger from DEL). */
-   int dotkey = (m->kp_mode == 4) || (kp_thresh(m->kp_mode) && m->units) ||
+   int dotkey = (kp_thresh(m->kp_mode) && m->units) ||
                 m->kp_mode == 14;
    int iprows = dotkey ? 5 : 4;
    int gm     = fb->width / 12;
@@ -5033,12 +5237,12 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
    int ksc    = wfit < hfit ? wfit : hfit;
    if (ksc < sc)
       ksc = sc;
-   static const char *keys[12]   = {"7", "8", "9", "4", "5", "6",
-                                    "1", "2", "3", "0", "<", "OK"};
+   static const char *keys[12]   = {"7", "8", "9", "4",   "5", "6",
+                                    "1", "2", "3", "0", "DEL", "OK"};
    static const int acts[12]     = {107, 108, 109, 104, 105, 106,
                                     101, 102, 103, 100, 110, MA_OK};
-   static const char *ipkeys[12] = {"7", "8", "9", "4", "5", "6",
-                                    "1", "2", "3", ".", "0", "<"};
+   static const char *ipkeys[12] = {"7", "8", "9", "4", "5",   "6",
+                                    "1", "2", "3", ".", "0", "DEL"};
    static const int ipacts[12]   = {107, 108, 109, 104,    105, 106,
                                     101, 102, 103, MA_DOT, 100, 110};
    const char **kk               = dotkey ? ipkeys : keys;

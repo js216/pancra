@@ -9,7 +9,7 @@
 #   - function-cognitive-complexity: an advisory metric, not a defect. The few
 #     functions over the threshold are the correctness-critical BLE state machine,
 #     the renderer and the input dispatch; restructuring them purely to satisfy a
-#     heuristic — and unverifiable without the device — would risk reliability.
+#     heuristic -- and unverifiable without the device -- would risk reliability.
 #     Every genuine simplification found during the cleanup was applied.
 # FunctionCase is intentionally NOT enforced: every function we define is already
 # lower_case, and the only non-conforming names are the NDK/JNI entry points

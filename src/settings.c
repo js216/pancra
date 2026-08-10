@@ -10,6 +10,7 @@
 #include "dexlibc.h"
 #include "plot.h"
 #include "sensors.h" /* MARK_N / MARK_SIZE_MAX: the real bounds */
+#include "ui.h"      /* MA_INS_SLOW / MA_WT_OPEN: the default pinned actions */
 #include "util.h"
 #include "weight.h" /* WT_KG / WT_LB: the weight display unit */
 #include <stdio.h>  /* snprintf */
@@ -56,13 +57,35 @@ int g_ins_color[2]  = {6, 1};
 int g_ins_size[2]   = {2, 2};
 int g_statbar_val   = 1; /* status bar shows the VALUE (0 = app icon) */
 int g_lockscr_val   = 1; /* notification visible on the lock screen */
-/* No shortcuts by default: the main screen stays as it was until the user
- * asks for one on the ADD menu. */
-int g_shortcut[SC_MAX] = {0, 0, 0};
+/* PINNED BY DEFAULT on a fresh install: SLOW insulin and WEIGHT.
+ *
+ * Those are the two things logged on a schedule rather than in reaction to
+ * something -- once a day, at roughly the same hour -- so they are the two the
+ * main screen can save a trip through the ADD menu for on the very first day,
+ * before the user has found the PIN column to ask. FAST is deliberately not
+ * among them: a correction dose is logged when it happens, not on a routine,
+ * and the third slot is left free so the first pin the user chooses has
+ * somewhere to go.
+ *
+ * These are MA_* action codes (see settings.h on why positions are not
+ * stored); ui.h is included for exactly these two names. A settings file
+ * written before the shortcut fields existed still loads with none pinned --
+ * that is an upgrade, not a first install, and silently adding buttons to a
+ * main screen someone already knows is not a default, it is a surprise. */
+int g_shortcut[SC_MAX] = {MA_INS_SLOW, MA_WT_OPEN, 0};
 char g_code_str[16] = "9973"; /* Stelo applicator default (rebuild to change) */
 int g_remote_on;              /* push each new datapoint; default off */
-char g_remote_ip[16];         /* dotted quad; "" until the user sets one */
-int g_remote_port = 80;       /* glucoserve.py's default */
+/* Defaulted, not blank: a fresh install that has to be told the server before
+ * it can do anything is a fresh install that mostly does not get told. Anyone
+ * running their own instance edits one row. */
+char g_remote_server[64] = "pancra.org";
+long g_sync_uid;              /* 0 until an app is paired */
+unsigned char g_sync_key[16];
+char g_sync_email[64];
+/* 443, because the client always speaks https now: the platform's TLS is
+ * free and the session cookie the server sets is Secure. The old default of
+ * 80 belonged to a plain-HTTP intake API that no longer exists. */
+int g_remote_port = 443;
 char g_info_path[256], g_alarm_path[256], g_settings_path[256],
     g_code_path[256], g_remote_path[256];
 
@@ -158,7 +181,13 @@ void alarm_load(void)
    int fd = open(g_alarm_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   char b[48];
+   /* 256, matching what remote_save writes. It was 48, sized for
+    * "1 1.2.3.4 8080" -- and the line has since grown a host NAME, a user id,
+    * a 32-character key and an email address. The read simply truncated, so
+    * the key came back malformed and the account came back empty, and the app
+    * looked like it had forgotten a pairing it had actually stored. Both ends
+    * of this file are now the same size for that reason. */
+   char b[256];
    int n = (int)read(fd, b, sizeof b - 1);
    close(fd);
    if (n <= 0)
@@ -341,35 +370,41 @@ void code_save(void)
    close(fd);
 }
 
-int remote_ip_valid(const char *s)
+/* A hostname or an IPv4 address: labels of letters, digits and hyphens
+ * separated by single dots, no empty label, none starting or ending with a
+ * hyphen. It used to accept a dotted quad ONLY, which was right when the
+ * server was a box on the LAN and wrong the moment it got a name.
+ *
+ * Deliberately permissive about the whole name -- "duo", "pancra.org" and
+ * "192.168.0.243" are all things the user legitimately types -- because this
+ * is a field they typed, not a security boundary; what it must not do is
+ * accept something that cannot be a host at all and then silently point every
+ * future sync at nothing. */
+int remote_server_valid(const char *s)
 {
-   if (!s)
+   if (!s || !*s)
       return 0;
-   int octets = 0;
-   while (*s) {
-      if (*s < '0' || *s > '9')
-         return 0; /* each group starts with a digit */
-      int v  = 0;
-      int nd = 0;
-      while (*s >= '0' && *s <= '9') {
-         if (nd >= 3)
-            return 0; /* >3 digits can wrap; reject before accumulating */
-         v = (v * 10) + (*s - '0');
-         nd++;
-         s++;
-      }
-      if (v > 255)
+   int n     = 0;
+   int label = 0;
+   for (const char *p = s; *p; p++) {
+      if (++n > 63)
          return 0;
-      octets++;
-      if (*s == '.') {
-         if (!s[1])
-            return 0; /* trailing dot: "1.2.3." */
-         s++;
-      } else if (*s) {
-         return 0; /* anything but a digit or a separating dot */
+      if (*p == '.') {
+         if (label == 0 || p[-1] == '-')
+            return 0; /* empty label, or one ending in a hyphen */
+         label = 0;
+         continue;
       }
+      int alnum = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9');
+      if (!alnum && *p != '-')
+         return 0;
+      if (label == 0 && *p == '-')
+         return 0; /* a label may not start with a hyphen */
+      if (++label > 63)
+         return 0;
    }
-   return octets == 4;
+   return label > 0 && s[n - 1] != '-';
 }
 
 void remote_save(void)
@@ -377,9 +412,21 @@ void remote_save(void)
    int fd = open(g_remote_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd < 0)
       return;
-   char b[48];
-   int n = snprintf(b, sizeof b, "%d %s %d\n", g_remote_on ? 1 : 0,
-                    g_remote_ip[0] ? g_remote_ip : "-", g_remote_port);
+   /* "on server port uid keyhex". The two trailing fields were added with
+    * pairing; a file without them loads as "not paired", so an upgrade keeps
+    * the server and simply asks to pair again. */
+   char kh[33];
+   static const char hx[] = "0123456789abcdef";
+   for (int i = 0; i < 16; i++) {
+      kh[2 * i]     = hx[g_sync_key[i] >> 4];
+      kh[2 * i + 1] = hx[g_sync_key[i] & 15];
+   }
+   kh[32] = 0;
+   char b[256];
+   int n = snprintf(b, sizeof b, "%d %s %d %ld %s %s\n", g_remote_on ? 1 : 0,
+                    g_remote_server[0] ? g_remote_server : "-", g_remote_port,
+                    g_sync_uid, g_sync_uid > 0 ? kh : "-",
+                    g_sync_email[0] ? g_sync_email : "-");
    n     = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
@@ -391,7 +438,13 @@ void remote_load(void)
    int fd = open(g_remote_path, O_RDONLY, 0);
    if (fd < 0)
       return;
-   char b[48];
+   /* 256, matching what remote_save writes. It was 48, sized for
+    * "1 1.2.3.4 8080" -- and the line has since grown a host NAME, a user id,
+    * a 32-character key and an email address. The read simply truncated, so
+    * the key came back malformed and the account came back empty, and the app
+    * looked like it had forgotten a pairing it had actually stored. Both ends
+    * of this file are now the same size for that reason. */
+   char b[256];
    int n = (int)read(fd, b, sizeof b - 1);
    close(fd);
    if (n <= 0)
@@ -403,14 +456,14 @@ void remote_load(void)
    int on = *q++ - '0';
    while (*q == ' ')
       q++;
-   char ip[sizeof g_remote_ip];
+   char host[sizeof g_remote_server];
    int k = 0;
    while (*q && *q != ' ' && *q != '\n') {
-      if (k >= (int)sizeof ip - 1)
+      if (k >= (int)sizeof host - 1)
          return; /* an address that long cannot be valid */
-      ip[k++] = *q++;
+      host[k++] = *q++;
    }
-   ip[k] = 0;
+   host[k] = 0;
    while (*q == ' ')
       q++;
    int port = 0;
@@ -423,22 +476,106 @@ void remote_load(void)
       q++;
    }
    /* "-" is the saver's own empty-address marker; anything else must be a
-    * well-formed dotted quad, and the port must be a real TCP port. Commit all
+    * well-formed host name, and the port must be a real TCP port. Commit all
     * three together or nothing: a half-applied file (say, a valid port with a
     * corrupt address) could silently re-point the push at the wrong host. */
-   int ip_ok = (ip[0] == '-' && ip[1] == 0) || remote_ip_valid(ip);
-   if (!ip_ok || port < 1 || port > 65535)
+   int host_ok = (host[0] == '-' && host[1] == 0) || remote_server_valid(host);
+   if (!host_ok || port < 1 || port > 65535)
       return;
+   /* The paired identity and the account, read as SEQUENTIAL TOKENS.
+    *
+    * They were read by OFFSET -- the email was taken from 32 bytes past the
+    * uid, the length of a key in hex. That is right only when a key is
+    * actually there: unpaired, the saver writes "-" for the key, so the
+    * offset landed inside the next field and the email loaded as "-", which
+    * the check below then treated as unset. The address the user had typed
+    * vanished on the next launch, with nothing to say why. Never compute a
+    * position in a whitespace-separated line; walk it. */
+   while (*q == ' ')
+      q++;
+   long uid = 0;
+   int ud   = 0;
+   while (*q >= '0' && *q <= '9') {
+      if (ud < 18) {
+         uid = (uid * 10) + (*q - '0');
+         ud++;
+      }
+      q++;
+   }
+   while (*q == ' ')
+      q++;
+   /* the key token, however long it turns out to be */
+   char keytok[80];
+   int kk = 0;
+   while (*q && *q != ' ' && *q != '\n' && kk < (int)sizeof keytok - 1)
+      keytok[kk++] = *q++;
+   keytok[kk] = 0;
+   while (*q == ' ')
+      q++;
+   char em[sizeof g_sync_email];
+   int ek = 0;
+   while (*q && *q != ' ' && *q != '\n' && ek < (int)sizeof em - 1)
+      em[ek++] = *q++;
+   em[ek] = 0;
+
+   unsigned char key[16];
+   int keyok = 0;
+   if (uid > 0 && kk == 32) {
+      keyok = 1;
+      for (int i = 0; i < 16 && keyok; i++) {
+         int v = 0;
+         for (int h = 0; h < 2; h++) {
+            char c = keytok[(2 * i) + h];
+            int d  = -1;
+            if (c >= '0' && c <= '9')
+               d = c - '0';
+            else if (c >= 'a' && c <= 'f')
+               d = (c - 'a') + 10;
+            else if (c >= 'A' && c <= 'F')
+               d = (c - 'A') + 10;
+            if (d < 0) {
+               keyok = 0;
+               break;
+            }
+            v = (v * 16) + d;
+         }
+         key[i] = (unsigned char)v;
+      }
+   }
    g_remote_on   = on;
    g_remote_port = port;
-   if (ip[0] == '-')
-      g_remote_ip[0] = 0;
-   else
+   if (ek && !(em[0] == '-' && em[1] == 0)) {
       for (int i = 0;; i++) {
-         g_remote_ip[i] = ip[i];
-         if (!ip[i])
+         g_sync_email[i] = em[i];
+         if (!em[i])
             break;
       }
+   } else {
+      g_sync_email[0] = 0;
+   }
+   if (uid > 0 && keyok) {
+      g_sync_uid = uid;
+      for (int i = 0; i < 16; i++)
+         g_sync_key[i] = key[i];
+   } else {
+      g_sync_uid = 0;
+   }
+   if (host[0] == '-')
+      g_remote_server[0] = 0;
+   else
+      for (int i = 0;; i++) {
+         g_remote_server[i] = host[i];
+         if (!host[i])
+            break;
+      }
+}
+
+void sync_key_save(long uid, const unsigned char key[16])
+{
+   g_sync_uid = uid;
+   for (int i = 0; i < 16; i++)
+      g_sync_key[i] = key[i];
+   remote_save();
 }
 
 void code_load(void)

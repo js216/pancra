@@ -7,9 +7,24 @@
 
 /* A dose is what the user TYPED, not something a sensor measured, so this log
  * is deliberately minimal: when, which kind, how much. The file is the
- * lifetime record (append-only, never rewritten, same discipline as
- * readings.csv); the in-memory tail exists for the UI -- pre-populating the
- * entry form with the last dose of a type, and any future plotting. */
+ * lifetime record and the in-memory tail exists for the UI -- pre-populating
+ * the entry form with the last dose of a type, and any future plotting.
+ *
+ * THE FILE IS APPEND-ONLY, INCLUDING EDITS AND DELETES (schema v2). It used
+ * to be rewritten in place by the edit form, which made it the one log that
+ * could lose history to a bug, and left it unable to say what a dose used to
+ * be. Now every row is an ASSERTION about a dose identified by an id:
+ *
+ *     written,id,del,unix_time,type,units,tz_offset_s
+ *
+ * Replay in file order, last assertion per id wins, del=1 removes it. So
+ * "6 units at 08:12, corrected to 4 at 08:15" is two rows and both survive,
+ * and a past day's rows never change -- which is also what lets the sync
+ * protocol treat old buckets as frozen.
+ *
+ * Rows in the OLD four-field form (unix_time,type,units,tz_offset_s) still
+ * load, and are given negative ids by file order so they can never collide
+ * with a minted one. Nothing rewrites them. */
 
 #define INS_SLOW 0 /* basal / long-acting */
 #define INS_FAST 1 /* bolus / rapid-acting */
@@ -49,11 +64,10 @@ int insulin_append(long t, int type, int units, long tz);
  * what the LOG INSULIN form pre-populates with. */
 int insulin_last_units(int type);
 
-/* Rewrite the LAST file row matching `orig` (t/type/units) to the new
- * values, or delete it. Rewrite-and-rename (a crash never truncates the
- * log), then the tail is reloaded. 0 on success, -1 on failure or when no
- * row matches. These exist for the EDIT INSULIN form only -- everything
- * else treats the log as append-only. */
+/* Correct or retract the LAST dose matching `orig` (t/type/units) by
+ * APPENDING an assertion against its id -- the file is never rewritten. 0 on
+ * success, -1 when nothing matches or the write failed. Matching is by
+ * CONTENT, so a stale tail index can never touch the wrong dose. */
 int insulin_update(const struct ins_rec *orig, long t, int type, int units,
                    long tz);
 int insulin_delete(const struct ins_rec *orig);

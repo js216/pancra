@@ -2298,6 +2298,47 @@ int main(void)
       printf("uitest: label column is not a plot tab on %d shapes\n", nas);
    }
 
+   /* CO-LOCATED MARKERS STAY REACHABLE.
+    *
+    * A dose and a weight logged in the same sitting map to one pixel column,
+    * and a plain nearest-by-x pick then hands every touch on the plot to the
+    * same one: the other is drawn and cannot be scrubbed at all. plot_hit's
+    * `split` shares the column's territory out between them. Assert on the
+    * REACHABILITY (does some press select it), not on the offsets, so the
+    * split's arithmetic can be retuned without rewriting the test. */
+   {
+      const int pw         = 700;
+      const int ph         = 400;
+      const long pnow      = 1000000;
+      const int phours     = 24;
+      struct plot_pt cp[3] = {
+          {0, 0, 0, 0, 0, 0},
+          {0, 0, 0, 0, 0, 0},
+          {0, 0, 0, 0, 0, 0}
+      };
+      cp[0].t = pnow - (3600L * 5); /* dose */
+      cp[1].t = pnow - (3600L * 5); /* weight, same instant */
+      cp[2].t = pnow - (3600L * 12);
+      for (int i = 0; i < 3; i++)
+         cp[i].glu = 60;
+      for (int sp = 0; sp < 2; sp++) {
+         int won[3] = {0, 0, 0};
+         for (int tx = 0; tx < pw; tx++) {
+            int k = plot_hit(0, 0, pw, ph, cp, 3, pnow, phours, tx, ph / 2, sp);
+            if (k >= 0)
+               won[k]++;
+         }
+         printf("uitest: co-located pick split=%d reach %d/%d/%d px\n", sp,
+                won[0], won[1], won[2]);
+         /* Only the split pass is required to reach both; the plain pass is
+          * the glucose trace's rule and is deliberately left alone. */
+         if (sp && (won[0] < 10 || won[1] < 10 || won[2] < 10)) {
+            printf("  FAIL: a co-located marker is unscrubbable\n");
+            fail = 1;
+         }
+      }
+   }
+
    printf("uitest: %s\n", fail ? "FAIL" : "OK");
    return fail;
 }

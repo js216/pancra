@@ -69,6 +69,12 @@ static const uint8_t font_rarrow[7] = {0x00, 0x08, 0x04, 0x1F,
                                        0x04, 0x08, 0x00};
 /* ',' appears in the medical disclaimer; '?' in FORGET? and in an unknown
  * calibration-permitted state. Both rendered blank. */
+/* '@': an O with a tail inside, open at the lower right. Needed because the
+ * ACCOUNT field is an email address -- without a glyph the key on the text
+ * editor draws BLANK, so the one character every address needs looks like a
+ * dead space in the grid. */
+static const uint8_t font_at[7] = {0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0F};
+
 static const uint8_t font_comma[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08};
 static const uint8_t font_quest[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
 
@@ -106,6 +112,8 @@ const uint8_t *glyph_for(char c)
       return font_rarrow; /* primary-sensor marker */
    if (c == ',')
       return font_comma;
+   if (c == '@')
+      return font_at;
    if (c == '?')
       return font_quest;
    return 0; /* space / unknown: blank cell */

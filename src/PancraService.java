@@ -4,7 +4,7 @@
 
 /* Foreground service: keeps the process alive (and BLE-exempt from Doze) so the
  * sensor connection and reading collection continue when the app is not in the
- * foreground — or has been swiped away entirely, like the official app.
+ * foreground -- or has been swiped away entirely, like the official app.
  *
  * It runs no logic itself. All BLE state is static in Ble and lives in this same
  * process; the GATT callbacks arrive on binder threads and keep driving the
@@ -225,7 +225,7 @@ public final class PancraService extends Service {
      * cycles reconnection depends on our process getting CPU; in deep Doze the
      * process is frozen and queued BLE callbacks (the auto-reconnect) don't get
      * delivered. This alarm briefly unfreezes us each cycle so those callbacks
-     * flush and the EXISTING reconnect path runs — it does not touch BLE itself.
+     * flush and the EXISTING reconnect path runs -- it does not touch BLE itself.
      * setAndAllowWhileIdle needs no special permission and fires during Doze. */
     private void scheduleWake() {
         try {
@@ -264,7 +264,7 @@ public final class PancraService extends Service {
                 startForeground(1, build());
         } catch (Throwable t) { Log.i("pancra", "startForeground: " + t); }
         /* i == null means the system restarted us on its own (START_STICKY) with no
-         * activity — BLE lives in the activity's native lib, so this would be a
+         * activity -- BLE lives in the activity's native lib, so this would be a
          * zombie (notification + wakelock, reading nothing). Don't auto-restart:
          * stop cleanly so the app is simply gone until reopened, never a zombie. */
         if (i == null) { stopSelf(); return START_NOT_STICKY; }
