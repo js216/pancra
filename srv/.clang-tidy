@@ -1,0 +1,61 @@
+# The server's linter settings.
+#
+# srv/ was linted by NOTHING until now: the tidy target ran over $(SRC) (the
+# app plus lib/) and $(TEST_SRC) (the app's tests), and srv/ was in neither.
+# So the half that terminates TLS and parses HTTP for strangers had never seen
+# clang-tidy while the app had run under it for months. Moving four files from
+# srv/ into lib/ is what exposed it -- they collected 27 real diagnostics the
+# instant they crossed into a directory the linter could see.
+#
+# WHAT IS ON: everything that finds DEFECTS. clang-analyzer (the path-
+# sensitive checks), bugprone-*, cert-*, portability-* and performance-*. That
+# includes cert-err33-c, which is how the unchecked sqlite3_step() and write()
+# returns get found rather than remembered.
+#
+# WHAT IS OFF, AND WHY IT IS A DEFERRAL RATHER THAN A JUDGEMENT: the app's
+# configuration also enables the stylistic families -- readability-*,
+# modernize-*, cppcoreguidelines-*, hicpp-*, misc-*. Turning those on here
+# reports about four hundred findings across srv/, essentially all of them
+# mechanical: declarations to split one per line, unsigned suffixes on shift
+# counts, direct includes for symbols already reached through a header.
+# None of them is a bug. Fixing them is worth doing and is a sweep of its own;
+# doing it in the same change as the security fixes would have buried those in
+# four hundred lines of noise.
+#
+# THE TARGET IS PARITY WITH app/. When the sweep happens, delete this file and
+# srv/ inherits the root configuration, which is the point.
+InheritParentConfig: true
+
+# The individually disabled checks below are not deferrals -- they were read,
+# every site was looked at, and none of them was a defect in this code:
+#
+#   cert-err33-c: 45 sites, and 45 of them are fprintf(stderr, ...) reporting
+#     a failure we are already handling, or snprintf into a buffer whose
+#     truncation is checked (or impossible). The genuinely unchecked returns
+#     that matter -- a glucose write, a sqlite3_step reported to the user as
+#     success -- are a different set and are fixed by hand, not by this check.
+#   bugprone-suspicious-string-compare: wants `strcmp(a, b) == 0` written out.
+#     `if (!strcmp(a, b))` is ordinary C and is used consistently here.
+#   bugprone-not-null-terminated-result: fires on memcpy into the HkdfLabel
+#     buffer, which is a length-prefixed binary structure. A NUL would be a
+#     protocol error, not a fix.
+#   bugprone-implicit-widening-of-multiplication-result: index arithmetic on
+#     values bounded far below anything that could overflow an int.
+#   optin.performance.Padding: struct layout advice, not correctness.
+#
+# What is KEPT is what found real bugs the first time it ran: an uninitialised
+# array read as an insulin dose's type and units (srv/home.c), and an
+# uninitialised pointer printed on a transport failure (srv/synccli.c).
+Checks: >
+  -readability-*,
+  -modernize-*,
+  -cppcoreguidelines-*,
+  -hicpp-*,
+  -misc-*,
+  -cert-err33-c,
+  -bugprone-suspicious-string-compare,
+  -bugprone-not-null-terminated-result,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -clang-analyzer-optin.performance.Padding
+
+WarningsAsErrors: '*'

@@ -5,25 +5,18 @@ several CGMs paired at the same time, a new sensor can warm up while the old one
 is still reporting. It supports two independent alarm levels, a one time nudge
 and a persistent alarm, both for high and for low glucose levels.
 
-## Safety Disclaimer
+The other half of this repository is `srv/` -- a small glucose sync server the
+app pairs with. One binary and one sqlite file: no daemons, no proxy, no
+runtime.
 
-Pancra is a **wellness app**. It is not a medical device, it is not approved by
-any regulator, and it has not been tested to any clinical standard. Readings
-can arrive late, wrong, or not at all.
+It is written for this app, not as a general service: the pages render glucose
+and insulin, the pairing is the app's EC-J-PAKE exchange, and the wire protocol
+is the one `srv/sync.h` and `app/sync.h` define between them. What IS general is
+underneath -- `lib/` is a self-contained set of primitives (P-256, AES-GCM,
+SHA-256, HMAC, HKDF, PBKDF2, ECDSA, J-PAKE), and every file in it compiles
+standalone with only `lib/` on the include path.
 
-**Never use it to decide a dose, a correction, or any other treatment.** For
-that, use the approved sensor manufacturer's readout device.
-
-Pancra is *NOT* affiliated with, endorsed by or supported by Dexcom or
-LifeScan. Dexcom, G7 and Stelo are trademarks of Dexcom, Inc.; OneTouch and
-Verio are trademarks of LifeScan.
-
-Cloud sync is optional and off until you set it up. When it is on, the record
-travels over HTTPS and every request is signed with a key established by
-pairing; the server holds it behind a login. Nobody but you sees it unless you
-share it, and sharing is a link you create and can revoke.
-
-## What it does
+## What it Does
 
 - **Several sensors at once, so sessions can overlap.** Start the replacement
   sensor before the current one expires and it warms up while the old one is
@@ -42,24 +35,83 @@ share it, and sharing is a link you create and can revoke.
   both switch it on and pair, and it stays off until then. The phone is the
   authoritative copy: it pairs once with a 6-digit code, and from then on the
   two are kept in step -- corrections and deletions included -- over HTTPS,
-  with every request signed. See [glucoserve](../glucoserve).
+  with every request signed. See **The server** below.
 
-## Building
+## Building the App
 
 Prerequisites:
 
     sudo apt-get install clang-19 llvm-19 default-jdk adb aapt \
                          android-sdk-build-tools android-framework-res \
-                         clang-format clang-tidy
+                         clang-format clang-tidy zip
 
-`android.jar` and `r8.jar` are not packaged; put them in `tmp/tools/`.
+`make check` additionally runs the server's suite, which needs:
 
-    make            # builds and signs build/pancra.apk
+    sudo apt-get install gcc curl sqlite3 openssl python3
+
+Those are not optional extras: without `openssl` the TLS tests cannot run, and
+without `python3` neither can the forged-record case. Both now FAIL rather than
+skip quietly -- set `ALLOW_SKIP=1` if you genuinely mean to accept an untested
+TLS layer. The same applies to `duocheck`, which compiles the riscv64 build
+that actually ships to the board.
+
+The compiler, strip and JDK are discovered from `PATH`; override any of them
+explicitly if you have several installed:
+
+    make CLANG=/usr/bin/clang-19 JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+`android.jar` and `r8.jar` are not packaged; put them in `tools/` along with
+`bundletool.jar` if you want an `.aab`. Nothing in `tools/` is in git.
+
+    make            # both halves
+    make app        # builds and signs build/app/pancra.apk
     make install    # adb install
-    make check      # format, static analysis, test suites
+    make check      # format, static analysis, both test suites
+    make clean      # rm -rf build
 
-Native C against the NDK, no third-party libraries.
+### The Server
 
-## Licence
+Prerequisites:
 
-Copyright 2026 Jakob Kastelic. GPL-3.0.
+    sudo apt-get install build-essential curl unzip
+
+sqlite is the one library the server does not carry itself. It goes in
+`tools/` with everything else that is downloaded rather than written:
+
+    cd tools
+    curl -O https://sqlite.org/2024/sqlite-amalgamation-3460100.zip
+    unzip sqlite-amalgamation-3460100.zip
+
+For the Milk-V Duo, the riscv64/musl cross-compiler goes beside it:
+
+    cd tools
+    curl -O https://musl.cc/riscv64-linux-musl-cross.tgz
+    tar xf riscv64-linux-musl-cross.tgz
+
+    make srv                            # native
+    make duo                            # riscv64, static, for the board
+    make srv CROSS=<prefix>             # any other cross target
+
+Usage of the CLI:
+
+    ./build/srv/sync 8444 [datadir] [cert.pem key.pem]
+    ./build/srv/sync invite  [owner-email]  # print a signup link
+    ./build/srv/sync invites                # list the live ones
+    ./build/srv/sync revoke  <url|token|all>  # take one back
+    ./build/srv/sync adduser <email> <password>  # the first account
+    ./build/srv/sync passwd  <email> <password>  # the only password reset
+
+## Legal
+
+Pancra is a **wellness app**. It is not a medical device, it is not approved by
+any regulator, and it has not been tested to any clinical standard. Readings
+can arrive late, wrong, or not at all.
+
+**Never use it to decide a dose, a correction, or any other treatment.** For
+that, use the approved sensor manufacturer's readout device.
+
+Pancra is *NOT* affiliated with, endorsed by, or supported by Dexcom or
+LifeScan. Dexcom, G7 and Stelo are trademarks of Dexcom, Inc.; OneTouch and
+Verio are trademarks of LifeScan.
+
+Copyright 2026 Jakob Kastelic. GPL-3.0 only.

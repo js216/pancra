@@ -1,6 +1,12 @@
 *.swp
 *.pdf
+*.o
+*.d
 .claude
-build
-tmp
 data
+build
+tools
+lib/sqlite*
+
+# clangd index: generated, and not ours to carry
+.cache/

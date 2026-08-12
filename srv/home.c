@@ -1,0 +1,497 @@
+/* SPDX-License-Identifier: GPL-3.0
+ * home.c --- the record page and the dose log
+ * Copyright 2026 Jakob Kastelic
+ */
+#include "db.h"
+#include "http.h"
+#include "page.h"
+#include "pair.h"
+#include "util.h"
+#include <sqlite3.h>
+#include <stdarg.h> /* apnd: a bounded snprintf append */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#define HSLOTS 12
+#define HMAX   400
+
+struct hpt {
+   int slot;
+   long glu;
+   int ty;
+};
+
+/* Append to out[k], and NEVER return a k past cap.
+ *
+ * snprintf returns the length it WOULD have written, so `k += snprintf(...)`
+ * walks the offset past the end of the buffer as soon as one call is
+ * truncated -- and hour_row's guards were written as though it returned the
+ * length it did write. " [%ld]" of a 20-digit long is 23 bytes against a
+ * `k + 16 < cap` guard, so a single row carrying LONG_MIN pushed k beyond cap
+ * and the caller then read past a 48 kB static into the response. row_ok
+ * admits that value, so a paired app could put it there.
+ *
+ * Returning the clamped offset makes every guard in the function true by
+ * construction rather than by arithmetic nobody re-checks. */
+static size_t apnd(char *out, size_t cap, size_t k, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static size_t apnd(char *out, size_t cap, size_t k, const char *fmt, ...)
+{
+   if (k + 1 >= cap)
+      return k; /* no room for even a NUL: leave the offset alone */
+   va_list ap;
+   va_start(ap, fmt);
+   int n = vsnprintf(out + k, cap - k, fmt, ap);
+   va_end(ap);
+   if (n < 0)
+      return k;
+   size_t room = cap - k - 1; /* vsnprintf always NUL-terminates */
+   return k + ((size_t)n > room ? room : (size_t)n);
+}
+
+static size_t hour_row(char *out, size_t cap, int hour, const struct hpt *hp,
+                       int hn, int first)
+{
+   size_t k = apnd(out, cap, 0, "%02d", hour);
+   int last = -1;
+   for (int i = 0; i < hn; i++)
+      if (hp[i].slot > last)
+         last = hp[i].slot;
+   for (int sl = 0; sl <= last && k + 48 < cap; sl++) {
+      if (sl < first) {
+         k = apnd(out, cap, k, "    ");
+         continue;
+      }
+      int any = 0;
+      /* hp is filled newest-first, so emit back-to-front for left-to-right
+       * time order within the cell. */
+      for (int i = hn; i-- > 0 && k + 16 < cap;) {
+         if (hp[i].slot != sl)
+            continue;
+         k   = apnd(out, cap, k, hp[i].ty == 1 ? " [%ld]" : " %3ld", hp[i].glu);
+         any = 1;
+      }
+      if (!any)
+         k = apnd(out, cap, k, "   .");
+   }
+   if (k < cap)
+      out[k++] = '\n';
+   return k;
+}
+
+/* One reading row, newest first, as the page walks backwards. */
+struct rd {
+   long t, glu;
+   int ty;
+};
+
+/* The NEWEST reading, whatever its age: the single-user page always showed
+ * its timestamp -- with a fresh value that says how current it is, and with a
+ * stale one it says since when. Only the big number goes to "---". Asked
+ * separately from the 24-hour window so a record that stopped a year ago
+ * still says so instead of rendering blank.
+ *
+ * The LIMIT is not a guess at how many rows are recent: rows arrive in bucket
+ * order and a backfilled row can sort ahead of them, so the newest few
+ * buckets are scanned and the maximum taken by TIME. */
+static void newest_reading(long owner, long *out_t, long *out_glu)
+{
+   *out_t = *out_glu = 0;
+   sqlite3_stmt *st =
+       db_prep("SELECT line FROM logrow WHERE user_id=? AND log='readings'"
+               " ORDER BY bucket DESC, line DESC LIMIT 400");
+   if (!st)
+      return;
+   sqlite3_bind_int64(st, 1, owner);
+   while (sqlite3_step(st) == SQLITE_ROW) {
+      const char *ln = (const char *)sqlite3_column_text(st, 0);
+      if (!ln || *ln < '0' || *ln > '9')
+         continue;
+      long t         = strtol(ln, NULL, 10);
+      const char *c1 = strchr(ln, ',');
+      if (!c1 || t <= *out_t)
+         continue;
+      *out_t   = t;
+      *out_glu = strtol(c1 + 1, NULL, 10);
+   }
+   sqlite3_finalize(st);
+}
+
+/* The readings the table draws, from the last few days of buckets. Returns
+ * the count, or -1 if the record could not be read at all -- which is not the
+ * same as a record with nothing in it. */
+static int load_recent(long owner, long today, struct rd *out, int cap)
+{
+   sqlite3_stmt *st =
+       db_prep("SELECT line FROM logrow WHERE user_id=? AND log='readings'"
+               " AND bucket >= ? ORDER BY bucket DESC, line DESC");
+   if (!st)
+      return -1;
+   sqlite3_bind_int64(st, 1, owner);
+   sqlite3_bind_int64(st, 2, today - 2);
+
+   int n = 0;
+   while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+      const char *ln = (const char *)sqlite3_column_text(st, 0);
+      if (!ln || *ln < '0' || *ln > '9')
+         continue;
+      const char *c1 = strchr(ln, ',');
+      if (!c1)
+         continue;
+      /* field 9 is the type; walk to it rather than counting offsets, since
+       * the row is variable-width */
+      const char *p = ln;
+      for (int f = 0; f < 8 && p; f++) {
+         p = strchr(p, ',');
+         if (p)
+            p++;
+      }
+      out[n].t   = strtol(ln, NULL, 10);
+      out[n].glu = strtol(c1 + 1, NULL, 10);
+      out[n].ty  = p ? (int)strtol(p, NULL, 10) : 0;
+      n++;
+   }
+   sqlite3_finalize(st);
+   return n;
+}
+
+void h_home(struct req *r, long me, const char *cookie)
+{
+   int have_own = 0;
+   long owner   = viewed_owner(r, me, &have_own);
+   if (!owner)
+      return;
+   int foot_attr = 0;
+   char myemail[256], owneremail[256];
+   email_of(me, myemail, sizeof myemail);
+   email_of(owner, owneremail, sizeof owneremail);
+   int tz = tz_of(owner);
+
+   struct sb s = {0};
+   nav(&s, myemail, cookie);
+   if (owner != me) {
+      char esc[300] = {0};
+      html_esc(esc, sizeof esc, owneremail);
+      /* "back to mine" only when there IS a mine. A follower with no readings
+       * and no paired app has nothing to go back to, and the link just leads
+       * to an empty page wearing their own name. They still get told whose
+       * record they are reading. */
+      if (have_own || strstr(r->target, "who="))
+         sb_add(&s,
+                "<div>Viewing <b>%s</b> &mdash; "
+                "<a href=\"/\">back to mine</a></div>\n",
+                esc);
+      else
+         /* Deferred to the foot of the page: for a follower this IS their
+          * page, so the reading belongs at the top where their eye goes, and
+          * whose reading it is belongs where a caption goes. */
+         foot_attr = 1;
+   }
+
+   /* The list of records shared with this viewer -- but not when it would
+    * name the one record they are already looking at. A follower with a
+    * single share gets that record AS their page and its owner in the
+    * caption at the foot; a "Shared with you: <the same address>" line above
+    * it says the same thing twice. */
+   sqlite3_stmt *sh = foot_attr ? NULL
+                                : db_prep("SELECT u.id,u.email FROM share s"
+                                          " JOIN user u ON u.id=s.owner_id"
+                                          " WHERE s.viewer_id=? ORDER BY"
+                                          " u.email");
+   if (sh) {
+      sqlite3_bind_int64(sh, 1, me);
+      int any = 0;
+      while (sqlite3_step(sh) == SQLITE_ROW) {
+         if (!any)
+            sb_add(&s, "<div>Shared with you: ");
+         any           = 1;
+         char esc[300] = {0};
+         html_esc(esc, sizeof esc, (const char *)sqlite3_column_text(sh, 1));
+         sb_add(&s, "<a href=\"/?who=%lld\">%s</a> ",
+                (long long)sqlite3_column_int64(sh, 0), esc);
+      }
+      if (any)
+         sb_add(&s, "</div>\n");
+      sqlite3_finalize(sh);
+   }
+
+   long now   = (long)time(NULL);
+   long today = now / 86400;
+   long newest_t, newest_glu;
+   newest_reading(owner, &newest_t, &newest_glu);
+
+   static struct rd rd[4096];
+   int nrd = load_recent(owner, today, rd, (int)(sizeof rd / sizeof rd[0]));
+   if (nrd < 0) {
+      sb_free(&s);
+      oops(r);
+      return;
+   }
+
+   /* Newest by TIME, not by bucket order: a backfilled row sorts by its own
+    * timestamp, which is what the reader is looking at. */
+   for (int i = 1; i < nrd; i++) {
+      struct rd tmp = rd[i];
+      int j         = i - 1;
+      while (j >= 0 && rd[j].t < tmp.t) {
+         rd[j + 1] = rd[j];
+         j--;
+      }
+      rd[j + 1] = tmp;
+   }
+
+   /* The big number is the latest value, and its stamp is shown whether or
+    * not it is fresh: with a fresh value it says how current it is, and when
+    * stale it says since when. */
+   char big[16] = "---";
+   char stamp[40];
+   snprintf(stamp, sizeof stamp, "%s", "-");
+   char title[64];
+   snprintf(title, sizeof title, "Pancra");
+   if (newest_t > 0) {
+      stamp_local(newest_t, tz, stamp, sizeof stamp);
+      if (now - newest_t <= 900)
+         snprintf(big, sizeof big, "%ld", newest_glu);
+      /* "HH:MM value", so a pinned tab is a glanceable readout -- and the
+       * value blanks with the big number, so the tab can never show a
+       * reading the page itself refuses to. */
+      snprintf(title, sizeof title, "%s %s", stamp + 11, big);
+   }
+   sb_add(&s, "<div>%s</div>\n", stamp);
+   sb_add(&s,
+          "<a href=\"/\" style=\"text-decoration:none;color:inherit\">"
+          "<div style=\"font-size:10em\">%s</div></a>\n"
+          "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">\n",
+          big);
+
+   static char pre[48 * 1024];
+   size_t k      = 0;
+   long win_from = now - (24L * 3600);
+   long prev_day = -1, cur_key = -1;
+   int cur_hour = 0, have = 0, cur_first = 0;
+   static struct hpt hp[HMAX];
+   int hn = 0;
+   for (int i = 0; i < nrd; i++) {
+      if (rd[i].t <= win_from || rd[i].t > now)
+         continue;
+      long local = rd[i].t + ((long)tz * 60);
+      long days  = local / 86400;
+      int hour   = (int)((local % 86400) / 3600);
+      int minute = (int)((local % 3600) / 60);
+      long key   = (days * 100) + hour;
+      if (key != cur_key) {
+         if (have && k + 120 < sizeof pre)
+            k += hour_row(pre + k, sizeof pre - k, cur_hour, hp, hn, cur_first);
+         cur_key  = key;
+         cur_hour = hour;
+         {
+            long hour_start = rd[i].t - ((long)minute * 60) - (rd[i].t % 60);
+            cur_first       = 0;
+            if (hour_start < win_from)
+               cur_first = (int)((win_from - hour_start + 299) / 300);
+            if (cur_first > HSLOTS)
+               cur_first = HSLOTS;
+         }
+         hn   = 0;
+         have = 1;
+         if (days != prev_day && k + 60 < sizeof pre) {
+            if (prev_day != -1)
+               pre[k++] = '\n';
+            char dstamp[40];
+            stamp_local(rd[i].t, tz, dstamp, sizeof dstamp);
+            dstamp[10] = '\0';
+            k          = apnd(pre, sizeof pre, k, "<b>%s</b>\n", dstamp);
+            prev_day   = days;
+         }
+      }
+      if (hn < HMAX) {
+         hp[hn].slot = minute / 5;
+         hp[hn].glu  = rd[i].glu;
+         hp[hn].ty   = rd[i].ty;
+         hn++;
+      }
+   }
+   if (have && k + 120 < sizeof pre)
+      k += hour_row(pre + k, sizeof pre - k, cur_hour, hp, hn, cur_first);
+   pre[k < sizeof pre ? k : sizeof pre - 1] = '\0';
+   sb_raw(&s, pre, k);
+   sb_add(&s,
+          "</pre>\n"
+          "<a href=\"/units%s\">Units ...</a>\n"
+          "<br>\n"
+          "<a href=\"/plots%s\">Plots ...</a>\n",
+          r->who, r->who);
+   if (foot_attr) {
+      char esc[300] = {0};
+      html_esc(esc, sizeof esc, owneremail);
+      sb_add(&s, "<div>Viewing <b>%s</b></div>\n", esc);
+   }
+
+   if (!newest_t) {
+      if (pair_is_paired(owner))
+         sb_add(&s, "<div>An app is paired. Nothing has synced yet.</div>\n");
+      else
+         sb_add(&s, "<div>No readings yet. Pair the app from "
+                    "<a href=\"/settings\">settings</a>.</div>\n");
+   }
+   page_refresh(r, 200, "OK", title, s.p ? s.p : "", 120);
+   sb_free(&s);
+}
+
+/* ---- the dose log: raw records, newest first, and nothing else ----
+ *
+ * Deliberately plain, like the single-user version: a table of what was
+ * entered, in the order it happened. No plot, no totals.
+ *
+ * The log is append-only ASSERTIONS now (see pancra's insulin.h): each row
+ * names a dose by id, and a later row for the same id corrects or retracts
+ * it. So the file is replayed rather than read -- last assertion per id
+ * wins, del removes -- which is also why an edit made today can change what
+ * a row from March says. */
+struct dose {
+   long id, t;
+   int type, units;
+};
+
+void h_units(struct req *r, long owner)
+{
+   int tz = tz_of(owner);
+   static struct dose d[4096];
+   int nd = 0;
+
+   sqlite3_stmt *st = db_prep("SELECT line FROM logrow WHERE user_id=?"
+                              " AND log='insulin' ORDER BY bucket, line");
+   if (st) {
+      sqlite3_bind_int64(st, 1, owner);
+      long legacy = 0;
+      while (sqlite3_step(st) == SQLITE_ROW) {
+         const char *ln = (const char *)sqlite3_column_text(st, 0);
+         if (!ln || *ln < '0' || *ln > '9')
+            continue;
+         int commas = 0;
+         for (const char *q = ln; *q; q++)
+            if (*q == ',')
+               commas++;
+         long id = 0, t = 0;
+         int del = 0, type = 0, units = 0;
+         if (commas >= 6) {
+            long f[7];
+            const char *q = ln;
+            for (int i = 0; i < 7; i++) {
+               f[i] = strtol(q, NULL, 10);
+               q    = strchr(q, ',');
+               if (!q)
+                  break;
+               q++;
+            }
+            id    = f[1];
+            del   = (int)f[2];
+            t     = f[3];
+            type  = (int)f[4];
+            units = (int)f[5];
+         } else {
+            /* the original four-field row: no id, so give it a negative one
+             * by file order, exactly as the app does */
+            /* ZERO-INITIALISED, and the field count is checked. The loop stops
+             * at the first missing comma, so a row with fewer than three
+             * fields left f[1] and f[2] holding whatever was on the stack --
+             * and those become the dose's TYPE and UNITS, rendered to the
+             * reader as if they had been recorded. A short row is malformed
+             * data, not a reason to invent a dose. */
+            long f[4]     = {0};
+            int got       = 0;
+            const char *q = ln;
+            for (int i = 0; i < 4; i++) {
+               f[i] = strtol(q, NULL, 10);
+               got++;
+               q = strchr(q, ',');
+               if (!q)
+                  break;
+               q++;
+            }
+            if (got < 3)
+               continue;
+            id    = -(++legacy);
+            t     = f[0];
+            type  = (int)f[1];
+            units = (int)f[2];
+         }
+         if (!id)
+            continue;
+         /* THE SAME VALIDATION THE APP APPLIES, which this copy had dropped.
+          *
+          * This replay is a clone of app/insulin.c's ins_parse_assert and
+          * ins_apply -- same dialect select, same field order, same
+          * last-wins-per-id, same negative ids for the legacy rows -- but the
+          * app REJECTS an assertion whose time, type or dose is out of range,
+          * and this one rendered whatever strtol returned. A malformed row the
+          * phone refuses to show was displayed here as a dose the person had
+          * taken. A viewer of a medical record must not invent entries its own
+          * writer would not accept.
+          *
+          * The bounds are app/insulin.h's, restated because the server cannot
+          * include that header: they are protocol, and like everything else on
+          * the wire the two halves have to be changed together. */
+         if (t <= 0 || t >= 32503680000L) /* INS_T_MAX: the year 3000 */
+            continue;
+         if (type != 0 && type != 1) /* INS_SLOW / INS_FAST */
+            continue;
+         if (units < 1 || units > 99) /* INS_UNITS_MIN..INS_UNITS_MAX */
+            continue;
+         int at = -1;
+         for (int i = 0; i < nd; i++)
+            if (d[i].id == id) {
+               at = i;
+               break;
+            }
+         if (del) {
+            if (at >= 0) {
+               for (int i = at + 1; i < nd; i++)
+                  d[i - 1] = d[i];
+               nd--;
+            }
+            continue;
+         }
+         if (at < 0) {
+            if (nd >= (int)(sizeof d / sizeof d[0]))
+               continue;
+            at = nd++;
+         }
+         d[at].id    = id;
+         d[at].t     = t;
+         d[at].type  = type;
+         d[at].units = units;
+      }
+      sqlite3_finalize(st);
+   }
+
+   /* newest first, like every other list here */
+   for (int i = 1; i < nd; i++) {
+      struct dose tmp = d[i];
+      int j           = i - 1;
+      while (j >= 0 && d[j].t < tmp.t) {
+         d[j + 1] = d[j];
+         j--;
+      }
+      d[j + 1] = tmp;
+   }
+
+   struct sb s = {0};
+   sb_add(&s, "<pre>\n");
+   if (!nd)
+      sb_add(&s, "(nothing logged)\n");
+   /* ONE RECORD PER LINE: date, time, amount, kind. Every line carries its
+    * own date, so none of it depends on a heading further up. */
+   for (int i = 0; i < nd; i++) {
+      char when[64];
+      stamp_local(d[i].t, tz, when, sizeof when);
+      sb_add(&s, "%s %4d  %s\n", when, d[i].units,
+             d[i].type == 1 ? "fast" : "slow");
+   }
+   sb_add(&s, "</pre>\n");
+   sub_page(r, "Units", s.p ? s.p : "");
+   sb_free(&s);
+}
