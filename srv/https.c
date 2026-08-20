@@ -13,6 +13,7 @@
  * is this file's. They used to be the same file, which made the waiting rules
  * hard to find among the crypto, and the crypto impossible to replace.
  */
+#include "https.h"
 #include "http.h"
 #include "tls.h"
 #include <sys/time.h>
@@ -23,6 +24,14 @@
  * http_max_per_conn and by yielding to waiting clients. */
 static _Thread_local double conn_start;
 
+/* THE CONNECTION THIS WORKER IS SERVING, for the one callback that cannot be
+ * handed it: tls.c's give-up hook takes no argument (it is consulted from
+ * inside a retry loop), and the waiting rule below has to know which
+ * listening socket to check. A worker serves exactly one connection at a
+ * time, which is what makes a per-thread pointer exact rather than an
+ * assumption -- the same reason conn_start above is per-thread. */
+static _Thread_local const struct http_conn *cur_conn;
+
 /* THE WAITING RULE, handed to srv/tls.c to consult between retries.
  *
  * A peer gets the full budget while it is the only one who wants the server.
@@ -32,69 +41,90 @@ static _Thread_local double conn_start;
  * client eight seconds. */
 static int give_up(void)
 {
-   return http_mono_s() - conn_start > http_deadline_s ||
-          http_give_way(conn_start);
+   return http_mono_s() - conn_start > HTTPS_DEADLINE_S ||
+          http_give_way(cur_conn, conn_start);
 }
 
-static ssize_t tls_read_hook(int fd, void *buf, size_t n)
+static ssize_t tls_read_hook(const struct http_conn *c, void *buf, size_t n)
 {
-   (void)fd;
-   return tls_recv(buf, n, give_up);
+   return tls_recv(c->tp_state, buf, n, give_up);
 }
 
-static ssize_t tls_write_hook(int fd, const void *buf, size_t n)
+static ssize_t tls_write_hook(const struct http_conn *c, const void *buf,
+                              size_t n)
 {
-   (void)fd;
    /* No give_up on the way out: the response is already owed to this client,
     * and abandoning it half-written is worse for everyone than the wait. */
-   return tls_send(buf, n, NULL);
+   return tls_send(c->tp_state, buf, n, NULL);
 }
 
-static int buffered_hook(void)
+static int buffered_hook(const struct http_conn *c)
 {
-   return tls_pending();
+   return tls_pending(c->tp_state);
 }
 
-static void new_request_hook(void)
+static void new_request_hook(const struct http_conn *c)
 {
+   cur_conn   = c;
    conn_start = http_mono_s();
 }
+
+/* THE TLS TRANSPORT, as one named value.
+ *
+ * These five used to be assigned into loose globals in http.c at startup,
+ * which converted the whole process to TLS and left http.c unable to say what
+ * its own same-named write wrote to. Named and handed to the pool, the
+ * transport belongs to the connections this server accepts. */
+static const struct http_transport tls_transport = {
+    .read        = tls_read_hook,
+    .write       = tls_write_hook,
+    .buffered    = buffered_hook,
+    .new_request = new_request_hook,
+    .deadline_s  = HTTPS_DEADLINE_S,
+};
 
 /* Runs on the accepted socket before any request. Doing the handshake inside
  * the pool worker is the whole point: ten can be in flight at once on a board
  * that computes one at a time, because a handshake is mostly waiting. */
-static int prepare(int fd)
+static int prepare(struct http_conn *c)
 {
+   cur_conn   = c;
    conn_start = http_mono_s();
-   return tls_handshake(fd, give_up);
+   /* THE ONE AMBIENT LOOKUP, and it happens once. From here the connection
+    * travels as c->tp_state and every tls.c call names it. */
+   c->tp_state = tls_conn_slot();
+   return tls_handshake(c->tp_state, c->fd, give_up);
 }
 
-static void finish(int fd)
+static void finish(struct http_conn *c)
 {
-   (void)fd;
-   tls_bye();
+   tls_bye(c->tp_state);
 }
 
 int https_serve(int port, const char *cert, const char *key, const char *name,
-                http_handler handle)
+                http_handler handle, const struct http_policy *pol, void *user)
 {
    if (tls_init(cert, key, name) != 0)
       return 1;
 
-   /* From here on every connection is TLS: install the hooks once. */
-   http_read        = tls_read_hook;
-   http_write       = tls_write_hook;
-   http_deadline_s  = HTTPS_DEADLINE_S;
-   http_buffered    = buffered_hook;
-   http_new_request = new_request_hook;
-
    int srv = http_listen(port, name);
    if (srv < 0)
       return 1;
-   /* So the request loop can stop waiting on an idle keep-alive connection
-    * the moment another client is queued behind it. */
-   http_set_idle_watch(srv);
+
+   /* The policy travels with the pool, and the pool's listening socket is
+    * what a connection checks for clients queued behind it -- so the request
+    * loop can stop waiting on an idle keep-alive connection the moment
+    * somebody else is waiting. Both used to be process globals installed by
+    * setter calls that had to happen in the right order before the first
+    * accept. */
    struct http_pool p = {
-       .srv = srv, .handle = handle, .prepare = prepare, .finish = finish};
+       .srv     = srv,
+       .handle  = handle,
+       .user    = user,
+       .tp      = &tls_transport,
+       .pol     = pol ? *pol : (struct http_policy){0, 2.0, 500, HTTP_BODY_MAX},
+       .prepare = prepare,
+       .finish  = finish
+   };
    return http_run_pool(&p, HTTP_WORKERS);
 }

@@ -12,6 +12,12 @@
 #include <stddef.h>
 
 void *memcpy(void *dst, const void *src, size_t n);
+/* memmove, not memcpy, when the ranges may overlap: memcpy's contract says
+ * they must not, and a compiler is entitled to act on that. Declared here for
+ * the same reason as the rest of this header -- the app builds -ffreestanding,
+ * where no libc declares them, and a use without a declaration is an implicit
+ * int-returning function whose result is then treated as a pointer. */
+void *memmove(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 int strcmp(const char *a, const char *b);

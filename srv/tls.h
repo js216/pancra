@@ -33,33 +33,84 @@ typedef int (*tls_giveup_fn)(void);
  * is printed. */
 int tls_init(const char *cert_pem, const char *key_pem, const char *name);
 
+/* ONE TLS CONNECTION. Opaque: everything inside it is tls.c's business.
+ *
+ * These five used to take no connection at all -- the header said they acted
+ * on "the connection this thread last handshook", which is a sentence doing
+ * the job a parameter should. A caller could not say which connection it
+ * meant, and nothing stopped a hook that had forgotten to handshake from
+ * reading a previous connection's keys. */
+struct tls_conn;
+
+/* This worker's connection slot. Storage is per WORKER and reused, because
+ * the struct is several kilobytes and this runs on a 56 MB board -- but it is
+ * fetched ONCE, when a connection is accepted, and passed explicitly from
+ * there on. */
+struct tls_conn *tls_conn_slot(void);
+
 /* Take an accepted socket through the handshake, on this thread. Returns 1 on
  * success. A failure needs no message: port scanners and plain-HTTP probes
  * hit a public 443 constantly, and syslog is not a honeypot log. */
-int tls_handshake(int fd, tls_giveup_fn giveup);
+int tls_handshake(struct tls_conn *c, int fd, tls_giveup_fn giveup);
 
-/* Read and write the connection this thread last handshook. Both return -1
- * on error or on giving up; tls_send moves all `n` bytes or fails. */
-ssize_t tls_recv(void *buf, size_t n, tls_giveup_fn giveup);
-ssize_t tls_send(const void *buf, size_t n, tls_giveup_fn giveup);
+/* Read and write one connection. Both return -1 on error or on giving up;
+ * tls_send moves all `n` bytes or fails. */
+ssize_t tls_recv(struct tls_conn *c, void *buf, size_t n, tls_giveup_fn giveup);
+ssize_t tls_send(struct tls_conn *c, const void *buf, size_t n,
+                 tls_giveup_fn giveup);
 
 /* Whether whole records are already decrypted and waiting. Polling the socket
  * cannot see those, so a caller that sleeps on the fd must ask this first or
  * it will mistake a buffered request for an idle connection. */
-int tls_pending(void);
+int tls_pending(struct tls_conn *c);
 
 /* Say goodbye, best effort: the response is already flushed and the peer may
  * well have hung up first. */
-void tls_bye(void);
+void tls_bye(struct tls_conn *c);
 
 /* The TLS 1.3 key schedule (RFC 8446 7.1). HKDF itself is a primitive and
  * lives in lib/hkdf.c; the "tls13 " label wrapper is TLS and lives in tls.c.
  * Declared here only so the test suite can pin both to RFC 8448's published
  * handshake -- the one way to learn a key schedule is wrong without a peer
- * to disagree with you. */
-void hkdf_expand_label(const uint8_t secret[32], const char *label,
-                       const uint8_t *ctx, size_t ctxn, uint8_t *out, size_t n);
-void derive_secret(const uint8_t secret[32], const char *label,
-                   const uint8_t *transcript, size_t tn, uint8_t out[32]);
+ * to disagree with you.
+ *
+ * BOTH RETURN 1 OR 0, AND 0 LEAVES `out` UNTOUCHED. Every field of an
+ * HkdfLabel has a width in RFC 8446 7.1 and every one of them is now
+ * enforced; an over-long label, an over-long context, or an output length
+ * HKDF cannot produce is refused rather than truncated into a derivation that
+ * succeeds with the wrong inputs. Callers here pass literals and fixed sizes,
+ * so a 0 means a programming error, not a peer -- but it is reported, because
+ * the alternative is a session key derived from a label nobody wrote. */
+int hkdf_expand_label(const uint8_t secret[32], const char *label,
+                      const uint8_t *ctx, size_t ctxn, uint8_t *out, size_t n);
+int derive_secret(const uint8_t secret[32], const char *label,
+                  const uint8_t *transcript, size_t tn, uint8_t out[32]);
+
+#ifdef TLS_FAULTS
+/* ---- THE TEST BUILD'S DOOR ONTO SESSION TICKETS ------------------------
+ *
+ * Present only under -DTLS_FAULTS, which only srv/test/cryptotest.c's recipe
+ * sets, alongside the injected monotonic clock (TLS_FAIL_MONOTONIC,
+ * TLS_MONOTONIC_FIXED -- see srv/tls.c). A shipping binary has none of this,
+ * the same way nothing that ships carries srv/db.c's DB_FAULTS hooks.
+ *
+ * WHY A DOOR AND NOT AN END-TO-END TEST. "No monotonic clock, no ticket"
+ * cannot be provoked from outside the process: clock_gettime(CLOCK_MONOTONIC)
+ * does not fail on a test machine, and the peer that would have to hold the
+ * other end of a resumption is openssl, in another process, where the fault
+ * cannot be injected. These three let the suite seal a ticket, present it
+ * back, and watch a NewSessionTicket either reach a socket or not.
+ *
+ * tls_fault_send_ticket runs one throwaway PLAINTEXT connection on `fd` and
+ * returns 1 only when a NewSessionTicket was written, so a caller can assert
+ * on the bytes as well as on the answer. It reuses this worker's connection
+ * slot, which it clears first. */
+size_t tls_fault_ticket_seal(const uint8_t psk[32], uint8_t *out);
+int tls_fault_ticket_open(const uint8_t *t, size_t n, uint8_t psk[32]);
+int tls_fault_send_ticket(int fd);
+/* Fill the transcript to `pre`, offer `n` more: 1 = counted, 0 = refused.
+ * Writes whether the connection was marked fatal through `fatal`. */
+int tls_fault_transcript(size_t pre, size_t n, int *fatal);
+#endif
 
 #endif

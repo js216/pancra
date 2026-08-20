@@ -36,6 +36,7 @@
 int *__errno(void);
 #define errno  (*__errno())
 #define ENOENT 2 /* Linux; this build targets nothing else */
+#define EINTR  4 /* a write cut short by a signal is not a failed write */
 #endif
 
 /* POSIX file / RNG source */
@@ -43,8 +44,16 @@ int open(const char *path, int flags, ...);
 long read(int fd, void *buf, size_t n);
 long write(int fd, const void *buf, size_t n);
 int close(int fd);
+int fsync(int fd);
 int unlink(const char *path);
+/* NOT redeclared on a hosted build: rename is the one name in this list that
+ * <stdio.h> already provides, so declaring it again here is a second
+ * declaration of a standard function -- with different parameter names, which
+ * is exactly what the linter reports. Same shape as the errno split above:
+ * the freestanding shim has no rename, the hosted libc does. */
+#if !__STDC_HOSTED__
 int rename(const char *from, const char *to);
+#endif
 int ftruncate(int fd, long len);
 int sched_yield(void);
 long lseek(int fd, long off, int whence);

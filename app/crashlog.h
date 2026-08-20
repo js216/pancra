@@ -19,10 +19,13 @@
 #ifndef CRASHLOG_H
 #define CRASHLOG_H
 
+#include <stdatomic.h>
+
 /* What to record besides the signal. POINTERS to the live values, not copies:
  * the handler must read whatever is true at the moment of the crash, and it
- * cannot call anything to go and fetch it. Reading through them is a plain
- * load, which is safe in a signal handler; anything cleverer would not be. */
+ * cannot call anything to go and fetch it. Reading through them is a single
+ * lock-free load, which is safe in a signal handler; anything cleverer would
+ * not be. */
 struct crash_ctx {
    /* TWO stars, and the difference is the whole point.
     *
@@ -34,7 +37,32 @@ struct crash_ctx {
     * every crash report at "boot". Storing the address of the variable makes
     * the handler read the label that is current at the moment of the crash,
     * which is the only reason the field exists. */
-   const volatile char **where; /* -> the last checkpoint label */
+   /* ATOMIC, not volatile, and for a reason volatile cannot serve: the
+    * checkpoint is written by every thread in the app and read here from a
+    * signal handler that can interrupt any of them mid-instruction. volatile
+    * keeps the compiler from discarding the store; it does not make the load
+    * indivisible, and a torn pointer read in a crash handler turns a crash
+    * report into a second crash. A relaxed atomic load is one instruction on
+    * every target this builds for, and is async-signal-safe. */
+   const char *_Atomic *where; /* -> the last checkpoint label */
+
+   /* THE REST STAY VOLATILE, deliberately, and this is the argument.
+    *
+    * They are pointers into ordinary storage the app already owns -- a char
+    * array and three plain ints -- and what the handler needs from them is
+    * that the compiler re-read them at the moment of the crash instead of
+    * using a value it cached earlier. That is exactly what volatile is for,
+    * and it is what the rest of the world calls this idiom.
+    *
+    * The checkpoint is different in kind, not degree: it is a pointer that is
+    * REPOINTED, so a stale or torn read there is a wild pointer the handler
+    * then walks. An int read one microsecond out of date is a slightly wrong
+    * number in a diagnostic line, which is the worst these can do.
+    *
+    * (`glu` and `nhist` are written by binder threads under the history lock,
+    * so they are cross-thread state -- but an aligned int on this target
+    * cannot tear, the handler cannot take a lock, and a crash report is not
+    * somewhere to trade a guaranteed line for a stricter one.) */
    const volatile char *status; /* the status line on screen */
    const volatile int *glu;     /* current glucose, or -1 */
    const volatile int *menu;    /* which screen was up */

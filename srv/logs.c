@@ -18,8 +18,10 @@
 #include "logs.h"
 #include "db.h"
 #include "http.h"
+#include "oops.h"
+#include "page.h"
+#include "proto.h"
 #include "sha256.h"
-#include "sync.h"
 #include "util.h"
 #include <sqlite3.h>
 #include <stdio.h>
@@ -70,7 +72,7 @@ static void send_sb(struct req *r, struct sb *s)
    if (s->err)
       oops(r);
    else
-      http_respond(r->fd, 200, "OK", "text/plain", s->p ? s->p : "", s->n);
+      http_respond(r->c, 200, "OK", "text/plain", s->p ? s->p : "", s->n);
    sb_free(s);
 }
 
@@ -81,8 +83,9 @@ static void send_sb(struct req *r, struct sb *s)
  * index scan and no intermediate storage. */
 void h_digest(struct req *r)
 {
-   sqlite3_stmt *st = db_prep("SELECT log,bucket,line FROM logrow"
-                              " WHERE user_id=? ORDER BY log,bucket,line");
+   sqlite3_stmt *st =
+       db_prep(r->db, "SELECT log,bucket,line FROM logrow"
+                      " WHERE user_id=? ORDER BY log,bucket,line");
    if (!st) {
       oops(r);
       return;
@@ -95,7 +98,8 @@ void h_digest(struct req *r)
    int in_log = 0, in_bucket = 0;
    struct sha256_ctx bh, lh;
 
-   while (sqlite3_step(st) == SQLITE_ROW) {
+   int rc;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *log = (const char *)sqlite3_column_text(st, 0);
       long bucket     = (long)sqlite3_column_int64(st, 1);
       const char *ln  = (const char *)sqlite3_column_text(st, 2);
@@ -133,7 +137,13 @@ void h_digest(struct req *r)
       hash_line(&bh, ln);
       rows++;
    }
+   int done = db_finished(rc);
    sqlite3_finalize(st);
+   if (!done) {
+      sb_free(&out);
+      oops(r);
+      return;
+   }
    if (in_bucket) {
       char bhex[17];
       hash16(&bh, bhex);
@@ -155,12 +165,12 @@ void h_digest(struct req *r)
 void h_digest_log(struct req *r, const char *log)
 {
    if (!log_name_ok(log)) {
-      http_text(r->fd, 400, "Bad Request", "bad log name\n");
+      http_text(r->c, 400, "Bad Request", "bad log name\n");
       return;
    }
    sqlite3_stmt *st =
-       db_prep("SELECT bucket,line FROM logrow"
-               " WHERE user_id=? AND log=? ORDER BY bucket,line");
+       db_prep(r->db, "SELECT bucket,line FROM logrow"
+                      " WHERE user_id=? AND log=? ORDER BY bucket,line");
    if (!st) {
       oops(r);
       return;
@@ -171,7 +181,8 @@ void h_digest_log(struct req *r, const char *log)
    long cur = -1, rows = 0;
    int in_bucket = 0;
    struct sha256_ctx bh;
-   while (sqlite3_step(st) == SQLITE_ROW) {
+   int rc;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
       long bucket    = (long)sqlite3_column_int64(st, 0);
       const char *ln = (const char *)sqlite3_column_text(st, 1);
       if (!ln)
@@ -192,7 +203,13 @@ void h_digest_log(struct req *r, const char *log)
       hash_line(&bh, ln);
       rows++;
    }
+   int done = db_finished(rc);
    sqlite3_finalize(st);
+   if (!done) {
+      sb_free(&out);
+      oops(r);
+      return;
+   }
    if (in_bucket) {
       char bhex[17];
       hash16(&bh, bhex);
@@ -209,12 +226,12 @@ void h_digest_log(struct req *r, const char *log)
 void h_bucket_get(struct req *r, const char *log, long bucket)
 {
    if (!log_name_ok(log) || bucket < 0) {
-      http_text(r->fd, 400, "Bad Request", "bad log or bucket\n");
+      http_text(r->c, 400, "Bad Request", "bad log or bucket\n");
       return;
    }
-   sqlite3_stmt *st = db_prep("SELECT line FROM logrow"
-                              " WHERE user_id=? AND log=? AND bucket=?"
-                              " ORDER BY line");
+   sqlite3_stmt *st = db_prep(r->db, "SELECT line FROM logrow"
+                                     " WHERE user_id=? AND log=? AND bucket=?"
+                                     " ORDER BY line");
    if (!st) {
       oops(r);
       return;
@@ -223,13 +240,44 @@ void h_bucket_get(struct req *r, const char *log, long bucket)
    sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
    sqlite3_bind_int64(st, 3, bucket);
    struct sb out = {0};
-   while (sqlite3_step(st) == SQLITE_ROW) {
+   int rc;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *ln = (const char *)sqlite3_column_text(st, 0);
       if (ln)
          sb_add(&out, "%s\n", ln);
    }
+   int done = db_finished(rc);
    sqlite3_finalize(st);
+   if (!done) {
+      sb_free(&out);
+      oops(r);
+      return;
+   }
    send_sb(r, &out);
+}
+
+/* ONE QUOTA COUNT, or a definite failure.
+ *
+ * `log` NULL binds only the user; a `bucket` of -1 leaves that parameter
+ * unbound. Returns 0 if the statement could not be prepared or did not
+ * produce its row -- see the caller for why that must refuse the write rather
+ * than assume zero. */
+static int quota_count(struct db *d, long *out, const char *sql, long uid,
+                       const char *log, long bucket)
+{
+   sqlite3_stmt *st = db_prep(d, sql);
+   if (!st)
+      return 0;
+   sqlite3_bind_int64(st, 1, uid);
+   if (log)
+      sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
+   if (bucket >= 0)
+      sqlite3_bind_int64(st, 3, bucket);
+   int ok = sqlite3_step(st) == SQLITE_ROW;
+   if (ok)
+      *out = (long)sqlite3_column_int64(st, 0);
+   sqlite3_finalize(st);
+   return ok;
 }
 
 /* A row is one line of text and nothing else: the bytes ARE the identity, so
@@ -261,7 +309,7 @@ static int row_ok(const char *line, size_t len)
 void h_bucket_put(struct req *r, const char *log, long bucket)
 {
    if (!log_name_ok(log) || bucket < 0 || bucket > 0x7fffffffL) {
-      http_text(r->fd, 400, "Bad Request", "bad log or bucket\n");
+      http_text(r->c, 400, "Bad Request", "bad log or bucket\n");
       return;
    }
    /* Parse and vet the WHOLE body before touching the database: a partially
@@ -276,7 +324,7 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
          len--;
       if (len) {
          if (!row_ok(r->body + i, len)) {
-            http_text(r->fd, 400, "Bad Request", "malformed row\n");
+            http_text(r->c, 400, "Bad Request", "malformed row\n");
             return;
          }
          nlines++;
@@ -284,7 +332,7 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
       i = j + 1;
    }
    if (nlines > BUCKET_ROWS) {
-      http_text(r->fd, 400, "Bad Request", "too many rows in one bucket\n");
+      http_text(r->c, 400, "Bad Request", "too many rows in one bucket\n");
       return;
    }
 
@@ -299,72 +347,69 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
     * time-of-use, and two concurrent PUTs could each see room for the last
     * rows and both take it. BEGIN IMMEDIATE takes the write lock now, so the
     * numbers this reads are the numbers the INSERT obeys. */
-   if (!db_exec("BEGIN IMMEDIATE")) {
+   if (!db_exec(r->db, "BEGIN IMMEDIATE")) {
       oops(r);
       return;
    }
-   sqlite3_stmt *st;
+   /* EVERY COUNT IS MANDATORY.
+    *
+    * These four queries decide whether the write is allowed. Each used to be
+    * wrapped in `if (st)` with the count left at 0 when prepare failed, and
+    * with a step that was not a row leaving it at 0 too -- so a database
+    * error did not refuse the write, it granted UNLIMITED quota: zero rows
+    * held, zero buckets, zero logs, every cap passed. The one path where the
+    * server cannot see what it is holding is exactly the path where it must
+    * not decide it has room. */
    long have_rows = 0, have_here = 0, have_logs = 0, have_buckets = 0;
-   st = db_prep("SELECT count(*) FROM logrow WHERE user_id=?");
-   if (st) {
-      sqlite3_bind_int64(st, 1, r->uid);
-      if (sqlite3_step(st) == SQLITE_ROW)
-         have_rows = (long)sqlite3_column_int64(st, 0);
-      sqlite3_finalize(st);
-   }
-   st = db_prep("SELECT count(*) FROM logrow"
-                " WHERE user_id=? AND log=? AND bucket=?");
-   if (st) {
-      sqlite3_bind_int64(st, 1, r->uid);
-      sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
-      sqlite3_bind_int64(st, 3, bucket);
-      if (sqlite3_step(st) == SQLITE_ROW)
-         have_here = (long)sqlite3_column_int64(st, 0);
-      sqlite3_finalize(st);
-   }
-   st = db_prep("SELECT count(DISTINCT log) FROM logrow WHERE user_id=?");
-   if (st) {
-      sqlite3_bind_int64(st, 1, r->uid);
-      if (sqlite3_step(st) == SQLITE_ROW)
-         have_logs = (long)sqlite3_column_int64(st, 0);
-      sqlite3_finalize(st);
-   }
-   st = db_prep("SELECT count(DISTINCT bucket) FROM logrow"
-                " WHERE user_id=? AND log=?");
-   if (st) {
-      sqlite3_bind_int64(st, 1, r->uid);
-      sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
-      if (sqlite3_step(st) == SQLITE_ROW)
-         have_buckets = (long)sqlite3_column_int64(st, 0);
-      sqlite3_finalize(st);
+   int counted = 1;
+   counted     = counted && quota_count(r->db, &have_rows,
+                                        "SELECT count(*) FROM logrow"
+                                        " WHERE user_id=?",
+                                        r->uid, NULL, -1);
+   counted = counted && quota_count(r->db, &have_here,
+                                    "SELECT count(*) FROM logrow"
+                                    " WHERE user_id=? AND log=? AND bucket=?",
+                                    r->uid, log, bucket);
+   counted = counted && quota_count(r->db, &have_logs,
+                                    "SELECT count(DISTINCT log) FROM logrow"
+                                    " WHERE user_id=?",
+                                    r->uid, NULL, -1);
+   counted = counted && quota_count(r->db, &have_buckets,
+                                    "SELECT count(DISTINCT bucket) FROM logrow"
+                                    " WHERE user_id=? AND log=?",
+                                    r->uid, log, -1);
+   if (!counted) {
+      db_exec(r->db, "ROLLBACK");
+      oops(r);
+      return;
    }
    if (have_rows - have_here + (long)nlines > USER_ROWS) {
-      db_exec("ROLLBACK");
-      http_text(r->fd, 507, "Insufficient Storage", "at the row cap\n");
+      db_exec(r->db, "ROLLBACK");
+      http_text(r->c, 507, "Insufficient Storage", "at the row cap\n");
       return;
    }
    if (have_here == 0 && nlines && have_buckets >= LOG_BUCKETS) {
-      db_exec("ROLLBACK");
-      http_text(r->fd, 400, "Bad Request", "too many buckets in one log\n");
+      db_exec(r->db, "ROLLBACK");
+      http_text(r->c, 400, "Bad Request", "too many buckets in one log\n");
       return;
    }
    if (have_here == 0 && nlines && have_buckets == 0 &&
        have_logs >= USER_LOGS) {
-      db_exec("ROLLBACK");
-      http_text(r->fd, 400, "Bad Request", "too many logs\n");
+      db_exec(r->db, "ROLLBACK");
+      http_text(r->c, 400, "Bad Request", "too many logs\n");
       return;
    }
-   sqlite3_stmt *del =
-       db_prep("DELETE FROM logrow WHERE user_id=? AND log=? AND bucket=?");
-   sqlite3_stmt *ins = db_prep("INSERT OR IGNORE INTO"
-                               " logrow(user_id,log,bucket,line)"
-                               " VALUES(?,?,?,?)");
+   sqlite3_stmt *del = db_prep(
+       r->db, "DELETE FROM logrow WHERE user_id=? AND log=? AND bucket=?");
+   sqlite3_stmt *ins = db_prep(r->db, "INSERT OR IGNORE INTO"
+                                      " logrow(user_id,log,bucket,line)"
+                                      " VALUES(?,?,?,?)");
    if (!del || !ins) {
       if (del)
          sqlite3_finalize(del);
       if (ins)
          sqlite3_finalize(ins);
-      db_exec("ROLLBACK");
+      db_exec(r->db, "ROLLBACK");
       oops(r);
       return;
    }
@@ -397,12 +442,16 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
    }
    sqlite3_finalize(ins);
    if (!ok) {
-      db_exec("ROLLBACK");
+      db_exec(r->db, "ROLLBACK");
       oops(r);
       return;
    }
-   db_exec("COMMIT");
+   if (!db_exec(r->db, "COMMIT")) {
+      (void)db_exec(r->db, "ROLLBACK");
+      oops(r);
+      return;
+   }
    char msg[64];
    snprintf(msg, sizeof msg, "stored %ld rows\n", stored);
-   http_text(r->fd, 200, "OK", msg);
+   http_text(r->c, 200, "OK", msg);
 }

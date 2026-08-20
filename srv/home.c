@@ -4,8 +4,10 @@
  */
 #include "db.h"
 #include "http.h"
+#include "oops.h"
 #include "page.h"
 #include "pair.h"
+#include "rowdec.h"
 #include "util.h"
 #include <sqlite3.h>
 #include <stdarg.h> /* apnd: a bounded snprintf append */
@@ -82,6 +84,19 @@ static size_t hour_row(char *out, size_t cap, int hour, const struct hpt *hp,
    return k;
 }
 
+/* HOW OLD THE BIG NUMBER MAY BE, in seconds -- and it is the PHONE's window,
+ * not a number of this file's own.
+ *
+ * The page and the app must blank at the same moment. They did not: this was
+ * 900 s against the app's 660, so for four minutes after a sensor went quiet
+ * the web page showed a value the phone had already replaced with "---", and
+ * a reader comparing the two saw the page contradict the device. The app's
+ * definition lives in app/alarmlogic.h (AL_FRESH_S) with the reasoning for
+ * the value; `make crosscheck` fails if these two ever drift apart again --
+ * the server cannot include an app header, so the agreement is checked
+ * rather than shared. */
+#define WEB_FRESH_S 660
+
 /* One reading row, newest first, as the page walks backwards. */
 struct rd {
    long t, glu;
@@ -97,65 +112,109 @@ struct rd {
  * The LIMIT is not a guess at how many rows are recent: rows arrive in bucket
  * order and a backfilled row can sort ahead of them, so the newest few
  * buckets are scanned and the maximum taken by TIME. */
-static void newest_reading(long owner, long *out_t, long *out_glu)
+/* THE BIG NUMBER IS A CGM READING, never a fingerstick.
+ *
+ * This took the newest row of any kind, so a meter reading -- taken minutes
+ * after the sensor's last sample, which is exactly when people test -- became
+ * the number at the top of the page. The two are not interchangeable: a
+ * fingerstick is a spot check from a different device with its own
+ * calibration, and the page shows it in brackets in the table for precisely
+ * that reason. The app's own big number has always resolved the primary CGM;
+ * only this page conflated them.
+ *
+ * Returns 0 when the scan did not finish: the caller shows "--" rather than a
+ * NEWEST reading that is merely the newest of the rows we managed to read. */
+static int newest_reading(struct db *d, long owner, long *out_t, long *out_glu)
 {
    *out_t = *out_glu = 0;
    sqlite3_stmt *st =
-       db_prep("SELECT line FROM logrow WHERE user_id=? AND log='readings'"
-               " ORDER BY bucket DESC, line DESC LIMIT 400");
+       db_prep(d, "SELECT line FROM logrow WHERE user_id=? AND log='readings'"
+                  " ORDER BY bucket DESC, line DESC LIMIT 400");
    if (!st)
-      return;
+      return 0;
    sqlite3_bind_int64(st, 1, owner);
-   while (sqlite3_step(st) == SQLITE_ROW) {
+   int rc;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *ln = (const char *)sqlite3_column_text(st, 0);
-      if (!ln || *ln < '0' || *ln > '9')
+      if (!ln)
          continue;
-      long t         = strtol(ln, NULL, 10);
-      const char *c1 = strchr(ln, ',');
-      if (!c1 || t <= *out_t)
+      /* ONE DECODER, and it is the one every other reader here uses (see
+       * rowdec.h). A row either decodes whole -- every field present, every
+       * numeric field consumed entirely, every value in range -- or it is not
+       * a row. There is no partial answer, because a partial answer is what
+       * put a dose in the plot and an untyped row at the top of the page. */
+      struct row_reading rr;
+      if (!row_decode(ln, (int)strlen(ln), &rr))
          continue;
-      *out_t   = t;
-      *out_glu = strtol(c1 + 1, NULL, 10);
+      if (rr.t <= *out_t)
+         continue;
+      /* REQUIRE AN EXPLICIT CGM. Not "anything but a fingerstick", and not
+       * "a fingerstick unless the row forgot to say": KIND_INS and KIND_WT
+       * are a DOSE and a BODY WEIGHT, so "8" would be printed as a blood
+       * sugar of 8, and a row that does not state its kind does not say what
+       * device made it. The number at the top of the page is the one a
+       * person reads before deciding whether to eat or to inject; it may
+       * only come from a row that says what it is. (row_decode already
+       * refuses a row that stops before the kind.) */
+      if (rr.kind != ROW_KIND_CGM)
+         continue; /* including ROW_KIND_NONE: silence is not a claim */
+      *out_t   = rr.t;
+      *out_glu = rr.glu;
    }
+   int ok = db_finished(rc);
    sqlite3_finalize(st);
+   if (!ok) {
+      *out_t = *out_glu = 0;
+      return 0;
+   }
+   return 1;
 }
 
 /* The readings the table draws, from the last few days of buckets. Returns
  * the count, or -1 if the record could not be read at all -- which is not the
  * same as a record with nothing in it. */
-static int load_recent(long owner, long today, struct rd *out, int cap)
+static int load_recent(struct db *d, long owner, long today, struct rd *out,
+                       int cap)
 {
    sqlite3_stmt *st =
-       db_prep("SELECT line FROM logrow WHERE user_id=? AND log='readings'"
-               " AND bucket >= ? ORDER BY bucket DESC, line DESC");
+       db_prep(d, "SELECT line FROM logrow WHERE user_id=? AND log='readings'"
+                  " AND bucket >= ? ORDER BY bucket DESC, line DESC");
    if (!st)
       return -1;
    sqlite3_bind_int64(st, 1, owner);
    sqlite3_bind_int64(st, 2, today - 2);
 
    int n = 0;
-   while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+   int rc;
+   while (n < cap && (rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *ln = (const char *)sqlite3_column_text(st, 0);
-      if (!ln || *ln < '0' || *ln > '9')
+      if (!ln)
          continue;
-      const char *c1 = strchr(ln, ',');
-      if (!c1)
+      /* THE SAME DECODER the headline uses. These two disagreed: the table
+       * took any numeric prefix it could find, so a row the headline refused
+       * as malformed was still drawn -- one page showing what the other one
+       * would not vouch for. */
+      struct row_reading rr;
+      if (!row_decode(ln, (int)strlen(ln), &rr))
          continue;
-      /* field 9 is the type; walk to it rather than counting offsets, since
-       * the row is variable-width */
-      const char *p = ln;
-      for (int f = 0; f < 8 && p; f++) {
-         p = strchr(p, ',');
-         if (p)
-            p++;
-      }
-      out[n].t   = strtol(ln, NULL, 10);
-      out[n].glu = strtol(c1 + 1, NULL, 10);
-      out[n].ty  = p ? (int)strtol(p, NULL, 10) : 0;
+      out[n].t   = rr.t;
+      out[n].glu = rr.glu;
+      /* The table BRACKETS a fingerstick, so an untyped row is drawn like a
+       * sensor reading -- which is a display choice, not a claim about the
+       * device. The headline, which IS such a claim, refuses it. */
+      out[n].ty = (rr.kind == ROW_KIND_NONE) ? ROW_KIND_CGM : rr.kind;
       n++;
    }
+   /* WHY THE LOOP ENDED. Filling the buffer is a legitimate early exit -- the
+    * page shows a few days and the array is the ceiling -- but anything else
+    * that is not SQLITE_DONE is a read that STOPPED: a busy writer, an I/O
+    * error, a damaged page. Returning `n` for those renders a partial day as
+    * though it were the whole one, which is the failure this rule exists to
+    * prevent, and the reader cannot tell: the table simply has fewer rows in
+    * it than the sensor took. */
+   int ok = (n >= cap) || db_finished(rc);
    sqlite3_finalize(st);
-   return n;
+   return ok ? n : -1;
 }
 
 void h_home(struct req *r, long me, const char *cookie)
@@ -166,9 +225,9 @@ void h_home(struct req *r, long me, const char *cookie)
       return;
    int foot_attr = 0;
    char myemail[256], owneremail[256];
-   email_of(me, myemail, sizeof myemail);
-   email_of(owner, owneremail, sizeof owneremail);
-   int tz = tz_of(owner);
+   email_of(r->db, me, myemail, sizeof myemail);
+   email_of(r->db, owner, owneremail, sizeof owneremail);
+   int tz = tz_of(r->db, owner);
 
    struct sb s = {0};
    nav(&s, myemail, cookie);
@@ -196,15 +255,17 @@ void h_home(struct req *r, long me, const char *cookie)
     * single share gets that record AS their page and its owner in the
     * caption at the foot; a "Shared with you: <the same address>" line above
     * it says the same thing twice. */
-   sqlite3_stmt *sh = foot_attr ? NULL
-                                : db_prep("SELECT u.id,u.email FROM share s"
-                                          " JOIN user u ON u.id=s.owner_id"
-                                          " WHERE s.viewer_id=? ORDER BY"
-                                          " u.email");
+   sqlite3_stmt *sh = foot_attr
+                          ? NULL
+                          : db_prep(r->db, "SELECT u.id,u.email FROM share s"
+                                           " JOIN user u ON u.id=s.owner_id"
+                                           " WHERE s.viewer_id=? ORDER BY"
+                                           " u.email");
    if (sh) {
       sqlite3_bind_int64(sh, 1, me);
       int any = 0;
-      while (sqlite3_step(sh) == SQLITE_ROW) {
+      int shrc;
+      while ((shrc = sqlite3_step(sh)) == SQLITE_ROW) {
          if (!any)
             sb_add(&s, "<div>Shared with you: ");
          any           = 1;
@@ -215,16 +276,33 @@ void h_home(struct req *r, long me, const char *cookie)
       }
       if (any)
          sb_add(&s, "</div>\n");
+      /* A list that stopped early is a list of people the page does not
+       * mention -- say so rather than quietly drop them. */
+      if (!db_finished(shrc))
+         sb_add(&s,
+                "<div>(the shared-with-you list could not be read)</div>\n");
       sqlite3_finalize(sh);
    }
 
    long now   = (long)time(NULL);
    long today = now / 86400;
    long newest_t, newest_glu;
-   newest_reading(owner, &newest_t, &newest_glu);
+   /* A scan that did not finish leaves both at 0, which renders as "--": the
+    * page says it does not know rather than naming the newest row it happened
+    * to reach. */
+   /* A SCAN THAT DID NOT FINISH IS NOT A RECORD WITH NOTHING IN IT. Ignoring
+    * this printed "--" over a real reading, and -- with the recent table
+    * empty for the same reason -- the page went on to say "No readings yet",
+    * which is a statement about the user's data that was not true. */
+   if (!newest_reading(r->db, owner, &newest_t, &newest_glu)) {
+      sb_free(&s);
+      oops(r);
+      return;
+   }
 
    static struct rd rd[4096];
-   int nrd = load_recent(owner, today, rd, (int)(sizeof rd / sizeof rd[0]));
+   int nrd =
+       load_recent(r->db, owner, today, rd, (int)(sizeof rd / sizeof rd[0]));
    if (nrd < 0) {
       sb_free(&s);
       oops(r);
@@ -253,7 +331,7 @@ void h_home(struct req *r, long me, const char *cookie)
    snprintf(title, sizeof title, "Pancra");
    if (newest_t > 0) {
       stamp_local(newest_t, tz, stamp, sizeof stamp);
-      if (now - newest_t <= 900)
+      if (now - newest_t <= WEB_FRESH_S)
          snprintf(big, sizeof big, "%ld", newest_glu);
       /* "HH:MM value", so a pinned tab is a glanceable readout -- and the
        * value blanks with the big number, so the tab can never show a
@@ -269,7 +347,22 @@ void h_home(struct req *r, long me, const char *cookie)
 
    static char pre[48 * 1024];
    size_t k      = 0;
+   /* THE WINDOW STARTS AT THE TOP OF AN HOUR, not exactly 24h ago.
+    *
+    * Taken literally, "the last 24 hours" cuts the oldest hour wherever the
+    * current minute happens to fall, and that hour then renders as a row of
+    * leading blanks with a few readings on the end:
+    *
+    *     18                     149 140 134 138 145 151 154
+    *
+    * which reads as missing data rather than as a window boundary. Rounding
+    * DOWN to the hour shows a little MORE than 24 hours -- at most 59 minutes
+    * more -- and every row is then a complete hour. Showing slightly more
+    * history than advertised is the cheaper error: the alternative is a
+    * ragged first row on every page load except the one at the top of the
+    * hour. */
    long win_from = now - (24L * 3600);
+   win_from -= win_from % 3600;
    long prev_day = -1, cur_key = -1;
    int cur_hour = 0, have = 0, cur_first = 0;
    static struct hpt hp[HMAX];
@@ -331,13 +424,51 @@ void h_home(struct req *r, long me, const char *cookie)
    }
 
    if (!newest_t) {
-      if (pair_is_paired(owner))
+      /* Only reachable once the two scans above have SUCCEEDED, so this
+       * really is "nothing has synced", not "we could not tell". */
+      if (pair_is_paired(r->db, owner))
          sb_add(&s, "<div>An app is paired. Nothing has synced yet.</div>\n");
       else
          sb_add(&s, "<div>No readings yet. Pair the app from "
                     "<a href=\"/settings\">settings</a>.</div>\n");
    }
-   page_refresh(r, 200, "OK", title, s.p ? s.p : "", 120);
+   /* REFRESH JUST AFTER THE NEXT SAMPLE IS DUE, not every two minutes.
+    *
+    * A CGM reports every five minutes, so a fixed 120 s poll is wrong twice
+    * over: it fetches a page that cannot have changed, and when it does land
+    * after a new sample it is on average two and a half minutes stale. Aiming
+    * at the sample itself makes at most one request per reading AND shows it
+    * within seconds of arriving.
+    *
+    * Five seconds AFTER the due time, because the reading has to travel:
+    * sensor to phone over BLE, phone to here over the sync push. Landing
+    * exactly on the due instant would reliably miss it and then wait a full
+    * cycle.
+    *
+    * WHAT THE BOUNDS ARE FOR. A record that is stale -- the sensor is off,
+    * the phone is away, the session ended -- has no "next sample" to aim at,
+    * and computing one from a timestamp hours old gives a due time long past.
+    * That would clamp to the floor and turn a dead page into a hot loop
+    * against the server, which is the opposite of what the fixed poll got
+    * wrong. So: if the due instant has already passed, fall back to a slow
+    * poll rather than a fast one. */
+   {
+      long due     = newest_t + 300 + 5; /* next sample, plus travel */
+      long secs    = due - now;
+      int refresh_s;
+      if (newest_t <= 0 || secs <= 0) {
+         /* Nothing to wait for: poll slowly and let the next real sample
+          * re-aim it. */
+         refresh_s = 120;
+      } else if (secs > 300) {
+         /* A clock disagreement, or a backdated row: never wait longer than
+          * one whole cadence, or a page could sit still through several. */
+         refresh_s = 300;
+      } else {
+         refresh_s = (int)secs;
+      }
+      page_refresh(r, 200, "OK", title, s.p ? s.p : "", refresh_s);
+   }
    sb_free(&s);
 }
 
@@ -358,16 +489,18 @@ struct dose {
 
 void h_units(struct req *r, long owner)
 {
-   int tz = tz_of(owner);
+   int tz = tz_of(r->db, owner);
    static struct dose d[4096];
    int nd = 0;
 
-   sqlite3_stmt *st = db_prep("SELECT line FROM logrow WHERE user_id=?"
-                              " AND log='insulin' ORDER BY bucket, line");
+   sqlite3_stmt *st =
+       db_prep(r->db, "SELECT line FROM logrow WHERE user_id=?"
+                      " AND log='insulin' ORDER BY bucket, line");
    if (st) {
       sqlite3_bind_int64(st, 1, owner);
       long legacy = 0;
-      while (sqlite3_step(st) == SQLITE_ROW) {
+      int irc;
+      while ((irc = sqlite3_step(st)) == SQLITE_ROW) {
          const char *ln = (const char *)sqlite3_column_text(st, 0);
          if (!ln || *ln < '0' || *ln > '9')
             continue;
@@ -465,6 +598,8 @@ void h_units(struct req *r, long owner)
          d[at].type  = type;
          d[at].units = units;
       }
+      if (!db_finished(irc))
+         nd = 0; /* an incomplete dose list is not a dose list */
       sqlite3_finalize(st);
    }
 

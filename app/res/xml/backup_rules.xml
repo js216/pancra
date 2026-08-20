@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0 -->
+<!--
+  LEGACY (PRE-ANDROID-12) FULL-BACKUP POLICY / the same refusal as
+  res/xml/data_extraction_rules.xml, spelled in the older schema.
+
+  WHY BOTH FILES EXIST. android:dataExtractionRules is read from API 31
+  onwards; android:fullBackupContent is what API 30 and below read, and it is
+  IGNORED from 31 up. minSdkVersion here is 29, so there are two live Android
+  generations in this app's supported span and each one reads a different
+  file. Supplying only the modern one leaves Android 29 and 30 / phones
+  people are still using, and exactly the phones being replaced, which is
+  when a transfer happens / with no rules at all.
+
+  Every domain is named for the reason given in the other file: whatever is
+  not excluded is included, so a domain nobody wrote down ships the user's
+  glucose history and their sync credential off the device.
+-->
+<full-backup-content>
+  <exclude domain="root" path="." />
+  <exclude domain="file" path="." />
+  <exclude domain="database" path="." />
+  <exclude domain="sharedpref" path="." />
+  <exclude domain="external" path="." />
+  <exclude domain="device_root" path="." />
+  <exclude domain="device_file" path="." />
+  <exclude domain="device_database" path="." />
+  <exclude domain="device_sharedpref" path="." />
+</full-backup-content>

@@ -15,12 +15,18 @@
  */
 #include "syncjni.h"
 #include "dexlibc.h" /* open/lseek: the state stamp */
+#include "exercise.h"
+#include "food.h"
 #include "insulin.h"
-#include "pancra.h" /* pancra_logs_reload: restore writes files */
+#include "jbridge.h" /* jb_checked: the one exception verdict this app has */
+#include "reading.h" /* pancra_logs_reload: a restore rewrote the files */
 #include "sensors.h"
 #include "settings.h"
 #include "store.h"
 #include "sync.h"
+#include "syncreport.h" /* sync_report: how the sync went */
+#include "syncstat.h"
+#include "util.h"
 #include "weight.h"
 #include <jni.h>    /* JNIEnv, jstring, jbyteArray: this file IS the bridge */
 #include <jni_md.h> /* jint, jbyte: the JDK puts the scalar types here */
@@ -35,6 +41,7 @@ static JavaVM *g_vm;
 static jclass g_cls;            /* Ble, global ref */
 static jmethodID m_synchttp;    /* the transport */
 static jmethodID m_synccode;    /* the status of the last one */
+static jmethodID m_syncfail;    /* ...and why, when there was no status */
 static jmethodID m_syncsoon;    /* ask Java to run a sync on its worker */
 static jmethodID m_restoresoon; /* ...and to run a restore there */
 static jmethodID m_pairsoon;    /* ask Java to run a pairing on its worker */
@@ -51,67 +58,229 @@ static JNIEnv *sync_env(void)
    return 0;
 }
 
+/* WHY THE RUN FAILED, remembered as the requests go by.
+ *
+ * sync.c reports a run as "worked" or "did not" and can report nothing else:
+ * it never sees a socket, only this hook's return value. So each request that
+ * fails records what it failed as, and the run reports the last one -- which
+ * is the one that stopped it, because sync.c aborts on the first failure.
+ *
+ * Written and read on the sync worker only (Ble calls syncRun/syncPair from
+ * its push worker and nowhere else), so no lock: the UI never touches it.
+ */
+static int g_why = SYNC_IDLE;
+
+static void why_note(int status, int netfail)
+{
+   int by_status = sync_outcome_of_status(status);
+   if (by_status != SYNC_IDLE) {
+      g_why = by_status; /* the server ANSWERED; that beats a guess */
+      return;
+   }
+   if (status < 100)
+      g_why = sync_outcome_of_net(netfail);
+}
+
+/* What to report for a run that failed, when nothing more specific was
+ * recorded -- a failure inside sync.c itself (a reply it could not parse, a
+ * file it could not read) rather than on the wire. */
+static int why_failed(void)
+{
+   return g_why == SYNC_IDLE ? SYNC_FAILED : g_why;
+}
+
+/* A PAIRING that failed. sync.c cannot tell a refused code from a server it
+ * never reached -- both are "rc != 0" -- but this file saw the wire, so it
+ * can: anything that failed before a usable answer is reported as itself, and
+ * everything else means the server heard us and said no. */
+static int pair_why(void)
+{
+   int w = why_failed();
+   return sync_outcome_before_reply(w) ? w : SYNC_PAIR_REFUSED;
+}
+
 /* The transport hook sync.c calls. Returns the HTTP status, or -1 if the
  * request could not be made at all -- which sync.c treats as "nothing
  * happened", so the whole run is retried later rather than half-applied. */
 static int jni_http(const char *method, const char *path, const char *hdr,
                     const char *body, int blen, char *out, int outcap)
 {
+   /* ONE snapshot of where this goes and as whom. Taken as two reads, a
+    * request could be addressed to the old server carrying the new account's
+    * signature -- see remote_config_get. */
+   struct remote_config rc;
+   remote_config_get(&rc);
    JNIEnv *e = sync_env();
-   if (!e || !g_cls || !m_synchttp || !m_synccode)
+   if (!e || !g_cls || !m_synchttp || !m_synccode || !m_syncfail)
       return -1;
-   if (!g_remote_server[0])
+   if (!rc.server[0])
       return -1;
 
-   jstring jsrv  = (*e)->NewStringUTF(e, g_remote_server);
-   jstring jm    = (*e)->NewStringUTF(e, method);
-   jstring jp    = (*e)->NewStringUTF(e, path);
-   jstring jh    = hdr ? (*e)->NewStringUTF(e, hdr) : 0;
+   /* Declared together and zeroed, because the unwind at the bottom is
+    * reached from eight places and has to be able to tell an argument that
+    * was never built from one that was. */
+   jstring jsrv  = 0;
+   jstring jm    = 0;
+   jstring jp    = 0;
+   jstring jh    = 0;
    jbyteArray jb = 0;
+   jobject r     = 0;
+   int code      = -1;
+   int netfail   = SYNC_NET_OK;
+   int n         = 0;
+   int too_long  = 0;
+   int ret       = -1;
+
+   /* ONE ALLOCATION, ONE VERDICT, AND NOTHING AFTER A FAILED ONE.
+    *
+    * These five used to be made back to back with no check between them, and
+    * the results tested -- three of the five -- only when it was time to
+    * call. Three separate things went wrong with that, and they get worse in
+    * order:
+    *
+    *   1. IT ENTERED JAVA WITH A NULL BODY. `jb` was never tested. So a
+    *      NewByteArray that failed with blen > 0 left jb NULL and the call
+    *      went ahead: Ble.syncHttp reads `body != null && body.length > 0`,
+    *      finds null, sets no output stream, and posts the request WITH NO
+    *      BODY AT ALL. The server then answers a well-formed empty push, and
+    *      the phone reads that answer as the outcome of the push it thought
+    *      it had made. The same hole swallowed `jh`: a header string that
+    *      failed to allocate produced a request with no Authorization line
+    *      rather than a request that was not made.
+    *   2. IT READ A STATUS THAT BELONGED TO ANOTHER REQUEST. When jsrv, jm or
+    *      jp was null the call was skipped -- and then syncCode() was asked
+    *      anyway. sSyncCode is a field holding the status of the LAST
+    *      syncHttp, so a request that never happened returned the previous
+    *      one's 200, with an empty body, to a caller whose whole contract is
+    *      that a negative value means "nothing happened". sync.c would treat
+    *      an upload it never made as accepted and move on.
+    *   3. IT MADE JNI CALLS WITH AN EXCEPTION PENDING. NewStringUTF and
+    *      NewByteArray do not merely return NULL on failure; they leave an
+    *      OutOfMemoryError pending, and every JNI function called after that
+    *      -- the next NewStringUTF, DeleteLocalRef, the call itself -- is
+    *      illegal. Under CheckJNI, which is on for a debuggable build and for
+    *      anyone attached with a debugger, that is not a failure the app can
+    *      report: it is `JNI DETECTED ERROR IN APPLICATION: JNI NewStringUTF
+    *      called with pending exception java.lang.OutOfMemoryError` and an
+    *      immediate SIGABRT. Somebody whose app aborted saw it die during a
+    *      background sync -- a workflow they never started -- with the
+    *      tombstone naming whichever innocent JNI call came next.
+    *
+    * So: allocate one at a time, refuse on the first failure, and leave
+    * through the unwind below without touching Java. */
+   jsrv = (*e)->NewStringUTF(e, rc.server);
+   if (!jsrv)
+      goto refused;
+   jm = (*e)->NewStringUTF(e, method);
+   if (!jm)
+      goto refused;
+   jp = (*e)->NewStringUTF(e, path);
+   if (!jp)
+      goto refused;
+   /* NO HEADER and A HEADER WE COULD NOT BUILD are different things. Java
+    * treats a null `hdr` as "set no extra request properties", which is
+    * correct for the requests that carry none and catastrophic for the ones
+    * that carry the signature -- so only the first may reach it. */
+   if (hdr) {
+      jh = (*e)->NewStringUTF(e, hdr);
+      if (!jh)
+         goto refused;
+   }
    if (blen > 0) {
       jb = (*e)->NewByteArray(e, (jsize)blen);
-      if (jb)
-         (*e)->SetByteArrayRegion(e, jb, 0, (jsize)blen, (const jbyte *)body);
+      if (!jb)
+         goto refused;
+      /* SetByteArrayRegion throws ArrayIndexOutOfBoundsException rather than
+       * returning anything, so the only way to learn it did not fill the
+       * array is to ask -- and an unfilled array is a request whose body is
+       * whatever the VM zeroed it to. */
+      (*e)->SetByteArrayRegion(e, jb, 0, (jsize)blen, (const jbyte *)body);
+      if (!jb_checked(e, "SetByteArrayRegion(body)"))
+         goto refused;
    }
-   jobject r = 0;
-   if (jsrv && jm && jp)
-      r = (*e)->CallStaticObjectMethod(e, g_cls, m_synchttp, jsrv,
-                                       (jint)g_remote_port, jm, jp, jh, jb);
+
+   /* Every argument exists and nothing is pending: NOW Java may be entered. */
+   r = (*e)->CallStaticObjectMethod(e, g_cls, m_synchttp, jsrv, (jint)rc.port,
+                                    jm, jp, jh, jb);
    /* A pending exception makes every later JNI call illegal, so clear it here
     * and report failure rather than take the process down on the next one. */
    if ((*e)->ExceptionCheck(e)) {
       (*e)->ExceptionClear(e);
       r = 0;
    }
-   int code = (int)(*e)->CallStaticIntMethod(e, g_cls, m_synccode);
+   code = (int)(*e)->CallStaticIntMethod(e, g_cls, m_synccode);
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
+   netfail = (int)(*e)->CallStaticIntMethod(e, g_cls, m_syncfail);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   why_note(code, netfail);
 
-   int n = 0;
+   /* A REPLY THAT DOES NOT FIT IS A FAILED REQUEST, not a short one.
+    *
+    * This used to clamp to outcap-1 and still hand back 200. The caller
+    * cannot tell: a truncated body is exactly outcap-1 bytes, which is also
+    * what a legitimate body of that length looks like, and sync_fetch_bucket
+    * checks only `len < cap`. So a bucket between the phone's own buffer
+    * (SYNC_BUF_MAX) and the wire's ceiling (BODY_MAX) was accepted with rows
+    * missing off the end -- and then compared, hashed and acted on. The
+    * asymmetry rule in lib/wirevec.h is explicit that an implementation may
+    * hold less than the wire allows and must then DECLINE, never truncate. */
    if (r) {
       jsize len = (*e)->GetArrayLength(e, (jbyteArray)r);
-      n         = len < outcap - 1 ? (int)len : outcap - 1;
-      if (n > 0)
-         (*e)->GetByteArrayRegion(e, (jbyteArray)r, 0, (jsize)n, (jbyte *)out);
-      (*e)->DeleteLocalRef(e, r);
+      if (outcap <= 0 || (long)len > (long)outcap - 1) {
+         too_long = 1;
+      } else {
+         n = (int)len;
+         if (n > 0)
+            (*e)->GetByteArrayRegion(e, (jbyteArray)r, 0, (jsize)n,
+                                     (jbyte *)out);
+      }
    }
-   out[n < 0 ? 0 : n] = '\0';
+   if (outcap > 0)
+      out[too_long ? 0 : n] = '\0';
+   /* NEGATIVE, like a request that could not be made at all: the transport
+    * contract in sync.h says a negative value means "no answer", and no
+    * answer is exactly what an oversized one is worth here. */
+   ret = too_long ? -1 : code;
+   goto unwind;
 
-   if (jsrv)
-      (*e)->DeleteLocalRef(e, jsrv);
-   if (jm)
-      (*e)->DeleteLocalRef(e, jm);
-   if (jp)
-      (*e)->DeleteLocalRef(e, jp);
-   if (jh)
-      (*e)->DeleteLocalRef(e, jh);
+refused:
+   /* THE REQUEST WAS NEVER MADE, so nothing about it may be reported as if it
+    * had been. syncCode() and syncFail() are deliberately NOT consulted here:
+    * they answer for the previous request, and the caller cannot tell a stale
+    * 200 from a fresh one. The outcome is recorded as a plain local failure
+    * so the screen says something rather than nothing, and -1 tells sync.c to
+    * retry the whole run later rather than treat any of it as applied. */
+   (void)jb_checked(e, "sync argument marshalling");
+   if (outcap > 0)
+      out[0] = '\0';
+   g_why = SYNC_FAILED;
+   LOGI("sync request NOT SENT: its JNI arguments could not be built");
+   ret = -1;
+
+unwind:
+   /* EVERY local ref this call took, on every path. There is no Java frame to
+    * pop out here -- the sync worker is an attached native thread -- so these
+    * accumulate against the reference ceiling for the life of the process,
+    * and a sync is dozens of requests. */
+   if (r)
+      (*e)->DeleteLocalRef(e, r);
    if (jb)
       (*e)->DeleteLocalRef(e, jb);
-   return code;
+   if (jh)
+      (*e)->DeleteLocalRef(e, jh);
+   if (jp)
+      (*e)->DeleteLocalRef(e, jp);
+   if (jm)
+      (*e)->DeleteLocalRef(e, jm);
+   if (jsrv)
+      (*e)->DeleteLocalRef(e, jsrv);
+   return ret;
 }
 
 /* WHICH FILES SYNC. Everything that is a record of what happened, and nothing
- * that is a credential: g_code_path and g_remote_path hold the pairing code
+ * that is a credential: code_path() and remote_path() hold the pairing code
  * and the derived key, and uploading those would put the secret that
  * authenticates us TO the server inside the server's own database.
  *
@@ -121,21 +290,46 @@ static int jni_http(const char *method, const char *path, const char *hdr,
 void syncjni_register_logs(void)
 {
    sync_clear_logs();
-   (void)sync_add_log("readings", g_store_path, 1);
-   (void)sync_add_log("insulin", g_ins_path, 1);
-   (void)sync_add_log("weight", g_wt_path, 1);
-   (void)sync_add_log("sensors", g_sensors_path, 1);
-   (void)sync_add_log("slots", g_slots_path, 0);
+   (void)sync_add_log("readings", store_path(), 1);
+   (void)sync_add_log("insulin", insulin_path(), 1);
+   (void)sync_add_log("weight", weight_path(), 1);
+   (void)sync_add_log("food", food_path(), 1);
+   (void)sync_add_log("exercise", exercise_path(), 1);
+   /* THE FOOD VOCABULARY IS NOT BUCKETED, and it is the one log here whose
+    * rows do not begin with a timestamp -- they are "<id>,<name>". Bucketing
+    * splits on the leading field read as a UTC day, so asking for it here
+    * would file every food under whichever day its ID happened to look like.
+    * It is also small and rewritten by append only, so a single bucket costs
+    * nothing, exactly as for slots below. */
+   (void)sync_add_log("foodtypes", food_types_path(), 0);
+   (void)sync_add_log("sensors", sensors_path(), 1);
+   (void)sync_add_log("slots", slots_path(), 0);
 }
 
-/* Sizes of every synced file, added up. A reading, a dose, a correction or a
- * deletion all change one of them, and nothing else does. Cheap: five
- * open/lseek pairs, no reading. */
+/* HAS ANYTHING CHANGED SINCE THE LAST SYNC?
+ *
+ * The sizes of every synced file, plus the count of committed record
+ * mutations (util.h). The sizes alone were the whole answer once, and they
+ * are wrong for exactly the changes a person makes deliberately: correcting a
+ * dose from 12 to 13 units rewrites the row at the same length, so every
+ * size is identical and the phone concluded it had nothing to send. The
+ * correction then sat unsent until the six-hour safety sync.
+ *
+ * THIS LIST AND syncjni_register_logs MUST NAME THE SAME FILES. A log
+ * registered for sync but missing here is worse than one missing from both:
+ * it uploads correctly whenever something ELSE has changed, and never when
+ * only it has -- so it appears to work, and loses exactly the records that
+ * were logged on their own. When this list said "the five synced files" it
+ * meant it, and adding food and exercise to the registry without adding them
+ * here would have been that bug, twice.
+ *
+ * Cheap either way: an open/lseek pair per file and a counter, no reading. */
 long syncjni_state_stamp(void)
 {
-   static const char *const paths[] = {g_store_path, g_ins_path, g_wt_path,
-                                       g_sensors_path, g_slots_path};
-   long total                       = 0;
+   const char *paths[] = {store_path(),  insulin_path(),    weight_path(),
+                          food_path(),   food_types_path(), exercise_path(),
+                          sensors_path(), slots_path()};
+   long total          = 0;
    for (int i = 0; i < (int)(sizeof paths / sizeof paths[0]); i++) {
       if (!paths[i] || !paths[i][0])
          continue;
@@ -147,19 +341,47 @@ long syncjni_state_stamp(void)
       if (n > 0)
          total += n;
    }
-   return total;
+   /* Mixed in rather than added, so a mutation cannot be cancelled out by a
+    * size moving the other way. */
+   return (total * 1000003L) + record_generation();
 }
 
 void syncjni_wire(JNIEnv *e, jclass ble)
 {
+   if (!e || !ble)
+      return;
    (*e)->GetJavaVM(e, &g_vm);
-   g_cls      = (*e)->NewGlobalRef(e, ble);
+   /* CHECKED BEFORE ANYTHING ELSE IS ASKED FOR. NewGlobalRef fails only by
+    * running out of memory, and when it does it leaves an OutOfMemoryError
+    * PENDING -- so the six GetStaticMethodID calls that used to follow it
+    * unconditionally were six illegal JNI calls, the first of which aborts
+    * under CheckJNI. Leaving with g_cls NULL is the honest outcome: every
+    * entry point in this file tests it, so the sync degrades to "no
+    * transport" (jni_http returns -1, the run is reported failed and retried)
+    * instead of taking the launch down. */
+   jclass gcls = (*e)->NewGlobalRef(e, ble);
+   if (!gcls) {
+      (void)jb_checked(e, "NewGlobalRef(Ble) for the sync transport");
+      LOGI("sync transport NOT wired: no global reference for Ble");
+      return;
+   }
+   /* SWAPPED, NOT OVERWRITTEN. dexble_register calls this, and init_java calls
+    * THAT again whenever the activity is recreated in the same process -- so a
+    * plain assignment dropped the previous global ref beyond any reach, once
+    * per relaunch, for the life of the process. */
+   {
+      jclass old = g_cls;
+      g_cls      = gcls;
+      if (old)
+         (*e)->DeleteGlobalRef(e, old);
+   }
    m_synchttp = (*e)->GetStaticMethodID(
        e, ble, "syncHttp",
        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;"
        "Ljava/lang/String;[B)[B");
    m_synccode    = (*e)->GetStaticMethodID(e, ble, "syncCode", "()I");
-   m_syncsoon    = (*e)->GetStaticMethodID(e, ble, "syncSoon", "()V");
+   m_syncfail    = (*e)->GetStaticMethodID(e, ble, "syncFail", "()I");
+   m_syncsoon    = (*e)->GetStaticMethodID(e, ble, "syncSoon", "()Z");
    m_restoresoon = (*e)->GetStaticMethodID(e, ble, "syncRestoreSoon", "()V");
    m_pairsoon    = (*e)->GetStaticMethodID(
        e, ble, "syncPairSoon", "(Ljava/lang/String;Ljava/lang/String;)V");
@@ -171,20 +393,23 @@ void syncjni_wire(JNIEnv *e, jclass ble)
 
 jint syncjni_run(JNIEnv *e, jobject cls)
 {
+   struct remote_config rc;
+   remote_config_get(&rc);
    (void)e;
    (void)cls;
    syncjni_register_logs(); /* the paths are set after wiring, on first launch
                              */
-   if (!g_sync_uid) {
-      sync_report(0, "NOT PAIRED");
+   if (!rc.uid) {
+      sync_report(SYNC_NOT_PAIRED);
       return 0;
    }
+   g_why  = SYNC_IDLE;
    int ok = sync_run() == 0;
    /* One line per sync, not per request: a sync is dozens of requests, and a
     * log entry each turned the app's log into its own traffic. */
-   LOGI("sync %s (uid %ld, %s:%d)", ok ? "ok" : "FAILED", g_sync_uid,
-        g_remote_server, g_remote_port);
-   sync_report(ok, ok ? "SYNCED" : "SYNC FAILED");
+   LOGI("sync %s (uid %ld, %s:%d)", ok ? "ok" : "FAILED", rc.uid, rc.server,
+        rc.port);
+   sync_report(ok ? SYNC_OK : why_failed());
    return ok ? 1 : 0;
 }
 
@@ -195,26 +420,54 @@ jint syncjni_run(JNIEnv *e, jobject cls)
  * Logs are reloaded here rather than by the caller, because sync_restore
  * writes FILES -- without this the rows are on disk and the plot, statistics
  * and history still show what they showed before, which looks exactly like a
- * restore that did nothing. */
+ * restore that did nothing.
+ *
+ * EVERY pancra_logs_reload() below runs BEFORE the sync_report() beside it,
+ * and that order is the contract, not an accident of layout. sync_report is
+ * how the restore announces itself to the screen the user is watching; the
+ * moment it fires they look at the history, the plot and the TIR/average
+ * beside them. Reporting first would put a "RESTORED" line on a screen whose
+ * numbers had not been rebuilt yet -- which is the same disagreement the
+ * rebuild exists to remove, moved from "until you restart" to "for however
+ * long the rebuild takes". Anything added here that publishes state must go
+ * on the reload side of that line. */
 jint syncjni_restore(JNIEnv *e, jobject cls)
 {
+   struct remote_config rc;
+   remote_config_get(&rc);
    (void)e;
    (void)cls;
    syncjni_register_logs();
-   if (!g_sync_uid) {
-      sync_report(0, "NOT PAIRED");
+   if (!rc.uid) {
+      sync_report(SYNC_NOT_PAIRED);
       return 0;
    }
+   g_why = SYNC_IDLE;
    int n = sync_restore();
-   LOGI("restore %s (uid %ld, %d bucket(s))", n >= 0 ? "ok" : "FAILED",
-        g_sync_uid, n);
+   LOGI("restore %s (uid %ld, %d bucket(s))",
+        n == SYNC_RESTORE_UNSYNCED ? "UNSYNCED"
+        : n >= 0                   ? "ok"
+                                   : "FAILED",
+        rc.uid, n);
+   /* CHANGED BUT UNPROVEN, and handled BEFORE the `n < 0` test -- it is
+    * negative so no caller counts it as rows, and reading it as a failure
+    * would report nothing restored over a log that has every row in it.
+    *
+    * The logs are reloaded, because the rows really are in the files and the
+    * user should see them; what is uncertain is only whether a power loss
+    * before the writeback completes takes them away again. */
+   if (n == SYNC_RESTORE_UNSYNCED) {
+      pancra_logs_reload();
+      sync_report(SYNC_RESTORED_UNSYNCED);
+      return 1;
+   }
    if (n < 0) {
-      sync_report(0, "RESTORE FAILED");
+      sync_report(why_failed());
       return 0;
    }
    if (n > 0)
       pancra_logs_reload(); /* the files changed under the in-memory state */
-   sync_report(1, n > 0 ? "RESTORED" : "NOTHING TO RESTORE");
+   sync_report(n > 0 ? SYNC_RESTORED : SYNC_NOTHING_NEW);
    return 1;
 }
 
@@ -226,16 +479,23 @@ jint syncjni_pair(JNIEnv *e, jobject cls, jstring email, jstring code)
    uint8_t key[SYNC_KEY_LEN];
    long uid = 0;
    int rc   = -1;
+   g_why    = SYNC_IDLE;
    if (em && cd)
       rc = sync_pair(em, cd, key, &uid);
    if (rc == 0) {
-      sync_key_save(uid, key);
-      sync_report(0, "PAIRED");
+      if (sync_key_save(uid, key) == 0) {
+         sync_report(SYNC_PAIRED);
+      } else {
+         sync_report(SYNC_KEY_NOT_SAVED);
+         rc = -1;
+      }
    } else {
       /* The server refuses a wrong code, an unknown account and a spent code
-       * the same way, on purpose -- so this cannot say which, only that it
-       * did not work. Silence was worse: the keypad simply closed. */
-      sync_report(0, "PAIRING FAILED");
+       * the same way, on purpose -- so this cannot say WHICH of those, only
+       * that it did not work. It can still say whether the server was
+       * reached at all, which is the part the user can act on. Silence was
+       * worse: the keypad simply closed. */
+      sync_report(pair_why());
    }
    if (em)
       (*e)->ReleaseStringUTFChars(e, email, em);
@@ -246,44 +506,82 @@ jint syncjni_pair(JNIEnv *e, jobject cls, jstring email, jstring code)
 
 /* Both of these hand the work to Java's push worker and return at once: they
  * are called from the tick and from the UI, and neither may block. */
-void syncjni_sync_request(void)
+int syncjni_sync_request(void)
 {
    JNIEnv *e = sync_env();
    if (!e || !g_cls || !m_syncsoon) {
       LOGI("sync request DROPPED: env=%p cls=%p m=%p", (void *)e, (void *)g_cls,
            (void *)m_syncsoon);
-      return;
+      return 0;
    }
-   (*e)->CallStaticVoidMethod(e, g_cls, m_syncsoon);
-   if ((*e)->ExceptionCheck(e))
+   jboolean took = (*e)->CallStaticBooleanMethod(e, g_cls, m_syncsoon);
+   /* A THROW IS A DROP. The exception is cleared (leaving one pending would
+    * abort the VM at the next JNI call on this thread), but clearing it does
+    * not mean the worker was started -- and the caller has to know the
+    * difference, because nothing else will ever tell it. */
+   if ((*e)->ExceptionCheck(e)) {
       (*e)->ExceptionClear(e);
+      LOGI("sync request DROPPED: Ble.syncSoon threw");
+      return 0;
+   }
+   /* ...AND SO IS A COALESCED REFUSAL. syncSoon drops a request made while a
+    * sync is already running, which is the COMMON case: the tick fires every
+    * minute and a slow sync easily outlives one. That path throws nothing and
+    * returns normally, so it was indistinguishable from success. */
+   if (!took) {
+      LOGI("sync request DROPPED: a sync is already running");
+      return 0;
+   }
+   return 1;
 }
 
-/* Ask Java to run a restore on the sync worker. */
+/* Ask Java to run a restore on the sync worker.
+ *
+ * A DROP IS REPORTED, unlike the sync's. Both of these are USER-INITIATED --
+ * a tap on RESTORE, a pairing code typed into the keypad -- so there is a
+ * person watching a screen for the answer, and the answer arrives only
+ * through sync_report(). A silent drop leaves the restore row unchanged
+ * forever and closes the pairing keypad with nothing said, which is exactly
+ * the failure syncjni_pair() was written to remove at the other end of the
+ * same flow. The sync's own drop needs no report: nobody is waiting on it,
+ * and remote.c retries it at the next tick. */
 void syncjni_restore_request(void)
 {
    JNIEnv *e = sync_env();
    if (!e || !g_cls || !m_restoresoon) {
       LOGI("restore request DROPPED: env=%p cls=%p m=%p", (void *)e,
            (void *)g_cls, (void *)m_restoresoon);
+      sync_report(SYNC_FAILED);
       return;
    }
    (*e)->CallStaticVoidMethod(e, g_cls, m_restoresoon);
-   if ((*e)->ExceptionCheck(e))
+   if ((*e)->ExceptionCheck(e)) {
       (*e)->ExceptionClear(e);
+      LOGI("restore request DROPPED: Ble.syncRestoreSoon threw");
+      sync_report(SYNC_FAILED);
+   }
 }
 
 void syncjni_pair_request(const char *email, const char *code)
 {
    JNIEnv *e = sync_env();
-   if (!e || !g_cls || !m_pairsoon)
+   if (!e || !g_cls || !m_pairsoon) {
+      LOGI("pair request DROPPED: env=%p cls=%p m=%p", (void *)e, (void *)g_cls,
+           (void *)m_pairsoon);
+      sync_report(SYNC_FAILED);
       return;
+   }
    jstring je = (*e)->NewStringUTF(e, email);
    jstring jc = (*e)->NewStringUTF(e, code);
    if (je && jc)
       (*e)->CallStaticVoidMethod(e, g_cls, m_pairsoon, je, jc);
-   if ((*e)->ExceptionCheck(e))
-      (*e)->ExceptionClear(e);
+   /* A NULL string is an OutOfMemoryError pending, so this covers it too. */
+   if (!je || !jc || (*e)->ExceptionCheck(e)) {
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
+      LOGI("pair request DROPPED: the request never reached the worker");
+      sync_report(SYNC_FAILED);
+   }
    if (je)
       (*e)->DeleteLocalRef(e, je);
    if (jc)

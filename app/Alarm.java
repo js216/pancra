@@ -31,7 +31,11 @@ import android.util.Log;
 
 public final class Alarm {
     private static final String CH = "pancra-alarm";
-    private static final int NID = 2;              /* distinct from the service's id 1 */
+    /* BoundaryLogic owns every notification id (see the list there). This used
+     * to be a local `2` whose comment said "distinct from the service's id 1"
+     * -- true, and blind to PancraService's stopped-monitoring notice, which
+     * was also 2. */
+    private static final int NID = BoundaryLogic.NOTIF_ALARM;
     private static MediaPlayer player;
     /* trigger() runs on a BLE binder thread, silence() on the main looper.
      * Unsynchronized, silence() could read `player` as null (the binder thread
@@ -381,22 +385,31 @@ public final class Alarm {
      * alarm the locking around these calls exists to prevent. Stop the sound
      * FIRST and unconditionally. */
     public static synchronized void silence(Context ctx) {
-        try { stopSound(); }
-        catch (Throwable t) { Log.i("pancra", "alarm silence (sound): " + t); }
-
         Context app;
         try { app = ctx.getApplicationContext(); }
-        catch (Throwable t) { Log.i("pancra", "alarm silence (context): " + t); return; }
+        catch (Throwable t) { Log.i("pancra", "alarm silence (context): " + t);
+                              try { stopSound(); } catch (Throwable u) { }
+                              return; }
+        final Context c = app;
 
-        try {
-            Vibrator v = app.getSystemService(Vibrator.class);
-            if (v != null) v.cancel();
-        } catch (Throwable t) { Log.i("pancra", "alarm silence (vibrate): " + t); }
-
-        try {
-            NotificationManager nm = app.getSystemService(NotificationManager.class);
-            if (nm != null) nm.cancel(NID);
-        } catch (Throwable t) { Log.i("pancra", "alarm silence (notify): " + t); }
+        /* THREE INDEPENDENT STAGES, and every one of them runs.
+         *
+         * The sound, the vibration and the notification are separate ways the
+         * user is being alerted, and silencing is not partly done: a throw
+         * from any one of them must not stop the others, because the two that
+         * still work are the two the user can still hear and feel. This was a
+         * sequence of separate try blocks that happened to be right;
+         * runIndependent makes it a property the host test can assert, along
+         * with the ORDER -- sound first, because it is the loudest. */
+        BoundaryLogic.runIndependent(
+            new BoundaryLogic.Attempt() { @Override public void run() {
+                stopSound(); } },
+            new BoundaryLogic.Attempt() { @Override public void run() {
+                Vibrator v = c.getSystemService(Vibrator.class);
+                if (v != null) v.cancel(); } },
+            new BoundaryLogic.Attempt() { @Override public void run() {
+                NotificationManager nm = c.getSystemService(NotificationManager.class);
+                if (nm != null) nm.cancel(NID); } });
     }
 
     /* release() gets its OWN try, and the reference is dropped last.
@@ -407,10 +420,15 @@ public final class Alarm {
      * un-silenceable alarm the rest of this file is built to prevent, and it
      * was the one place here that was not stage-isolated. */
     private static void stopSound() {
-        MediaPlayer p = player;
+        final MediaPlayer p = player;
         if (p == null) return;
-        try { p.stop(); } catch (Throwable t) { Log.i("pancra", "stop: " + t); }
-        try { p.release(); } catch (Throwable t) { Log.i("pancra", "release: " + t); }
+        /* THE POLICY IS BoundaryLogic's, so the host test exercises the same
+         * code this does rather than a parallel copy of it. */
+        boolean released = BoundaryLogic.stopPlayer(new BoundaryLogic.Player() {
+            @Override public void stop() { p.stop(); }
+            @Override public void release() { p.release(); }
+        });
+        if (!released) Log.i("pancra", "alarm: player would not release");
         player = null;
     }
 }

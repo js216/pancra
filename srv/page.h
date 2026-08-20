@@ -11,8 +11,10 @@
 #ifndef PANCRA_PAGE_H
 #define PANCRA_PAGE_H
 
-#include "sync.h"
-#include "util.h" /* struct sb: nav and the page builders take one */
+struct db; /* db.h: every storage call names its database */
+
+#include "proto.h" /* struct req: what a handler is given */
+#include "util.h"  /* struct sb: nav and the page builders take one */
 
 /* The page skeleton the single-user version used: doctype, title, viewport,
  * the one-line stylesheet, then the body. `refresh` seconds, or 0 for none --
@@ -25,9 +27,20 @@ void sub_page(struct req *r, const char *title, const char *body_html);
  * need of. */
 void nav(struct sb *s, const char *email, const char *cookie);
 
+/* THE PAGE SKELETON'S OWN ENTRY POINTS, declared where page.c implements
+ * them. They were in the protocol header, which made every module in the
+ * server -- the database, the log store, the pairing -- include the surface
+ * of the web interface. */
+long web_user(struct req *r, char *cookie, size_t cap, int *failed);
+void redirect(struct req *r, const char *to, const char *set_cookie);
+/* (oops -- the one answer for "the database said no" -- is oops.h: it is a
+ * response, not a page, and every layer needs it.) */
+void page(struct req *r, int code, const char *reason, const char *title,
+          const char *body_html);
+
 /* Who is asking, and what they may see. */
-void email_of(long uid, char *out, size_t cap);
-int may_view(long viewer, long owner);
+void email_of(struct db *d, long uid, char *out, size_t cap);
+int may_view(struct db *d, long viewer, long owner);
 /* The record being viewed: `who=` when it is shared, else the viewer's own.
  * Returns 0 and answers the request itself when it is not shared. */
 long owner_of(struct req *r, long me);
@@ -41,8 +54,8 @@ long viewed_owner(struct req *r, long me, int *have_own);
  * "YYYY-MM-DD HH:MM" stamp. `have` (may be NULL) says whether anything
  * actually supplied the offset -- 0 because the user is on UTC is not the
  * same answer as 0 because nothing has ever synced. */
-int tz_resolve(long uid, int *have);
-int tz_of(long uid);
+int tz_resolve(struct db *d, long uid, int *have);
+int tz_of(struct db *d, long uid);
 void stamp_local(long t, int tz_min, char *out, size_t cap);
 
 /* The cookie a browser is given, and the check every state-changing form

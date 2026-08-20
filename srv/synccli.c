@@ -9,7 +9,7 @@
  *
  * It is a TEST TOOL and deliberately not a reference implementation: it
  * speaks plain HTTP, keeps the key on the command line, and trusts whatever
- * answers. pancra is the real client; srv/sync.h and the handlers it
+ * answers. pancra is the real client; srv/proto.h and the handlers it
  * declares are the contract.
  *
  *   synccli <host> <port> pair <email> <code>
@@ -19,15 +19,18 @@
  */
 #include "hmac.h"
 #include "jpake.h"
-#include "sync.h"
+#include "proto.h"
 #include "util.h"
 #include <arpa/inet.h>
+#include <ctype.h> /* tolower: the header search is case-insensitive */
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h> /* fstat/S_ISREG: what is about to be signed */
+#include <sys/time.h> /* struct timeval: every exchange has a deadline */
 #include <unistd.h>
 
 static int dial(const char *host, int port)
@@ -51,6 +54,60 @@ static int dial(const char *host, int port)
    return fd;
 }
 
+/* ---- WRITE ALL OF IT, READ ALL OF IT, AND FRAME WHAT COMES BACK ------
+ *
+ * This is a test client, but a test client that is loose about framing tests
+ * the wrong thing: a partial write makes the server see a truncated request
+ * and answer 400, which reads as a protocol failure rather than as this
+ * program's own bug. Every one of the following was wrong here:
+ *
+ *   - a single write() for the header and another for the body, with only the
+ *     sign of the return checked. A short write on a socket is ordinary, and
+ *     it silently sent a prefix.
+ *   - read() treated like EOF on error, so a connection reset produced the
+ *     bytes received so far and a status parsed out of them.
+ *   - the response buffer doubled with no ceiling, so a server (or something
+ *     answering on its port) could grow it until the allocator failed.
+ *   - the status line read at a fixed offset with atoi, accepting anything
+ *     12 bytes long -- "HTTP/1.1 2" and a partial line included.
+ *   - no Content-Length check, so a reply cut off mid-body was indistinguish-
+ *     able from a complete one.
+ *
+ * SO_RCVTIMEO/SO_SNDTIMEO give every exchange a deadline: without one, a
+ * server that accepts and never answers hangs synctest.sh rather than failing
+ * it. */
+#define CLI_RSP_MAX (4L * 1024 * 1024)
+#define CLI_TIMEO_S 30
+
+/* Case-insensitive search, written out rather than strcasestr: that is a GNU
+ * extension, and this file is also compiled for the board's toolchain. */
+static const char *find_ci(const char *hay, const char *needle)
+{
+   size_t n = strlen(needle);
+   for (const char *p = hay; *p; p++) {
+      size_t i = 0;
+      while (i < n && p[i] &&
+             tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+         i++;
+      if (i == n)
+         return p;
+   }
+   return NULL;
+}
+
+static int write_all(int fd, const void *b, size_t n)
+{
+   const char *p = b;
+   size_t off    = 0;
+   while (off < n) {
+      ssize_t w = write(fd, p + off, n - off);
+      if (w <= 0)
+         return -1; /* including EINTR: a test client need not retry */
+      off += (size_t)w;
+   }
+   return 0;
+}
+
 /* Send one request, return the whole response. `out` is malloc'd. */
 static int http_do(const char *host, int port, const char *method,
                    const char *path, const char *extra, const void *body,
@@ -68,6 +125,12 @@ static int http_do(const char *host, int port, const char *method,
    *olen = 0;
 
    int fd = dial(host, port);
+   if (fd < 0)
+      return -1;
+   struct timeval tv = {CLI_TIMEO_S, 0};
+   (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+   (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
    char hdr[2048];
    int n = snprintf(hdr, sizeof hdr,
                     "%s %s HTTP/1.1\r\nHost: %s\r\n%s"
@@ -75,16 +138,21 @@ static int http_do(const char *host, int port, const char *method,
                     method, path, host, extra ? extra : "", blen);
    if (n <= 0 || n >= (int)sizeof hdr)
       return close(fd), -1;
-   if (write(fd, hdr, (size_t)n) < 0)
+   if (write_all(fd, hdr, (size_t)n) != 0)
       return close(fd), -1;
-   if (blen && write(fd, body, blen) < 0)
+   if (blen && write_all(fd, body, blen) != 0)
       return close(fd), -1;
+
    size_t cap = 65536, got = 0;
    char *buf = malloc(cap);
    if (!buf)
       return close(fd), -1;
    for (;;) {
       if (got + 4096 > cap) {
+         if (cap >= (size_t)CLI_RSP_MAX) {
+            free(buf);
+            return close(fd), -1; /* a reply this large is not this protocol */
+         }
          char *bigger = realloc(buf, cap * 2);
          if (!bigger) { /* realloc leaves the old block alive; do not leak it */
             free(buf);
@@ -94,27 +162,56 @@ static int http_do(const char *host, int port, const char *method,
          buf = bigger;
       }
       ssize_t r = read(fd, buf + got, cap - got - 1);
-      if (r <= 0)
-         break;
+      if (r == 0)
+         break; /* orderly EOF */
+      if (r < 0) {
+         /* AN ERROR IS NOT AN END. Treated as EOF, a reset connection or an
+          * expired timeout handed back whatever had arrived and a status
+          * parsed out of it. */
+         free(buf);
+         return close(fd), -1;
+      }
       got += (size_t)r;
    }
    close(fd);
    buf[got] = '\0';
-   /* "HTTP/1.1 200 ..." -- the status starts at offset 9, so a reply shorter
-    * than that has no code to read and atoi would run off the buffer. */
-   if (got < 12) {
+
+   /* THE STATUS LINE, IN FULL. "HTTP/1.x <3 digits>" and a CRLF after it --
+    * not "at least twelve bytes, then atoi". */
+   char *eol = strstr(buf, "\r\n");
+   if (!eol || eol - buf < 12 || strncmp(buf, "HTTP/1.", 7) != 0 ||
+       buf[8] != ' ' || buf[9] < '0' || buf[9] > '9' || buf[10] < '0' ||
+       buf[10] > '9' || buf[11] < '0' || buf[11] > '9') {
       free(buf);
       return -1;
    }
+   int code = ((buf[9] - '0') * 100) + ((buf[10] - '0') * 10) + (buf[11] - '0');
+
+   /* THE HEADERS MUST HAVE ENDED. Without the blank line the reply is still
+    * in flight, and taking the whole buffer as a body -- which is what the
+    * `else` branch here used to do -- turns a truncated response into a
+    * plausible one. */
    char *sep = strstr(buf, "\r\n\r\n");
-   int code  = atoi(buf + 9);
-   if (sep) {
-      *out  = sep + 4;
-      *olen = got - (size_t)(sep + 4 - buf);
-   } else {
-      *out  = buf;
-      *olen = got;
+   if (!sep) {
+      free(buf);
+      return -1;
    }
+   char *bodyp  = sep + 4;
+   size_t bodyn = got - (size_t)(bodyp - buf);
+
+   /* ...AND ALL OF THE BODY ARRIVED. Content-Length is what says how much
+    * there should be; a reply cut off mid-body is otherwise identical to a
+    * complete one. */
+   const char *cl = find_ci(buf, "\r\ncontent-length:");
+   if (cl && cl < sep) {
+      long want = strtol(cl + 18, NULL, 10);
+      if (want < 0 || (size_t)want != bodyn) {
+         free(buf);
+         return -1;
+      }
+   }
+   *out  = bodyp;
+   *olen = bodyn;
    return code;
 }
 
@@ -130,6 +227,23 @@ static void die(const char *what, const char *saw)
 static int do_pair(const char *host, int port, const char *email,
                    const char *code, int spoil)
 {
+   /* THE ADDRESS IS CHECKED HERE TOO, AND IT IS NOT DEFENCE IN DEPTH.
+    *
+    * The round-1 body is "<address>\n<320 hex>\n" built with snprintf into a
+    * kilobyte. snprintf TRUNCATES: an address of 800 bytes did not fail, it
+    * produced a body whose J-PAKE packet was cut in half, and `n` was the
+    * length the body WOULD have had -- so http_do was handed a length past the
+    * end of the buffer it was given. The server then refused the request for a
+    * malformed packet, which is a diagnostic pointing at the crypto for a
+    * problem in the address field, and the read past the end was nobody's
+    * report at all. Refusing the address first makes the truncation
+    * unreachable; the explicit check on `n` below makes that a fact the
+    * compiler and the reader can both see rather than an argument about
+    * sizes. */
+   char cemail[EMAIL_BUF];
+   if (!email_canon(email, cemail, sizeof cemail))
+      die("that is not an address this server will accept", email);
+
    jpake_init();
    struct jpake *p =
        jpake_new((const uint8_t *)code, strlen(code), 1 /* client */);
@@ -145,7 +259,9 @@ static int do_pair(const char *host, int port, const char *email,
    if (!jpake_round1(p, pkt))
       die("round1 build failed", NULL);
    hex_of(pkt, PAIR_PKT, hex);
-   int n     = snprintf(body, sizeof body, "%s\n%s\n", email, hex);
+   int n = snprintf(body, sizeof body, "%s\n%s\n", cemail, hex);
+   if (n <= 0 || (size_t)n >= sizeof body)
+      die("the pairing body does not fit", cemail);
    int code1 = http_do(host, port, "POST", "/v1/pair/1", NULL, body, (size_t)n,
                        &rsp, &rlen);
    if (code1 != 200)
@@ -241,18 +357,39 @@ static int do_req(const char *host, int port, const char *uid,
    char *owned      = NULL;
    size_t blen      = 0;
    if (bodyfile) {
+      /* WHAT IS ABOUT TO BE SIGNED, checked at every step.
+       *
+       * The MAC covers these bytes, so a body read short is a signature over
+       * something the caller never chose -- and none of fseek, ftell or fread
+       * was checked here. A directory (fread returns 0 and the request goes
+       * out empty), a file that grew between the size and the read, an
+       * unreadable file: each produced a confidently signed wrong request. */
       FILE *f = fopen(bodyfile, "rb");
       if (!f)
          die("cannot open body file", bodyfile);
-      fseek(f, 0, SEEK_END);
+      struct stat st;
+      if (fstat(fileno(f), &st) != 0)
+         die("cannot stat body file", bodyfile);
+      if (!S_ISREG(st.st_mode))
+         die("body file is not a regular file", bodyfile);
+      if (fseek(f, 0, SEEK_END) != 0)
+         die("cannot seek body file", bodyfile);
       long sz = ftell(f);
-      fseek(f, 0, SEEK_SET);
+      if (sz < 0)
+         die("cannot size body file", bodyfile);
+      if (sz > BODY_MAX)
+         die("body file is larger than the protocol allows", bodyfile);
+      if (fseek(f, 0, SEEK_SET) != 0)
+         die("cannot rewind body file", bodyfile);
       owned = malloc((size_t)sz + 1);
       if (!owned)
          die("out of memory reading", bodyfile);
-      blen        = fread(owned, 1, (size_t)sz, f);
+      blen = fread(owned, 1, (size_t)sz, f);
+      if (blen != (size_t)sz || ferror(f))
+         die("body file was not read whole", bodyfile);
       owned[blen] = '\0';
-      fclose(f);
+      if (fclose(f) != 0)
+         die("body file did not close cleanly", bodyfile);
       body = owned;
    }
    uint8_t key[16];
@@ -291,6 +428,21 @@ static int do_req(const char *host, int port, const char *uid,
    char *rsp;
    size_t rlen;
    int code = http_do(host, port, method, path, extra, body, blen, &rsp, &rlen);
+   /* THE STATUS, where a shell can assert on it.
+    *
+    * Only the body reached stdout, so every assertion about the signed API was
+    * a substring of the body and the status was invisible: a 500 whose text
+    * happened to contain the wanted word passed, and so did a 400 where a 401
+    * was the actual contract. Writing it to a named file rather than stdout
+    * keeps the body clean for the callers that pipe it. */
+   const char *cf = getenv("SYNCCLI_CODE_FILE");
+   if (cf && *cf) {
+      FILE *cfp = fopen(cf, "wb");
+      if (cfp) {
+         fprintf(cfp, "%d", code);
+         fclose(cfp);
+      }
+   }
    fwrite(rsp, 1, rlen, stdout);
    return code == 200 ? 0 : 1;
 }

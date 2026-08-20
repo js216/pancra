@@ -47,13 +47,28 @@ struct ins_rec {
    int units; /* whole units, INS_UNITS_MIN..INS_UNITS_MAX */
 };
 
-extern struct ins_rec g_ins[NINS]; /* oldest first; the newest is at the end */
-extern int g_nins;
-extern char g_ins_path[256];
+/* THE TAIL IS PRIVATE, for the same reasons as the weight log's (weight.h):
+ * every reader used to depend on the representation, the ordering invariant
+ * and the lifetime -- and could write to it. These hand out COPIES.
+ *
+ * ORDER IS PART OF THE CONTRACT: oldest first, newest last, which is what the
+ * dose table and the plot both draw. */
+int ins_count(void);
+/* The i-th, oldest first; out of range yields a zeroed record. */
+struct ins_rec ins_at(int i);
+/* Copy up to `cap`, oldest first; returns how many were copied. */
+int ins_copy(struct ins_rec *out, int cap);
+const char *insulin_path(void);
+/* Point it at the data directory; the filename lives here. */
+/* 1 when every path this module persists to fitted; 0 when one did
+ * not, and then NONE of them is usable -- see data_path in util.h. */
+int insulin_paths(const char *dir);
 
 /* Load the tail of the log (the last NINS plausible rows). Safe on a fresh
  * install: a missing file is an empty log. */
-void insulin_load(void);
+/* 0 read whole (or nothing to read), -1 a read failed partway: whatever
+ * parsed is kept, and the caller says the record is incomplete. */
+int insulin_load(void);
 
 /* Append one dose durably and mirror it into the tail. Returns 0 on success,
  * -1 when the write failed (the tail is then left untouched, so memory never
@@ -73,5 +88,37 @@ int insulin_update(const struct ins_rec *orig, long t, int type, int units,
 int insulin_delete(const struct ins_rec *orig);
 
 const char *insulin_type_name(int type); /* "SLOW" / "FAST" */
+
+/* ================= THE DOSE-ENTRY WORKFLOW ==========================
+ *
+ * The LOG INSULIN form is four values and three rules about them, and all
+ * seven lived as globals plus branches in the shell's action dispatcher --
+ * where nothing could reach them. The rules are small and entirely about
+ * doses, which is what makes them worth having here instead:
+ *
+ *   - a NEW form is pre-populated with this type's last amount, because each
+ *     type has its own habitual dose and retyping it every time is the whole
+ *     friction of logging;
+ *   - changing the type on a NEW form re-populates from the new type, but on
+ *     an EDIT it must NOT -- the amount being edited is the one on record;
+ *   - the time starts at the whole minute, so two doses logged in the same
+ *     minute are the same instant and dedup as one.
+ *
+ * `edit` is the index of the entry being edited, or < 0 for a new dose. */
+struct ins_form {
+   long t;   /* the dose's instant */
+   int type; /* INS_SLOW / INS_FAST */
+   int units;
+   int edit;
+};
+
+/* Open a fresh form. `type` < 0 keeps the form's current type (what the
+ * legacy "LOG INSULIN" entry point does); otherwise it is preset, which is
+ * what the ADD menu's FAST and SLOW buttons do. `now` is the clock. */
+void ins_form_open(struct ins_form *f, int type, long now);
+
+/* Toggle SLOW <-> FAST. Re-populates the amount from the new type's history,
+ * but only when this is a new dose. */
+void ins_form_toggle_type(struct ins_form *f);
 
 #endif

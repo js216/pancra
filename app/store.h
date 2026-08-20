@@ -5,6 +5,8 @@
 #ifndef PANCRA_STORE_H
 #define PANCRA_STORE_H
 
+#include "ingest.h" /* STORE_GLU_MIN/MAX: what a stored reading may be */
+
 /* Master reading history. This is the DISPLAY buffer the plot draws from, and
  * its size is what bounds how far back the longest plot span (7D = 168 h) can
  * actually be filled. It MUST be a count large enough that a full 7 days of
@@ -15,9 +17,9 @@
  * fingersticks, reconnect backfill re-reads -- pushed real 7-day data off the
  * left edge. 5040 = 7 days at one reading every 2 minutes, a ceiling that
  * covers two concurrent 5-min CGMs plus a meter plus backfill with margin.
- * Keep UI_PLOT_MAX in ui.c EQUAL to this (the Makefile crosscheck enforces it;
- * ui.c is decoupled from this header, so a smaller UI cap would re-truncate the
- * plot even with a large NHIST). */
+ * Keep UI_PLOT_MAX in uirender.c EQUAL to this (the Makefile crosscheck
+ * enforces it; uirender.c is decoupled from this header, so a smaller UI cap
+ * would re-truncate the plot even with a large NHIST). */
 #define NHIST 5040
 /* Read BUFFER size for the startup replay -- not a limit on how much of the
  * log is read. store_load streams the WHOLE file through this in chunks,
@@ -43,15 +45,51 @@ struct reading {
    long t;             /* canonical UTC epoch seconds */
 };
 
-/* Reading data model, owned by store.c and read by the UI. History is kept
- * newest-first and deduped; g_cur_* is the latest reading snapshot. */
-extern struct reading g_hist[NHIST];
-extern int g_nhist;
-extern int g_cur_glu, g_cur_trend;
-extern long g_cur_time; /* epoch seconds of the latest reading */
-extern int g_cur_rssi, g_cur_rssi_ok;
-extern int g_stored;           /* total rows in the log */
-extern char g_store_path[256]; /* path to the readings CSV */
+/* THE HISTORY IS PRIVATE. It was `extern struct reading g_hist[NHIST]` and a
+ * count, which made every reader depend on the representation (an array, this
+ * long, NEWEST FIRST, deduped) and let any of them write to it -- and a
+ * reading written by hand is a reading in the plot and the alarms that is not
+ * in the log.
+ *
+ * ORDER IS PART OF THE CONTRACT: newest first, because everything that reads
+ * this wants the recent end and stops early.
+ *
+ * THE LOCK IS STILL THE CALLER'S for a multi-step walk (see hist_lock): the
+ * readings arrive on a binder thread, so a walk that wants a consistent view
+ * has to hold it across the whole walk, and no per-call lock can provide
+ * that. hist_copy is the exception -- it takes the lock itself, because one
+ * call IS the whole walk. */
+
+/* How many readings the in-memory tail holds. Caller holds hist_lock for a
+ * value it is about to walk with. */
+int hist_count(void);
+/* The i-th, NEWEST first; out of range yields a zeroed reading. */
+struct reading hist_at(int i);
+/* Copy up to `cap`, newest first, under the lock; returns how many. */
+int hist_copy(struct reading *out, int cap);
+/* Forget the in-memory tail (a reload rebuilds it from the file). Does not
+ * touch the log. */
+void hist_clear(void);
+
+/* How many readings have been APPENDED this run (what the settings screen
+ * reports as "stored"). Distinct from store_count(), which counts the rows in
+ * the file. */
+int store_appended(void);
+
+/* THE CRASH HANDLER'S TWO POINTERS, and nothing else's. It runs on a signal
+ * stack: it may not lock, allocate, or call into the modules it is
+ * describing, so it holds these addresses from startup and reads them
+ * directly. A torn read in a crash report is better than no context. */
+const int *store_glu_ptr(void);
+const int *hist_count_ptr(void);
+/* The reading log's path, for the code that must NAME the file: the sync
+ * client registers it, the long-span plot re-reads it, and the log line at
+ * startup says where it is. Read-only -- it is set once, by store_paths. */
+const char *store_path(void);
+/* Point it at the data directory; the filename lives here. */
+/* 1 when every path this module persists to fitted; 0 when one did
+ * not, and then NONE of them is usable -- see data_path in util.h. */
+int store_paths(const char *dir);
 
 /* hist_insert results. HIST_OLD exists because NHIST is a DISPLAY cap, not a
  * retention policy: a reading older than the ~7 days kept on screen is still a
@@ -114,19 +152,130 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
  * an unsynchronized read of a concurrently-shifted array, and locking it here
  * would invert the reg->hist order. */
 void hist_refresh_current(int prime);
+
+/* THE CURRENT READING, AS ONE FACT.
+ *
+ * g_cur_glu, g_cur_trend and g_cur_time are written as SEPARATE stores by
+ * hist_refresh_current, under the history lock, from whichever thread a
+ * reading arrived on. Every reader that took them one at a time could pair a
+ * new glucose with the previous timestamp -- which evaluates as stale, so a
+ * genuine low is not raised on that pass -- or the mirror, a stale
+ * out-of-range value stamped with a fresh time, which chimes and then
+ * silences itself.
+ *
+ * This is the only way to read them: one call, one lock, one consistent
+ * triple. `stale` is computed inside, against the same `now` the caller is
+ * reasoning about, so two readers cannot disagree about it either. */
+struct reading_now {
+   int glu; /* -1 when nothing has been seen */
+   int trend;
+   long t;    /* epoch seconds of that reading */
+   int stale; /* no reading, or older than the freshness window */
+};
+struct reading_now store_now(long now);
+
+/* THE SAME TRIPLE, for a caller that ALREADY HOLDS the store lock -- the
+ * frame builder (draw() holds it across the whole frame) and the alarm
+ * gatherer. The lock is not recursive, so store_now would self-deadlock
+ * there; holding it is also what makes the three consistent, which is exactly
+ * what store_now provides an unlocked caller. Naming the variant is what
+ * stops the read being open-coded again. */
+struct reading_now store_now_locked(long now);
+
+/* THE LINK RSSI THAT GOES WITH THE CURRENT READING, as one value. Written by
+ * the reading path when a sample or a connection reports one; read by the
+ * frame. `ok` is 0 when nothing has reported one yet -- distinct from a
+ * genuine 0 dBm, which no radio produces. */
+struct reading_rssi {
+   int dbm;
+   int ok;
+};
+struct reading_rssi store_rssi(void);
+/* ...for a caller already holding the store lock. */
+struct reading_rssi store_rssi_locked(void);
+/* Record one, from the reading path. */
+void store_note_rssi(int dbm);
+
+/* ===================== RECORDING ONE READING =========================
+ *
+ * A reading is FOUR things happening in a fixed order, and until this
+ * interface existed every caller performed all four by hand:
+ *
+ *   1. take the history lock;
+ *   2. hist_insert, and feed stat_add on ANY non-zero result (not just
+ *      HIST_NEW -- gating on HIST_NEW made TIR and the average differ before
+ *      and after a restart, because stat_load has no NHIST notion);
+ *   3. hist_refresh_current with the primary resolved BEFORE the lock was
+ *      taken (resolving it inside would invert the reg -> hist lock order);
+ *   4. release the lock, then store_append OUTSIDE it -- and check the
+ *      result, because a reading that did not persist is still on screen and
+ *      still alarmed on, and is gone after a restart.
+ *
+ * Three call sites did that -- the CGM path, the backfill path and the meter
+ * path -- each with its own copy of the ordering, and each an opportunity to
+ * get one step wrong in a way nothing would report. Every rule above is a
+ * comment somewhere explaining a bug that had already happened.
+ *
+ * So: a reading is a VALUE, and recording it is one operation that owns the
+ * lock, the order and the failure.
+ */
+struct reading_event {
+   long t;    /* when the reading was taken */
+   int glu;   /* mg/dL, ALREADY rescaled */
+   int trend; /* tenths of mg/dL per minute; 127 = unknown */
+   int src;   /* provenance id of the device that made it */
+   int kind;  /* KIND_CGM / KIND_BGM */
+   int rssi;  /* link RSSI, meaningful only when has_rssi */
+   int has_rssi;
+   long raw;       /* the sensor's own uncorrected time */
+   long tz;        /* the offset assumed when converting it */
+   int rescale_pm; /* factor applied to glu, permille; 1000 = none */
+   /* WARM-UP BACKFILL. Points replayed out of a sensor's own memory are real
+    * readings and belong in the log and the history, but they were already
+    * counted in the statistics when they were first seen -- feeding them
+    * again double-counts a day of a person's time in range. */
+   int warm;
+   /* The primary source id, resolved by the caller UNDER THE REGISTRY LOCK
+    * before calling. -1 when no CGM is registered. It is a parameter and not
+    * a lookup for the lock-order reason in hist_refresh_current's comment. */
+   int prime;
+};
+
+/* What recording it did. */
+struct reading_result {
+   int inserted;  /* HIST_DUP / HIST_NEW / HIST_OLD */
+   int persisted; /* 1 = the row reached the disk. CHECK IT. */
+   /* This source's previous glucose within CHIRP_MAX_GAP_S, captured before
+    * the insert (afterwards the newest sample from src IS this one), or -1.
+    * The NEW DATAPOINT chirp pitches on it. */
+   int prev_glu;
+};
+
+/* Record one reading: history, statistics, current value and disk, in the one
+ * order they are allowed to happen in. Takes and releases the history lock
+ * itself; the disk append happens outside it.
+ *
+ * `gap` is the window hist_prev_glu searches back over for prev_glu. */
+struct reading_result store_record(const struct reading_event *ev, long gap);
+
+/* THE HISTORY LOCK, which lives here because the history does.
+ *
+ * It used to be a flag in the shell called g_draw_busy, taken by name at fifty
+ * call sites in a different translation unit from the array it protects. A
+ * lock that lives away from its data is a lock somebody forgets to take. */
+void store_lock(void);
+void store_unlock(void);
+int store_trylock(void);
+/* Wait up to `ms` for the lock to be FREE without taking it -- for teardown,
+ * which must be bounded (see app/thread.h, rule 5). 1 if it went free. */
+int store_drain(int ms);
+
 /* The bound a STORED reading must satisfy, which is NOT the live sensor bound.
  *
- * main.c's glucose_plausible (20..600) gates the RAW value off the sensor and
- * is right for that. But a rescale is applied AFTER it and before the write,
- * scaling by up to RESCALE_MAX_PM (+25%), so a legitimately stored value
- * reaches 750 -- and 20 at -25% reaches 15. Both replay readers used the raw
- * 20..600, so a genuine extreme excursion was displayed, alarmed and counted
- * live, then silently excluded from history, the plot and TIR/AVG/A1C on the
- * next launch: the record of exactly the readings that matter clinically
- * disappeared, and live stats disagreed with replayed ones. Widen once, here,
- * so both readers and any future one share the writer's actual range. */
-#define STORE_GLU_MIN 15
-#define STORE_GLU_MAX 750
+ * The range itself is in ingest.h -- see there. It is not the STORE's fact:
+ * every reader of the log needs it, and stats.c included this whole header
+ * for those two numbers alone, which put a cycle between the history and the
+ * statistics it feeds. */
 
 /* Load the tail of the CSV into g_hist (most-recent NHIST rows) + g_cur_*. */
 /* Load the whole log into the in-memory history. Returns 0 on success -- a
@@ -134,8 +283,15 @@ void hist_refresh_current(int prime);
  * could not be read whole, which means the history is SHORT and everything
  * derived from it (plot, statistics, the restored current reading) is
  * understated. Callers must say so rather than render a partial record as a
- * complete one. */
-int store_load(void);
+ * complete one.
+ *
+ * `prime` is the PRIMARY SENSOR'S ID, resolved by the caller BEFORE it takes
+ * the history lock. This function used to call sensor_primary_id() itself, at
+ * the end, with the history lock held -- registry inside history, the inverse
+ * of the documented registry -> history order, and one binder thread away
+ * from a freeze. The lock order is a property of the CALL SITE, so the id is
+ * an argument. -1 means "no primary". */
+int store_load(int prime);
 /* Count the rows currently in the log (one pass). */
 int store_count(void);
 

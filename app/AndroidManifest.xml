@@ -1,9 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: GPL-3.0 -->
+<!--
+  WHAT IS DELIBERATELY NOT IN THIS FILE: android:versionCode,
+  android:versionName, and <uses-sdk>.
+
+  They were here, hard-coded, as versionCode="1" and targetSdkVersion="34".
+  A hard-coded versionCode is the one packaging mistake that cannot be
+  repaired after the fact: Android refuses to install a package whose version
+  code does not EXCEED the installed one, so the second artifact ever
+  distributed could not update the first. The only way past that refusal is
+  for the user to uninstall / and uninstalling this app deletes its private
+  storage, which is every glucose reading, insulin dose and meal they have
+  logged since the day they installed it. The fix has to happen before the
+  first release, because after it there is no version of this app that the
+  people running the first one can be moved to.
+
+  So all four numbers are supplied by the BUILD, from explicit inputs in the
+  Makefile (VERSION_CODE, VERSION_NAME, MIN_SDK, TARGET_SDK), through
+  aapt/aapt2's the version-code flag / the version-name flag / the min-sdk-version flag /
+  the target-sdk-version flag.
+
+  AND THEY CANNOT BE HERE AS WELL, which is not a style preference. Measured
+  on this toolchain (aapt v0.2-debian, aapt2 2.19-debian): all four of those
+  flags are INJECT-IF-ABSENT, not overrides. Given an attribute in this file
+  the flag is accepted, ignored, and the tool says nothing. That is how the
+  AAB rule came to pass the target-sdk-version flag 34 for months while nobody could
+  have changed the shipped target SDK by editing it: the value in this file
+  won every time. An attribute reappearing here does not conflict with the
+  build inputs / it SILENTLY REPLACES them. `make versioncheck` refuses this
+  file if one comes back.
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-          package="com.jk.pancra"
-          android:versionCode="1" android:versionName="0.1">
-  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
+          package="com.jk.pancra">
 
   <!-- Android 12+ (API 31+): scanning never used to derive location -->
   <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
@@ -30,14 +58,33 @@
   <!-- debuggable is intentionally absent (defaults to false = release-safe).
        Dev builds flip it on via aapt's debug-mode flag so crash.log is
        retrievable on-device; `make release` does not. -->
-  <!-- usesCleartextTraffic: the REMOTE push goes to a user-configured LAN
-       address (glucoserve.py) over plain HTTP; Android 9+ blocks cleartext
-       without this. -->
+  <!-- usesCleartextTraffic: the REMOTE push may go to a user-configured LAN
+       address over plain HTTP (the server is srv/, and the default is HTTPS
+       to pancra.org); Android 9+ blocks cleartext without this. -->
+  <!-- BACKUP AND DEVICE-TO-DEVICE TRANSFER: refused explicitly, on both
+       channels, for both Android generations this app supports.
+
+       allowBackup="false" was here alone. It settles cloud backup and says
+       nothing about the OTHER channel Android 12 split out / the
+       device-to-device copy a setup wizard makes when somebody moves to a
+       new phone. What that channel does with an app that supplies no rules
+       is a platform default, it has not been identical across releases, and
+       the files it would be deciding about are this user's entire medical
+       history plus the credential that authenticates their phone to the sync
+       account holding the same history on the server.
+
+       The two resources below say no to every domain on every channel:
+       @xml/data_extraction_rules is read from API 31 up, @xml/backup_rules
+       by API 30 and below (each is ignored by the other's range, and
+       minSdkVersion is 29, so both ranges are live). allowBackup="false"
+       stays as the outermost of the three. -->
   <application android:label="Pancra"
                android:icon="@mipmap/ic_launcher"
                android:roundIcon="@mipmap/ic_launcher_round"
                android:usesCleartextTraffic="true"
                android:allowBackup="false"
+               android:dataExtractionRules="@xml/data_extraction_rules"
+               android:fullBackupContent="@xml/backup_rules"
                android:theme="@android:style/Theme.NoTitleBar">
     <activity android:name="android.app.NativeActivity" android:exported="true"
               android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">

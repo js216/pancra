@@ -6,7 +6,9 @@
 #include "auth.h"
 #include "db.h"
 #include "http.h"
+#include "oops.h"
 #include "pair.h"
+#include "rowdec.h"
 #include "util.h"
 #include <sqlite3.h>
 #include <stdio.h>
@@ -26,25 +28,37 @@ void sub_page(struct req *r, const char *title, const char *body_html)
    sb_free(&s);
 }
 
-void oops(struct req *r)
-{
-   http_text(r->fd, 500, "Internal Server Error", "server error\n");
-}
-
+/* A redirect is a RESPONSE, and goes out the same way every other one does.
+ *
+ * It used to hand-write its own header block and push it straight down the
+ * socket. Every caller of this -- login, logout, accepting an invitation,
+ * saving a setting -- is reached from web_route_locked, i.e. while the page
+ * mutex is HELD. So a client that asked for a redirect and then stopped
+ * reading blocked that mutex, and with it every page for every other user, at
+ * the peer's pace. That is precisely the failure the buffered model exists to
+ * prevent, and web_route's own comment describes it -- while this function sat
+ * outside the model and did it anyway.
+ *
+ * Now it fills in the response like page() does, and web_route flushes it
+ * after unlocking. */
 void redirect(struct req *r, const char *to, const char *set_cookie)
 {
-   char hdr[512];
-   int n = snprintf(hdr, sizeof hdr,
-                    "HTTP/1.1 303 See Other\r\n"
-                    "Location: %s\r\n"
-                    "%s%s%s"
-                    "Content-Length: 0\r\n"
-                    "Connection: %s\r\n\r\n",
-                    to, set_cookie ? "Set-Cookie: " : "",
-                    set_cookie ? set_cookie : "", set_cookie ? "\r\n" : "",
-                    http_conn_value());
-   if (n > 0)
-      (void)!http_write(r->fd, hdr, (size_t)n);
+   int n =
+       snprintf(r->resp_extra, sizeof r->resp_extra, "Location: %s\r\n%s%s%s",
+                to, set_cookie ? "Set-Cookie: " : "",
+                set_cookie ? set_cookie : "", set_cookie ? "\r\n" : "");
+   if (n < 0 || n >= (int)sizeof r->resp_extra) {
+      /* Cannot describe the redirect -- say so rather than send half of it. */
+      r->resp_extra[0] = '\0';
+      r->resp_code     = 500;
+      r->resp_reason   = "Internal Server Error";
+      r->resp_ctype    = "text/plain";
+      return;
+   }
+   r->resp_code   = 303;
+   r->resp_reason = "See Other";
+   r->resp_ctype  = "text/plain";
+   /* No body: resp stays NULL, and the flush sends headers alone. */
 }
 
 /* The single-user version's whole stylesheet, kept exactly: one monospace
@@ -91,7 +105,7 @@ void page_refresh(struct req *r, int code, const char *reason,
    r->resp_ctype  = "text/html";
 }
 
-long web_user(struct req *r, char *cookie, size_t cap)
+long web_user(struct req *r, char *cookie, size_t cap, int *failed)
 {
    char all[1024];
    cookie[0] = '\0';
@@ -111,15 +125,17 @@ long web_user(struct req *r, char *cookie, size_t cap)
       if (p)
          p++;
    }
+   if (failed)
+      *failed = 0;
    if (!cookie[0])
       return 0;
-   return session_user(cookie);
+   return session_user(r->db, cookie, failed);
 }
 
-void email_of(long uid, char *out, size_t cap)
+void email_of(struct db *d, long uid, char *out, size_t cap)
 {
    out[0]           = '\0';
-   sqlite3_stmt *st = db_prep("SELECT email FROM user WHERE id=?");
+   sqlite3_stmt *st = db_prep(d, "SELECT email FROM user WHERE id=?");
    if (!st)
       return;
    sqlite3_bind_int64(st, 1, uid);
@@ -142,18 +158,29 @@ void email_of(long uid, char *out, size_t cap)
  * offset of 0 because the user is on UTC is not the same as 0 because no
  * reading has ever arrived, and the settings page must not present the second
  * as though it were the first. */
-int tz_resolve(long uid, int *have)
+int tz_resolve(struct db *d, long uid, int *have)
 {
-   int found = 0;
    if (have)
       *have = 1;
-   long v = db_one_long("SELECT tz_offset FROM user WHERE id=? AND"
-                        " tz_offset IS NOT NULL",
-                        uid, &found);
-   if (found)
+   long v        = 0;
+   enum db_get g = db_get_long(d,
+                               "SELECT tz_offset FROM user WHERE id=? AND"
+                               " tz_offset IS NOT NULL",
+                               uid, &v);
+   if (g == DB_GET_VALUE)
       return (int)v;
    if (have)
       *have = 0;
+   /* A DATABASE THAT COULD NOT ANSWER IS NOT A USER WITH NO SETTING, and the
+    * difference is visible: falling through to the reading-derived offset
+    * below would render every timestamp on the page in whatever that found,
+    * and the settings box would present it as the stored choice. `have` is
+    * already 0, so the caller that cares (the settings page) shows the
+    * automatic row rather than a fabricated one -- and callers that do not
+    * pass `have` get 0, which is what they got before for an unreadable
+    * database anyway. */
+   if (g == DB_GET_FAIL)
+      return 0;
    /* Whose readings to take the offset from: this user's own, or -- for a
     * FOLLOWER, who may never pair an app at all -- those of whoever shares
     * with them. A follower is looking at the owner's timeline anyway, so the
@@ -163,61 +190,66 @@ int tz_resolve(long uid, int *have)
     * say without javascript, and IP geolocation would mean either a database
     * on a 56 MB board or sending every viewer's address to somebody else. */
    sqlite3_stmt *st =
-       db_prep("SELECT line FROM logrow WHERE log='readings' AND user_id ="
-               " CASE WHEN EXISTS(SELECT 1 FROM logrow WHERE user_id=?1"
-               "                  AND log='readings')"
-               "      THEN ?1"
-               "      ELSE COALESCE((SELECT owner_id FROM share"
-               "                     WHERE viewer_id=?1 ORDER BY created_at"
-               "                     LIMIT 1), ?1) END"
-               " ORDER BY bucket DESC, line DESC LIMIT 1");
+       db_prep(d, "SELECT line FROM logrow WHERE log='readings' AND user_id ="
+                  " CASE WHEN EXISTS(SELECT 1 FROM logrow WHERE user_id=?1"
+                  "                  AND log='readings')"
+                  "      THEN ?1"
+                  "      ELSE COALESCE((SELECT owner_id FROM share"
+                  "                     WHERE viewer_id=?1 ORDER BY created_at"
+                  "                     LIMIT 1), ?1) END"
+                  " ORDER BY bucket DESC, line DESC LIMIT 1");
    if (!st)
       return 0;
    sqlite3_bind_int64(st, 1, uid);
    int off = 0;
    if (sqlite3_step(st) == SQLITE_ROW) {
       const char *ln = (const char *)sqlite3_column_text(st, 0);
-      if (ln) {
-         /* epoch,glu,trend,rssi,lag,src,raw,tz_off,kind[,rescale] */
-         const char *p = ln;
-         for (int f = 0; f < 7 && p; f++) {
-            p = strchr(p, ',');
-            if (p)
-               p++;
-         }
-         if (p) {
-            off = (int)(strtol(p, NULL, 10) / 60);
-            if (have)
-               *have = 1;
-         }
+      struct row_reading rr;
+      /* THE SAME DECODER as every other reader (rowdec.h). This walked to the
+       * eighth field and handed it to strtol, so a row that stopped early --
+       * or a field with anything but digits in it -- resolved to an offset of
+       * ZERO and set *have: the settings page then presented UTC as the
+       * user's own timezone, and every timestamp on every page was rendered
+       * in it. Not knowing is a different answer from knowing zero. */
+      if (ln && row_decode(ln, (int)strlen(ln), &rr)) {
+         off = rr.tz / 60;
+         if (have)
+            *have = 1;
       }
    }
    sqlite3_finalize(st);
    return off;
 }
 
-int tz_of(long uid)
+int tz_of(struct db *d, long uid)
 {
-   return tz_resolve(uid, NULL);
+   return tz_resolve(d, uid, NULL);
 }
 
 void stamp_local(long t, int tz_min, char *out, size_t cap)
 {
    time_t local = (time_t)(t + (long)tz_min * 60);
    struct tm tm;
-   gmtime_r(&local, &tm);
+   /* A TIMESTAMP THAT COULD NOT BE COMPUTED IS NOT A TIMESTAMP. gmtime_r
+    * fails on a time_t it cannot represent as a date, and leaves `tm`
+    * untouched -- so the fields printed below were whatever the stack held,
+    * rendered as a date beside a real glucose reading. Say it is unknown. */
+   if (!gmtime_r(&local, &tm)) {
+      snprintf(out, cap, "(unknown time)");
+      return;
+   }
    snprintf(out, cap, "%04d-%02d-%02d %02d:%02d", tm.tm_year + 1900,
             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
 }
 
 /* May `viewer` see `owner`'s record? Ownership, or a share row. Followers are
  * read-only by construction: no write path in this program consults share. */
-int may_view(long viewer, long owner)
+int may_view(struct db *d, long viewer, long owner)
 {
    if (viewer == owner)
       return 1;
    sqlite3_stmt *st =
-       db_prep("SELECT 1 FROM share WHERE owner_id=? AND viewer_id=?");
+       db_prep(d, "SELECT 1 FROM share WHERE owner_id=? AND viewer_id=?");
    if (!st)
       return 0;
    sqlite3_bind_int64(st, 1, owner);
@@ -283,8 +315,34 @@ void set_cookie_str(const char *cookie, char *out, size_t cap)
 int csrf_guard(struct req *r, const char *cookie)
 {
    char sent[128];
-   form_get(r->body, r->body_len, "csrf", sent, sizeof sent);
-   if (csrf_ok(cookie, sent))
+   /* THE TOKEN MUST BE THE ONLY ONE, AND IT MUST BE A TOKEN.
+    *
+    * This used to read the field and throw the decoder's answer away -- one
+    * bit of an answer, which is all there was -- and go straight into
+    * csrf_ok on whatever had been written. Two shapes got past it:
+    *
+    *   "csrf=<valid>%00anything"  decoded to a NUL-terminated <valid>, and
+    *      csrf_ok is a string compare, so it PASSED -- while a proxy, a log
+    *      or a WAF counting bytes saw a different value entirely.
+    *   "csrf=<valid>&csrf=<junk>" was answered with the first, silently. Any
+    *      other reader of the same body is free to prefer the last.
+    *
+    * Neither is a token this browser was given, so neither is a form this
+    * user submitted. Every not-OK answer is refused the same way and with the
+    * same page: which of the five it was tells an attacker how their guess
+    * was WRONG, and the honest answer to all of them is that the form did not
+    * come from here. They are still named one by one so that -Wswitch-enum
+    * makes a sixth answer, added later, a compile error here rather than a
+    * silent "carry on". */
+   int usable = 0;
+   switch (form_field(r->body, r->body_len, "csrf", sent, sizeof sent)) {
+      case FORM_OK: usable = 1; break;
+      case FORM_ABSENT:
+      case FORM_MALFORMED:
+      case FORM_TOO_LONG:
+      case FORM_DUPLICATE: usable = 0; break;
+   }
+   if (usable && csrf_ok(cookie, sent))
       return 1;
    page(r, 403, "Forbidden", "expired",
         "<p>That form expired. <a href=\"/settings\">Try again</a>.</p>");
@@ -325,23 +383,33 @@ long viewed_owner(struct req *r, long me, int *have_own)
       return owner;
    }
 
-   int mine = 0;
-   db_one_long("SELECT 1 FROM logrow WHERE user_id=? AND log='readings'"
-               " LIMIT 1",
-               me, &mine);
-   *have_own = mine || pair_is_paired(me);
+   /* "DOES THIS VIEWER HAVE A RECORD OF THEIR OWN?" -- and a database that
+    * cannot say must not answer NO. Answering no sends the caller down the
+    * follower path below, which can hand back somebody ELSE'S account as the
+    * owner: the wrong person's readings, rendered as the viewer's own,
+    * because a query errored. Treated as "yes, their own", the worst case is
+    * an empty page about the right account. */
+   enum db_get gm = db_get_long(r->db,
+                                "SELECT 1 FROM logrow WHERE user_id=? AND"
+                                " log='readings' LIMIT 1",
+                                me, NULL);
+   int mine       = (gm != DB_GET_NONE); /* VALUE or FAIL */
+   *have_own      = mine || pair_is_paired(r->db, me) != 0;
    if (*have_own) {
       set_who(r, owner, me);
       return owner;
    }
 
-   int one = 0;
-   long only =
-       db_one_long("SELECT owner_id FROM share WHERE viewer_id=?"
+   long only = 0;
+   /* ONLY an actual row re-points the view. A failure here leaves `owner` as
+    * the viewer, which is the conservative answer: showing somebody their own
+    * empty record is recoverable, showing them a stranger's is not. */
+   if (db_get_long(r->db,
+                   "SELECT owner_id FROM share WHERE viewer_id=?"
                    " AND (SELECT count(*) FROM share WHERE viewer_id=?1)"
                    "     = 1",
-                   me, &one);
-   if (one && only > 0)
+                   me, &only) == DB_GET_VALUE &&
+       only > 0)
       owner = only;
    set_who(r, owner, me);
    return owner;
@@ -355,7 +423,7 @@ long owner_of(struct req *r, long me)
       owner = strtol(q + 4, NULL, 10);
    if (owner <= 0)
       owner = me;
-   if (!may_view(me, owner)) {
+   if (!may_view(r->db, me, owner)) {
       page(r, 403, "Forbidden", "Pancra",
            "<p>That record is not shared with you.</p>"
            "<p><a href=\"/\">Back</a></p>");

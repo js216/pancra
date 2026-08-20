@@ -54,41 +54,91 @@ static void put_code(struct wr *w, int code, int width)
    }
 }
 
-/* ---- LZW dictionary: (prefix code, next byte) -> code, hashed ---- */
+/* ---- LZW dictionary: (prefix code, next byte) -> code, hashed ----
+ *
+ * The table belongs to the CALLER (struct gif_ws, see gif.h): as two
+ * file-scope arrays, two concurrent encodes shared one dictionary and both
+ * emitted streams that decode to garbage. */
 
-#define HSIZE 8192 /* power of two, > 4096 codes */
-static int32_t h_key[HSIZE];
-static uint16_t h_code[HSIZE];
-
-static void dict_reset(void)
+static void dict_reset(struct gif_ws *ws)
 {
-   memset(h_key, 0xFF, sizeof h_key); /* -1 = empty */
+   memset(ws->key, 0xFF, sizeof ws->key); /* -1 = empty */
 }
 
-static int dict_find(int32_t key)
+static int dict_find(const struct gif_ws *ws, int32_t key)
 {
-   uint32_t i = ((uint32_t)key * 2654435761U) & (HSIZE - 1);
-   while (h_key[i] != -1) {
-      if (h_key[i] == key)
-         return h_code[i];
-      i = (i + 1) & (HSIZE - 1);
+   uint32_t i = ((uint32_t)key * 2654435761U) & (GIF_HSIZE - 1);
+   while (ws->key[i] != -1) {
+      if (ws->key[i] == key)
+         return ws->code[i];
+      i = (i + 1) & (GIF_HSIZE - 1);
    }
    return -1;
 }
 
-static void dict_add(int32_t key, int code)
+static void dict_add(struct gif_ws *ws, int32_t key, int code)
 {
-   uint32_t i = ((uint32_t)key * 2654435761U) & (HSIZE - 1);
-   while (h_key[i] != -1)
-      i = (i + 1) & (HSIZE - 1);
-   h_key[i]  = key;
-   h_code[i] = (uint16_t)code;
+   uint32_t i = ((uint32_t)key * 2654435761U) & (GIF_HSIZE - 1);
+   while (ws->key[i] != -1)
+      i = (i + 1) & (GIF_HSIZE - 1);
+   ws->key[i]  = key;
+   ws->code[i] = (uint16_t)code;
 }
 
-size_t gif_encode(uint8_t *out, size_t cap, const uint8_t *px, int w, int h,
-                  const uint8_t pal[][3], int ncolors)
+/* ---- THE DIMENSION RULE, AS A FUNCTION OF NOTHING (see gif.h) ---------- */
+
+int gif_dims_ok(int w, int h, size_t *npx)
 {
-   if (w <= 0 || h <= 0 || ncolors < 2 || ncolors > 256)
+   /* ANSWERED FIRST, ALWAYS. A caller that drops the return value must be
+    * left with a count of zero rather than its own stack, because the one
+    * thing it will do with *npx is bound a loop over somebody's pixels. */
+   if (npx)
+      *npx = 0;
+   if (!npx)
+      return 0;
+   /* 1..65535 in each direction. Zero is refused rather than treated as an
+    * empty image: a zero-width Image Descriptor is a file decoders disagree
+    * about, and the encoder below would read px[0] out of a buffer that has no
+    * pixels in it. Negative is refused because `int` is what the parameter is,
+    * not because a negative size means anything. */
+   if (w < 1 || w > GIF_DIM_MAX || h < 1 || h > GIF_DIM_MAX)
+      return 0;
+   /* CHECKED MULTIPLICATION, even though the _Static_assert in gif.h proves it
+    * cannot fail at the current GIF_DIM_MAX. It costs one divide once per
+    * image, and it is the line that stays correct if the limit ever moves --
+    * the old code multiplied through a signed `long`, which on a 32-bit `long`
+    * is undefined behaviour rather than a wrong answer. */
+   if ((size_t)w > SIZE_MAX / (size_t)h)
+      return 0;
+   *npx = (size_t)w * (size_t)h;
+   return 1;
+}
+
+size_t gif_encode(struct gif_ws *ws, uint8_t *out, size_t cap,
+                  const uint8_t *px, int w, int h, const uint8_t pal[][3],
+                  int ncolors)
+{
+   /* EVERY CHECK BEFORE EVERY WRITE. `struct wr` is not even constructed until
+    * the arguments are known good, so there is no path on which the six bytes
+    * of "GIF89a" reach `out` and the call then decides it cannot continue.
+    * That ordering is the whole point: a refusal that has already written a
+    * header is indistinguishable, to the buffer's owner, from a success.
+    *
+    * The NULL tests are new and were reachable. `px` was dereferenced
+    * unconditionally at the head of the pixel loop (`int prefix = px[0]`), so
+    * gif_encode(ws, out, cap, NULL, 8, 8, pal, 16) segfaulted -- measured, not
+    * inferred. `pal` was read while emitting the global colour table, and
+    * `out` was written through by put() whenever cap was nonzero. Only `ws`
+    * was ever checked. */
+   if (!ws || !out || !px || !pal)
+      return 0;
+   if (ncolors < 2 || ncolors > 256)
+      return 0;
+   /* THE DIMENSIONS, AND THE PIXEL COUNT, IN ONE PLACE. See gif.h for what a
+    * width above 65535 used to put on the wire; the short version is a header
+    * claiming four pixels above a stream carrying 262148 of them. */
+   size_t npx;
+   if (!gif_dims_ok(w, h, &npx))
       return 0;
    /* palette size field: 2^(pbits) entries, smallest that fits */
    int pbits = 1;
@@ -128,14 +178,15 @@ size_t gif_encode(uint8_t *out, size_t cap, const uint8_t *px, int w, int h,
    const int eoi   = clear + 1;
    int next        = eoi + 1;
    int width       = mcs + 1;
-   dict_reset();
+   dict_reset(ws);
    put_code(&wr, clear, width);
-   long npx   = (long)w * h;
+   /* npx came from gif_dims_ok above, as a size_t: `long npx = (long)w * h`
+    * was signed and could overflow where `long` is 32 bits. */
    int prefix = px[0];
-   for (long i = 1; i < npx; i++) {
+   for (size_t i = 1; i < npx; i++) {
       int c       = px[i];
       int32_t key = ((int32_t)prefix << 8) | c;
-      int found   = dict_find(key);
+      int found   = dict_find(ws, key);
       if (found >= 0) {
          prefix = found;
          continue;
@@ -150,11 +201,11 @@ size_t gif_encode(uint8_t *out, size_t cap, const uint8_t *px, int w, int h,
       if (next == (1 << width) && width < 12)
          width++;
       if (next < 4096) {
-         dict_add(key, next);
+         dict_add(ws, key, next);
          next++;
       } else { /* dictionary full: start over */
          put_code(&wr, clear, width);
-         dict_reset();
+         dict_reset(ws);
          next  = eoi + 1;
          width = mcs + 1;
       }

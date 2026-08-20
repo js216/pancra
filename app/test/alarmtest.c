@@ -20,6 +20,9 @@
  * Built and run by `make alarmtest`, which `make check` depends on.
  */
 #include "alarmlogic.h"
+#include <pthread.h> /* the prediction word is published across threads */
+#include <sched.h>   /* sched_yield: let the reader run on a single core */
+#include <stdatomic.h>
 #include <stdio.h>
 
 static int all = 1;
@@ -29,6 +32,91 @@ static void ck(int cond, const char *what)
    printf("  [%s] %s\n", cond ? "PASS" : "FAIL", what);
    if (!cond)
       all = 0;
+}
+
+/* ---- THE PREDICTION WORD, DRIVEN BY TWO THREADS ---------------------------
+ *
+ * alarm.c publishes a link's predicted glucose and the monotonic second it
+ * arrived as ONE atomic word, because the writer is a GATT binder thread
+ * holding the DRIVER lock and the reader is the alarm evaluation holding the
+ * ALARM lock -- two threads, two different locks, and no common one that may
+ * be taken (alarm_lk is held across blocking MediaPlayer JNI, so taking it
+ * under the driver lock is a freeze). alarm.c itself is in no test binary, so
+ * what is executed here is the PRIMITIVE it rests on: pack, publish, load,
+ * unpack, under real concurrency and under ThreadSanitizer.
+ *
+ * THE PAIR MUST BE MUTUALLY CHECKABLE, or this proves nothing. A run of
+ * plausible-looking values passes against an unsynchronised publication
+ * simply because every value is in range -- that is exactly what happened to
+ * bondtabletest before it encoded identity into its values (200/200 green
+ * over an unsynchronised table). So the writer publishes pairs satisfying a
+ * relation the reader can check: mono == PRED_T0 + mgdl. A mixed pair -- one
+ * epoch's value with another epoch's stamp -- violates it, and a torn word
+ * violates it in both halves at once. */
+#define PRED_T0 4000000L
+#define PRED_LO 40
+#define PRED_HI 900
+/* How many publications the writer makes before it is allowed to stop, and how
+ * many the reader must have OBSERVED by then. */
+#define PRED_ITERS    200000
+#define PRED_MIN_SEEN 1000
+/* ...and the hard cap that keeps a starved reader a REPORTED failure instead
+ * of a hung suite. A gate that can hang is a gate that gets disabled. */
+#define PRED_MAX_ITERS 200000000L
+
+static _Atomic unsigned long long g_pred_word;
+/* atomic_int, NOT volatile: `volatile` orders nothing between threads and
+ * ThreadSanitizer correctly reports a volatile stop flag as a race. */
+static atomic_int g_pred_stop;
+static atomic_int g_pred_seen;  /* pairs the reader actually observed */
+static atomic_int g_pred_mixed; /* ...of which were incoherent */
+
+static void *pred_writer(void *arg)
+{
+   (void)arg;
+   /* THE WRITER WAITS FOR THE READER TO HAVE LOOKED.
+    *
+    * Without this the case passes on scheduling luck and proves nothing: 200k
+    * relaxed stores take about a millisecond, so the writer can finish and
+    * raise the stop flag before the reader thread is ever scheduled -- the
+    * reader then observes ZERO pairs and "no mixed pair was seen" is true
+    * because nothing was seen. Observed happening on the first run of this
+    * suite at -O2. The `seen > 0` assertion below is what catches it; this
+    * loop is what stops it being the common case. */
+   for (long i = 0;; i++) {
+      int mgdl = PRED_LO + (int)(i % (PRED_HI - PRED_LO + 1));
+      atomic_store_explicit(&g_pred_word, pred_pack(mgdl, PRED_T0 + mgdl),
+                            memory_order_relaxed);
+      if (i < PRED_ITERS)
+         continue;
+      if (atomic_load_explicit(&g_pred_seen, memory_order_relaxed) >=
+          PRED_MIN_SEEN)
+         break;
+      if (i >= PRED_MAX_ITERS)
+         break;      /* the reader never ran; let the assertion say so */
+      sched_yield(); /* one core: give the reader somewhere to run */
+   }
+   atomic_store_explicit(&g_pred_stop, 1, memory_order_release);
+   return 0;
+}
+
+static void *pred_reader(void *arg)
+{
+   (void)arg;
+   while (!atomic_load_explicit(&g_pred_stop, memory_order_acquire)) {
+      /* ONE load, then decide from the pair it yielded -- the shape
+       * any_pred_low uses. Re-reading the word for the second field would put
+       * the mixed-pair hole straight back. */
+      struct link_pred p =
+          pred_unpack(atomic_load_explicit(&g_pred_word, memory_order_relaxed));
+      if (!p.mgdl && !p.mono)
+         continue; /* nothing published yet */
+      if (p.mono != PRED_T0 + p.mgdl)
+         atomic_fetch_add_explicit(&g_pred_mixed, 1, memory_order_relaxed);
+      /* Incremented LAST and visibly, because the writer waits on it. */
+      atomic_fetch_add_explicit(&g_pred_seen, 1, memory_order_relaxed);
+   }
+   return 0;
 }
 
 int main(void)
@@ -93,15 +181,21 @@ int main(void)
    ck(alarm_zone(-1, now, now, lo, hi) == 0, "no reading is not a zone");
 
    printf("== stale: threshold, launch grace, and disabled ==\n");
-   ck(alarm_stale(100, now - 10000, now, now - 10000, 0) == 0,
+   /* `mono` is the monotonic clock, which is a DIFFERENT number space from
+    * `now`: seconds since boot, not since 1970. It is deliberately nothing
+    * like `now` here, so a call that fed the wall clock into the grace pair
+    * (or the other way round) could not accidentally still pass. */
+   const long mono   = 5000;
+   const long launch = mono - 10000; /* long since out of the launch grace */
+   ck(alarm_stale(100, now - 10000, now, mono, launch, 0) == 0,
       "disc disabled never fires");
-   ck(alarm_stale(100, now - 100, now, now - 10000, 600) == 0,
+   ck(alarm_stale(100, now - 100, now, mono, launch, 600) == 0,
       "a recent reading is not stale");
-   ck(alarm_stale(100, now - 601, now, now - 10000, 600) == 1,
+   ck(alarm_stale(100, now - 601, now, mono, launch, 600) == 1,
       "past the threshold is stale");
-   ck(alarm_stale(100, now - 601, now, now - 10, 600) == 0,
+   ck(alarm_stale(100, now - 601, now, mono, mono - 10, 600) == 0,
       "inside the launch grace, not stale");
-   ck(alarm_stale(-1, now, now, now - 10000, 600) == 1,
+   ck(alarm_stale(-1, now, now, mono, launch, 600) == 1,
       "no reading at all is stale");
 
    printf("== a glucose excursion outranks a stale warning ==\n");
@@ -124,7 +218,7 @@ int main(void)
        * actively called silence() on a ringing hypo. */
       const long gt = now - AL_FRESH_S - 60; /* one minute past fresh */
       int zone      = alarm_zone(45, gt, now, lo, hi);
-      int stale_off = alarm_stale(45, gt, now, now - 100000, 0); /* disc OFF */
+      int stale_off = alarm_stale(45, gt, now, 5000, -95000, 0); /* disc OFF */
       ck(zone == 0, "the zone still decays (it must not mask a stale alarm)");
       ck(stale_off == 0, "the configured stale alarm is off");
       int stranded = alarm_stranded(45, gt, now, lo, hi);
@@ -205,6 +299,148 @@ int main(void)
       /* In-range fresh data clears everything. */
       ck(alarm_want_sustained(0, 0, 0, AL_LOW) == AL_NONE,
          "returning to range silences a sustained alarm");
+   }
+
+   /* ---- A CLOCK ROLLBACK ----
+    *
+    * The phone corrects its wall clock BACKWARDS as a matter of routine: an
+    * NTP step after the battery went flat, a timezone-database fix, a date
+    * typed in by hand. Every reading already in the log is then stamped in
+    * the FUTURE, and every freshness test in this file used to be
+    * `now - stamp <= limit`, which a negative age satisfies. So after a
+    * correction the app believed a three-hour-old reading was the current
+    * one, indefinitely -- and "fresh" is what decides whether a low is
+    * believed and sounded.
+    *
+    * Every assertion below is written against the ROLLED-BACK clock: `rb` is
+    * `now` after the correction, and `gt` is a reading taken before it, which
+    * is therefore in `rb`'s future.
+    */
+   printf("== a clock ROLLBACK must not make stale data read as fresh ==\n");
+   {
+      const long gt = now;        /* stamped before the correction */
+      const long rb = now - 3600; /* ...which then moved an hour back */
+
+      /* THE BOUNDARY, both sides of it. Age 0 is fresh (a reading that has
+       * just landed) and age -1 is not. These two are what pin `age >= 0`:
+       * an assertion at -3600 alone is satisfied by a mutant that merely
+       * shifts the window, and one at 0 alone by deleting the test outright.
+       */
+      ck(alarm_zone(45, now, now, lo, hi) == 1, "a zero-age reading is fresh");
+      ck(alarm_zone(45, now, now - 1, lo, hi) == 0,
+         "ONE SECOND into the future is already not fresh");
+      ck(alarm_zone(45, gt, rb, lo, hi) == 0,
+         "...and an hour into the future is not a live LOW zone either");
+
+      /* The nudge's own freshness, which has the same shape and the same
+       * -1 = "no idea" answer a dropout gets. */
+      ck(nudge_zone(120, now, now, 100, 200) == NG_NONE,
+         "a zero-age reading is a known nudge zone");
+      ck(nudge_zone(120, now, now - 1, 100, 200) == -1,
+         "a future-stamped reading is UNKNOWN, not in-range");
+
+      /* STRANDED MUST STILL FIRE. This is the rule that keeps a ringing hypo
+       * alive when the sensor drops out; it declines while the data is
+       * "fresh", so the old predicate switched it off at exactly the moment
+       * the data stopped being ageable -- and alarm_want then returned
+       * AL_NONE, which actively SILENCES a hypo alarm. */
+      ck(alarm_stranded(45, gt, rb, lo, hi) == 1,
+         "a future-stamped LOW is stranded, so the alarm is not silenced");
+      ck(alarm_stranded(45, now, now - 1, lo, hi) == 1,
+         "...one second is enough: an unageable stamp is not fresh data");
+      ck(alarm_stranded(45, now, now, lo, hi) == 0,
+         "...while a genuinely current LOW is still the zone's business");
+      ck(alarm_stranded(100, gt, rb, lo, hi) == 0,
+         "and a future-stamped IN-RANGE reading strands nothing");
+
+      /* THE STALE TRANSITION MUST STILL FIRE. `now - glu_t > disc_s` was
+       * false for every negative age, so the user's DISCONNECT alarm could
+       * never announce a sensor that had stopped reporting. */
+      ck(alarm_stale(100, gt, rb, mono, launch, 600) == 1,
+         "a future-stamped reading is STALE: its age is unknowable");
+      ck(alarm_stale(100, now, now - 1, mono, launch, 600) == 1,
+         "...one second into the future is already unknowable");
+      ck(alarm_stale(100, now, now, mono, launch, 600) == 0,
+         "...while a zero-age reading is not stale");
+
+      /* THE WHOLE COMPOSITION, which is what the user actually hears. */
+      int zone     = alarm_zone(45, gt, rb, lo, hi);
+      int stale    = alarm_stale(45, gt, rb, mono, launch, 600);
+      int stranded = alarm_stranded(45, gt, rb, lo, hi);
+      ck(alarm_want_sustained(zone, stale, stranded, AL_LOW) == AL_LOW,
+         "a hypo already sounding survives the correction, unrelabelled");
+      ck(alarm_want_sustained(zone, stale, stranded, AL_NONE) == AL_STALE,
+         "with nothing sounding, the correction announces STALE, not silence");
+   }
+
+   /* ---- THE LAUNCH GRACE IS MONOTONIC ----
+    *
+    * The grace exists because data may legitimately be stale until the first
+    * sync, and while it holds alarm_stale returns 0 UNCONDITIONALLY -- which
+    * is to say the grace SUPPRESSES the user's DISCONNECT alarm. Measured on
+    * the wall clock, a phone that finds a network shortly after boot (which
+    * is when this app starts) could step its clock and disable that alarm for
+    * the length of the skew, or end the grace early and announce a
+    * disconnected sensor over data that was merely waiting.
+    *
+    * The pairs below differ ONLY in the realtime `now`. The monotonic pair is
+    * identical across each pair, so the answer must be too.
+    */
+   printf("== the launch grace is not moved by a wall-clock jump ==\n");
+   {
+      const long m0 = 900000;    /* seconds since boot; nothing like `now` */
+      const long gt = now - 601; /* data older than the 600 s threshold */
+      const long jump_back = -86400;
+      const long jump_fwd  = 86400;
+
+      /* INSIDE the grace: 10 monotonic seconds up, threshold 600. */
+      ck(alarm_stale(100, gt, now, m0 + 10, m0, 600) == 0,
+         "10 s after launch the grace holds");
+      ck(alarm_stale(100, gt, now + jump_back, m0 + 10, m0, 600) == 0,
+         "...and a wall clock jumping a day BACK does not end it");
+      ck(alarm_stale(100, gt, now + jump_fwd, m0 + 10, m0, 600) == 0,
+         "...nor does one jumping a day FORWARD");
+
+      /* PAST the grace, at the exact boundary: 600 monotonic seconds up is
+       * no longer `< 600`, so the alarm becomes reachable. Pinning the
+       * boundary is what stops a mutant that merely widens or narrows it. */
+      ck(alarm_stale(100, gt, now, m0 + 599, m0, 600) == 0,
+         "one second short of the threshold, the grace still holds");
+      ck(alarm_stale(100, gt, now, m0 + 600, m0, 600) == 1,
+         "AT the threshold the grace is over and the alarm can fire");
+      ck(alarm_stale(100, gt, now + jump_back, m0 + 600, m0, 600) == 1,
+         "...and a wall-clock rollback cannot put us back inside it");
+      ck(alarm_stale(100, gt, now + jump_fwd, m0 + 600, m0, 600) == 1,
+         "...nor can a jump forward, which never had a grace to give");
+   }
+
+   /* ---- THE IMMINENT-HYPO PREDICTION'S FRESHNESS ----
+    *
+    * This is the alarm that sounds through a muted phone and re-triggers
+    * itself after every silence, so a prediction preserved past its useful
+    * life is an alarm that cannot be switched off and is no longer about
+    * anything. Both stamps are MONOTONIC -- the arrival time of an
+    * in-process fact that is never written down and never displayed.
+    */
+   printf("== a hypo prediction expires, and cannot be preserved ==\n");
+   {
+      const long m = 900000; /* monotonic: seconds since boot */
+      ck(alarm_pred_low(50, m, m) == 1,
+         "a fresh prediction below 55 forces LOW");
+      ck(alarm_pred_low(54, m, m) == 1, "one below the threshold counts");
+      ck(alarm_pred_low(PRED_LOW_MGDL, m, m) == 0,
+         "AT 55 it does not: the override is for BELOW Level 2");
+      ck(alarm_pred_low(80, m, m) == 0, "a comfortable prediction is silent");
+      ck(alarm_pred_low(50, m, m + AL_FRESH_S) == 1,
+         "at the freshness edge it still holds");
+      ck(alarm_pred_low(50, m, m + AL_FRESH_S + 1) == 0,
+         "one second past it, the prediction has expired");
+      ck(alarm_pred_low(50, m, m - 1) == 0,
+         "a stamp from the future is refused, exactly like a reading's");
+      ck(alarm_pred_low(0, m, m) == 0,
+         "no prediction recorded is not an alarm");
+      ck(alarm_pred_low(50, 0, m) == 0,
+         "a link that has never reported one is not an alarm either");
    }
 
    printf("== the announce/dismiss sequences, end to end ==\n");
@@ -492,6 +728,156 @@ int main(void)
       alarm_plan_next(0 /* zone: in range */, 0, 1, 1, 0, AL_LOW, 0, 1, &pl);
       ck(pl.want != AL_LOW,
          "an acked stranded level stops sustaining the old want");
+   }
+
+   /* ---- THE WHOLE ACTUATION TRANSITION ----
+    *
+    * Every piece below was already tested on its own. The COMPOSITION was
+    * not, and that is where the gap was: main.c wrote out its own version of
+    * plan_next + decide by hand, so the tested pieces could have been deleted
+    * without failing anything the phone runs. alarm_actuate_step is that
+    * composition, and this is the test that makes deleting it fail here. */
+   printf("== the alarm actuation transition ==\n");
+   {
+      struct alarm_state st = {AL_NONE, 0, 0};
+      struct alarm_obs obs  = {0};
+      struct alarm_state nx;
+      struct alarm_effect eff;
+
+      /* Nothing wrong, nothing to say. */
+      obs.sound_on = 1;
+      obs.vib_on   = 1;
+      alarm_actuate_step(&st, &obs, &nx, &eff);
+      ck(eff.act == AL_ACT_NONE, "in range and silent: no actuation");
+
+      /* A low is announced, with the user's outputs. */
+      obs.zone = AL_LOW;
+      alarm_actuate_step(&st, &obs, &nx, &eff);
+      ck(eff.act == AL_ACT_TRIGGER, "a low triggers");
+      ck(eff.kind == alarm_java_kind(AL_LOW), "...as Java's LOW kind");
+      ck(nx.want == AL_LOW, "...and commits the level");
+      ck(eff.sound == 1 && eff.vib == 1, "...with the configured outputs");
+
+      /* Same level again is not re-chimed. */
+      st = nx;
+      alarm_actuate_step(&st, &obs, &nx, &eff);
+      ck(eff.act == AL_ACT_NONE, "the same level again does not re-chime");
+
+      /* THE IMMINENT-HYPO OVERRIDE, end to end through the transition: it
+       * sounds even with the alarm muted, and it re-triggers after a silence
+       * so it cannot be dismissed while the prediction holds. */
+      struct alarm_state q = {AL_NONE, 0, 0};
+      struct alarm_obs po  = {0};
+      po.pred_low          = 1;
+      po.sound_on          = 0; /* the user has muted the alarm */
+      po.vib_on            = 0;
+      alarm_actuate_step(&q, &po, &nx, &eff);
+      ck(eff.act == AL_ACT_TRIGGER && eff.kind == alarm_java_kind(AL_LOW),
+         "a predicted hypo triggers a LOW");
+      ck(eff.sound == 1, "...audibly, even with the alarm sound switched off");
+
+      /* Silenced by the user (sounding 0, want still LOW) -- and the very next
+       * evaluation must announce it again. */
+      struct alarm_state silenced = {AL_LOW, 1, 0};
+      alarm_actuate_step(&silenced, &po, &nx, &eff);
+      ck(eff.act == AL_ACT_TRIGGER,
+         "...and re-triggers after a silence: it cannot be dismissed");
+
+      /* A dismissed STRANDED level stops sustaining, so a later disconnect
+       * alarm is reachable again. */
+      struct alarm_state acked = {AL_LOW, 1, 0};
+      struct alarm_obs so      = {0};
+      so.stranded              = 1;
+      so.sound_on              = 1;
+      alarm_actuate_step(&acked, &so, &nx, &eff);
+      ck(nx.want != AL_LOW || eff.act != AL_ACT_NONE,
+         "an acked stranded level does not pin the old want forever");
+   }
+
+   /* ---- A PREDICTION AND ITS ARRIVAL TIME ARE ONE FACT ----
+    *
+    * They were two plain arrays in alarm.c, stored separately by a binder
+    * thread and loaded separately under the alarm lock: a C data race, and a
+    * reader landing between the two stores got this sample's value carrying
+    * the previous sample's stamp. Item 70 asks whether an age is sane; this
+    * asks whether the value and the age belong to each other at all, and
+    * neither question is any use without the other.
+    */
+   printf("== a prediction and its arrival time survive a round trip ==\n");
+   {
+      /* Exact values, so a shift off by one bit or a dropped field cannot
+       * pass. The two fields are asserted SEPARATELY: a single combined
+       * assertion is satisfied by a mutant that swaps them. */
+      struct link_pred p = pred_unpack(pred_pack(48, 1234567));
+      ck(p.mgdl == 48, "the predicted value comes back exactly");
+      ck(p.mono == 1234567, "...and so does the second it arrived");
+
+      /* The zero pair is "nothing recorded", and must round-trip as that --
+       * alarm_pred_low refuses it, so a rebuilt nonzero would mint an alarm
+       * for a link that has never reported. */
+      struct link_pred z = pred_unpack(pred_pack(0, 0));
+      ck(z.mgdl == 0 && z.mono == 0, "the empty pair stays empty");
+
+      /* NEITHER FIELD MAY BLEED INTO THE OTHER. Each of these puts a maximal
+       * value in one half and a distinctive one in the other; if the widths
+       * or the shift are wrong, the small field is what changes. */
+      struct link_pred a = pred_unpack(pred_pack(PRED_MGDL_MAX, 7));
+      ck(a.mgdl == PRED_MGDL_MAX && a.mono == 7,
+         "a maximal glucose does not disturb the stamp");
+      struct link_pred b = pred_unpack(pred_pack(7, 0xffffffffffffL));
+      ck(b.mgdl == 7 && b.mono == 0xffffffffffffL,
+         "...and a maximal stamp does not disturb the glucose");
+      struct link_pred c = pred_unpack(pred_pack(55, 0x1ffffffffL));
+      ck(c.mgdl == 55 && c.mono == 0x1ffffffffL,
+         "a stamp past 32 bits keeps every bit it had");
+
+      /* CLAMPED, NOT TRUNCATED. A masked-off high bit does not give a
+       * slightly wrong number, it gives a plausible one -- a stamp that
+       * wraps reads as an arrival that never happened, on the alarm the user
+       * cannot silence. */
+      struct link_pred big = pred_unpack(pred_pack(PRED_MGDL_MAX + 1, 5));
+      ck(big.mgdl == PRED_MGDL_MAX, "an over-large glucose clamps");
+      ck(big.mono == 5, "...without corrupting the stamp beside it");
+      /* THE STAMP'S OWN CEILING. A stamp past 48 bits masked rather than
+       * clamped comes back as a SMALL number -- one ring of the counter
+       * earlier -- which reads as an arrival that never happened and, worse,
+       * as an ancient one: the prediction would silently expire. Clamping
+       * yields the largest representable second instead, which ages
+       * correctly. Verified by mutation: dropping this clamp survived the
+       * whole suite until this case existed. */
+      struct link_pred hi = pred_unpack(pred_pack(50, 0x1000000000000L));
+      ck(hi.mono == 0xffffffffffffL, "an over-large stamp clamps, not wraps");
+      ck(hi.mgdl == 50, "...without corrupting the glucose beside it");
+
+      struct link_pred neg = pred_unpack(pred_pack(-1, -1));
+      ck(neg.mgdl == 0 && neg.mono == 0,
+         "negatives become 'nothing recorded', which is refused outright");
+      ck(alarm_pred_low(neg.mgdl, neg.mono, 900000) == 0,
+         "...and refused it is: a clamped pair cannot mint an alarm");
+   }
+
+   printf("== ...and are published across threads as ONE value ==\n");
+   {
+      pthread_t w;
+      pthread_t r;
+      /* The reader first, so it is spinning before anything is published. */
+      if (pthread_create(&r, 0, pred_reader, 0) != 0 ||
+          pthread_create(&w, 0, pred_writer, 0) != 0) {
+         ck(0, "the concurrency case could not start its threads");
+      } else {
+         pthread_join(w, 0);
+         pthread_join(r, 0);
+         int seen  = atomic_load(&g_pred_seen);
+         int mixed = atomic_load(&g_pred_mixed);
+         /* The reader must actually have LOOKED. Without this the case
+          * passes on zero observations, which is the "5abc is rejected"
+          * shape: an assertion satisfied because the input never reached
+          * the rule. */
+         ck(seen > 0, "the reader observed published pairs at all");
+         ck(mixed == 0,
+            "no reader ever saw a value from one epoch with a stamp from "
+            "another");
+      }
    }
 
    printf("\n%s\n", all ? "ALL ALARM TESTS PASSED" : "SOME TESTS FAILED");

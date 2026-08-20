@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0 -->
+<!--
+  ANDROID 12+ (API 31+) BACKUP AND DEVICE-TRANSFER POLICY.
+
+  WHAT IS IN THIS APP'S PRIVATE STORAGE. Every glucose reading the user has
+  ever taken, every insulin dose and every meal they logged, the calibration
+  history of their sensors / and, in the settings store, the sync credential
+  that authenticates this phone to the account on the server. That last one
+  is not merely private data: it is the key to all the rest of it, sitting on
+  the server, for as long as the account exists.
+
+  WHY android:allowBackup="false" IS NOT ENOUGH ON ITS OWN. allowBackup
+  governs backup. From Android 12 the transfer paths were SPLIT: cloud backup
+  (Google Drive / auto backup) and DEVICE-TO-DEVICE transfer / the copy made
+  when the user sets up a new phone from an old one / are separate channels
+  with separate rules, and the platform decides what an app that supplies no
+  <data-extraction-rules> gets on each channel. That default has not been the
+  same on every release, and it is not ours to choose by omission. An app
+  whose files are a medical record should not be depending on which way a
+  vendor's setup wizard happened to jump.
+
+  WHAT THIS FILE SAYS. Nothing leaves this device by either channel. Both
+  <cloud-backup> and <device-transfer> exclude every domain the platform can
+  reach: the app's root directory, its files/, its databases, its shared
+  preferences, its external-storage area, and the device-protected-storage
+  (device_*) twins of each / which are separate domains precisely because
+  they survive a locked boot, and which an "exclude root" alone does not
+  cover. Enumerated rather than summarised, because a domain nobody wrote
+  down is a domain that is included.
+
+  IF DATA MUST EVER BE MOVED BETWEEN PHONES, it goes through EXPORT DATA and
+  the sync server, where the user chooses it, sees it happen, and where the
+  credential is re-established on the new device rather than copied to it.
+-->
+<data-extraction-rules>
+  <cloud-backup>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+    <exclude domain="device_root" />
+    <exclude domain="device_file" />
+    <exclude domain="device_database" />
+    <exclude domain="device_sharedpref" />
+  </cloud-backup>
+  <device-transfer>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+    <exclude domain="device_root" />
+    <exclude domain="device_file" />
+    <exclude domain="device_database" />
+    <exclude domain="device_sharedpref" />
+  </device-transfer>
+</data-extraction-rules>

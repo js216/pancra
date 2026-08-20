@@ -12,16 +12,30 @@
  * valid on the thread that produced it, so one may never be stashed in a
  * global and reused from another. Driver state is serialised by driver_lock().
  */
+#include "alarm.h" /* pancra_alarm_check: a crossing rings on THIS thread */
+#include "blejni.h"
+#include "bletrans.h"
+#include "bondtable.h"
+#include "calib.h" /* pancra_cal_result: the sensor's answer to a write */
 #include "dexdriver.h"
 #include "dexlibc.h"
-#include "otble.h"
-#include "pancra.h"
+#include "jbridge.h" /* jb_checked: the one exception verdict this app has */
+#include "meter.h"
+#include "reading.h"
+#include "remote.h" /* pancra_remote_ok: the push worker's acknowledgement */
+#include "shell.h"  /* shell_service_tick: the heartbeat's one entry point */
+#include "status.h"
 #include "syncjni.h"
+#include "util.h"
 #include <jni.h>
 #include <jni_md.h>
 #include <stdint.h>
-#include <stdio.h>  /* snprintf: the bond table copies an address */
-#include <string.h> /* strcmp: ...and looks one up by address */
+/* NOT thread.h, <stdio.h> or <string.h>. All three were here for the bond
+ * table -- its leaf mutex, the snprintf that copies an address into a slot,
+ * the strcmp that looks one up -- and the table is in bondtable.c now. An
+ * include kept for a reason that has moved out is worse than a missing one:
+ * it is a claim, in the file's own include list, that this translation unit
+ * still does something it no longer does. */
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
@@ -71,7 +85,7 @@ JNIEnv *dexble_env(void)
 
 /* The app Context, as a global ref that outlives the activity.
  *
- * main.c's notification path used g_act->clazz, which is NULL once the
+ * the notification path used g_act->clazz, which is NULL once the
  * activity is destroyed -- so the one glucose display left to the user froze.
  * This ref is created in dexble_register and never released. */
 jobject dexble_ctx(void)
@@ -201,7 +215,7 @@ int dexble_alarm_silence(void)
 }
 
 /* ---- drv_* transport hooks ---- */
-void drv_connect(const char *mac)
+void drv_connect(int link, const char *mac)
 {
    JNIEnv *e = any_env();
    if (!e)
@@ -216,68 +230,54 @@ void drv_connect(const char *mac)
          (*e)->ExceptionClear(e);
       return;
    }
-   jstring err = (*e)->CallStaticObjectMethod(e, g_ble, m_connect, g_ctx, m,
-                                              (jint)driver_link());
+   jstring err =
+       (*e)->CallStaticObjectMethod(e, g_ble, m_connect, g_ctx, m, (jint)link);
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(
           e); /* don't leave it pending for the next JNI call */
    (*e)->DeleteLocalRef(e, m);
    if (err) {
       /* GetStringUTFChars can itself return NULL on OOM; s then flows into
-       * LOGI("%s") and pancra_status -> NULL deref. */
+       * LOGI("%s") and set_status -> NULL deref. */
       const char *s = (*e)->GetStringUTFChars(e, err, 0);
       if (s) {
          LOGI("connect: %s", s);
-         pancra_status(s);
+         set_status(s);
          (*e)->ReleaseStringUTFChars(e, err, s);
       }
       (*e)->DeleteLocalRef(e, err);
    }
 }
 
-/* The last bond state the receiver reported, per address.
+/* The bond table lives in bondtable.c.
  *
- * A tiny fixed table rather than a field on the sensor slot: the bond is a
- * property of the ADDRESS as the OS sees it, the broadcast arrives on a binder
- * thread with nothing but a MAC, and a device can be bonding before it has a
- * slot at all (the meter path connects to a bond it is still forming). Sized
- * for LINK_MAX devices plus slack; the oldest entry is recycled, which is
- * harmless because only the newest transition per device is ever interesting.
- */
-#define BOND_SLOTS 12
+ * It was here, in the middle of the JNI bridge, and that is why nothing
+ * tested it: this file is one translation unit holding the whole bridge, so
+ * linking it into a host suite means supplying a JavaVM. The table itself
+ * needs none of that -- it is a fixed array, a lock, and two functions over
+ * strings -- so it moved to a file that a host test CAN link, and
+ * bondtabletest now runs a reader and a writer at it under ThreadSanitizer.
+ * The race this lock exists for was, until then, argued rather than shown. */
 
-static struct {
-   char mac[20];
-   int state;
-} g_bond[BOND_SLOTS];
-
-static int g_bond_n;
-
-int dexble_bond_state(const char *mac)
+/* A BLUETOOTH ADDRESS, AS MUCH OF IT AS A LOG LINE NEEDS.
+ *
+ * logcat is readable by anyone holding the phone with adb enabled, and it is
+ * exactly what a bug report collects and mails off. A Bluetooth address is a
+ * stable per-device identifier, so a full one in a log line is a durable
+ * record of WHICH sensor this person wears, sitting in a file that leaves the
+ * device for reasons that have nothing to do with pairing. The last two
+ * octets are enough to tell two sensors apart while a human reads a log,
+ * which is all any of these lines is for: "AA:BB:CC:DD:EE:FF" -> "EE:FF".
+ *
+ * Returns a pointer INTO the caller's string, so there is nothing to free and
+ * nothing to size; a MAC too short to trim is returned whole, because a
+ * malformed address is a bug worth seeing in full. */
+static const char *mac_tail(const char *mac)
 {
-   if (!mac || !mac[0])
-      return 0;
-   /* No lock: written on a binder thread, read on the main loop, and both are
-    * a single int per entry whose only use is a status string. A torn read
-    * would cost one frame of a stale label. Taking driver_lock here would put
-    * a BLE callback behind the driver mutex for a cosmetic value. */
-   for (int i = 0; i < g_bond_n; i++)
-      if (strcmp(g_bond[i].mac, mac) == 0)
-         return g_bond[i].state;
-   return 0;
-}
-
-static void bond_state_set(const char *mac, int state)
-{
-   for (int i = 0; i < g_bond_n; i++) {
-      if (strcmp(g_bond[i].mac, mac) == 0) {
-         g_bond[i].state = state;
-         return;
-      }
-   }
-   int i = (g_bond_n < BOND_SLOTS) ? g_bond_n++ : (BOND_SLOTS - 1);
-   (void)snprintf(g_bond[i].mac, sizeof g_bond[i].mac, "%s", mac);
-   g_bond[i].state = state;
+   int n = 0;
+   while (mac[n])
+      n++;
+   return n > 5 ? mac + n - 5 : mac;
 }
 
 static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
@@ -289,7 +289,7 @@ static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
    if (!m)
       return;
    bond_state_set(m, (int)state);
-   LOGI("bond: %s state=%d", m, (int)state);
+   LOGI("bond: ..%s state=%d", mac_tail(m), (int)state);
    (*e)->ReleaseStringUTFChars(e, mac, m);
 }
 
@@ -309,13 +309,13 @@ int dexble_create_bond(const char *mac)
       (*e)->ExceptionClear(e);
    (*e)->DeleteLocalRef(e, m);
    if (!err) {
-      LOGI("createBond %s: requested", mac);
+      LOGI("createBond ..%s: requested", mac_tail(mac));
       return 1;
    }
    const char *s = (*e)->GetStringUTFChars(e, err, 0);
    if (s) {
-      LOGI("createBond %s: %s", mac, s);
-      pancra_status(s);
+      LOGI("createBond ..%s: %s", mac_tail(mac), s);
+      set_status(s);
       (*e)->ReleaseStringUTFChars(e, err, s);
    }
    (*e)->DeleteLocalRef(e, err);
@@ -381,14 +381,14 @@ void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
 }
 
 /* The Dexcom driver owns LINK_CGM; these keep its existing hook names. */
-void drv_subscribe(const char *uuid, int indicate)
+void drv_subscribe(int link, const char *uuid, int indicate)
 {
-   dexble_subscribe(driver_link(), uuid, indicate);
+   dexble_subscribe(link, uuid, indicate);
 }
 
-void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
+void drv_write(int link, const char *uuid, const uint8_t *d, int n, int no_resp)
 {
-   dexble_write(driver_link(), uuid, d, n, no_resp);
+   dexble_write(link, uuid, d, n, no_resp);
 }
 
 /* Drop the link now rather than waiting for the peer to time out. The meter
@@ -409,16 +409,16 @@ void dexble_link_close(int link)
 
 void drv_status(const char *s)
 {
-   pancra_status(s);
+   set_status(s);
 }
 
-static void ble_read_rssi(void)
+static void ble_read_rssi(int link)
 {
    JNIEnv *e = any_env();
    if (!e || !m_readrssi)
       return;
    (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi,
-                              (jint)driver_link()); /* result -> onRssi */
+                              (jint)link); /* result -> onRssi */
    if ((*e)->ExceptionCheck(e)) /* never return to Java with one pending */
       (*e)->ExceptionClear(e);
 }
@@ -427,21 +427,21 @@ static void ble_read_rssi(void)
  * actually exposes: model 0x2A24, firmware 0x2A26, manufacturer 0x2A29. (It has
  * no 0x2A25 serial / 0x2A28 software characteristic.) Results arrive on onRead.
  */
-/* Read the Device Information Service on an explicit link (the meter needs its
- * own model/firmware recorded, not the CGM's). */
+static void dexble_devinfo_on(int link);
+
+/* Read the Device Information Service on an EXPLICIT LINK. There was a
+ * no-argument wrapper beside this that read LINK_CGM, left over from when
+ * there was one link -- an ambient version of a link-addressed operation,
+ * which is the exact shape the driver boundary was rebuilt to remove: the
+ * meter's model and firmware are not the CGM's, and a caller that forgot to
+ * say which link recorded one device's strings against another's row, in an
+ * append-only file. Nothing called it. */
 void dexble_request_devinfo_link(int link)
 {
-   /* Under the lock, so swapping the driver's selected link cannot be observed
-    * by another thread mid-operation. */
-   driver_lock();
-   int drv = driver_link();
-   driver_select(link);
-   dexble_request_devinfo();
-   driver_select(drv);
-   driver_unlock();
+   dexble_devinfo_on(link);
 }
 
-void dexble_request_devinfo(void)
+static void dexble_devinfo_on(int link)
 {
    JNIEnv *e = any_env();
    if (!e || !m_read)
@@ -458,7 +458,7 @@ void dexble_request_devinfo(void)
             (*e)->ExceptionClear(e);
          return;
       }
-      (*e)->CallStaticVoidMethod(e, g_ble, m_read, (jint)driver_link(),
+      (*e)->CallStaticVoidMethod(e, g_ble, m_read, (jint)link,
                                  u); /* result -> onRead */
       /* Per iteration: a pending exception makes the NEXT NewStringUTF
        * illegal, so this cannot wait until the loop ends. */
@@ -468,26 +468,34 @@ void dexble_request_devinfo(void)
    }
 }
 
-void drv_glucose(int mg, int trend, int age)
+/* THE ANSWER IS PASSED STRAIGHT BACK, not summarised here. Whether a reading
+ * was kept is a fact only the history knows, and the driver is the only
+ * caller that needs it -- see drv_glucose in dexdriver.h for what it does
+ * with it. */
+int drv_glucose(int link, int mg, int trend, int age)
 {
-   pancra_glucose(mg, trend, age);
+   return pancra_glucose(link, mg, trend, age);
 }
 
-void drv_cal_result(int result)
+void drv_cal_result(int link, int result, int sensor_id, int mg_dl,
+                    unsigned gen)
 {
-   pancra_cal_result(result);
+   (void)link; /* the queue is keyed by SENSOR id, not by link */
+   /* The token is passed straight through: the driver kept it only so this
+    * answer could name the write it belongs to, and the queue -- which is the
+    * only thing that knows what is queued now -- decides whether it matches. */
+   pancra_cal_result(result, sensor_id, mg_dl, gen);
 }
 
-void drv_backfill(int mg, int trend, int age)
+int drv_backfill(int link, int mg, int trend, int age)
 {
-   pancra_backfill(mg, trend, age);
+   return pancra_backfill(link, mg, trend, age);
 }
 
-int drv_key_load(uint8_t key[16])
+int drv_key_load(int link, uint8_t key[16])
 {
    char pth[264];
-   int fd =
-       open(link_path(pth, sizeof pth, g_keypath, driver_link()), O_RDONLY);
+   int fd = open(link_path(pth, sizeof pth, g_keypath, link), O_RDONLY);
    if (fd < 0)
       return 0;
    int ok = (read(fd, key, 16) == 16);
@@ -495,39 +503,32 @@ int drv_key_load(uint8_t key[16])
    return ok;
 }
 
-void drv_key_save(const uint8_t key[16])
+int drv_key_save(int link, const uint8_t key[16])
 {
    char pth[264];
-   int fd = open(link_path(pth, sizeof pth, g_keypath, driver_link()),
-                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (fd < 0) {
-      LOGW("link %d: session key NOT SAVED (cannot open %s)", driver_link(),
-           pth);
-      return;
+   link_path(pth, sizeof pth, g_keypath, link);
+   if (atomic_replace(pth, key, 16) == REPLACE_FAILED) {
+      /* NO PATH. It is the app's private data directory, which is a
+       * filesystem layout detail the reader cannot act on and logcat has no
+       * business publishing; the link number already names the file. */
+      LOGW("link %d: session key NOT SAVED", link);
+      return -1;
    }
-   /* A key that does not reach the disk is a sensor that demands a fresh
-    * J-PAKE pairing at the next restart, with an applicator code the user
-    * threw away -- so the sensor is simply lost. O_TRUNC has already emptied
-    * the file by this point, so a short write leaves it WORSE than before.
-    * Saying so is the least this can do. */
-   if (write(fd, key, 16) != 16)
-      LOGW("link %d: session key NOT SAVED (short write)", driver_link());
-   close(fd);
+   return 0;
 }
 
-void drv_key_clear(void)
+void drv_key_clear(int link)
 {
    char pth[264];
-   unlink(link_path(pth, sizeof pth, g_keypath, driver_link()));
+   unlink(link_path(pth, sizeof pth, g_keypath, link));
 } /* stale key: force a fresh pairing */
 
 /* Persist the bonded sensor's MAC next to the key, so after a restart we
  * reconnect ONLY to that exact sensor (never grab another Dexcom in range). */
-int drv_mac_load(char *mac, int n)
+int drv_mac_load(int link, char *mac, int n)
 {
    char pth[264];
-   int fd =
-       open(link_path(pth, sizeof pth, g_macpath, driver_link()), O_RDONLY);
+   int fd = open(link_path(pth, sizeof pth, g_macpath, link), O_RDONLY);
    if (fd < 0)
       return 0;
    long r = read(fd, mac, (unsigned)(n - 1));
@@ -538,32 +539,24 @@ int drv_mac_load(char *mac, int n)
    return 1;
 }
 
-void drv_mac_save(const char *mac)
+int drv_mac_save(int link, const char *mac)
 {
    char pth[264];
-   int fd = open(link_path(pth, sizeof pth, g_macpath, driver_link()),
-                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (fd < 0) {
-      LOGW("link %d: sensor address NOT SAVED (cannot open %s)", driver_link(),
-           pth);
-      return;
-   }
+   link_path(pth, sizeof pth, g_macpath, link);
    int len = 0;
    while (mac[len])
       len++;
-   /* Without this address the advert path has no bonded sensor to match, so
-    * the link comes up unlocked and reconnects to nothing. Same cost as a
-    * lost key, and the same O_TRUNC caveat: a short write leaves a truncated
-    * address, which is worse than none. */
-   if (write(fd, mac, (unsigned)len) != len)
-      LOGW("link %d: sensor address NOT SAVED (short write)", driver_link());
-   close(fd);
+   if (atomic_replace(pth, mac, len) == REPLACE_FAILED) {
+      LOGW("link %d: sensor address NOT SAVED", link); /* no path: see above */
+      return -1;
+   }
+   return 0;
 }
 
-void drv_mac_clear(void)
+void drv_mac_clear(int link)
 {
    char pth[264];
-   unlink(link_path(pth, sizeof pth, g_macpath, driver_link()));
+   unlink(link_path(pth, sizeof pth, g_macpath, link));
 }
 
 /* ---- Ble.java callbacks (each stashes its env, then drives the state machine)
@@ -571,102 +564,44 @@ void drv_mac_clear(void)
 /* Which protocol owns each link. The link id -- not the characteristic -- is
  * the routing key, so two sensors that share a GATT layout (Stelo and G7 do)
  * can be connected at once without their events being confused. */
-/* WHICH LINKS CARRY A METER. A bitmask, not the LINK_METER constant.
- *
- * Every routing decision below is by LINK ID, because two sensors can share a
- * GATT layout and only the link tells their events apart. That was fine while
- * exactly one link was the meter's -- but a meter is only reachable for the
- * second or two it is switched on, so each registered meter needs its OWN
- * standing connection, and therefore its own link. The link a meter occupies
- * is now whatever the allocator gave it, so the transport has to be told
- * rather than assume.
- *
- * Set from main.c as links are bound. A link with no bit set runs the Dexcom
- * state machine, which is the safe default: an unset bit costs a meter a sync
- * it can retry, while a wrongly SET bit would feed a CGM's notifications to
- * the meter parser. */
-static unsigned g_meter_links;
-
-void dexble_set_meter_link(int link, int on)
-{
-   if (link < 0 || link >= LINK_MAX)
-      return;
-   /* UNDER driver_lock, because every READER is.
-    *
-    * jni_connected / jni_disconnected / jni_notify / jni_written consult this
-    * on a binder thread with driver_lock held, while the shell arms and
-    * releases links from the main thread. Writing it unlocked was a plain
-    * data race on the value that decides whether a packet goes to the Dexcom
-    * state machine or the OneTouch parser -- the same misrouting the bitmask
-    * was introduced to prevent. driver_lock is recursive, so callers that
-    * already hold it (dexble_meter_connect) pay nothing. */
-   driver_lock();
-   if (on)
-      g_meter_links |= 1U << (unsigned)link;
-   else
-      g_meter_links &= ~(1U << (unsigned)link);
-   driver_unlock();
-}
-
-static int is_meter_link(int link)
-{
-   if (link < 0 || link >= LINK_MAX)
-      return 0;
-   return (g_meter_links & (1U << (unsigned)link)) != 0;
-}
-
+/* (WHICH LINK CARRIES A METER used to be a bitmask here AND a table in
+ * meter.c -- the same fact in two places, each written under the driver's
+ * lock from another module. It is the driver's now: see
+ * driver_link_set_meter, and driver_route_* for the callbacks that read it.)
+ */
 static void jni_connected(JNIEnv *e, jclass c, jint link)
 {
    (void)c;
-   (void)e;
-   driver_lock();
-   if (is_meter_link(link)) {
-      /* Ask the shell first: it owns the per-meter index and the single
-       * protocol state, and only it can say whether this link may have it. */
-      if (!pancra_meter_connected(link)) {
-         driver_unlock();
-         dexble_link_close(link);
-         return;
-      }
-      ot_on_connected();
-      /* Sample the meter's link RSSI now -- it is only connected during a sync,
-       * so this brief window is the one chance. Read THIS link explicitly
-       * (ble_read_rssi() targets driver_link(), which is not the meter here);
-       * the result returns via onRssi -> jni_rssi -> pancra_meter_rssi. */
+   /* THE ROUTING IS THE DRIVER'S. This used to read the meter bit here and
+    * branch, holding the driver's lock across both halves -- the decision and
+    * the dispatch have to be one critical section, and doing that from the
+    * transport meant reaching for another module's lock. One call now; what
+    * is left for this side is whatever reaches Java, which must happen with
+    * that lock released. */
+   enum driver_after after = driver_route_connected(link);
+   if (after == DRV_AFTER_CLOSE) {
+      dexble_link_close(link);
+      return;
+   }
+   if (after == DRV_AFTER_RSSI_METER) {
+      /* Read THIS link explicitly: ble_read_rssi targets the CGM link, which
+       * is not the meter here. The result returns via onRssi -> jni_rssi ->
+       * pancra_meter_rssi. */
       if (e && m_readrssi) {
          (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, link);
          if ((*e)->ExceptionCheck(e)) /* we return into Java from here */
             (*e)->ExceptionClear(e);
       }
-   } else {
-      driver_select(link);
-      driver_on_connected();
-      ble_read_rssi();
+   } else if (after == DRV_AFTER_RSSI) {
+      ble_read_rssi(link);
    }
-   driver_unlock();
 }
 
 static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
 {
    (void)c;
    (void)e;
-   driver_lock();
-   if (is_meter_link(link)) {
-      /* ONLY the link that owns the exchange may reset otble's state.
-       *
-       * Every registered meter holds a standing connect, so a disconnect can
-       * arrive for a meter that is merely idle -- or for one the shell just
-       * refused because another was mid-sync. Routing that into
-       * ot_on_disconnected wiped the protocol state out from under the meter
-       * that WAS syncing: phase to idle mid-walk, and its remaining records
-       * lost or filed under the wrong id. The shell owns that decision. */
-      if (pancra_meter_disconnected(link))
-         ot_on_disconnected();
-   } else {
-      driver_select(link);
-      driver_on_disconnected(s);
-   }
-   driver_unlock();
+   driver_route_disconnected(link, s);
 }
 
 static void jni_written(JNIEnv *e, jclass c, jint link, jstring ju, jint s)
@@ -678,24 +613,12 @@ static void jni_written(JNIEnv *e, jclass c, jint link, jstring ju, jint s)
       (*e)->ExceptionClear(e);
       return;
    }
-   /* The meter driver is request/response and drives itself off notifications,
-    * so a write ack needs no action there.
-    *
-    * THE TEST ITSELF MUST BE UNDER THE LOCK. g_meter_links is written from
-    * the MAIN thread (link_set_meter -> dexble_set_meter_link) and read from
-    * BINDER threads, and the writer takes driver_lock on the stated premise
-    * that "the readers already hold it" -- which jni_connected,
-    * jni_disconnected and jni_notify do, and this did not. A stale read here
-    * is not cosmetic: it feeds a METER's write-ack into driver_on_written on
-    * a link with no Dexcom session, or drops a real CGM ack, and the J-PAKE
-    * handshake is a state machine driven by exactly those acks. Recursive,
-    * so hoisting it costs nothing. */
-   driver_lock();
-   if (!is_meter_link(link)) {
-      driver_select(link);
-      driver_on_written(u, s);
-   }
-   driver_unlock();
+   /* The meter protocol is request/response and drives itself off
+    * notifications, so a write ack needs no action there -- but the TEST and
+    * the dispatch must still be one step: a stale read feeds a METER's ack
+    * into the Dexcom state machine on a link with no session, or drops a real
+    * CGM ack, and the J-PAKE handshake is driven by exactly those acks. */
+   driver_route_written(link, u, s);
    (*e)->ReleaseStringUTFChars(e, ju, u);
 }
 
@@ -718,14 +641,7 @@ static void jni_notify(JNIEnv *e, jclass c, jint link, jstring ju,
       n = 256;
    if (n > 0)
       (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
-   driver_lock();
-   if (is_meter_link(link)) {
-      ot_on_notify(buf, n);
-   } else {
-      driver_select(link);
-      driver_on_notify(u, buf, n);
-   }
-   driver_unlock();
+   driver_route_notify(link, u, buf, n);
    /* Evaluate the alarm here -- on this BLE thread, but only AFTER the driver
     * lock is released.
     *
@@ -749,21 +665,12 @@ static void jni_tick(JNIEnv *e, jclass c)
 {
    (void)e;
    (void)c;
-   pancra_alarm_check();
-   /* Keep the lock-screen notification tracking readings too: it is the only
-    * glucose display left once the activity is gone. */
-   pancra_notify_refresh();
-   /* Also repair stranded links. on_timer does this too, but on_timer lives on
-    * the ACTIVITY's looper and dies with it, while this service tick is
-    * designed to outlive the activity by days -- which is exactly the window
-    * in which a stranded link would otherwise never be reconnected. */
-   pancra_link_watchdog();
-   /* And push: the sync is driven from here for the SAME reason -- the
-    * activity's timer dies with the activity, so with the app backgrounded
-    * nothing left the phone until it was reopened. */
-   pancra_remote_sync();
-   meter_sync_watchdog();
-   pancra_reconcile_tick();
+   /* ONE CALL. This named six functions from six modules, in an order that
+    * mattered, inside the BLE transport -- the layer with the least business
+    * knowing which workflows the app has. WHAT the heartbeat drives is the
+    * shell's list (shell.h); that this thread is where it happens is the
+    * transport's fact, and that is all this function knows. */
+   shell_service_tick();
 }
 
 /* Ble.remotePush's worker thread: the server acknowledged a push (2xx). */
@@ -778,15 +685,11 @@ static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
 {
    (void)e;
    (void)c;
-   /* Same unlocked-read as jni_written had -- see there. Only the TEST needs
-    * the lock, so snapshot the bit and dispatch outside it: pancra_*_rssi
-    * call back into main.c and may take sensors_lock, and there is no reason
-    * to widen the critical section to cover them. */
-   driver_lock();
-   int meter = is_meter_link(link);
-   driver_unlock();
-   if (!meter)
-      pancra_rssi(rssi);
+   /* Only the TEST needs to be atomic here, and the query is: the dispatch
+    * below calls back into main.c, which takes locks of its own, and there is
+    * no reason to widen a critical section over that. */
+   if (!driver_link_is_meter(link))
+      pancra_rssi(link, rssi);
    else
       pancra_meter_rssi(rssi); /* meter's last-sync signal strength */
 }
@@ -811,7 +714,7 @@ static void jni_read(JNIEnv *e, jclass c, jint link, jstring ju, jbyteArray jd)
    (*e)->ReleaseStringUTFChars(e, ju, u);
 }
 
-/* ---- public API (called from main.c) ---- */
+/* ---- public API (called from the app side) ---- */
 void dexble_init(const char *data_dir)
 {
    int i = 0;
@@ -833,8 +736,8 @@ void dexble_init(const char *data_dir)
 
 int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
 {
-   g_ble = (*e)->NewGlobalRef(e, ble);
-   g_ctx = (*e)->NewGlobalRef(e, ctx);
+   if (!e || !ble || !ctx)
+      return 0;
    /* JNINativeMethod.name/signature are char* (a JNI API wart); hold the text
     * in mutable arrays so no const is cast away (-Wcast-qual +
     * -Wwrite-strings). */
@@ -879,11 +782,65 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n10, s10, (void *)syncjni_pair    },
        {n11, s11, (void *)syncjni_restore },
    };
+   /* BUILT IN LOCALS, PUBLISHED AS A PAIR, AND ONLY ONCE THE NATIVES ARE ON
+    * THE CLASS.
+    *
+    * The two global refs used to be assigned straight into g_ble and g_ctx,
+    * unchecked, before anything else was attempted. Three consequences, and
+    * the process never recovers from any of them, because a global reference
+    * lives as long as the process does:
+    *
+    *   - A FAILED NewGlobalRef LEFT AN EXCEPTION PENDING. It fails by running
+    *     out of memory, and then the next line called NewGlobalRef again with
+    *     an OutOfMemoryError pending -- illegal, and under CheckJNI (on for a
+    *     debuggable build and for anyone attached with a debugger) an
+    *     immediate `JNI DETECTED ERROR IN APPLICATION` abort. Somebody whose
+    *     app aborted saw it die on the launch that first hit memory pressure,
+    *     with the tombstone naming NewGlobalRef and no hint that the previous
+    *     one was the failure.
+    *   - A FAILED RegisterNatives KEPT THE REFS ANYWAY. `return 0` left g_ble
+    *     and g_ctx set, so the app that had just reported BLE REG FAILED --
+    *     with no native methods bound at all -- nevertheless held, and
+    *     published through dexble_ctx(), a Context that every later caller
+    *     would take as proof the transport was up.
+    *   - A RETRY OVERWROTE THEM. init_java runs again when the activity is
+    *     recreated in the same process (a back-press does exactly that), and
+    *     the plain assignment dropped the previous pair on the floor: two
+    *     permanently unreachable global refs per relaunch, against a table
+    *     with a hard ceiling and an abort behind it.
+    *
+    * So: construct into locals, refuse on the first failure with BOTH deleted,
+    * and publish the pair in one step at the point where Java can begin
+    * calling back into C -- which is the instant RegisterNatives succeeds, and
+    * not before. */
+   jclass gble  = (*e)->NewGlobalRef(e, ble);
+   jobject gctx = 0;
+   if (gble) /* not if it failed: the second call would be the illegal one */
+      gctx = (*e)->NewGlobalRef(e, ctx);
+   if (!gble || !gctx)
+      goto refuse;
+
    /* The COUNT, not a literal that has to be remembered: registering 8 of 9
     * leaves onBondState unbound, and the first bond transition then takes the
     * process down with an UnsatisfiedLinkError from a binder thread. */
    if ((*e)->RegisterNatives(e, ble, m, (jint)(sizeof m / sizeof m[0])) != 0)
-      return 0;
+      goto refuse;
+
+   /* PUBLISHED. From here a binder thread may call jni_notify and read g_ctx,
+    * so the pair has to be live before the first callback -- which is why
+    * this is the moment, and why the id lookups below cannot be waited for.
+    * The previous pair (a relaunch) is released after the swap, never before:
+    * a reader between the two stores must see a valid ref, not a freed one. */
+   {
+      jclass old_ble  = g_ble;
+      jobject old_ctx = g_ctx;
+      g_ble           = gble;
+      g_ctx           = gctx;
+      if (old_ble)
+         (*e)->DeleteGlobalRef(e, old_ble);
+      if (old_ctx)
+         (*e)->DeleteGlobalRef(e, old_ctx);
+   }
    m_connect = (*e)->GetStaticMethodID(
        e, ble, "connect",
        "(Landroid/content/Context;Ljava/lang/String;I)Ljava/lang/String;");
@@ -927,6 +884,26 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
     * never happen. */
    return m_connect && m_subscribe && m_write && m_readrssi && m_read &&
           m_disconnect && m_startsvc && m_createbond && m_bondwatch;
+
+refuse:
+   /* NOTHING WAS PUBLISHED, so nothing is left behind. jb_checked describes
+    * the OutOfMemoryError (or whatever RegisterNatives raised -- it throws
+    * NoSuchMethodError when a native's signature no longer matches Ble.java,
+    * which is the ordinary consequence of libpancra and classes.dex being out
+    * of step) and clears it, because the caller goes on to draw a status row,
+    * and a pending exception would abort at whichever JNI call came first.
+    *
+    * DeleteGlobalRef is one of the few JNI calls that is legal with an
+    * exception pending, so the order here -- clear, then release -- is a
+    * courtesy to the log rather than a requirement. Both are released whether
+    * one or both were taken. */
+   (void)jb_checked(e, "dexble_register");
+   if (gctx)
+      (*e)->DeleteGlobalRef(e, gctx);
+   if (gble)
+      (*e)->DeleteGlobalRef(e, gble);
+   LOGI("BLE natives NOT registered; no global refs published");
+   return 0;
 }
 
 /* Wire the Alarm class. FindClass here would resolve via the framework loader,
@@ -967,10 +944,7 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
 
 void dexble_pair(int link, const char *mac, const char *code)
 {
-   driver_lock();
-   driver_select(link);
-   driver_start(mac, code);
-   driver_unlock();
+   driver_start(link, mac, code);
 }
 
 /* Open the meter's link. It is a plain connect: the meter driver takes over
@@ -988,27 +962,20 @@ int dexble_meter_connect(int link, const char *mac)
     * the caller then recorded the meter as armed forever. */
    if (!any_env())
       return 0;
-   driver_lock();
-   dexble_set_meter_link(link, 1); /* route this link's events to otble */
-   int drv = driver_link();
-   driver_select(link);
-   drv_connect(mac);
-   driver_select(drv);
-   driver_unlock();
+   /* ONE step for both: routing the link to the meter protocol and issuing
+    * the connect must not be observable half-done by a concurrent CGM
+    * reconnect -- a connect on a link whose routing has not landed yet
+    * delivers the meter's first notification to the Dexcom state machine. */
+   driver_meter_connect(link, mac, drv_connect);
    return 1;
 }
 
 void dexble_reconnect(int link)
 { /* stall watchdog: force a fresh connect on a SPECIFIC link */
-   driver_lock();
-   /* Select explicitly. driver_kick() acts on the ambient context, and the GATT
-    * callbacks select without restoring -- so with a second sensor or a meter
-    * sync in flight this kicked whichever link a binder thread last touched,
-    * spuriously reconnecting a healthy link while leaving the stalled one
-    * stranded until the next throttle window. */
-   int prev = driver_link();
-   driver_select(link);
-   driver_kick();
-   driver_select(prev);
-   driver_unlock();
+   /* NAMED, not ambient. driver_kick used to act on whatever context was
+    * selected, and the GATT callbacks selected without restoring -- so with a
+    * second sensor or a meter sync in flight this kicked whichever link a
+    * binder thread last touched, spuriously reconnecting a healthy link while
+    * leaving the stalled one stranded until the next throttle window. */
+   driver_kick(link);
 }

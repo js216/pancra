@@ -2,9 +2,10 @@
 // plotdata.c --- long plot spans, read from the log (see plotdata.h)
 // Copyright 2026 Jakob Kastelic
 #include "plotdata.h"
+#include "csvcur.h"  /* the shared CSV cursor; the grammar stays here */
+#include "ingest.h"  /* STORE_GLU_MAX: the plot must be able to show it */
 #include "sensors.h" /* KIND_CGM */
-#include "store.h"   /* STORE_GLU_MAX: the plot must be able to show it */
-#include "ui.h"      /* struct ui_point, in full */
+#include "uimodel.h"
 #include <stddef.h>
 /* The app is freestanding and declares its own syscalls (dexlibc.h); the
  * host test build has the real headers. Same code either way -- this file
@@ -63,74 +64,117 @@ static long plot_log_size(const char *path)
    return n < 0 ? 0 : n;
 }
 
+/* THE WIDEST PROVENANCE ID THAT CAN EXIST, and it is not a guess: struct
+ * reading stores `src` in sixteen bits (store.h), so sensor_mint refuses to
+ * issue an id past 0xFFFF rather than let 65536 alias legacy id 0 and
+ * reattribute a reading to a different physical device (sensors.c, "An id
+ * must fit the 16-bit `src` field"). A wider number in this column therefore
+ * did not come from this app, and cannot name anything on this phone.
+ *
+ * Spelled here rather than shared with sensors.c because that file's constant
+ * is a MINTING rule and this one is a READING rule; nothing checks that the
+ * two agree, which is worth knowing when either moves. */
+#define PLOT_SRC_MAX 0xFFFF
+
 /* One readings.csv row -> (t, glu, src, kind). Returns 0 if the line is not
  * a datapoint. Legacy short rows carry no source or kind; they read as the
- * unattributed CGM trace, exactly as they do everywhere else. */
+ * unattributed CGM trace, exactly as they do everywhere else.
+ *
+ * THE CURSOR, NOT A FIFTH HAND-ROLLED DIGIT LOOP. Every field after glucose
+ * used to be accumulated with a bare `n = n * 10 + digit` and NO CAP AT ALL.
+ * Two things were wrong with that, and the second is the one that reaches the
+ * screen:
+ *
+ *   1. Signed overflow is undefined behaviour, and it happened while PARSING
+ *      -- before any range check below could refuse the value. readings.csv
+ *      is append-only and a torn write or a hand-edit can leave a long digit
+ *      run in it, so this was reachable from a file rather than from a peer.
+ *      At -O2 that is not "a wrong number": it is the whole translation unit
+ *      losing its meaning, and this is the translation unit the 30- and
+ *      90-day glucose plots are drawn from.
+ *
+ *   2. Even with the arithmetic made safe, A BOUND ON THE WRONG SIDE OF A
+ *      NARROWING CAST IS NOT A BOUND. The kind column was already
+ *      "normalised" here, with a comment saying so -- but the comparison
+ *      `n == KIND_BGM` ran on an `int` the parse had already wrapped, and
+ *      4294967297 wraps to exactly 1, which IS KIND_BGM. So the single input
+ *      that column's normalisation existed to stop walked straight through
+ *      it: the row drew as a fingerstick nobody took. The same digits in the
+ *      source column wrapped to 1 and borrowed device slot 1's colour and
+ *      name. Both are measured in test/plottest.c; both were live.
+ *
+ * So: read every column through csvcur.h's bounded reader, keep the value in
+ * a `long` while it is checked, and cast only after. A field with more digits
+ * than that reader holds is not a wrong value to be clamped -- it describes a
+ * different row entirely -- so the COMPLETE row is refused, and refused
+ * before any of the four out-params is written. A parser that rejects a field
+ * after it has already published three others is the same defect one step
+ * later: the caller sees 0, ignores the row, and the next caller to forget
+ * that gets whatever the corrupt line left behind. */
 int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
 {
-   const char *p = ln;
-   long v        = 0;
-   if (*p < '0' || *p > '9')
+   /* The cursor reads inside ONE line and can never run past it, so it needs
+    * that line's end. Callers hand this function either a NUL-terminated
+    * buffer carved out of the read below, or a whole line from fgets with its
+    * '\n' still attached -- stop at whichever arrives first. */
+   const char *e = ln;
+   while (*e && *e != '\n')
+      e++;
+   struct csv_cur c;
+   csv_open(&c, ln, e);
+
+   /* A leading digit is what makes a line a datapoint at all: the header
+    * row, a comment and a blank line all fail here, exactly as before. Kept
+    * as an explicit test rather than leaning on CSV_FIELD_EMPTY because
+    * csv_num also accepts a leading '-', and a negative first column is not
+    * a timestamp this file has ever written. */
+   if (c.p >= c.e || *c.p < '0' || *c.p > '9')
       return 0;
-   /* CAP THE DIGITS, the rdfield/stats/sensors/insulin/weight idiom.
-    * Signed overflow is UB and happens DURING parsing, before any range
-    * check downstream can reject the value -- and this parser reads an
-    * append-only file that a torn write can corrupt. Saturate so the
-    * bounds below discard the row instead. */
-   int nt = 0;
-   while (*p >= '0' && *p <= '9') {
-      if (nt < 18) {
-         v = (v * 10) + (*p - '0');
-         nt++;
-      }
-      p++;
-   }
-   if (nt >= 18)
-      v = 0; /* unparseable: fails the *t > 0 bound below */
-   *t = v;
-   if (*p != ',')
+
+   enum csv_field why;
+   long tv = csv_num(&c, &why);
+   if (why != CSV_FIELD_OK)
       return 0;
-   p++;
-   int g = 0;
-   int d = 0;
-   while (*p >= '0' && *p <= '9') {
-      if (d < 9)
-         g = (g * 10) + (*p - '0');
-      else
-         g = 16777216; /* saturate: fails the *glu < 2000 bound below */
-      p++;
-      d++;
-   }
-   if (!d)
+   if (!csv_sep(&c))
       return 0;
-   *glu  = g;
-   *src  = 0;
-   *kind = KIND_CGM;
+   long gv = csv_num(&c, &why);
+   if (why != CSV_FIELD_OK)
+      return 0;
+
+   /* Nothing is published yet; these are the row's answers, held back until
+    * the whole row has been read and passed. */
+   long srcv  = 0;
+   long kindv = KIND_CGM;
+
    /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale */
    int f = 1;
-   while (*p && *p != '\n') {
-      if (*p != ',') {
-         p++;
+   while (!csv_at_end(&c)) {
+      if (!csv_sep(&c)) {
+         /* Trailing junk inside a column -- "7x" -- is stepped over rather
+          * than fatal, which is what this reader has always done: the column
+          * keeps its leading digits. Worth naming, because it means a
+          * contaminated field can still yield a perfectly legal value. */
+         c.p++;
          continue;
       }
-      p++;
       f++;
-      int neg = 0;
-      if (*p == '-') {
-         neg = 1;
-         p++;
-      }
-      int n = 0;
-      int k = 0;
-      while (*p >= '0' && *p <= '9') {
-         n = (n * 10) + (*p++ - '0');
-         k++;
-      }
-      if (!k)
-         continue;
-      if (f == 5)
-         *src = neg ? 0 : n;
-      else if (f == 8)
+      long n = csv_num(&c, &why);
+      if (why == CSV_FIELD_OVERFLOW)
+         return 0; /* more digits than any column of this file can mean */
+      if (why == CSV_FIELD_EMPTY)
+         continue; /* an absent column leaves its default standing */
+      if (f == 5) {
+         /* OUT OF THE ID DOMAIN IS UNATTRIBUTED, NOT A DROPPED READING.
+          * Refusing the row here would delete a glucose value from the plot,
+          * and this file's header explains at length that a dropped reading
+          * is not clamped to an edge -- it is simply absent from the view you
+          * opened to see it. Source is decoration; the reading is the datum.
+          * So an id that cannot name any device on this phone reads as 0,
+          * which the renderer already draws as the unattributed trace, the
+          * same as every pre-registry row. Unattributed is honest;
+          * misattributed -- which is what the wrapped 1 was -- is not. */
+         srcv = (n >= 0 && n <= PLOT_SRC_MAX) ? n : 0;
+      } else if (f == 8) {
          /* NORMALISE, do not store what the file says. This is the SECOND
           * reader of readings.csv -- hist_insert is the other, and it had the
           * identical gap -- and the return below bounds t and glu while
@@ -138,14 +182,30 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
           * accepted 9, 15, 149, 363 and 2312.
           *
           * The consequence is on screen: this kind is copied into the
-          * ui_point handed to the long-span plot, and ui.c draws
+          * ui_point handed to the long-span plot, and the renderer draws
           * kind == KIND_INS along the bottom edge -- so a corrupt 2 becomes
           * an insulin dose that never happened, and anything else is not
           * KIND_BGM so it draws as a CGM line point. The log is append-only,
-          * so a row admitted once is redrawn at every launch. */
-         *kind = (!neg && n == KIND_BGM) ? KIND_BGM : KIND_CGM;
+          * so a row admitted once is redrawn at every launch.
+          *
+          * `n` IS STILL A LONG HERE, and that is the whole repair: this
+          * comparison is the bound, and it used to sit downstream of the
+          * wrap that produced the value it was checking. */
+         kindv = (n == KIND_BGM) ? KIND_BGM : KIND_CGM;
+      }
    }
-   return *t > 0 && *glu > 0 && *glu < 2000;
+
+   /* Both bounds are applied on the WIDE side, before anything narrows: gv
+    * is compared as a long, so a value that would wrap into 1..1999 on the
+    * way into an int is refused rather than admitted as a plausible
+    * glucose. */
+   if (tv <= 0 || gv <= 0 || gv >= 2000)
+      return 0;
+   *t    = tv;
+   *glu  = (int)gv;
+   *src  = (int)srcv;
+   *kind = (int)kindv;
+   return 1;
 }
 
 static void plong_build(const char *path, long end, long span)

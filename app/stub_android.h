@@ -23,6 +23,8 @@ int AKeyEvent_getAction(const void *ev);
 int AKeyEvent_getKeyCode(const void *ev);
 float AMotionEvent_getX(const void *ev, unsigned long i);
 float AMotionEvent_getY(const void *ev, unsigned long i);
+unsigned long AMotionEvent_getPointerCount(const void *ev);
+int AMotionEvent_getPointerId(const void *ev, unsigned long i);
 unsigned long AMotionEvent_getHistorySize(const void *ev);
 float AMotionEvent_getHistoricalX(const void *ev, unsigned long i,
                                   unsigned long h);

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0
- * rand.c --- cryptographic random bytes from the operating system
+ * rand.c --- the entropy boundary: ask the provider, check the answer
  * Copyright 2026 Jakob Kastelic
  *
  * See rand.h. There is nothing clever here, and that is the point: this used
@@ -8,47 +8,40 @@
  * whether a short read was worth retrying and whether a failure was fatal.
  * A short read from /dev/urandom is rare enough that a copy which ignores it
  * looks correct for years.
+ *
+ * WHAT IS NOT HERE ANY MORE: the operating system. This file used to open
+ * /dev/urandom and hand-declare open/read/close for the freestanding build.
+ * Those live in the platform provider now (lib/randunix.c), and this file --
+ * the one every piece of crypto in lib/ depends on -- names no syscall, no
+ * device and no header outside the C standard's freestanding subset.
  */
 #include "rand.h"
+#include "entropy.h"
 #include <stddef.h>
 #include <stdint.h>
 
-/* ONE copy, compiled by both halves. The app builds -ffreestanding, where no
- * libc declares open/read/close; the server is an ordinary hosted program and
- * takes them from the system. That is the entire difference, and
- * __STDC_HOSTED__ asks exactly that question, so no build flag is needed to
- * tell them apart.
- *
- * The freestanding branch declares the three syscalls ITSELF rather than
- * including app/dexlibc.h. lib/ is meant to be a self-contained collection of
- * primitives, and a file in it naming a header in app/ is the dependency
- * pointing the wrong way -- it compiled only because the app build happens to
- * pass -Iapp, and the server's own include path could not have resolved it.
- * Three prototypes are a smaller price than that edge. */
-#if __STDC_HOSTED__
-#include <fcntl.h>
-#include <unistd.h>
-#else
-int open(const char *path, int flags, ...);
-long read(int fd, void *buf, size_t n);
-int close(int fd);
-#ifndef O_RDONLY
-#define O_RDONLY 0U
-#endif
-#endif
+/* NULL means "the platform's own", resolved at the call rather than stored
+ * here: a pointer initialised to entropy_fill would be a second place that
+ * decides the default, and the two could disagree after a test forgot to
+ * restore. */
+static rand_source_fn g_src;
+
+rand_source_fn rand_set_source(rand_source_fn src)
+{
+   rand_source_fn prev = g_src;
+   g_src               = src;
+   return prev;
+}
 
 int rand_bytes(uint8_t *buf, size_t n)
 {
-   int fd = open("/dev/urandom", O_RDONLY);
-   if (fd < 0)
+   if (!buf)
       return 0;
-   size_t off = 0;
-   while (off < n) {
-      long r = read(fd, buf + off, n - off);
-      if (r <= 0)
-         break; /* a short read is a failure, not something to paper over */
-      off += (size_t)r;
-   }
-   close(fd);
-   return off == n;
+   if (n == 0)
+      return 1; /* nothing asked for is nothing to fail at */
+   /* THE PROVIDER'S ANSWER IS NOT TAKEN ON TRUST. A source that reports
+    * success is required to have filled every byte; this wrapper is where
+    * that contract is stated, so each provider does not restate it. */
+   int ok = g_src ? g_src(buf, n) : entropy_fill(buf, n);
+   return ok ? 1 : 0;
 }

@@ -2,11 +2,12 @@
 // alarmlogic.h --- Pure alarm decision logic (host-testable)
 // Copyright 2026 Jakob Kastelic
 
-/* The alarm DECISION, split out from the alarm ACTUATION in main.c.
+/* The alarm DECISION, split out from the alarm ACTUATION in alarm.c.
  *
- * Why this file exists: `make check` cannot fail on anything in main.c -- it is
+ * Why this file exists: `make check` cannot fail on anything in the Android
+ * shell -- it is
  * in no test binary -- and an adversarial review proved it by making
- * glucose_zone() return 0 unconditionally, which makes a glucose alarm
+ * alarm_zone() return 0 unconditionally, which makes a glucose alarm
  * impossible under every input, with the whole gate still green. Across this
  * codebase's review history the alarm path is where regressions concentrated,
  * precisely because nothing behavioural guarded it.
@@ -38,6 +39,53 @@
  * check reads it from here; when it was open-coded as 360 in five files, a
  * change like this one silently left some of them behind. */
 #define AL_FRESH_S 660
+
+/* IS A STAMP RECENT ENOUGH TO ACT ON -- and did it come from the PAST?
+ *
+ * THE BUG THIS EXISTS TO KILL. Every freshness test in the alarm was
+ * `now - stamp <= limit`, which is true for every negative age as well as
+ * every small positive one. A negative age is not exotic: the phone corrects
+ * its clock BACKWARDS routinely -- an NTP step after a flat battery, a
+ * timezone database fix, a user setting the date by hand -- and every reading
+ * already in the log then carries a timestamp in the future. The alarm's view
+ * of the world after such a correction was:
+ *
+ *   - the last reading, however old, is FRESH, and stays fresh forever. The
+ *     big number stops ageing. A 58 mg/dL from three hours ago reads as the
+ *     current value, and the low alarm rings on it, or worse is BELIEVED by
+ *     someone deciding whether to eat;
+ *   - alarm_zone therefore never decays, and a zone outranks a stale warning,
+ *     so the DISCONNECT alarm can never fire. A sensor that has fallen off,
+ *     run out, or lost its link is invisible for as long as the skew lasts;
+ *   - alarm_stranded returns 0 (it declines while the data is "fresh"), so
+ *     the one rule that keeps a ringing hypo alive through a dropout is
+ *     switched off at exactly the moment the data cannot be trusted;
+ *   - an imminent-hypo prediction is preserved indefinitely, and that alarm
+ *     is the one the user cannot silence.
+ *
+ * So the rule is: an age must be NONNEGATIVE as well as within the limit. A
+ * stamp from the future is a stamp whose age we do not know, and "I do not
+ * know how old this is" must read as NOT CURRENT everywhere.
+ *
+ * WHAT THAT COSTS, stated honestly rather than hidden. Right after a backward
+ * correction the newest reading is also future-dated, so the app reports no
+ * current data until the next sample arrives -- at most one CGM cadence,
+ * about five minutes, after which every stamp is on the corrected clock
+ * again. The old behaviour's window was not five minutes, it was unbounded:
+ * it lasted until the wall clock caught back up, and throughout it the app
+ * asserted a stale value as live. A bounded gap that says "no data" beats an
+ * unbounded one that says the wrong number confidently.
+ *
+ * `now` and `stamp` must be read from the SAME clock. For a persisted fact --
+ * a reading, a dose -- that clock is realtime_s(), because the stamp is the
+ * record's identity and is shown to a person. For something that only exists
+ * inside this process -- when a prediction arrived, when the process started
+ * -- it is mono_s(), which no correction can move; see clock.h. */
+static inline int data_fresh(long now, long stamp, long limit)
+{
+   long age = now - stamp;
+   return age >= 0 && age <= limit;
+}
 
 /* ---- NEW DATAPOINT alert modes (g_newdata_mode, persisted) ----
  *   ND_OFF    silent
@@ -145,8 +193,100 @@ int alarm_zone_merge(int a, int b);
  *
  * disc_s is the configured threshold in seconds; 0 disables it. A freshly
  * launched process gets a grace period equal to the threshold, since data may
- * legitimately be stale until the first sync. */
-int alarm_stale(int glu, long glu_t, long now, long launch_t, long disc_s);
+ * legitimately be stale until the first sync.
+ *
+ * TWO CLOCKS, AND THEY ARE NOT INTERCHANGEABLE. The four time arguments come
+ * in two pairs and each pair must be read from its own clock:
+ *
+ *   glu_t / now          REALTIME. glu_t is the reading's own timestamp --
+ *                        its identity in the log and the time shown beside it
+ *                        -- so it cannot be anything else, and `now` has to
+ *                        match it to be subtractable from it.
+ *   launch_mono/mono_now MONOTONIC. "How long has this process been up" is an
+ *                        interval that exists only in this process, so a wall
+ *                        clock correction must not move it. See clock.h, and
+ *                        the comment on the grace test in alarmlogic.c for
+ *                        what happened when it did.
+ *
+ * Passing all four rather than a precomputed "still in grace" flag keeps the
+ * COMPOSITION here, where a test executes it. The shell has composed this
+ * file's pieces by hand before, and the hand-written copy is the one that
+ * ran while the tested copy sat unreferenced -- see alarm_actuate_step. */
+int alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
+                long disc_s);
+
+/* ---- THE IMMINENT-HYPO OVERRIDE'S OWN PREDICATE ----
+ *
+ * 55 mg/dL is ADA "Level 2" hypoglycaemia -- clinically significant, the
+ * threshold at which guidance stops calling it a low and calls it urgent, and
+ * the same number Dexcom's own readouts use for their Urgent Low alert. That
+ * is why THIS alarm is the one that overrides the user's sound setting and
+ * cannot be silenced away: it is the only value in the app chosen because
+ * somebody else's evidence says a person may stop being able to act. */
+#define PRED_LOW_MGDL 55
+
+/* Does one CGM link's newest PREDICTION justify forcing a LOW right now?
+ *
+ * `pred_mono` is when that prediction ARRIVED, on the monotonic clock, and
+ * `now_mono` is read from the same one. A prediction is not a record: it is
+ * never written to a file and never shown, so the wall clock has no claim on
+ * it, and stamping it with realtime meant a backward correction preserved a
+ * prediction forever -- on the one alarm the user cannot silence.
+ *
+ * It lives here rather than in alarm.c because it is a pure decision on the
+ * app's loudest path, and alarm.c is reachable by no test: the override was
+ * once deleted outright (`if (pred_low)` -> `if (pred_low && 0)`) with the
+ * whole gate green. The shell folds this over its links; the rule is here. */
+int alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
+
+/* ---- ONE PREDICTION, PUBLISHED AS ONE VALUE -----------------------------
+ *
+ * THE RACE THIS REMOVES. The prediction and the time it arrived were two
+ * plain arrays in alarm.c, written as two separate stores by a GATT binder
+ * thread (pancra_glucose, with the DRIVER lock held) and read as two separate
+ * loads by the alarm evaluation under the ALARM lock. Two problems, and the
+ * second is the dangerous one:
+ *
+ *   1. It is a C data race -- unsynchronised access to a non-atomic object
+ *      from two threads -- which is undefined behaviour, not merely a
+ *      stale read. ThreadSanitizer reports it as one.
+ *   2. A reader landing between the two stores gets a MIXED PAIR: this
+ *      sample's predicted value stamped with the PREVIOUS sample's arrival
+ *      time, or the previous value with this arrival time. Item 70 makes the
+ *      freshness rule ask whether an age is sane; this makes sure the value
+ *      and the age belong to each other in the first place. Neither is any
+ *      use without the other -- a 48 mg/dL prediction carrying a stamp from
+ *      five minutes ago is refused as expired when it is current, and a
+ *      recovered value carrying a fresh stamp forces the unsilenceable LOW
+ *      over a prediction that no longer says anything.
+ *
+ * WHY NOT SIMPLY TAKE alarm_lk IN THE WRITER. Because the writer holds the
+ * DRIVER lock, and alarm_lk is held across blocking MediaPlayer JNI --
+ * hundreds of milliseconds. driver -> alarm would put a binder thread's
+ * driver lock behind a media call while the MAIN LOOPER spins on the driver
+ * lock, which is the freeze this app has already had (see any_pred_low, and
+ * app/thread.h rule 6: alarm_lk is taken ALONE). The pair is small enough to
+ * publish as ONE machine word, so it needs no lock and adds no order edge.
+ *
+ * THE ENCODING: glucose in the top 16 bits, arrival seconds in the low 48.
+ * 16 bits holds any prediction a CGM can express with three orders of
+ * magnitude to spare (the sensor scale stops at 400), and 48 bits of seconds
+ * is 8.9 million years of uptime. Both halves are clamped rather than
+ * truncated, because a wrapped stamp would read as an arrival time that never
+ * happened -- on the one alarm the user cannot silence.
+ *
+ * These two are PURE, so alarmtest executes them: a round trip that loses a
+ * field, or shifts by one bit, is the whole failure and is otherwise
+ * invisible in a file no test can reach. */
+#define PRED_MGDL_MAX 65535
+
+struct link_pred {
+   int mgdl;  /* predicted glucose; 0 means nothing has been recorded */
+   long mono; /* when it arrived, MONOTONIC seconds; 0 means never */
+};
+
+unsigned long long pred_pack(int mgdl, long mono);
+struct link_pred pred_unpack(unsigned long long word);
 
 /* Has the data gone stale while the last reading we DID have was out of range?
  *
@@ -212,12 +352,12 @@ int alarm_audible(int want, int sound_on, int vib_on);
  *
  * THE TWO NUMBERINGS MUST NOT BE THE SAME ONE. Java's kind puts LOW at 0, but
  * the internal level needs 0 to mean "nothing should be sounding" -- and when
- * a single enum served both, `want = ALARM_LOW` produced 0, indistinguishable
- * from silence. alarm_apply's own idempotence check then returned early and
- * the LOW GLUCOSE ALARM COULD NEVER FIRE, while HIGH and STALE worked
- * normally, which is exactly the shape that hides from casual testing. Keeping
- * the two spaces separate and converting explicitly here is what stops that
- * recurring. */
+ * a single enum served both, a request to sound LOW produced 0 --
+ * indistinguishable from silence. alarm_apply's own idempotence check then
+ * returned early and the LOW GLUCOSE ALARM COULD NEVER FIRE, while HIGH and
+ * STALE worked normally, which is exactly the shape that hides from casual
+ * testing. Keeping the two spaces separate and converting explicitly here is
+ * what stops that recurring. */
 int alarm_java_kind(int want);
 
 /* What alarm_apply should DO, given the level it computed and what is already
@@ -265,11 +405,12 @@ int alarm_reactuate_allowed(int acked);
  * REFUSE, never clamp. Silently altering a calibration the user typed is worse
  * than not accepting it: the sensor would be corrected toward a number nobody
  * chose. main.c calls this the single most consequential write in the app, and
- * it lives here because nothing in main.c is reachable by any test. */
+ * it lives here because the shell it actuates through is reachable by no
+ * test. */
 /* 40..400 mg/dL is the range a Dexcom sensor itself reports and clamps to, so
  * a calibration outside it describes a reading the sensor could not have
  * produced. THE SAME PAIR bounds what the app will believe off the wire --
- * glucose_plausible in main.c widens it to 20..600 so a genuine extreme is
+ * glucose_plausible in reading.c widens it to 20..600 so a genuine extreme is
  * recorded rather than dropped, and says so by deriving from these rather
  * than by repeating two more literals three thousand lines away. */
 #define CAL_MIN_MGDL 40
@@ -288,7 +429,7 @@ int cal_entry_mgdl(const char *digits, int n, int units);
  * Extracted for the same reason as the rest of this file: the clamp is a
  * guard-threshold, and getting a comparison one off here silently disables an
  * alarm (a low of 400 means nothing is ever below it) or latches both
- * permanently. Nothing in main.c can be tested; this can. */
+ * permanently. The shell that actuates it cannot be tested; this can. */
 #define AL_MIN  40
 #define AL_MAX  400
 #define AL_STEP 5
@@ -327,5 +468,52 @@ struct alarm_plan {
 void alarm_plan_next(int zone, int stale, int stranded, int acked, int pred_low,
                      int prev_want, int sounding, int sound_on,
                      struct alarm_plan *out);
+
+/* ================= THE ALARM ACTUATION WORKFLOW =====================
+ *
+ * The three pieces above -- sustain, override, decide -- were composed BY HAND
+ * inside alarm.c's actuator, which is how the composition escaped the gate: a
+ * pure copy of the override lived here and was tested, while the copy that
+ * actually ran was a second one written out inline. Deleting the tested copy
+ * would have failed alarmtest and changed nothing on the phone.
+ *
+ * So the composition is here too, as one transition. The shell holds the
+ * state, hands it in with what it observed, and does what the effect says.
+ *
+ * State, not globals: `want` is the level last committed to Java, `acked`
+ * whether the user has dismissed it, `sounding` whether anything is actually
+ * audible or tactile (which is what arms the tap-to-silence gesture). */
+struct alarm_state {
+   int want;
+   int acked;
+   int sounding;
+};
+
+/* What the shell is asked to DO. Nothing here touches Java; the shell does. */
+struct alarm_effect {
+   int act;  /* AL_ACT_NONE / AL_ACT_TRIGGER / AL_ACT_SILENCE */
+   int kind; /* Java's kind for a trigger, -1 when there is nothing to say */
+   int sound, vib; /* the outputs that trigger should use */
+};
+
+/* What the shell OBSERVED this tick. Every input the decision needs, so the
+ * transition can be pure -- no clock, no globals, no locks. */
+struct alarm_obs {
+   int zone;             /* 0 in range, AL_LOW, AL_HIGH from the reading */
+   int stale;            /* the current reading has aged out */
+   int stranded;         /* the sensor is gone, not merely quiet */
+   int pred_low;         /* a CGM predicts an imminent hypo */
+   int sound_on, vib_on; /* the user's alarm output settings */
+};
+
+/* state + observation -> next state + one effect. Pure.
+ *
+ * The caller commits `next` ONLY if the effect it performs succeeds; a failed
+ * JNI call must leave the old state, so the next tick tries again. That
+ * retry-by-level is the whole error-recovery story for the alarm, which is
+ * why the transition never assumes its effect happened. */
+void alarm_actuate_step(const struct alarm_state *st,
+                        const struct alarm_obs *obs, struct alarm_state *next,
+                        struct alarm_effect *eff);
 
 #endif

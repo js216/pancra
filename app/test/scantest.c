@@ -15,6 +15,7 @@
  */
 #include "scanlogic.h"
 #include <stdio.h>
+#include <string.h> /* strcmp: the failure messages are compared as text */
 
 static int all = 1;
 
@@ -38,6 +39,47 @@ static struct scan_state ok_state(void)
                           .hold_until    = 0,
                           .last_attempt  = 0};
    return s;
+}
+
+/* A MINIATURE OF scan.c's SCAN STATE, so the ORDER of these decisions is
+ * executed rather than argued.
+ *
+ * It composes exactly what start_scan and jni_scan_failed compose, in the same
+ * order: refuse a start inside the back-off, else allocate a generation and
+ * latch; match a failure against the latched generation, then stamp the
+ * back-off and clear the latch. Nothing here is a second copy of the POLICY --
+ * every judgement is scanlogic's, and this is only the state those judgements
+ * act on. */
+struct scan_model {
+   int gen;          /* generations handed out so far */
+   int scanning;     /* the latch that used to be permanent */
+   long retry_after; /* the back-off a failure left */
+   int last_err;     /* what the user was last told */
+   long now;
+};
+
+/* start_scan: returns the generation that went out, or 0 if it was refused. */
+static int model_start(struct scan_model *m)
+{
+   if (m->scanning)
+      return 0;
+   if (!scan_start_allowed(m->now, m->retry_after))
+      return 0;
+   m->scanning = 1;
+   return ++m->gen;
+}
+
+/* jni_scan_failed: returns 1 if the failure was acted on. */
+static int model_fail(struct scan_model *m, int gen, int err)
+{
+   struct scan_fail f = {
+       .failed_gen = gen, .cur_gen = m->gen, .scanning = m->scanning};
+   if (!scan_fail_applies(&f))
+      return 0;
+   m->last_err    = err;
+   m->retry_after = scan_fail_retry_at(m->now);
+   m->scanning    = 0;
+   return 1;
 }
 
 int main(void)
@@ -182,6 +224,164 @@ int main(void)
          ck(scan_pick_candidate(masked, 3) == -1,
             "a near tie is refused even with a distant third present");
       }
+   }
+
+   printf("== a late scan failure: whose scan was it? ==\n");
+   {
+      /* THE FAILURE THIS PINS. startScan() reports success and the platform
+       * refuses afterwards, on a binder thread. Native had already latched
+       * "scanning", every recovery path is gated on that flag being clear, and
+       * it was cleared in exactly one place -- a later successful stop. So the
+       * app stopped scanning for the life of the process: no reconnect after a
+       * dropout, no meter noticed when switched on, nothing on screen. */
+      struct scan_fail live = {.failed_gen = 4, .cur_gen = 4, .scanning = 1};
+      ck(scan_fail_applies(&live) == 1,
+         "the live scan's own failure must reset the state");
+
+      /* SUPERSEDED. Chosen so ONLY the generation differs: something is
+       * installed and native believes it is scanning, exactly as in the live
+       * case, so this case can only be refused by the generation comparison. */
+      struct scan_fail old = {.failed_gen = 4, .cur_gen = 5, .scanning = 1};
+      ck(scan_fail_applies(&old) == 0,
+         "a failure for a REPLACED scan must not cancel the newer one");
+
+      /* NO GENERATION AT ALL. cur_gen is 0 too -- the state before the first
+       * start -- so the generations MATCH and `scanning` is set: this case is
+       * refused only by the failed_gen <= 0 rule, and drops through to
+       * "current" the moment that rule is deleted. */
+      struct scan_fail none = {.failed_gen = 0, .cur_gen = 0, .scanning = 1};
+      ck(scan_fail_applies(&none) == 0,
+         "a failure carrying no generation is not the current scan's");
+      struct scan_fail neg = {.failed_gen = -1, .cur_gen = -1, .scanning = 1};
+      ck(scan_fail_applies(&neg) == 0, "...nor is a negative one");
+
+      /* ALREADY RESET. Generations match, so only the `scanning` rule can
+       * refuse it. The platform really does deliver more than one failure per
+       * registration, and a second reset would restamp the back-off (pushing
+       * the retry a further interval out for every duplicate) and clear a stop
+       * that is outstanding for an unrelated reason. */
+      struct scan_fail again = {.failed_gen = 4, .cur_gen = 4, .scanning = 0};
+      ck(scan_fail_applies(&again) == 0,
+         "a second failure for the same scan changes nothing");
+   }
+
+   printf("== the failure back-off is the retry throttle, not a bypass ==\n");
+   {
+      long now = 100000;
+      ck(scan_fail_retry_at(now) == now + SCAN_RETRY_S,
+         "a failure holds the next start off by the self-heal interval");
+      ck(scan_start_allowed(now, scan_fail_retry_at(now)) == 0,
+         "so a start attempted immediately after a failure is refused");
+      ck(scan_start_allowed(now + SCAN_RETRY_S - 1, scan_fail_retry_at(now)) ==
+             0,
+         "one second short of the interval is still refused");
+      ck(scan_start_allowed(now + SCAN_RETRY_S, scan_fail_retry_at(now)) == 1,
+         "at the interval the retry is allowed");
+      ck(scan_start_allowed(0, 0) == 1,
+         "with no failure recorded, a start is never held off");
+   }
+
+   printf("== the sequences that actually bit ==\n");
+   {
+      /* THE MODEL IS DRIVEN, NOT NARRATED.
+       *
+       * An earlier version of this block inlined each transition beside its
+       * assertion, which made one check ("the scheduled retry did not move")
+       * unfailable: the test itself never performed the restamp it claimed to
+       * rule out, so deleting the rule that prevents it changed nothing here.
+       * model_start/model_fail apply the state change whenever scanlogic
+       * permits it, so every assertion below is about state the RULES
+       * produced. */
+      struct scan_model m = {.now = 1000};
+
+      /* 1. THE HEALING SEQUENCE. */
+      int g1 = model_start(&m);
+      ck(g1 == 1 && m.scanning == 1, "a first start goes out and is latched");
+      ck(model_fail(&m, g1, 6) == 1, /* SCANNING_TOO_FREQUENTLY */
+         "its own failure is recognised and acted on");
+      ck(m.scanning == 0, "the latch is CLEARED -- this is the whole defect");
+      ck(m.retry_after == 1000 + SCAN_RETRY_S,
+         "...and the retry is SCHEDULED, not immediate");
+      long scheduled = m.retry_after;
+
+      /* 2. A DUPLICATE FAILURE MUST NOT PUSH THE RETRY FURTHER OUT. The stack
+       * delivers more than one per registration; without the already-reset
+       * rule each would restamp the back-off, and while failures kept arriving
+       * the retry would never come due -- the same permanent outage, by
+       * arithmetic instead of by a latch. */
+      m.now += 5;
+      ck(model_fail(&m, g1, 6) == 0, "the duplicate is refused");
+      ck(m.retry_after == scheduled,
+         "...so the scheduled retry did not move (no double-retry)");
+
+      /* 3. THE THROTTLE HOLDS UNTIL IT IS DUE. A start attempted inside the
+       * back-off must not go out: for failure 6 that call is literally what
+       * extends Android's block. */
+      ck(model_start(&m) == 0, "five seconds later the retry is refused");
+      ck(m.gen == g1, "...and no generation was spent on it");
+      m.now  = scheduled;
+      int g2 = model_start(&m);
+      ck(g2 == g1 + 1 && m.scanning == 1,
+         "at the deadline a NEW generation goes out");
+
+      /* 4. A LATE FAILURE FOR THE FIRST SCAN MUST NOT UNDO THE SECOND. This is
+       * the reason for generations at all: the reset is a real action -- it
+       * tells the app its scan is dead and holds starts off for an interval --
+       * so applying it for a scan that no longer exists is the original outage
+       * reintroduced by the fix for the original outage. */
+      ck(model_fail(&m, g1, 3) == 0,
+         "the first scan's failure is refused after the second started");
+      ck(m.scanning == 1, "...the working scan is still believed live");
+      ck(m.last_err == 6 && m.retry_after == scheduled,
+         "...and it left no back-off or message behind either");
+
+      /* 5. THE SECOND SCAN'S OWN FAILURE IS STILL ACTED ON, so the staleness
+       * rule cannot be satisfied by ignoring everything. */
+      ck(model_fail(&m, g2, 3) == 1, "the live generation still gets through");
+      ck(m.scanning == 0 && m.last_err == 3 &&
+             m.retry_after == m.now + SCAN_RETRY_S,
+         "...resetting the latch and rescheduling from NOW");
+   }
+
+   printf("== what the user is told ==\n");
+   {
+      /* One generic message for all six codes is what left people rebooting
+       * phones: "the radio is busy" and "Android is blocking us for scanning
+       * too often" ask for different patience. */
+      const char *seen[7];
+      int distinct = 1, present = 1, named = 1;
+      for (int e = 1; e <= 6; e++) {
+         seen[e] = scan_fail_text(e);
+         if (!seen[e] || !seen[e][0])
+            present = 0;
+         /* 25 COLUMNS, not 33: update_screen renders the row as
+          * "PANCRA  %.*s" with MAX_COLS - 8, so anything longer is truncated
+          * mid-word and the cause -- which is the last word of most of these --
+          * is the part that falls off the screen. */
+         int n = 0;
+         while (seen[e][n])
+            n++;
+         if (n > 33 - 8)
+            present = 0;
+         /* A KNOWN CAUSE MUST BE NAMED. Distinctness alone does not say this:
+          * one of the six collapsing into the unknown-code fallback leaves the
+          * remaining five distinct, so that check stays green over exactly the
+          * regression it looks like it covers (demonstrated by mutation). */
+         if (strcmp(seen[e], scan_fail_text(0)) == 0)
+            named = 0;
+         for (int p = 1; p < e; p++)
+            if (seen[p] == seen[e] || strcmp(seen[p], seen[e]) == 0)
+               distinct = 0;
+      }
+      ck(present == 1, "every ScanCallback code has a short message");
+      ck(distinct == 1, "and no two codes say the same thing");
+      ck(named == 1, "and none of them falls back to the generic line");
+      ck(strcmp(scan_fail_text(6), "SCAN THROTTLED") == 0,
+         "SCANNING_TOO_FREQUENTLY (6) names Android's own block");
+      ck(strcmp(scan_fail_text(0), "SCAN FAILED") == 0,
+         "a code this build never heard of is still a failure");
+      ck(strcmp(scan_fail_text(7), "SCAN FAILED") == 0,
+         "...including a seventh constant Android has yet to add");
    }
 
    printf("\n%s\n", all ? "ALL SCAN TESTS PASSED" : "SOME TESTS FAILED");

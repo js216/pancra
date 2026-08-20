@@ -11,9 +11,9 @@
  * user's glucose, fed to the alarm, counted in time-in-range, and appended to
  * a log that is never rewritten.
  *
- * They lived inside pancra_glucose in main.c, where nothing could reach them:
- * a review widened the value window to 0..100000 and the age bound to 65535
- * and `make check` stayed green through both -- the second of those
+ * They lived inside pancra_glucose (now reading.c), where nothing could reach
+ * them: a review widened the value window to 0..100000 and the age bound to
+ * 65535 and `make check` stayed green through both -- the second of those
  * REINTRODUCING, verbatim, the 18-hour backdating bug whose fix is described
  * three lines above it. That is the same argument that put alarmlogic.c in
  * its own file, and it applies here for the same reason.
@@ -24,6 +24,23 @@
 #define INGEST_H
 
 #include "alarmlogic.h" /* CAL_MIN_MGDL / CAL_MAX_MGDL: the sensor's own range */
+
+/* WHAT A STORED READING MAY BE, which is wider than what the sensor sends.
+ *
+ * reading.c's glucose_plausible (20..600) gates the RAW value off the sensor
+ * and is right for that. But a rescale is applied AFTER it and before the
+ * write, scaling by up to RESCALE_MAX_PM (+25%), so a legitimately stored
+ * value reaches 750 -- and 20 at -25% reaches 15. Both replay readers used
+ * the raw 20..600, so a genuine extreme excursion was displayed, alarmed and
+ * counted live, then silently excluded from history, the plot and TIR/AVG/A1C
+ * on the next launch: the record of exactly the readings that matter
+ * clinically disappeared, and live stats disagreed with replayed ones.
+ *
+ * Stated once, HERE, where what a reading may be is already decided -- rather
+ * than in store.h, which made every reader of the log depend on the history
+ * module for two numbers. */
+#define STORE_GLU_MIN 15
+#define STORE_GLU_MAX 750
 
 /* What a CGM can physically report is CAL_MIN_MGDL..CAL_MAX_MGDL -- the range
  * a Dexcom sensor clamps to. The window here is deliberately WIDER, so a

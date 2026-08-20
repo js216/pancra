@@ -21,8 +21,9 @@
  * The driver is transport-agnostic: it talks through the ot_drv_* hooks, which
  * this file implements. Built and run by `make metertest`.
  */
+#include "clock.h"
+#include "meterlogic.h"
 #include "otble.h"
-#include "util.h" /* realtime_s: the driver bounds against it */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -41,9 +42,15 @@ static long last_naive;
 static int last_done_new;
 static uint8_t sent[64];
 static int sentlen;
+/* HOW MANY frames went out, not just the last one's length. Two record
+ * requests are the same length, so comparing sentlen cannot tell whether
+ * another one was sent -- which made a "the walk did not advance" assertion
+ * true whatever the driver did. */
+static int n_writes;
 
 void ot_drv_write(const uint8_t *d, int n)
 {
+   n_writes++;
    sentlen = n < (int)sizeof sent ? n : (int)sizeof sent;
    memcpy(sent, d, (size_t)sentlen);
 }
@@ -80,6 +87,86 @@ void ot_drv_done(int new_records)
 {
    n_done++;
    last_done_new = new_records;
+}
+
+/* ---- A ZONE WITH TRANSITIONS IN IT, so a DST boundary can be crossed on
+ * demand rather than waited for -----------------------------------------
+ *
+ * US/Pacific, by the post-2007 rule: daylight time from 02:00 local on the
+ * second Sunday in March to 02:00 local on the first Sunday in November. The
+ * two edges are what this suite is about:
+ *
+ *   SPRING FORWARD  local 02:00 PST -> 03:00 PDT. Local times in
+ *                   [02:00, 03:00) that day NEVER HAPPENED.
+ *   FALL BACK       local 02:00 PDT -> 01:00 PST. Local times in
+ *                   [01:00, 02:00) that day happened TWICE, an hour apart.
+ *
+ * EVERY YEAR, not one hard-coded pair of dates: a fixture with a single
+ * year's transitions in it says nothing about an edit that moves a timestamp
+ * into a different year, which is exactly one of the edits the keypad makes.
+ *
+ * The offsets are seconds east of UTC and both are negative, which is the
+ * sign that catches truncating division: -28800 is standard, -25200 daylight.
+ */
+#define STD (-28800L)
+#define DST (-25200L)
+
+/* Days since 1970-01-01, by COUNTING. Deliberately NOT the Hinnant formula
+ * civil.c uses: ground truth computed with the code under test agrees with it
+ * by construction, which is no test at all. */
+static long day_of(int y, int m, int d)
+{
+   static const int L[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+   long n                 = 0;
+   for (int yy = 1970; yy < y; yy++)
+      n += 365 + ((yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0);
+   int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+   for (int mm = 1; mm < m; mm++)
+      n += L[mm - 1] + (mm == 2 && leap);
+   return n + d - 1;
+}
+
+/* A local clock reading, as civil.h means it: not an instant. */
+static long naive_at(int y, int m, int d, int hh, int mi)
+{
+   return (day_of(y, m, d) * 86400L) + (hh * 3600L) + (mi * 60L);
+}
+
+/* The n-th Sunday of a month. 1970-01-01 was a Thursday, so day 0 is weekday
+ * 4 counting Sunday as 0. */
+static int nth_sunday(int y, int m, int n)
+{
+   int dow   = (int)(((day_of(y, m, 1) + 4) % 7 + 7) % 7);
+   int first = 1 + ((7 - dow) % 7);
+   return first + (7 * (n - 1));
+}
+
+/* The transition INSTANTS, expressed through the offset in force just before
+ * each -- which is how a zone file states them. */
+static long spring_utc(int y)
+{
+   return naive_at(y, 3, nth_sunday(y, 3, 2), 2, 0) - STD;
+}
+
+static long fall_utc(int y)
+{
+   return naive_at(y, 11, nth_sunday(y, 11, 1), 2, 0) - DST;
+}
+
+static int zone_calls;
+
+/* WHICH YEAR an instant is in, closely enough to pick the right pair of
+ * transitions: the boundaries are in March and November, so a year taken from
+ * a plain division is never off by enough to matter. */
+static long pacific(void *ctx, long t)
+{
+   (void)ctx;
+   zone_calls++;
+   int y = 1970 + (int)(t / (365L * 86400L));
+   for (int k = y - 1; k <= y + 1; k++)
+      if (t >= spring_utc(k) && t < fall_utc(k))
+         return DST;
+   return STD;
 }
 
 static int all = 1;
@@ -153,6 +240,7 @@ static void feed_record(long ts, int glu, int ctrl, int tailset)
 static void begin(int stored_index)
 {
    n_readings = n_done = n_disc = 0;
+   n_writes                     = 0;
    last_glu                     = -1;
    last_naive                   = -1;
    last_done_new                = -1;
@@ -390,6 +478,354 @@ int main(void)
    ck(ot_last_index() == 100,
       "...and the window ENDS at the newest record, not one short of it");
    ck(n_done == 1, "the session finishes at the cap, not before");
+
+   printf("== the meter runtime's two timeouts ==\n");
+   {
+      /* Both are RECOVERY rules, and both exist because a BLE callback can
+       * simply not arrive. While they were `if` statements inside a function
+       * that closes GATT links and takes two locks, nothing could reach
+       * them -- and a wrong bound here is a meter that never syncs again. */
+      struct meter_tick mt;
+      long idle[METER_LINKS_MAX] = {0};
+
+      /* A sync inside its budget is left alone. */
+      meter_tick_eval(1, 1000, idle, METER_LINKS_MAX, 1000 + METER_SYNC_MAX_S,
+                      &mt);
+      ck(!mt.drop_sync, "a sync at exactly its budget has not overrun");
+      meter_tick_eval(1, 1000, idle, METER_LINKS_MAX,
+                      1000 + METER_SYNC_MAX_S + 1, &mt);
+      ck(mt.drop_sync, "...and one past it is dropped");
+      meter_tick_eval(0, 1000, idle, METER_LINKS_MAX, 9999999, &mt);
+      ck(!mt.drop_sync, "with no sync running there is nothing to drop");
+
+      /* A link waiting for a teardown is released only once the bound is
+       * genuinely past -- a real teardown is immediate or ~35 s. */
+      idle[2] = 5000;
+      meter_tick_eval(0, 0, idle, METER_LINKS_MAX,
+                      5000 + METER_TEARDOWN_MAX_S - 1, &mt);
+      ck(mt.nrelease == 0, "a link inside the teardown bound is left alone");
+      meter_tick_eval(0, 0, idle, METER_LINKS_MAX, 5000 + METER_TEARDOWN_MAX_S,
+                      &mt);
+      ck(mt.nrelease == 1 && mt.release[2],
+         "...and released once the bound is reached");
+      ck(!mt.release[0] && !mt.release[1], "...only the link that was waiting");
+
+      /* NOT WHILE A SYNC IS RUNNING. A busy runtime owns its links, and
+       * releasing one under it would tear down the very exchange the other
+       * rule may be about to end properly. */
+      meter_tick_eval(1, 9999999, idle, METER_LINKS_MAX, 9999999, &mt);
+      ck(mt.nrelease == 0, "a busy runtime keeps its links");
+
+      /* A link that is not waiting for anything is never released. */
+      long none[METER_LINKS_MAX] = {0};
+      meter_tick_eval(0, 0, none, METER_LINKS_MAX, 9999999, &mt);
+      ck(mt.nrelease == 0, "a link with no teardown pending is left alone");
+   }
+
+   printf("== late, duplicate and wrong-phase frames are refused ==\n");
+   {
+      /* The protocol is strictly request/response, and nothing enforced it:
+       * any CRC-valid frame ran the handler for whatever `phase` held. */
+
+      /* AFTER THE SESSION IS OVER. A non-0x06 status called finish() again --
+       * re-reporting the count and re-issuing the disconnect on a link that
+       * may since belong to another exchange. */
+      begin(5);
+      feed_count(5); /* nothing new: this finishes the session */
+      int done_after = n_done;
+      int disc_after = n_disc;
+      ck(done_after == 1, "the session completes once");
+
+      uint8_t refused[2] = {0x07, 0}; /* "command not allowed" */
+      feed(refused, 2, 0);
+      ck(n_done == done_after, "a frame after the session does NOT finish it "
+                               "again");
+      ck(n_disc == disc_after, "...and does not re-issue the disconnect");
+
+      /* BEFORE ANYTHING IS ASKED. ot_init leaves the driver idle; a frame
+       * there is an answer to a request that was never made. */
+      n_readings = n_done = n_disc = 0;
+      ot_init(0);
+      /* A REFUSAL status, deliberately: a 0x06 in P_IDLE matches no phase
+       * branch and does nothing even without the gate, so asserting on one
+       * would pass whatever the driver did. A non-0x06 is what used to reach
+       * finish() from a state that never started a session. */
+      uint8_t idle_refused[2] = {0x07, 0};
+      feed(idle_refused, 2, 0);
+      ck(n_done == 0 && n_disc == 0,
+         "a frame arriving while idle does not finish a session that never "
+         "began");
+
+      /* A SECOND ANSWER WITH NOTHING OUTSTANDING. Once the session has
+       * finished no command is in flight, so a repeated record frame is an
+       * answer to nothing: it must not be stored and must not restart the
+       * walk by acking and asking again.
+       *
+       * WHAT IS NOT ASSERTED, because this layer cannot do it: a duplicate
+       * that arrives inside the NEXT request's window. The record response
+       * carries a timestamp and a value but no index, and the frame header
+       * has no transaction id, so a repeat of record 5 landing after record 6
+       * was asked for is byte-identical to record 6's answer. Nothing here
+       * can separate them -- the store's timestamp dedup is what limits the
+       * damage. Asserting otherwise would be asserting a guarantee that does
+       * not exist. */
+      begin(5);
+      feed_count(5); /* nothing new: the session finishes */
+      int reads_before  = n_readings;
+      int writes_before = n_writes;
+      uint8_t rec[12]   = {0x06, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0};
+      feed(rec, 12, 0);
+      ck(n_readings == reads_before,
+         "a record frame with no request outstanding stores nothing");
+      ck(n_writes == writes_before,
+         "...and does not restart the walk by acking and asking again");
+   }
+
+   printf("== a wall-clock jump must not move these decisions ==\n");
+   /* THE CLOCK THESE TAKE IS ELAPSED TIME (mono_s), not the wall clock. The
+    * module cannot tell the difference -- it takes `now` as a number -- so
+    * what is pinned here is the SHAPE of the failure a wall-clock jump used
+    * to cause, with the jump expressed as the caller passing a moved clock.
+    *
+    * A phone that has been off, or has just found a network, corrects its
+    * clock by minutes or hours. On realtime that jump WAS the elapsed time. */
+   {
+      struct meter_tick mt;
+      long idle[METER_LINKS_MAX] = {0};
+      long start                 = 1000;
+
+      /* Forward jump: a sync that started a second ago, with the clock
+       * suddenly an hour ahead, looked an hour old and was torn down at
+       * once -- killing an exchange that was working. */
+      meter_tick_eval(1, start, idle, METER_LINKS_MAX, start + 1, &mt);
+      ck(!mt.drop_sync, "a one-second-old sync is not timed out");
+      meter_tick_eval(1, start, idle, METER_LINKS_MAX, start + 3600, &mt);
+      ck(mt.drop_sync, "...but an hour of ELAPSED time is a wedged exchange");
+
+      /* Backward jump: with `now` behind the start -- which the wall clock
+       * allowed and monotonic does not -- elapsed time went negative and the
+       * watchdog could never fire for that sync again. */
+      meter_tick_eval(1, start, idle, METER_LINKS_MAX, start - 3600, &mt);
+      ck(!mt.drop_sync, "a clock behind the start does not fire the watchdog");
+      meter_tick_eval(1, start, idle, METER_LINKS_MAX,
+                      start + METER_SYNC_MAX_S + 1, &mt);
+      ck(mt.drop_sync, "...and the real timeout still works afterwards");
+   }
+
+   printf("== the repeated hour: a MONOTONIC sequence, not a fixed guess ==\n");
+   /* TODO 132. A OneTouch record is a naive local clock reading. In the hour
+    * a fall-back repeats, that reading names two instants an hour apart, and
+    * the old code -- a fixed-point iteration over the zone -- always settled
+    * on the same one. Two fingersticks taken an hour apart therefore decoded
+    * to the SAME instant, and the reading log dedups a BGM by exact
+    * timestamp, so the second one was not stored an hour wrong: it was not
+    * stored at all.
+    *
+    * The evidence is the walk itself. The meter hands records over in
+    * ascending index order and an index is assigned when the fingerstick is
+    * taken, so the instants are known to increase even where the clock
+    * readings do not. */
+   {
+      /* A real morning across the 2025 fall-back, in the order the meter
+       * would report it. The clock reading goes 01:45 -> 01:15 because the
+       * clock went back; the INSTANTS never do. */
+      static const struct {
+         int hh, mi;
+         long off; /* the offset actually in force -- the ground truth */
+      } run[] = {
+          {0, 30, DST}, /* before the transition */
+          {1, 15, DST}, /* first pass of the repeated hour */
+          {1, 45, DST},
+          {1, 15, STD}, /* the clock has gone back: second pass */
+          {1, 50, STD},
+          {2, 30, STD}, /* past it: unambiguous again */
+      };
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long got[6];
+      int nbad = 0, ncollide = 0, nback = 0;
+      long import_t = naive_at(2025, 11, 3, 9, 0) - STD; /* imported next day */
+      for (int i = 0; i < 6; i++) {
+         long nv = naive_at(2025, 11, 2, run[i].hh, run[i].mi);
+         struct meter_stamp st =
+             meter_stamp_step(&sq, nv, import_t, pacific, 0);
+         got[i] = st.t;
+         if (st.t != nv - run[i].off)
+            nbad++;
+         for (int k = 0; k < i; k++)
+            if (got[k] == got[i])
+               ncollide++;
+         if (i && got[i] <= got[i - 1])
+            nback++;
+      }
+      ck(ncollide == 0, "no two fingersticks across the fall-back decode to "
+                        "the SAME instant");
+      ck(nback == 0, "...the sequence of instants is strictly increasing");
+      ck(nbad == 0, "...and every one of them is the instant it was actually "
+                    "taken at");
+      ck(got[3] - got[2] == 1800,
+         "the 01:15 AFTER the 01:45 is half an hour LATER, not half an hour "
+         "earlier");
+   }
+
+   printf("== two fingersticks with the SAME clock reading ==\n");
+   /* The collision in its purest form: 01:30 PDT and 01:30 PST are the same
+    * four bytes in the meter's memory. A single fixed offset makes them one
+    * instant, and one of the two fingersticks disappears into the log's
+    * dedup. */
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long nv              = naive_at(2025, 11, 2, 1, 30);
+      long import_t        = naive_at(2025, 11, 3, 9, 0) - STD;
+      struct meter_stamp a = meter_stamp_step(&sq, nv, import_t, pacific, 0);
+      struct meter_stamp b = meter_stamp_step(&sq, nv, import_t, pacific, 0);
+      ck(a.t != b.t, "identical clock readings do not decode to one instant");
+      ck(b.t - a.t == 3600, "...they are the hour apart they were taken");
+      ck(a.t == nv - DST && b.t == nv - STD,
+         "...the first in the first pass of the repeated hour, the second in "
+         "the second");
+      ck(a.off == DST && b.off == STD,
+         "...each stamped with the offset that was actually in force");
+      ck(!b.ambiguous, "the second is DECIDED -- by the record before it, not "
+                       "by a guess");
+   }
+
+   printf("== when nothing decides it, the ambiguity is KEPT ==\n");
+   /* A run of readings whose clock readings rise steadily through the
+    * repeated hour is consistent with the fall-back having happened anywhere
+    * in it. There is no evidence. The reading is still stored -- refusing it
+    * would lose a fingerstick -- but it is stored as a stated guess, with the
+    * instant that was not chosen travelling with it. */
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long import_t          = naive_at(2025, 11, 3, 9, 0) - STD;
+      int flagged            = 0;
+      int alt_kept           = 0;
+      int rising             = 1;
+      long prev              = 0;
+      static const int mi[3] = {10, 20, 30};
+      for (int i = 0; i < 3; i++) {
+         long nv = naive_at(2025, 11, 2, 1, mi[i]);
+         struct meter_stamp st =
+             meter_stamp_step(&sq, nv, import_t, pacific, 0);
+         if (st.ambiguous)
+            flagged++;
+         if (st.t_alt == nv - STD && st.t == nv - DST)
+            alt_kept++;
+         if (i && st.t <= prev)
+            rising = 0;
+         prev = st.t;
+      }
+      ck(flagged == 3, "an undecidable run is FLAGGED, every record of it");
+      ck(alt_kept == 3, "...with the instant that was not chosen retained");
+      ck(rising, "...and the sequence is still monotonic");
+   }
+
+   printf("== import time rules out the candidate in the future ==\n");
+   /* The one piece of evidence available to the FIRST record of a walk: a
+    * fingerstick cannot have been taken after it was imported. */
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long nv    = naive_at(2025, 11, 2, 1, 30);
+      long early = nv - DST;
+      long late  = nv - STD;
+      struct meter_stamp st =
+          meter_stamp_step(&sq, nv, early + 600, pacific, 0);
+      ck(st.t == early && !st.ambiguous,
+         "an import ten minutes after the earlier instant rules out the "
+         "later one");
+      ck(st.t_alt == late, "...and still says which one it ruled out");
+
+      /* Without an import time the same record is undecidable, and says so
+       * rather than pretending the constraint applied. */
+      meter_seq_reset(&sq);
+      struct meter_stamp no_t = meter_stamp_step(&sq, nv, 0, pacific, 0);
+      ck(no_t.ambiguous, "with no import time there is nothing to rule it out");
+   }
+
+   printf("== the skipped hour, and the ordinary hours around it ==\n");
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long nv               = naive_at(2025, 3, 9, 2, 30); /* never happened */
+      struct meter_stamp st = meter_stamp_step(
+          &sq, nv, naive_at(2025, 3, 10, 9, 0) - DST, pacific, 0);
+      ck(st.shifted, "a record in the skipped hour is reported as such");
+      ck(st.t + st.off == naive_at(2025, 3, 9, 3, 30),
+         "...and moved FORWARD by the gap, to 03:30");
+      ck(!st.ambiguous, "...which is a nonexistent time, not an ambiguous one");
+   }
+
+   printf("== and every record outside a transition decodes as before ==\n");
+   /* The regression a disambiguator invites. The old conversion was a
+    * fixed-point iteration: take the offset at the naive value read as an
+    * instant, then ask again with the result. Outside the two transition
+    * hours that is correct, and the new code must agree with it EXACTLY --
+    * fixing two hours a year by moving the other 8758 is not a fix. */
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      int differ = 0, flagged = 0, n = 0;
+      for (int mo = 1; mo <= 12; mo++) {
+         for (int hh = 0; hh < 24; hh++) {
+            long nv = naive_at(2025, mo, 20, hh, 7);
+            /* The OLD algorithm, spelled out here so the comparison is
+             * against what shipped rather than against the new code. */
+            long o1  = pacific(0, nv);
+            long old = nv - pacific(0, nv - o1);
+            meter_seq_reset(&sq); /* each record on its own, as before */
+            struct meter_stamp st = meter_stamp_step(&sq, nv, 0, pacific, 0);
+            n++;
+            if (st.t != old)
+               differ++;
+            if (st.ambiguous || st.shifted)
+               flagged++;
+         }
+      }
+      ck(n == 288 && differ == 0,
+         "288 ordinary records decode to exactly what the old conversion "
+         "gave");
+      ck(flagged == 0, "...and none of them is flagged as ambiguous or "
+                       "shifted");
+   }
+
+   printf("== a new walk starts with no evidence carried into it ==\n");
+   /* The run state IS the evidence, so it must not outlive the walk: a
+    * previous meter's last instant deciding this one's repeated-hour record
+    * is a guess wearing evidence's clothes. And a record that resolves
+    * cleanly closes the run, so a later ambiguous one is not pushed an hour
+    * late by a stale flag. */
+   {
+      struct meter_seq sq;
+      meter_seq_reset(&sq);
+      long import_t = naive_at(2026, 11, 3, 9, 0) - STD;
+      long nv       = naive_at(2025, 11, 2, 1, 30);
+      (void)meter_stamp_step(&sq, nv, import_t, pacific, 0);
+      (void)meter_stamp_step(&sq, nv, import_t, pacific, 0); /* forces late */
+      /* An ordinary record: unambiguous, and it closes the run. */
+      struct meter_stamp mid = meter_stamp_step(
+          &sq, naive_at(2025, 11, 2, 5, 0), import_t, pacific, 0);
+      ck(!mid.ambiguous && mid.t == naive_at(2025, 11, 2, 5, 0) - STD,
+         "an ordinary record after the repeated hour is unaffected by it");
+      /* NEXT year's repeated hour, in the same session: the earlier instant
+       * again, because the previous fall-back is not evidence about this
+       * one. */
+      long nv2               = naive_at(2026, 11, 1, 1, 30);
+      struct meter_stamp far = meter_stamp_step(&sq, nv2, import_t, pacific, 0);
+      ck(far.t == nv2 - DST,
+         "a later fall-back starts from the earlier instant again");
+      ck(far.ambiguous, "...and is undecided, not decided by last year's");
+
+      /* And a reset really does clear it. */
+      meter_seq_reset(&sq);
+      struct meter_stamp fresh_st =
+          meter_stamp_step(&sq, nv, import_t, pacific, 0);
+      ck(fresh_st.t == nv - DST,
+         "after meter_seq_reset the walk has no previous instant to lean on");
+   }
 
    printf("\n%s\n", all ? "ALL METER TESTS PASSED" : "SOME TESTS FAILED");
    return all ? 0 : 1;

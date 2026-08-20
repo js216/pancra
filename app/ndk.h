@@ -62,6 +62,14 @@ int32_t AInputEvent_getType(const struct AInputEvent *ev);
 int32_t AMotionEvent_getAction(const struct AInputEvent *ev);
 float AMotionEvent_getX(const struct AInputEvent *ev, unsigned long idx);
 float AMotionEvent_getY(const struct AInputEvent *ev, unsigned long idx);
+/* WHICH FINGER, not which slot. AMotionEvent_getX(ev, 0) is the position of
+ * whatever pointer happens to be at INDEX zero in this event, and indices are
+ * repacked as fingers come and go -- so a second finger arriving, or the first
+ * one lifting while a second stays down, silently moves another pointer into
+ * slot 0. A gesture has to follow an ID. */
+unsigned long AMotionEvent_getPointerCount(const struct AInputEvent *ev);
+int32_t AMotionEvent_getPointerId(const struct AInputEvent *ev,
+                                  unsigned long idx);
 unsigned long AMotionEvent_getHistorySize(const struct AInputEvent *ev);
 float AMotionEvent_getHistoricalX(const struct AInputEvent *ev,
                                   unsigned long idx, unsigned long h);
@@ -79,6 +87,13 @@ int32_t AKeyEvent_getKeyCode(const struct AInputEvent *ev);
 #define AMOTION_EVENT_ACTION_MOVE   2
 #define AMOTION_EVENT_ACTION_CANCEL 3
 #define AMOTION_EVENT_ACTION_MASK   0xff
+/* The second and later fingers get their own actions, and the action word
+ * carries the INDEX of the pointer that went down or up. Masked off and then
+ * ignored, these were the two events that let a gesture change fingers. */
+#define AMOTION_EVENT_ACTION_POINTER_DOWN        5
+#define AMOTION_EVENT_ACTION_POINTER_UP          6
+#define AMOTION_EVENT_ACTION_POINTER_INDEX_MASK  0xff00
+#define AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT 8
 
 /* ---- native activity ---- */
 struct ANativeActivity {
@@ -119,5 +134,13 @@ struct ANativeActivityCallbacks {
    void (*onConfigurationChanged)(struct ANativeActivity *);
    void (*onLowMemory)(struct ANativeActivity *);
 };
+
+/* THE ENTRY POINT ANDROID CALLS. Defined in main.c; declared here, with the
+ * rest of the NDK boundary, so it has a visible prototype and is understood
+ * to be externally linked -- the Android runtime resolves it by name, and
+ * without a declaration -Wmissing-prototypes would push it toward internal
+ * linkage, where the runtime could not find it. */
+void ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
+                              size_t saved_size);
 
 #endif

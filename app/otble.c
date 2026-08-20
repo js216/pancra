@@ -19,7 +19,7 @@
  * are zero for a real glucose reading. Non-glucose event records come back
  * with glucose 0 and a non-zero tail, which is what that check rejects. */
 #include "otble.h"
-#include "util.h" /* realtime_s: bound record timestamps against now */
+#include "clock.h"
 #include <stdint.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
@@ -47,6 +47,32 @@ static int walked;      /* records fetched this session (battery bound) */
  * record, so the session rewinds to it at the end -- unless the whole window
  * was refused, which is evidence the block is not transient. */
 static int retry_from;
+
+/* ---- ONE REQUEST OUTSTANDING AT A TIME ------------------------------
+ *
+ * This protocol is strictly request/response: every command is answered once
+ * and acknowledged before the next goes out. Nothing enforced that. Any
+ * CRC-valid frame was interpreted according to whatever `phase` happened to
+ * hold, so:
+ *
+ *   - a frame arriving in P_IDLE or P_DONE ran the handler for a phase the
+ *     session is no longer in, and a non-0x06 status called finish() again --
+ *     repeating the teardown, re-reporting the record count and re-issuing
+ *     the disconnect, after the session had already ended;
+ *   - a SECOND frame for a request already answered was consumed as the
+ *     answer to whatever had been asked since.
+ *
+ * `awaiting` is what a request being outstanding means: set when a command
+ * goes out, cleared by the frame that answers it. A frame with nothing
+ * outstanding is not an answer to anything and is dropped.
+ *
+ * WHAT THIS CANNOT CATCH, said plainly: a duplicate that arrives inside the
+ * NEXT request's window. The record response carries a timestamp and a value
+ * but no index, and the frame header has no transaction id, so a repeat of
+ * record 5 arriving after record 6 was asked for is byte-indistinguishable
+ * from record 6's answer. Nothing at this layer can separate them; the
+ * timestamp-based dedup in the store is what limits the damage. */
+static int awaiting;
 
 /* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final xor. */
 static uint16_t crc16(const uint8_t *p, int n)
@@ -100,6 +126,7 @@ static void send_cmd(const uint8_t *payload, int n)
  * exactly as the meter expects. */
 static void ask_time(void)
 {
+   awaiting                    = 1;
    static const uint8_t cmd[2] = {0x20, 0x02};
    phase                       = P_TIME;
    ot_drv_status("METER: HELLO");
@@ -108,6 +135,7 @@ static void ask_time(void)
 
 static void ask_rcount(void)
 {
+   awaiting                    = 1;
    static const uint8_t cmd[2] = {0x27, 0x00};
    phase                       = P_RCOUNT;
    send_cmd(cmd, 2);
@@ -117,6 +145,7 @@ static void ask_rcount(void)
  * capture shows this returning 76 while records 70..76 were readable. */
 static void ask_count(void)
 {
+   awaiting                    = 1;
    static const uint8_t cmd[3] = {0x0a, 0x02, 0x06};
    phase                       = P_COUNT;
    ot_drv_status("METER: COUNT");
@@ -125,6 +154,7 @@ static void ask_count(void)
 
 static void ask_record(int idx)
 {
+   awaiting       = 1;
    uint8_t cmd[3] = {0xb3, (uint8_t)idx, (uint8_t)((unsigned)idx >> 8U)};
    want_index     = idx;
    phase          = P_READ;
@@ -142,6 +172,7 @@ static void send_ack(void)
 void ot_init(int last)
 {
    phase       = P_IDLE;
+   awaiting    = 0;
    last_index  = last;
    want_index  = 0;
    top_index   = 0;
@@ -227,8 +258,15 @@ static void finish(void)
     * worth of records is refused with nothing accepted, retrying them forever
     * would never reach the good ones behind them. Both conditions are needed
     * -- dropping either one reintroduces a different permanent data loss. */
+   /* IDEMPOTENT. finish() reports the session's result, hands the count up
+    * and drops the link; running it twice re-reports a sync that already
+    * happened and disconnects a link that may since belong to another
+    * exchange. A late frame used to be able to do exactly that. */
+   if (phase == P_DONE)
+      return;
    rewind_refused();
-   phase = P_DONE;
+   phase    = P_DONE;
+   awaiting = 0;
    ot_drv_status(new_records ? "METER: SYNCED" : "METER: NOTHING NEW");
    ot_drv_done(new_records);
    ot_drv_disconnect();
@@ -250,6 +288,22 @@ void ot_on_notify(const uint8_t *buf, int n)
       LOGI("meter: CRC mismatch, frame dropped");
       return;
    }
+   /* A FRAME IS ONLY AN ANSWER IF SOMETHING WAS ASKED.
+    *
+    * P_IDLE and P_DONE are terminal for this purpose: no command is
+    * outstanding, so a frame arriving in either is late, duplicated, or from
+    * an exchange that has already ended -- and running a phase handler for it
+    * attributes its contents to a request that was never made. */
+   if (phase == P_IDLE || phase == P_DONE) {
+      LOGI("meter: frame in %s state, ignored",
+           phase == P_IDLE ? "idle" : "finished");
+      return;
+   }
+   if (!awaiting) {
+      LOGI("meter: unsolicited frame with no request outstanding, ignored");
+      return;
+   }
+   awaiting   = 0;
    int status = buf[5];
    /* 0x09 = "invalid record index" -- an EMPTY or non-existent slot, NOT a dead
     * meter. It is per-INDEX, so it must be SKIPPED, never fatal: different
@@ -396,7 +450,8 @@ void ot_on_notify(const uint8_t *buf, int n)
           * plausible meter clock: 2000-01-01 (its epoch) to ~40 years on. */
          /* A LOOSE bound only, because `ts` is the meter's NAIVE LOCAL clock
           * (see otble.h) and this layer cannot convert it -- ot_drv_reading
-          * does that, with meter_tz_for, and applies the exact bound there.
+          * does that, with meter_stamp_step, and applies the exact bound
+          * there.
           *
           * A previous version compared ts + OT_EPOCH against real UTC now with
           * an hour of slack. That is local-time-read-as-UTC versus UTC, so at

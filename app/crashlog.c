@@ -12,6 +12,7 @@
 #include "crashlog.h"
 #include "dexlibc.h"
 #include <signal.h>
+#include <stdatomic.h> /* the checkpoint is read from the handler; see the .h */
 
 static char g_crash_path[256];
 static struct crash_ctx g_ctx;
@@ -43,7 +44,13 @@ int crash_line(char *b, int cap, int sig, const struct crash_ctx *ctx)
    crash_puts(b, cap, &p, "CRASH sig=", 200);
    crash_putn(b, cap, &p, sig);
    crash_puts(b, cap, &p, " where=", 200);
-   crash_puts(b, cap, &p, (ctx && ctx->where) ? *ctx->where : 0, 40);
+   /* One relaxed load, which is what makes this safe to do from inside a
+    * signal handler: indivisible, no lock, no call. See crashlog.h. */
+   crash_puts(b, cap, &p,
+              (ctx && ctx->where)
+                  ? atomic_load_explicit(ctx->where, memory_order_relaxed)
+                  : 0,
+              40);
    crash_puts(b, cap, &p, " status=", 200);
    crash_puts(b, cap, &p, ctx ? ctx->status : 0, 24);
    crash_puts(b, cap, &p, " glu=", 200);

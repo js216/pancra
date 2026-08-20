@@ -5,17 +5,29 @@
 /* The reading data model: an in-memory newest-first history (deduped, out-of-
  * order safe for backfill) plus an append-only CSV log. The UI reads this via
  * store.h; only store_append / hist_insert mutate g_hist, always under the
- * caller's hist_lock (see main.c) so a main-thread draw sees consistent data.
+ * history lock -- which lives HERE now, with the data it protects, rather
+ * than as a flag in the shell taken by name from another translation unit.
+ *
+ * store_record is the whole of recording a reading: history, statistics,
+ * current value and disk, in the one order those are allowed to happen in.
+ * See store.h for what each of those orderings costs when a caller gets it
+ * wrong, which three of them independently did.
  */
 #include "store.h"
+#include "alarmlogic.h" /* AL_FRESH_S: one definition of "stale" */
+#include "clock.h"
 #include "dexlibc.h"
+#include "ingest.h"  /* STORE_GLU_MIN/MAX: what a stored reading may be */
 #include "sensors.h" /* KIND_CGM / KIND_BGM */
+#include "stats.h"   /* stat_add: recording a reading feeds the statistics */
+#include "thread.h"  /* the history lock lives with the history */
 #include "util.h"
 #if __STDC_HOSTED__
 #include <errno.h> /* store_load tells a missing log from an unreadable one */
 #endif
 #include <limits.h> /* LONG_MAX: saturate over-long numeric fields */
 #include <stdio.h>  /* snprintf, SEEK_SET / SEEK_END */
+#include <stdlib.h> /* calloc/free: a reload stages a whole new history */
 #include <string.h> /* memcpy: the chunked replay carries partial lines */
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
@@ -60,13 +72,139 @@ static long rdfield(char **p, const char *e, int *present)
    return neg ? -v : v;
 }
 
-struct reading g_hist[NHIST];
-int g_nhist;
-int g_cur_glu = -1, g_cur_trend;
-long g_cur_time;
-int g_cur_rssi, g_cur_rssi_ok;
-int g_stored;
-char g_store_path[256];
+/* THE HISTORY TABLE AS A VALUE, so a reload can build one that is not the
+ * live one.
+ *
+ * WHAT WENT WRONG WITHOUT THIS. store_load INSERTS; it does not replace. That
+ * is right at startup, where it fills a table that is empty by construction,
+ * and wrong the moment it is used to reload a log that has been REWRITTEN
+ * underneath the app -- which is exactly what a cloud restore does. After a
+ * restore the in-memory history was the UNION of what was there before and
+ * what came back:
+ *
+ *   - a reading the user had deleted before restoring was still on the plot
+ *     and in the history list, because nothing removes rows from g_hist;
+ *   - and where the restored file corrected a value, hist_insert's dedup saw
+ *     a sample from the same source within 150 s, declined it as a
+ *     restatement (which is the right rule for a live arrival) and KEPT THE
+ *     OLD ONE. The screen went on showing a number the restored record does
+ *     not contain, until the app was restarted.
+ *
+ * Both survive as long as the process does, and neither is visible as an
+ * error: the restored rows really did appear, so the restore looks like it
+ * worked. Rebuilding the rolling statistics from that table -- which the
+ * restore now does -- would have produced TIR and average figures matching
+ * neither the file nor anything else.
+ *
+ * So a reload STAGES a whole new table, and swaps it in only once the entire
+ * source has been read. `v` points at NHIST entries; `n` is how many are
+ * live. The live pair is still two file-statics, because the crash handler
+ * holds &g_nhist directly (see hist_count_ptr) and must not chase a pointer
+ * on a signal stack. */
+struct hist_tab {
+   struct reading *v;
+   int n;
+};
+
+static struct reading g_hist[NHIST];
+static int g_nhist;
+
+/* The LIVE table, as a hist_tab. It POINTS at g_hist rather than copying it,
+ * so a write through it is a write to the real thing; `n` is a copy and the
+ * caller writes it back. */
+static struct hist_tab live_hist(void)
+{
+   struct hist_tab h = {g_hist, g_nhist};
+   return h;
+}
+
+int hist_count(void)
+{
+   return g_nhist;
+}
+
+void hist_clear(void)
+{
+   store_lock();
+   g_nhist = 0;
+   store_unlock();
+}
+
+struct reading hist_at(int i)
+{
+   struct reading z = {0};
+   if (i < 0 || i >= g_nhist)
+      return z;
+   return g_hist[i];
+}
+
+int hist_copy(struct reading *out, int cap)
+{
+   int n = 0;
+   if (!out || cap <= 0)
+      return 0;
+   store_lock();
+   for (; n < cap && n < g_nhist; n++)
+      out[n] = g_hist[n];
+   store_unlock();
+   return n;
+}
+
+static int g_cur_glu = -1, g_cur_trend;
+static long g_cur_time;
+static int g_cur_rssi, g_cur_rssi_ok;
+
+struct reading_rssi store_rssi_locked(void)
+{
+   struct reading_rssi r;
+   r.dbm = g_cur_rssi;
+   r.ok  = g_cur_rssi_ok;
+   return r;
+}
+
+struct reading_rssi store_rssi(void)
+{
+   struct reading_rssi r;
+   store_lock();
+   r = store_rssi_locked();
+   store_unlock();
+   return r;
+}
+
+void store_note_rssi(int dbm)
+{
+   store_lock();
+   g_cur_rssi    = dbm;
+   g_cur_rssi_ok = 1;
+   store_unlock();
+}
+
+static int g_stored;
+
+int store_appended(void)
+{
+   return g_stored;
+}
+
+/* POINTERS, for the crash handler ONLY.
+ *
+ * It runs on a signal stack after the process has already gone wrong: it may
+ * not lock, may not allocate, and may not call back into a module whose state
+ * it is trying to describe. So it is given the addresses once, at startup,
+ * and reads them directly -- a torn read there is acceptable, because the
+ * alternative is no context at all in the report. Nothing else may use
+ * these. */
+const int *store_glu_ptr(void)
+{
+   return &g_cur_glu;
+}
+
+const int *hist_count_ptr(void)
+{
+   return &g_nhist;
+}
+
+static char g_store_path[256];
 
 /* Column header for readings.csv, so an exported log is self-describing. The
  * trailing `rescale` column is the multiplicative factor applied to this row's
@@ -76,6 +214,51 @@ char g_store_path[256];
 static const char g_store_hdr[] =
     "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
     "device_time,tz_offset_s,kind,rescale\n";
+
+/* ONE DEFINITION OF "THE CURRENT READING IS STALE", used by both forms below.
+ *
+ * data_fresh, not `now - r.t > AL_FRESH_S`. Both are realtime -- g_cur_time is
+ * the reading's own timestamp, which is its identity in the log and the time
+ * shown next to it on screen, so it stays realtime and must not become
+ * monotonic. What changed is that a NEGATIVE age no longer counts as fresh.
+ *
+ * A clock rollback (a timezone fix, an NTP step, a date set by hand) leaves
+ * every stored reading dated in the future. The old test then reported the
+ * last known value as current indefinitely: the big number stopped ageing and
+ * kept asserting, say, 58 mg/dL from three hours ago as the reading right
+ * now. That is worse than blanking, because the person deciding whether to
+ * treat a low has no way to tell a live number from a frozen one -- the
+ * screen looks exactly the same.
+ *
+ * It also has to agree with alarm_zone, which now refuses the same stamps: a
+ * screen showing a live value beside an alarm that has decided there is no
+ * current reading is two answers to one question. */
+static int cur_stale(int glu, long t, long now)
+{
+   return (glu < 0) || !data_fresh(now, t, AL_FRESH_S);
+}
+
+struct reading_now store_now_locked(long now)
+{
+   struct reading_now r;
+   r.glu   = g_cur_glu;
+   r.trend = g_cur_trend;
+   r.t     = g_cur_time;
+   r.stale = cur_stale(r.glu, r.t, now);
+   return r;
+}
+
+struct reading_now store_now(long now)
+{
+   struct reading_now r;
+   store_lock();
+   r.glu   = g_cur_glu;
+   r.trend = g_cur_trend;
+   r.t     = g_cur_time;
+   store_unlock();
+   r.stale = cur_stale(r.glu, r.t, now);
+   return r;
+}
 
 void hist_refresh_current(int prime)
 {
@@ -113,7 +296,8 @@ void hist_refresh_current(int prime)
    g_cur_time  = 0;
 }
 
-int hist_insert(long t, int glu, int trend, int src, int kind)
+static int tab_insert(struct hist_tab *h, long t, int glu, int trend, int src,
+                      int kind)
 {
    /* NORMALISE THE KIND FIRST. Two callers pass a value PARSED FROM A FILE
     * -- the readings.csv loader and the import path -- and neither bounds
@@ -125,8 +309,8 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
     * pre-rollback partial write" twice as a real occurrence) then breaks
     * four things at once, permanently, on every launch:
     *   - build_model copies this byte straight into the plot model, and
-    *     ui.c draws kind == KIND_INS along the bottom edge -- so a 2 renders
-    *     as a phantom INSULIN DOSE on the glucose plot;
+    *     the renderer draws kind == KIND_INS along the bottom edge -- so a 2
+    * renders as a phantom INSULIN DOSE on the glucose plot;
     *   - it is not KIND_BGM, so stats count it toward TIR, AVG and A1C;
     *   - the watchdogs read it as a live CGM sample and hold off a
     *     reconnect;
@@ -140,8 +324,8 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
     * source is a restatement of one fact; a fingerstick is always its own
     * event and is only ever deduped on an exact timestamp match. */
    long window = (kind == KIND_BGM) ? 0 : 150;
-   for (int i = 0; i < g_nhist; i++) {
-      if (g_hist[i].src != (unsigned short)src)
+   for (int i = 0; i < h->n; i++) {
+      if (h->v[i].src != (unsigned short)src)
          continue;
       /* Compare KIND too, or the invariant this header states -- that a BGM
        * fingerstick never dedups against a CGM sample -- is enforced only by
@@ -150,9 +334,9 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
        * this a CGM sample within the window would overwrite a fingerstick's
        * value in place, leave it flagged BGM, and return HIST_DUP so the CGM
        * sample was never persisted at all. */
-      if (g_hist[i].kind != (unsigned char)kind)
+      if (h->v[i].kind != (unsigned char)kind)
          continue;
-      long d = t - g_hist[i].t;
+      long d = t - h->v[i].t;
       if (d < 0)
          d = -d;
       if (d <= window) {
@@ -167,28 +351,38 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
          return HIST_DUP;
       }
    }
-   if (g_nhist == NHIST && t <= g_hist[NHIST - 1].t)
+   if (h->n == NHIST && t <= h->v[NHIST - 1].t)
       return HIST_OLD; /* genuinely new, but off the end of the display window
                         */
-   if (g_nhist < NHIST)
-      g_nhist++;
+   if (h->n < NHIST)
+      h->n++;
    /* Insertion sort keeps g_hist newest-first, which is what makes the merged
     * multi-sensor history monotonic in memory even though the file stays in
     * arrival order. Ties break on source id so the order is total and stable
     * rather than dependent on which BLE thread got there first. */
-   int i = g_nhist - 1;
+   int i = h->n - 1;
    while (i > 0 &&
-          (g_hist[i - 1].t < t ||
-           (g_hist[i - 1].t == t && g_hist[i - 1].src > (unsigned short)src))) {
-      g_hist[i] = g_hist[i - 1];
+          (h->v[i - 1].t < t ||
+           (h->v[i - 1].t == t && h->v[i - 1].src > (unsigned short)src))) {
+      h->v[i] = h->v[i - 1];
       i--;
    }
-   g_hist[i].t     = t;
-   g_hist[i].glu   = (short)glu;
-   g_hist[i].trend = (short)trend;
-   g_hist[i].src   = (unsigned short)src;
-   g_hist[i].kind  = (unsigned char)kind;
+   h->v[i].t     = t;
+   h->v[i].glu   = (short)glu;
+   h->v[i].trend = (short)trend;
+   h->v[i].src   = (unsigned short)src;
+   h->v[i].kind  = (unsigned char)kind;
    return HIST_NEW;
+}
+
+int hist_insert(long t, int glu, int trend, int src, int kind)
+{
+   /* THE LIVE TABLE. Every rule above is the same for a staged one; the only
+    * difference is which array it lands in. */
+   struct hist_tab h = live_hist();
+   int r             = tab_insert(&h, t, glu, trend, src, kind);
+   g_nhist           = h.n;
+   return r;
 }
 
 int hist_prev_glu(long t, int src, long not_before)
@@ -223,25 +417,12 @@ int hist_prev_glu(long t, int src, long not_before)
 int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                  long raw, long tz, int kind, int rescale_pm)
 {
-   int fd = open(g_store_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-   if (fd < 0) {
-      LOGW("store: cannot open %s to append a reading", g_store_path);
-      return -1;
-   }
-   /* One-line column header on a brand-new file, so an exported readings.csv is
-    * self-describing. Only ever written when the file is empty (never prepended
-    * to the existing append-only log); both loaders skip leading-'#' lines. */
-   if (lseek(fd, 0, SEEK_END) == 0) {
-      if (write(fd, g_store_hdr, sizeof g_store_hdr - 1) <
-          0) { /* best effort */
-      }
-   }
-   /* Where this row starts, so a short write can be undone. O_APPEND makes the
-    * write itself atomic against other writers, but not against a full disk:
-    * a partial row leaves no newline, so the NEXT append concatenates onto it
-    * and the pair parses as one row of spliced fields -- a fabricated reading
-    * at a fabricated time, indistinguishable from a real one forever after.
-    * Truncating back is the only way to keep the log parseable. */
+   /* THE HEADER AND THE FIRST ROW TOGETHER, and the whole append in one
+    * operation (see log_append). This was open / lseek / write the header /
+    * write the row / close, spelled out here and in three other files, with
+    * the same two holes in each: a first record that was not atomic (a
+    * failure after the row reached the file made the caller's retry write it
+    * twice) and a failed rollback reported as a clean failure. */
    long lag = realtime_s() - t; /* arrival delay from the datapoint stamp */
    char line[160];
    /* Rescale factor column: a decimal (1.040) when this glucose was rescaled,
@@ -263,21 +444,22 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
            : snprintf(line, sizeof line, "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s\n", t,
                       glu, trend, lag, src, raw, tz, kind, rs);
    n      = clampn(n, sizeof line);
-   long w = write(fd, line, n);
-   if (w != n) {
-      /* Roll back by exactly what WE wrote, measured from the end as it stands
-       * now -- not to a start offset sampled before the write. With O_APPEND
-       * another writer can append in between, and truncating to the stale
-       * offset would delete that writer's COMPLETE row as well. Same pattern
-       * as sensor_mint. */
-      if (w > 0)
-         ftruncate(fd, lseek(fd, 0, SEEK_END) - w);
-      close(fd);
-      LOGW("store: short write (%ld of %d), row rolled back", w, n);
-      return -1;
+   int rc = log_append(g_store_path, g_store_hdr, (int)sizeof g_store_hdr - 1,
+                       line, n);
+   if (rc == LOG_DAMAGED) {
+      /* A PARTIAL ROW IS STILL IN THE FILE. Distinct from "nothing was
+       * written": the next append would splice onto it, and the log now needs
+       * saying so rather than being retried blindly. */
+      LOGW("store: a partial row could NOT be rolled back; %s is damaged",
+           g_store_path);
+      return rc;
    }
-   close(fd);
+   if (rc != LOG_OK) {
+      LOGW("store: the reading was not written");
+      return rc;
+   }
    g_stored++;
+   record_mutated(); /* a synced record changed: see util.h */
    return 0;
 }
 
@@ -307,13 +489,52 @@ int store_count(void)
    return c;
 }
 
-static void store_load_chunk(char *buf);
+/* What a load is building, carried across chunks. */
+struct load_ctx {
+   struct hist_tab tab;
+   long best_t;   /* timestamp of the newest row seen anywhere in the file */
+   int best_rssi; /* ...and the link RSSI recorded with it */
+   int best_ok;
+};
 
-int store_load(void)
+static int store_load_chunk(struct load_ctx *c, char *buf);
+
+int store_load(int prime)
 {
    int fd = open(g_store_path, O_RDONLY, 0);
    if (fd < 0)
       return errno == ENOENT ? 0 : -1;
+   /* STAGE, VALIDATE, SWAP -- and the staging is the point.
+    *
+    * This function used to insert straight into the live table, which is
+    * correct exactly once: at startup, into a table that is empty by
+    * construction. Used to RELOAD a log that has been rewritten underneath
+    * the app -- which is what a cloud restore does -- inserting produced the
+    * UNION of the old table and the restored file. See struct hist_tab for
+    * the two ways that showed on the screen; both lasted until the next
+    * restart, and neither looked like an error.
+    *
+    * ~79 kB (NHIST x 16 B), and while it is held the phone has TWO histories
+    * in memory. That is the price of never being between them: the previous
+    * table stays whole and answerable -- the frame builder and the alarm both
+    * read it under the same lock this runs under -- right up to the single
+    * memcpy that replaces it. It is freed before this function returns, so
+    * the cost is the duration of one load and not a permanent doubling.
+    * malloc rather than a second static array for the same reason. */
+   struct reading *stage = calloc(NHIST, sizeof *stage);
+   if (!stage) {
+      /* NOTHING IS TOUCHED. The old table, the old current reading and the
+       * old row count all still describe the log the app was showing a moment
+       * ago, which is the whole contract of the failure path: a restore that
+       * leaves the user with neither their previous history nor the restored
+       * one is worse than the bug this replaces. */
+      close(fd);
+      return -1;
+   }
+   struct load_ctx ctx = {
+       {stage, 0},
+       0, 0, 0
+   };
    /* THE WHOLE FILE, not a tail.
     *
     * The log is in ARRIVAL order, which is not time order, so "the last N
@@ -327,18 +548,40 @@ int store_load(void)
     * arrive in, so one pass over everything is both correct and simple. It
     * costs a parse of a file measured in megabytes, once, at startup. */
    static char buf[STORE_TAIL + 1];
-   long cap   = (long)sizeof buf - 1;
-   long carry = 0; /* bytes of a partial line held over */
-   long n     = 0;
+   long cap    = (long)sizeof buf - 1;
+   long carry  = 0; /* bytes of a partial line held over */
+   long n      = 0;
+   int damaged = 0;
+   int unterm  = 0; /* the file ended without a newline */
    while ((n = read(fd, buf + carry, cap - carry)) > 0 || carry > 0) {
+      if (n <= 0 && carry > 0) {
+         /* THE LAST BYTES OF THE FILE WITH NO NEWLINE AFTER THEM -- what is
+          * left over once every complete line has been processed. The file is
+          * append-only and every finished row ends in a newline, so this is a
+          * write that did not finish: power loss, or a full disk mid-append.
+          * The bytes may parse perfectly and still be half a reading -- a
+          * plausible glucose at a plausible time that nobody measured -- so
+          * they are NOT published. They used to be, with the load then
+          * returning success, which is the one combination that puts an
+          * invented reading into the plot and the alarms. */
+         unterm = 1;
+         break;
+      }
       long have = carry + (n > 0 ? n : 0);
       buf[have] = 0;
       long last = have;
       if (n > 0) { /* trim to the last complete line */
          while (last > 0 && buf[last - 1] != '\n')
             last--;
-         if (last == 0)
-            last = have; /* one absurd line: process it anyway */
+         if (last == 0) {
+            /* One line longer than the whole buffer: it cannot be a reading,
+             * and parsing it would parse a TRUNCATION of one -- a fabricated
+             * value at a fabricated time. Drop it and say so. */
+            damaged = 1;
+            buf[0]  = 0;
+            carry   = 0;
+            continue;
+         }
       }
       char keep[512];
       long nkeep = have - last;
@@ -347,7 +590,8 @@ int store_load(void)
       if (nkeep > 0)
          memcpy(keep, buf + last, (size_t)nkeep);
       buf[last] = 0;
-      store_load_chunk(buf);
+      if (!store_load_chunk(&ctx, buf))
+         damaged = 1;
       if (n <= 0)
          break;
       carry = nkeep;
@@ -355,25 +599,71 @@ int store_load(void)
          memcpy(buf, keep, (size_t)carry);
    }
    close(fd);
-   /* A read that FAILED is not the same as end of file, and this used to be
-    * void so the two were indistinguishable. What is lost is not a file --
-    * it is history: g_hist drives the plot, the time-in-range figures and
-    * (through g_cur_glu/g_cur_time) the alarm's idea of the current reading.
-    * Coming up with a silently short record looks exactly like a working app
-    * that has simply not seen much. A never-written log is still fine: the
+   if (unterm)
+      damaged = 1;
+
+   /* THE SOURCE WAS NEVER SEEN WHOLE. A read() that FAILED is not end of
+    * file: we do not know what the rest of the log said, so the staged table
+    * is not a table, it is a prefix. Throw it away and leave everything as it
+    * was -- history, current reading and row count all still describe the log
+    * the app was showing, and the caller is told the load failed.
+    *
+    * A DAMAGED ROW IS NOT THIS, and the distinction is the one a later reader
+    * will get wrong. `damaged` means individual rows were rejected -- a line
+    * that does not parse, a glucose or a time no reading can have, a final
+    * write cut short by a power loss. The whole file was still read, so the
+    * staged table IS the record minus rows that were never readings, and the
+    * user keeps everything that survived. Discarding a person's entire
+    * history because one row of an append-only log got spliced would be a far
+    * worse answer than the understatement the -1 already reports. */
+   if (n < 0) {
+      free(stage);
+      return -1;
+   }
+
+   /* THE SWAP. One memcpy and one store, with the history lock already held
+    * by the caller (see store.h): nothing can observe a table that is half
+    * this load and half the last one. Only `ctx.tab.n` entries are live, so
+    * only they are copied -- the rest of g_hist is unreachable through
+    * hist_at/hist_copy, both of which bound on g_nhist. */
+   memcpy(g_hist, stage, (size_t)ctx.tab.n * sizeof *g_hist);
+   g_nhist = ctx.tab.n;
+   free(stage);
+
+   /* PUBLISHED AFTER THE SWAP, both of them. hist_refresh_current derives the
+    * big number from g_hist, so running it per chunk (as it used to) bound the
+    * current reading to a table that was still being built. */
+   hist_refresh_current(prime);
+   if (ctx.best_ok) {
+      g_cur_rssi    = ctx.best_rssi;
+      g_cur_rssi_ok = 1;
+   }
+   /* THE ROW COUNT IS THE FILE'S, not the tail's: the settings screen reports
+    * how many readings are stored, and the tail holds only the last NHIST of
+    * them. Counted here rather than by the caller, which had to know to do it
+    * and which counter it was setting. */
+   g_stored = store_count();
+   /* What is lost when this returns -1 is not a file -- it is history: g_hist
+    * drives the plot, the time-in-range figures and (through
+    * g_cur_glu/g_cur_time) the alarm's idea of the current reading. Coming up
+    * with a silently short record looks exactly like a working app that has
+    * simply not seen much, so the caller must say so rather than render a
+    * partial record as a complete one. A never-written log is still fine: the
     * open above answers that case with 0. */
-   return n < 0 ? -1 : 0;
+   return damaged ? -1 : 0;
 }
 
 /* Parse one chunk of WHOLE lines from the log (see store_load). Chunks are
  * line-aligned by the caller, so there is no partial first line to skip. */
-static void store_load_chunk(char *buf)
+/* Returns 1 when every row in the chunk was taken or was a comment, 0 when
+ * one was REJECTED -- a row that does not parse, or holds a glucose or a time
+ * no reading can have. Skipping it is right; reporting success afterwards is
+ * not, because this log is the record and it is never rewritten. */
+static int store_load_chunk(struct load_ctx *c, char *buf)
 {
-   char *p       = buf;
-   long now      = realtime_s();
-   long best_t   = 0;
-   int best_rssi = 0;
-   int best_ok   = 0; /* rssi of the newest row */
+   int damaged = 0;
+   char *p     = buf;
+   long now    = realtime_s();
    while (*p) {
       if (*p == '#') { /* header / comment line */
          while (*p && *p != '\n')
@@ -418,18 +708,94 @@ static void store_load_chunk(char *buf)
        * -- the two disagreeing about one file, which is exactly what the
        * bound above it was widened to prevent. */
       if (t > 0 && t <= now && glu >= STORE_GLU_MIN && glu <= STORE_GLU_MAX) {
-         hist_insert(t, (int)glu, (int)tr, (int)src, (int)kind);
-         if (t >= best_t) {
-            best_t    = t;
-            best_rssi = (int)rssi;
-            best_ok   = have_rssi;
+         /* INTO THE STAGED TABLE, never the live one: nothing this function
+          * does may be visible until the whole source has been read. */
+         tab_insert(&c->tab, t, (int)glu, (int)tr, (int)src, (int)kind);
+         /* THE NEWEST ROW IN THE WHOLE FILE, not in this chunk. best_t used
+          * to be a local reset on every chunk, so the last chunk that
+          * happened to carry an RSSI won -- and the log is in ARRIVAL order,
+          * so that is not the newest row. Carried in the context, it means
+          * what it says. */
+         if (t >= c->best_t) {
+            c->best_t    = t;
+            c->best_rssi = (int)rssi;
+            c->best_ok   = have_rssi;
          }
+      } else if (e != p) {
+         damaged = 1; /* a line that is not a reading */
       }
       p = (*e == '\n') ? e + 1 : e;
    }
-   hist_refresh_current(sensor_primary_id());
-   if (best_ok) {
-      g_cur_rssi    = best_rssi;
-      g_cur_rssi_ok = 1;
-   }
+   /* NO hist_refresh_current AND NO g_cur_rssi HERE. Both publish, and this
+    * function is halfway through reading a file; store_load does them once,
+    * after the swap. */
+   return !damaged;
+}
+
+/* ---- the history lock ---- */
+
+static struct mutex g_hist_lk = MUTEX_INIT;
+
+void store_lock(void)
+{
+   mutex_lock(&g_hist_lk);
+}
+
+void store_unlock(void)
+{
+   mutex_unlock(&g_hist_lk);
+}
+
+int store_trylock(void)
+{
+   return mutex_trylock(&g_hist_lk);
+}
+
+int store_drain(int ms)
+{
+   return mutex_drain(&g_hist_lk, ms);
+}
+
+/* ---- recording one reading ---- */
+
+struct reading_result store_record(const struct reading_event *ev, long gap)
+{
+   struct reading_result r = {HIST_DUP, 0, -1};
+   if (!ev)
+      return r;
+
+   store_lock();
+   /* BEFORE the insert: afterwards the newest sample from this source is the
+    * one being added, and prev_glu would report the reading against itself. */
+   r.prev_glu = hist_prev_glu(ev->t, ev->src, ev->t - gap);
+   r.inserted = hist_insert(ev->t, ev->glu, ev->trend, ev->src, ev->kind);
+   /* ANY non-zero result, not HIST_NEW alone -- see store.h. */
+   if (r.inserted && !ev->warm)
+      stat_add(ev->t, ev->glu);
+   hist_refresh_current(ev->prime);
+   store_unlock();
+
+   /* OUTSIDE the lock: file I/O touches no draw-shared state, and holding a
+    * lock the main thread also takes across a write is how a draw ends up
+    * waiting on an SD card. Persisted on HIST_OLD as well -- the log is the
+    * lifetime record and NHIST is only how much of it fits on screen. */
+   if (r.inserted)
+      r.persisted =
+          store_append(ev->t, ev->glu, ev->trend, ev->rssi, ev->has_rssi,
+                       ev->src, ev->raw, ev->tz, ev->kind, ev->rescale_pm) == 0;
+   return r;
+}
+
+/* The reading log's own filename. The shell hands over the data directory
+ * and nothing else -- it has no business knowing what this file is called. */
+int store_paths(const char *dir)
+{
+   int ok = 1;
+   ok &= data_path(g_store_path, sizeof g_store_path, dir, "/readings.csv");
+   return ok;
+}
+
+const char *store_path(void)
+{
+   return g_store_path;
 }

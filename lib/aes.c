@@ -31,9 +31,23 @@ static const uint8_t sbox[256] = {
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f,
     0xb0, 0x54, 0xbb, 0x16};
 
+/* Multiply by x in GF(2^8): shift left, and fold in the reduction polynomial
+ * if a one fell off the top.
+ *
+ * The fold used to be `(x >> 7) * 0x1b`, a multiply by a secret 0 or 1. Every
+ * core this repo targets has a fixed-latency integer multiplier, so that was
+ * almost certainly not leaking -- but "almost certainly" is a claim about a
+ * microarchitecture, and small cores with early-terminating multipliers exist
+ * (this server also builds for a riscv64 board). A mask costs the same and
+ * needs no such claim: 0 - (x >> 7) is 0x00 or 0xff, and AND with 0x1b picks
+ * the polynomial or nothing.
+ *
+ * This is a rounding error next to the S-box lookups below, and it is fixed
+ * here only because it was free. See aes.h for the leak that matters. */
 static uint8_t xtime(uint8_t x)
 {
-   return (uint8_t)(((unsigned)x << 1U) ^ (((unsigned)x >> 7U) * 0x1b));
+   const unsigned hi = (unsigned)x >> 7U; /* 0 or 1 */
+   return (uint8_t)(((unsigned)x << 1U) ^ ((0U - hi) & 0x1bU));
 }
 
 /* Expand 16-byte key into 176 bytes (11 round keys). */

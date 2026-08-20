@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: GPL-3.0
+// uiconfirm.c --- The screens that ask "are you sure" (see uipriv.h)
+// Copyright 2026 Jakob Kastelic
+//
+/* SIX SCREENS, ONE JOB: standing between a tap and something that cannot be
+ * undone -- forgetting a sensor, reviving an expired one, committing to a
+ * pairing, pulling the server's whole history down, replacing a queued
+ * calibration, stopping an active rescale.
+ *
+ * They live together because their SHAPE is the contract, not their content.
+ * Each states in plain words what is about to happen, puts a wide gap before
+ * the committing button so it cannot be caught by a finger still travelling,
+ * colours the way out and the way on differently, and treats the title-row X
+ * as "no". A confirmation that looked like an ordinary menu row would defeat
+ * the point of having one -- which is why they are checked side by side here
+ * rather than each drifting inside the screen family it belongs to.
+ */
+
+#include "ndk.h"
+#include "uiact.h"
+#include "uidraw.h"
+#include "uifmt.h"
+#include "uimodel.h"
+#include "uipriv.h"
+#include <stdint.h>
+#include <stdio.h> /* snprintf */
+
+/* Shown when CALIBRATION is opened while one is still queued: REPLACE it with a
+ * new value, or CANCEL (discard) it. X leaves the queue untouched. */
+void render_calpend(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                    struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   /* X / title-bar tap leaves the pending calibration in place. */
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_CAL_BACK, 0);
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+      return;
+   const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
+   draw_str(px, fb, x, y, tsc, "CAL PENDING", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1, 0);
+   y += lh;
+   {
+      char b[16];
+      char v[24];
+      fmt_glu(s->cal_pending, m->prefs.units, b, sizeof b);
+      (void)snprintf(v, sizeof v, "%s %s", b, UI_LBL(m->prefs.units));
+      menu_row(fb, h, y, sc, lh, "QUEUED", v, 0xFF44CCFF, -1, 0);
+      y += lh;
+   }
+   y += 2 * lh;
+
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "REPLACE", 0xFFFFFFFF, MA_CAL_REPLACE,
+                   0);
+   y += 3 * lh; /* wide gap so DELETE (discard) is deliberate */
+   /* "DELETE", not "CANCEL": CANCEL reads as "do nothing", but this button
+    * DISCARDS the queued calibration. The X in the title bar is the no-op. */
+   menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF0000FF, MA_CAL_CANCEL, 0);
+}
+
+/* Rescaling already active: CHANGE the value, or STOP. Mirrors render_calpend.
+ */
+void render_rescaleact(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                       struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_RESCALE_BACK, 0);
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+      return;
+   const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
+   draw_str(px, fb, x, y, tsc, "RESCALE ON", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   /* Same spacing as render_rescale, which it mirrors. */
+   y += 3 * lh;
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1, 0);
+   y += 2 * lh;
+   {
+      char v[32]; /* "PENDING " + value(<=11) + ' ' + unit(<=6) + NUL */
+      if (s->rescale_pending > 0) {
+         /* Held, awaiting a reading to compute the factor from. */
+         char gv[12];
+         fmt_glu(s->rescale_pending, m->prefs.units, gv, sizeof gv);
+         (void)snprintf(v, sizeof v, "PENDING %s %s", gv,
+                        UI_LBL(m->prefs.units));
+      } else {
+         fmt_rescale_pct(s->rescale_pm, v, sizeof v);
+      }
+      menu_row(fb, h, y, sc, lh, "RESCALING", v, 0xFF44CCFF, -1, 0);
+      y += 2 * lh;
+   }
+   y += lh;
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CHANGE", 0xFFFFFFFF, MA_RESCALE_CHANGE,
+                   0);
+   y += 3 * lh; /* wide gap so TURN OFF is deliberate */
+   /* "TURN OFF" (not STOP/CANCEL): STOP reads like ending the sensor SESSION,
+    * and CANCEL like doing nothing -- this turns rescaling off. White, not red:
+    * turning rescaling off is not destructive (no data is lost). */
+   menu_button(fb, h, x, y, bw, sc, "TURN OFF", 0xFFFFFFFF, MA_RESCALE_STOP, 0);
+}
+
+/* ---- forget confirmation ----
+ * Forgetting drops the slot only: the provenance row and every reading this
+ * sensor produced stay exactly where they are. Saying so here is the point of
+ * the screen -- otherwise "FORGET" reads like it deletes the data. */
+
+void render_forget(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                   struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   /* Height-bounded as well as width-bounded (see ui_fit_scale). Left on
+    * width-only scaling, this screen's controls were laid out past the
+    * bottom in landscape -- and render_forget records no close target, so
+    * it became a dead end with no way back. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int y   = (fb->height / 20) + (8 * sc);
+   /* A way out, recorded BEFORE the range guard. This screen had no close
+    * target of any kind, so with a stale selection it rendered blank and
+    * swallowed every tap -- and even when it rendered, landscape put CANCEL
+    * and FORGET off the buffer, leaving no way back. */
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_FORGET_NO, 0);
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+      return;
+   const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
+
+   int rx = fb->width - (4 * sc);
+   draw_str(px, fb, x, y, tsc, "DISCONNECT?", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X",
+            0xFFFFFFFF); /* close = cancel */
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, s->label, 0xFFFFFFFF);
+   y += 2 * lh;
+   static const char *const note[] = {
+       "STOPS THIS DEVICE AND MOVES",
+       "IT TO OLD DEVICES. READINGS",
+       "AND HISTORY ARE KEPT.",
+   };
+   for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
+      draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
+      y += lh;
+   }
+   y += 2 * lh;
+
+   /* Two consistent framed buttons, well separated so they cannot be confused:
+    * CANCEL (safe, white) and DISCONNECT (RED). This IS the confirmation step
+    * -- MA_FORGET_YES is what actually disconnects (the device becomes an OLD
+    * DEVICE; nothing is deleted). */
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_FORGET_NO, 0);
+   y += 3 * lh; /* wide gap so DISCONNECT is not tapped by accident */
+   menu_button(fb, h, x, y, bw, sc, "DISCONNECT", 0xFF0000FF, MA_FORGET_YES, 0);
+}
+
+/* ---- reconnect-an-EXPIRED-device confirmation ----
+ * Reconnecting a sensor pulled BEFORE it expired is direct; reconnecting one
+ * that has already expired rarely makes sense, so it lands here first. ---- */
+void render_reconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                   struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_RECON_NO, 0);
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+      return;
+   const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
+
+   draw_str(px, fb, x, y, tsc, "RECONNECT?", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, s->label, 0xFFFFFFFF);
+   y += 2 * lh;
+   static const char *const note[] = {
+       "THIS SENSOR IS EXPIRED.",
+       "RECONNECTING RARELY WORKS;",
+       "IT WILL JUST WAIT FOREVER.",
+   };
+   for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
+      draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
+      y += lh;
+   }
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_RECON_NO, 0);
+   y += 3 * lh;
+   menu_button(fb, h, x, y, bw, sc, "RECONNECT", 0xFF00FF00, MA_RECON_YES, 0);
+}
+
+/* ---- pairing confirmation ----
+ * Tapping a row in the device list used to commit the pairing on the spot,
+ * and commit_pair is consequential: it registers the device and (for a CGM)
+ * drops the chosen link's old bond before the J-PAKE. One mis-tap in a list
+ * ordered by live RSSI -- rows can reorder under the finger -- did all of
+ * that to the wrong device. So the pick only proposes; this screen's explicit
+ * YES is what commits, and NO returns to the list with nothing changed. */
+
+void render_pairconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                     struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   /* Height-bounded as well as width-bounded, for the same landscape reason
+    * as render_forget. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc = 2 * sc;
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int y   = (fb->height / 20) + (8 * sc);
+   /* A way out, recorded BEFORE anything can bail: a screen with no
+    * dispatchable escape is a dead end that swallows every tap. */
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_PAIR_NO, 0);
+
+   char title[24];
+   (void)snprintf(title, sizeof title, "PAIR %s?",
+                  m->dev.add_type ? m->dev.add_type : "SENSOR");
+   int rx = fb->width - (4 * sc);
+   (void)draw_title_fit(px, fb, x, y, tsc, title, 0xFFFFFFFF,
+                        rx - x - (7 * tsc));
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF); /* close = NO */
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, m->dev.pair_name ? m->dev.pair_name : "",
+            0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, m->dev.pair_mac ? m->dev.pair_mac : "",
+            0xFF888888);
+   y += 2 * lh;
+
+   /* Two consistent framed buttons, well separated so they cannot be
+    * confused: NO (safe, white) first, YES (commits, green) below. */
+   int bw = fb->width - (2 * x);
+   y      = menu_button(fb, h, x, y, bw, sc, "NO", 0xFFFFFFFF, MA_PAIR_NO, 0);
+   y += 3 * lh; /* wide gap so YES is not tapped by accident */
+   menu_button(fb, h, x, y, bw, sc, "YES", 0xFF00FF00, MA_PAIR_YES, 0);
+}
+
+/* RESTORE: the one screen that pulls the record DOWN.
+ *
+ * Framed like every other destructive-ish confirmation -- safe choice first,
+ * wide gap, the committing one below -- but the words matter more here than
+ * usual, because "restore" sounds harmless and the user needs to know what it
+ * will and will not do: it only ADDS days this phone does not have, and it
+ * cannot remove or overwrite anything already here. */
+void render_syncrestore(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                        struct hits *h)
+{
+   (void)m; /* the question does not depend on the model */
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_SYNCREST_NO, 0);
+
+   int rx = fb->width - (4 * sc);
+   (void)draw_title_fit(px, fb, x, y, tsc, "RESTORE?", 0xFFFFFFFF,
+                        rx - x - (7 * tsc));
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, "PULL BACK EVERY DAY THE", 0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, "SERVER HAS AND THIS PHONE", 0xFFFFFFFF);
+   y += lh;
+   draw_str(px, fb, x, y, sc, "DOES NOT.", 0xFFFFFFFF);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, "NOTHING HERE IS REMOVED", 0xFF888888);
+   y += lh;
+   draw_str(px, fb, x, y, sc, "OR OVERWRITTEN.", 0xFF888888);
+   y += 2 * lh;
+
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "NO", 0xFFFFFFFF, MA_SYNCREST_NO, 0);
+   y += 3 * lh;
+   menu_button(fb, h, x, y, bw, sc, "RESTORE", 0xFF00FF00, MA_SYNCREST_YES, 0);
+}

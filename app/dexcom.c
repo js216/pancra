@@ -17,10 +17,13 @@
  * Ported from Juggluco (GPLv3) and xDrip's jamorham.keks. GPLv3.
  */
 
+/* "p256.h" rather than "rand.h": the only entropy this file needs is one
+ * ECDSA nonce, and a nonce is a curve scalar, so it comes from p256_sc_rand
+ * and not from a raw byte source. */
 #include "dexcom.h"
 #include "aes.h"
 #include "ecdsa.h"
-#include "rand.h"
+#include "p256.h"
 #include "sha256.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -70,10 +73,21 @@ int dexcom_getchallenge(const uint8_t *challenge, size_t clen,
 
    for (int t = 0; t < 32; t++) {
       uint8_t k[32];
-      /* Abort, do NOT retry: with a dead entropy source every attempt would
-       * sign with the same stack garbage. Failing the key challenge is a
-       * case the driver already handles. */
-      if (!rand_bytes(k, 32))
+      /* p256_sc_rand, not rand_bytes: an ECDSA nonce is a scalar in [1, n-1]
+       * and this is the one generator that draws one (lib/p256.h). Zero was
+       * never the exposure here -- ecdsa_p256_sign has always refused k == 0
+       * and this loop would then have drawn a fresh k, which is the correct
+       * response -- so what this fixes at this site is the 2^-32 bias the
+       * reduction inside ecdsa_p256_sign introduced. It is included because a
+       * generator used by three of four scalar sites is not one rule.
+       *
+       * Abort, do NOT retry: with a dead entropy source every attempt would
+       * sign with the same stack garbage. p256_sc_rand propagates that
+       * distinction -- it returns 0 both for a dead source and for a source so
+       * broken that 64 straight draws were out of range, and neither is worth
+       * a second attempt. Failing the key challenge is a case the driver
+       * already handles. */
+      if (!p256_sc_rand(k))
          return 0;
       if (ecdsa_p256_sign(priv, hash, k, out64, out64 + 32))
          return 1;
@@ -96,8 +110,7 @@ int dexcom_verify_challenge(const uint8_t *challenge, size_t clen,
 }
 
 #ifdef DEXCOM_TEST
-#include "p256.h"
-#include <stdio.h>
+#include <stdio.h> /* p256.h is included unconditionally above now */
 
 int main(void)
 {

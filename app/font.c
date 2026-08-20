@@ -129,7 +129,7 @@ int str_len(const char *s)
 
 /* ---- 5x7 status icons: same format as the glyphs (7 rows, MSB = leftmost
  * of the low 5 bits), kept here so all the bitmap art lives in one file.
- * ui.c's draw_icon blits them. ---- */
+ * uirender.c's draw_icon blits them. ---- */
 
 /* Speaker: driver box left, cone opening right. */
 const uint8_t icon_speaker[7] = {0x01, 0x03, 0x1F, 0x1F, 0x1F, 0x03, 0x01};

@@ -62,76 +62,176 @@ public final class Ble {
      * everything); header lines (no leading digit) are always kept. The
      * three flags mirror the EXPORT DATA menu's checkboxes; the DEVICES
      * section is a registry, not a time series, so it never filters. */
+    /* ONE FILE PER EXPORT, AND IT IS NEVER WRITTEN AGAIN.
+     *
+     * This used to write files/pancra.csv -- one name, truncated on every
+     * export -- and share a content:// URI naming it. The receiving app opens
+     * that URI when it needs the bytes, not when the chooser closes: a mail
+     * client reads the attachment as the message is SENT, which for a draft, a
+     * queued send, or a phone that regains network overnight is minutes or
+     * hours later. A second export truncated and rewrote the file underneath
+     * it, so what reached the colleague or the doctor was empty, or half of
+     * one export followed by half of another -- and the sender had no way to
+     * know, having seen an ordinary share sheet and a correct file on the
+     * phone.
+     *
+     * Now: a constrained unique name (see BoundaryLogic.exportName -- the
+     * grammar and the reasons are there), created with createNewFile() so the
+     * filesystem itself refuses to reuse one, made read-only once written, and
+     * kept for a day so a delayed reader still finds its own bytes. Only that
+     * one URI is put in the intent, so only that one snapshot is granted. */
     public static void exportData(Context ctx, long cutoff, boolean glucose,
                                   boolean devices, boolean insulin,
                                   boolean weight) {
+        java.io.File out = null;
         try {
             java.io.File dir = ctx.getFilesDir();
-            java.io.File out = new java.io.File(dir, "pancra.csv");
-            java.io.FileOutputStream os = new java.io.FileOutputStream(out);
-            if (devices) {
-                copyInto(os, new java.io.File(dir, "sensors.csv"));
-                os.write('\n'); /* blank line between sections */
+            java.io.File snapdir =
+                new java.io.File(dir, BoundaryLogic.EXPORT_DIR);
+            /* A SUBDIRECTORY OF ITS OWN, so the cleanup below enumerates
+             * snapshots and cannot see -- let alone remove -- readings.csv,
+             * stelo.key or anything else the app depends on. */
+            if (!snapdir.isDirectory() && !snapdir.mkdirs()) {
+                Log.i(TAG, "export: cannot create " + BoundaryLogic.EXPORT_DIR);
+                return;
             }
-            if (glucose) {
-                copyFiltered(os, new java.io.File(dir, "readings.csv"), cutoff);
-                os.write('\n');
-            }
-            if (insulin) {
-                copyFiltered(os, new java.io.File(dir, "insulin.csv"), cutoff);
-                os.write('\n');
-            }
+            /* BEFORE the new snapshot exists, so it is not a candidate for its
+             * own cleanup and the four-newest rule is spent on real history. */
+            cleanupExports(snapdir);
+            out = newSnapshot(snapdir);
+            if (out == null) return; /* newSnapshot logged why */
+            /* THE BYTES, THE CLOSE AND THE PUBLICATION ARE ExportSnapshot'S,
+             * and its header says why each of the three is where it is. In
+             * one line: a row is copied only once its own '\n' has been read,
+             * so a source the native side is appending to cannot contribute a
+             * half-written row that this side then terminates; and `out`
+             * acquires its contents by a rename that happens AFTER the output
+             * stream closed without throwing, so no URI can ever name a
+             * prefix. A false return means every selected section was empty
+             * -- nothing to share, and nothing left on disk. */
+            java.util.ArrayList<ExportSnapshot.Section> secs =
+                new java.util.ArrayList<ExportSnapshot.Section>();
+            /* The DEVICES section is a registry, not a time series, so it is
+             * never filtered -- cutoff 0. */
+            if (devices)
+                secs.add(new ExportSnapshot.FileSection(
+                             new java.io.File(dir, "sensors.csv"), 0));
+            if (glucose)
+                secs.add(new ExportSnapshot.FileSection(
+                             new java.io.File(dir, "readings.csv"), cutoff));
+            if (insulin)
+                secs.add(new ExportSnapshot.FileSection(
+                             new java.io.File(dir, "insulin.csv"), cutoff));
             if (weight)
-                copyFiltered(os, new java.io.File(dir, "weight.csv"), cutoff);
-            os.close();
-            if (out.length() == 0) return;
-            Uri uri = Uri.parse("content://com.jk.pancra.files/pancra.csv");
+                secs.add(new ExportSnapshot.FileSection(
+                             new java.io.File(dir, "weight.csv"), cutoff));
+            if (!ExportSnapshot.write(new ExportSnapshot.FileSink(out),
+                    secs.toArray(new ExportSnapshot.Section[0])))
+                return;
+            Uri uri = Uri.parse("content://com.jk.pancra.files/"
+                                + out.getName());
             Intent send = new Intent(Intent.ACTION_SEND);
+            /* THE GRANT IS THIS URI AND NOTHING ELSE. The flag grants what the
+             * intent carries, and what it carries is one snapshot's name; the
+             * provider is not exported, so nothing else in the URI space is
+             * reachable without a grant, and PancraFiles refuses any name that
+             * is not a snapshot's anyway. */
             send.putExtra(Intent.EXTRA_STREAM, uri);
             send.setType("text/csv");
             send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             Intent chooser = Intent.createChooser(send, "Export pancra data");
             chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ctx.startActivity(chooser);
-        } catch (Throwable t) { Log.i(TAG, "export: " + t); }
+        } catch (Throwable t) {
+            Log.i(TAG, "export: " + t);
+            /* ExportSnapshot has already removed anything it wrote -- a
+             * failed export leaves neither the temporary nor the name. This
+             * covers the rest of the method: a snapshot that WAS published
+             * and then could not be handed to a chooser is a share that never
+             * happened, so it goes too rather than sitting in the directory
+             * with a name nothing will ever ask for. */
+            if (out != null) try { out.delete(); } catch (Throwable u) { }
+        }
     }
 
-    private static void copyInto(java.io.OutputStream os, java.io.File f)
-            throws java.io.IOException {
-        if (!f.exists()) return;
-        java.io.FileInputStream is = new java.io.FileInputStream(f);
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
-        is.close();
-    }
-
-    /* copyInto, but keeping only rows whose LEADING integer (epoch seconds,
-     * the first CSV field of readings.csv and insulin.csv alike) is >= cutoff.
-     * Lines that do not start with a digit (the column header) are kept, so a
-     * filtered export stays self-describing. */
-    private static void copyFiltered(java.io.OutputStream os, java.io.File f,
-                                     long cutoff)
-            throws java.io.IOException {
-        if (!f.exists()) return;
-        if (cutoff <= 0) { copyInto(os, f); return; }
-        java.io.BufferedReader r =
-            new java.io.BufferedReader(new java.io.FileReader(f));
-        String ln;
-        while ((ln = r.readLine()) != null) {
-            long t = -1;
-            int i = 0;
-            while (i < ln.length() && ln.charAt(i) >= '0'
-                   && ln.charAt(i) <= '9' && i < 12) {
-                t = (t < 0 ? 0 : t) * 10 + (ln.charAt(i) - '0');
-                i++;
+    /* A file that did not exist a moment ago, named to the export grammar.
+     *
+     * createNewFile() is the point: it creates ONLY if the name is free, so
+     * uniqueness is the filesystem's answer and not a promise made by the
+     * random tag. The retries exist for the collision that tag makes
+     * improbable (same second, same 32 bits) and for the one it does not
+     * cover at all -- a snapshot the user has not exported yet this session
+     * but whose name we happen to regenerate after a clock reset. Returning
+     * null after a bounded number of tries beats looping in the UI thread of
+     * a share the user is waiting for.
+     *
+     * SecureRandom rather than Random: the name is handed to another app, and
+     * a guessable one is a name a future mistake could let something else ask
+     * for. It costs one seeding on a user-initiated action. */
+    private static java.io.File newSnapshot(java.io.File dir) {
+        java.security.SecureRandom rnd = new java.security.SecureRandom();
+        for (int tries = 0; tries < 8; tries++) {
+            String name = BoundaryLogic.exportName(
+                System.currentTimeMillis() / 1000L, rnd.nextInt());
+            /* THE GENERATOR CHECKS ITS OWN OUTPUT. If these two ever disagree
+             * the export must fail here, where it can be logged, and not in
+             * the provider -- where the user sees a share that produces an
+             * empty or missing attachment in someone else's app. */
+            if (!BoundaryLogic.exportNameValid(name)) {
+                Log.i(TAG, "export: generated an invalid name '" + name + "'");
+                return null;
             }
-            if (t < 0 || t >= cutoff) {
-                os.write(ln.getBytes());
-                os.write('\n');
+            java.io.File f = new java.io.File(dir, name);
+            try {
+                if (f.createNewFile()) return f;
+            } catch (java.io.IOException e) {
+                Log.i(TAG, "export: createNewFile: " + e);
+                return null;
             }
         }
-        r.close();
+        Log.i(TAG, "export: no free snapshot name after 8 tries");
+        return null;
+    }
+
+    /* Remove snapshots that no reader can still be waiting for.
+     *
+     * The rule is BoundaryLogic.exportSnapshotExpendable, which is where the
+     * numbers and the asymmetry are argued: deleting one too early breaks a
+     * recipient's read, deleting one too late costs kilobytes. This half is
+     * only the enumeration, and it is deliberately narrow -- a file is a
+     * candidate ONLY if its name is a valid snapshot name, so anything else
+     * that ever appears in the directory is left strictly alone. */
+    private static void cleanupExports(java.io.File dir) {
+        try {
+            java.io.File[] all = dir.listFiles();
+            if (all == null) return;
+            java.util.ArrayList<java.io.File> snaps =
+                new java.util.ArrayList<java.io.File>();
+            for (java.io.File f : all)
+                if (f.isFile() && BoundaryLogic.exportNameValid(f.getName()))
+                    snaps.add(f);
+            /* NEWEST FIRST, so "rank" means what the rule thinks it means.
+             * By mtime and not by name: the name's timestamp comes from the
+             * wall clock, which can move backwards between exports, and a
+             * clock correction must not make the newest snapshot look like the
+             * oldest and get it deleted. */
+            java.util.Collections.sort(snaps,
+                new java.util.Comparator<java.io.File>() {
+                    @Override public int compare(java.io.File a, java.io.File b) {
+                        long x = a.lastModified(), y = b.lastModified();
+                        return (x == y) ? 0 : (x > y ? -1 : 1);
+                    }
+                });
+            long now = System.currentTimeMillis();
+            for (int i = 0; i < snaps.size(); i++) {
+                java.io.File f = snaps.get(i);
+                if (BoundaryLogic.exportSnapshotExpendable(now,
+                        f.lastModified(), i)) {
+                    Log.i(TAG, "export: retiring " + f.getName());
+                    f.delete();
+                }
+            }
+        } catch (Throwable t) { Log.i(TAG, "export cleanup: " + t); }
     }
 
     /* ---- REMOTE push: one datapoint per call to the configured server ---- */
@@ -179,7 +279,7 @@ public final class Ble {
      * CURSOR, GET /api/last), then sends everything newer in chronological
      * batches; a batch that fails for ANY reason is simply retried later
      * from the cursor, and the server skips what it already stored, so a
-     * reply lost in flight cannot double-write. See glucoserve.c.
+     * reply lost in flight cannot double-write. See srv/logs.c.
      *
      * All of it runs on pushExec (never a BLE binder thread, which holds
      * the driver lock). Native drives one step per tick and reads the
@@ -286,6 +386,15 @@ public final class Ble {
     /* start the foreground service so BLE keeps running in the background, and
      * ask to be exempted from battery optimisation so Doze can't kill us */
     public static void startService(Context ctx) {
+        /* The native side is up by the time this is called -- it is called
+         * FROM native. Recording that is what lets a service recreated later,
+         * on its own, tell "the app asked for me" from "I am alone in a fresh
+         * process and can monitor nothing" (see PancraService.serviceAction).
+         *
+         * It also clears any MONITORING STOPPED warning: the condition it
+         * describes has just been fixed by the app being open. */
+        PancraService.nativeReady();
+        PancraService.clearStoppedWarning(ctx);
         PancraService.start(ctx);
         PancraService.requestNoBatteryOpt(ctx);
     }
@@ -311,6 +420,9 @@ public final class Ble {
      * here touches the main looper.
      */
     private static volatile int sSyncCode = -1;
+    /* WHY the last one failed, when it failed before the server answered: a
+     * BoundaryLogic.NET_* kind, read by native alongside the status. */
+    private static volatile int sSyncFail = BoundaryLogic.NET_OK;
     private static volatile boolean sSyncBusy;
 
     static native int syncRun();
@@ -323,23 +435,140 @@ public final class Ble {
     /* The status of the LAST syncHttp call, read by native straight after. */
     static int syncCode() { return sSyncCode; }
 
+    /* ...and, when there was no status, WHY. Native turns this into the
+     * outcome the screen shows and the scheduler retries (or does not). */
+    static int syncFail() { return sSyncFail; }
+
+    /* THE WATCHDOG THAT ACTUALLY CUTS A WEDGED EXCHANGE OFF.
+     *
+     * Item 123's deadline is arithmetic, and arithmetic cannot interrupt a
+     * blocked socket read. The loop in BoundaryLogic re-checks the clock
+     * every time around, which ends a server that DRIBBLES -- one byte,
+     * another byte -- but a server that accepts the connection and then says
+     * nothing at all leaves the worker parked inside a single blocking call,
+     * where no amount of checking between calls is ever reached. (The read
+     * idle timeout does cover that one case; the write does not have one at
+     * all, and the gaps between connect, request and response are covered by
+     * nothing.) So there is a timer, and when it fires it CLOSES THE SOCKET,
+     * which is the only thing that makes a blocked read or write return.
+     *
+     * One shared thread, not one per request: a sync is dozens of requests
+     * and a restore is one per bucket. Core size 1 with core-thread timeout
+     * on, so the thread evaporates when nothing has synced for half a minute
+     * and a phone that is not syncing pays nothing for it. Daemon, so it can
+     * never be the reason a process lingers. removeOnCancel, because the
+     * normal path cancels every single one of these and a queue that keeps
+     * cancelled tasks until their deadline would hold a reference to every
+     * connection of the whole sync.
+     *
+     * This is NOT the sync worker. It must not be: the whole point is that it
+     * runs while pushExec's only thread is stuck. */
+    private static final java.util.concurrent.ScheduledThreadPoolExecutor
+        syncWatch = new java.util.concurrent.ScheduledThreadPoolExecutor(1,
+            new java.util.concurrent.ThreadFactory() {
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "pancra-syncwatch");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+    static {
+        syncWatch.setKeepAliveTime(30, java.util.concurrent.TimeUnit.SECONDS);
+        syncWatch.allowCoreThreadTimeOut(true);
+        syncWatch.setRemoveOnCancelPolicy(true);
+    }
+
     /* Called FROM native on the sync worker. Returns the response body, or
      * null; the status goes in sSyncCode, because a JNI call that returns two
-     * things needs two calls and this is the cheaper pair. */
+     * things needs two calls and this is the cheaper pair.
+     *
+     * ---- WHAT THIS USED TO DO TO SOMEBODY WEARING A CGM (items 122, 123) --
+     *
+     * It read the reply `while ((n = in.read(buf)) > 0)` into a
+     * ByteArrayOutputStream with no ceiling, then handed the finished array
+     * to native -- which measured it and refused it if it did not fit. The
+     * refusal was correct and it was three copies too late. A server that
+     * answered a bucket fetch with a gigabyte, whether hostile,
+     * misconfigured, or a captive portal serving an endless error page, got
+     * this app to allocate until the heap gave out. An OutOfMemoryError does
+     * not land where it was caused: it lands on the next allocation anywhere
+     * in the process, which here is as likely to be the BLE callback decoding
+     * a glucose reading. The screen stops updating, the low alarm stops
+     * sounding, and nothing says anything is wrong -- because nothing knows.
+     *
+     * And the clock was per-read. setReadTimeout restarts on every byte, so a
+     * server sending one byte every nineteen seconds never tripped it and
+     * never finished. This method runs on pushExec, which has a MAXIMUM of
+     * one thread and also carries pairing and restore, so one such server
+     * stopped every sync, every pairing attempt and every restore for the
+     * life of the process, silently, with the app believing a request was
+     * merely still in progress.
+     *
+     * Both bounds now live in BoundaryLogic, where the host JVM runs them
+     * against a dribbling stream and a lying Content-Length. What is left
+     * here is what needs Android: the connection, the two idle timeouts, and
+     * the watchdog above. */
     static byte[] syncHttp(String server, int port, String method, String path,
                            String hdr, byte[] body) {
         sSyncCode = -1;
+        sSyncFail = BoundaryLogic.NET_OK;
+        /* MONOTONIC, and the reason is item 70's: this is an elapsed-time
+         * question, and currentTimeMillis answers a different one. An NTP
+         * correction or the user setting the date mid-sync would move a wall
+         * clock, and a deadline computed from a clock that moved BACKWARDS
+         * grows -- it would hand exactly the wedged request this exists to
+         * kill even more time. nanoTime has no epoch and cannot be set. */
+        final long startMono = System.nanoTime();
+        /* Written by the watchdog thread, read by this one: a close that WE
+         * caused must be reported as a timeout, not as whatever SocketException
+         * the platform raises on a socket somebody yanked. */
+        final java.util.concurrent.atomic.AtomicBoolean cut =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.ScheduledFuture<?> alarm = null;
         java.net.HttpURLConnection c = null;
         try {
             /* https, always: the session this signs is not the only thing on
              * the wire -- the record itself is. The platform supplies the TLS,
              * so this costs nothing but the scheme. */
-            c = (java.net.HttpURLConnection) new java.net.URL(
+            final java.net.HttpURLConnection conn =
+                (java.net.HttpURLConnection) new java.net.URL(
                     "https", server, port, path).openConnection();
+            c = conn;
+            /* ARMED HERE, before a single byte moves. openConnection() does
+             * not connect -- HttpURLConnection is lazy -- so starting the
+             * timer at this line is what makes the budget cover the connect,
+             * the TLS handshake, the request body, the status line, the
+             * response body AND the gaps between them. Arming it after
+             * getResponseCode(), which is the obvious-looking place, would
+             * have left the connect and the write outside the deadline: the
+             * connect has its own 8 s, but the write has NO timeout of any
+             * kind, so a server that accepts a connection and never drains
+             * the request would have hung exactly as before. */
+            alarm = syncWatch.schedule(new Runnable() {
+                public void run() {
+                    cut.set(true);
+                    /* disconnect() closes the underlying socket, so whichever
+                     * blocking call the worker is parked in returns with an
+                     * IOException. It is the only lever that reaches a thread
+                     * already inside read(). */
+                    try { conn.disconnect(); } catch (Throwable t) { }
+                }
+            }, BoundaryLogic.SYNC_EXCHANGE_MS,
+               java.util.concurrent.TimeUnit.MILLISECONDS);
             c.setConnectTimeout(8000);
             c.setReadTimeout(20000);
             c.setRequestMethod(method);
             c.setUseCaches(false);
+            /* NO AUTOMATIC REDIRECTS, and this single line is item 124.
+             * HttpURLConnection follows 3xx by default, and a followed
+             * redirect changes the target -- or the METHOD -- of a request
+             * whose signature covers exactly the method and path native
+             * chose. The 2xx that comes back from wherever it went is then
+             * reported as the answer to the request we signed. See
+             * BoundaryLogic.redirectRefused for what that costs; the refusal
+             * of every 3xx lives there, and `make javacheck` fails the build
+             * if this line goes away. */
+            c.setInstanceFollowRedirects(false);
             if (hdr != null) {
                 /* "Name: value\r\n" lines, exactly as native built them. */
                 for (String line : hdr.split("\r\n")) {
@@ -349,44 +578,134 @@ public final class Ble {
                                              line.substring(colon + 1).trim());
                 }
             }
-            if (body != null && body.length > 0) {
-                c.setDoOutput(true);
-                c.setFixedLengthStreamingMode(body.length);
-                c.getOutputStream().write(body);
+            /* THE LIMIT IS NATIVE'S LIMIT. BoundaryLogic.SYNC_BODY_MAX is
+             * SYNC_BUF_MAX - 1 from app/sync.h, which is the `outcap` every
+             * sync.c call site passes to jni_http and the exact length that
+             * jni_http still accepts. `make javacheck` fails the build if the
+             * two ever disagree, so this is one number with a copy the build
+             * will not let rot -- not a second, independent guess.
+             *
+             * The exchange itself -- write the body and CLOSE it, then the
+             * status, then refuse a 3xx, then the bounded read, with every
+             * stream closed on every path -- is BoundaryLogic.runExchange,
+             * for the same reason the read loop is: none of those decisions
+             * needs Android, and on this side of the boundary they would be
+             * testable only on a phone. What is left below is the wiring the
+             * platform actually owns, including WHICH stream carries the body
+             * (getInputStream for a 2xx, getErrorStream for the rest, and
+             * getErrorStream is null when there is no error body). */
+            BoundaryLogic.Exchange x = BoundaryLogic.runExchange(
+                new BoundaryLogic.SyncConn() {
+                    public java.io.OutputStream openRequest(int len)
+                            throws java.io.IOException {
+                        conn.setDoOutput(true);
+                        conn.setFixedLengthStreamingMode(len);
+                        return conn.getOutputStream();
+                    }
+                    public int status() throws java.io.IOException {
+                        return conn.getResponseCode();
+                    }
+                    public String header(String name) {
+                        return conn.getHeaderField(name);
+                    }
+                    public java.io.InputStream openResponse(int status)
+                            throws java.io.IOException {
+                        return (status / 100 == 2) ? conn.getInputStream()
+                                                   : conn.getErrorStream();
+                    }
+                },
+                body, new BoundaryLogic.MonoClock() {
+                    public long nanos() { return System.nanoTime(); }
+                },
+                startMono, BoundaryLogic.SYNC_EXCHANGE_MS,
+                BoundaryLogic.SYNC_BODY_MAX);
+            if (x.body == null || cut.get()) {
+                /* SET THE STATUS BACK TO -1, and this line is load-bearing.
+                 * Native reads syncCode() separately from the returned array
+                 * (syncjni.c, jni_http): a null return with sSyncCode still
+                 * holding the 200 we got a moment ago is read there as a
+                 * successful request with an EMPTY body -- an upload we never
+                 * completed treated as accepted, a bucket fetch that returned
+                 * nothing treated as a bucket that IS empty, which is the one
+                 * kind of answer that drives the loop that deletes. A refused
+                 * body is "nothing happened", and nothing happened is -1.
+                 *
+                 * IT IS ALSO BELT AND BRACES NOW, DELIBERATELY. Since item
+                 * 124 the status is not published until there are bytes to
+                 * publish it with -- runExchange returns code -1 with every
+                 * null body, and the assignment below is the only one -- so
+                 * this line writes -1 over the -1 set on entry. It stays
+                 * because the invariant it enforces is one line's edit away
+                 * from being lost: the obvious "simplification" here is to
+                 * read the status straight off the connection as soon as it
+                 * is known, and that is exactly the code this replaced. */
+                sSyncCode = -1;
+                sSyncFail = cut.get() ? BoundaryLogic.NET_TIMEOUT : x.fail;
+                return null;
             }
-            sSyncCode = c.getResponseCode();
-            java.io.InputStream in = (sSyncCode / 100 == 2)
-                    ? c.getInputStream() : c.getErrorStream();
-            if (in == null)
-                return new byte[0];
-            java.io.ByteArrayOutputStream out =
-                new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[4096];
-            int n;
-            while ((n = in.read(buf)) > 0)
-                out.write(buf, 0, n);
-            return out.toByteArray();
+            sSyncCode = x.code;
+            return x.body;
         } catch (Throwable t) {
             /* Any failure is "the request did not happen": native retries the
              * whole sync later, and a partial answer must never look like a
-             * complete one. */
+             * complete one. But WHICH failure is not lost: a name that does
+             * not resolve and a refused certificate are the user's to fix,
+             * and retrying them for ever helps nobody. */
             sSyncCode = -1;
+            /* A socket WE closed reports as a timeout. netFailure would see a
+             * SocketException reading "Socket closed" and call it NET_OTHER,
+             * which on the screen is an unexplained failure rather than "that
+             * server is too slow" -- and NET_OTHER is retried on a schedule
+             * that assumes a transient fault. */
+            sSyncFail = cut.get() ? BoundaryLogic.NET_TIMEOUT
+                                  : BoundaryLogic.netFailure(t);
             return null;
         } finally {
-            /* NOT disconnect(): that tears the socket down, and the socket is
-             * the expensive part. A TLS handshake to the server costs 100-600
-             * ms and the request itself costs 5, so a sync that reconnects per
-             * bucket spends all its time shaking hands. Leaving the connection
-             * in the pool lets the whole sync ride one handshake. */
+            if (alarm != null)
+                alarm.cancel(false);
+            /* NOT disconnect() ON THE NORMAL PATH: that tears the socket down,
+             * and the socket is the expensive part. A TLS handshake to the
+             * server costs 100-600 ms and the request itself costs 5, so a
+             * sync that reconnects per bucket spends all its time shaking
+             * hands. Leaving the connection in the pool lets the whole sync
+             * ride one handshake.
+             *
+             * A connection the watchdog cut is the exception, and it is
+             * already gone -- disconnect() is what the watchdog called. That
+             * one must NOT go back in the pool: it is attached to a server
+             * that just demonstrated it does not finish, and the next request
+             * to reuse it would inherit the stall.
+             *
+             * ITEM 125 CHECKED THAT REASONING AND IT HOLDS -- but it was only
+             * half the story while nothing closed the STREAMS. Not
+             * disconnecting is what keeps the socket; closing the request and
+             * response streams is what makes keeping it correct, because a
+             * connection with unread bytes still on it is not a connection
+             * the next request may use. runExchange now closes both on every
+             * path, consumed or aborted, so what this block leaves in the
+             * pool is a connection that is actually reusable rather than one
+             * held open by a stream nobody ever finished with. There is
+             * still nothing to do HERE: the closing belongs where the streams
+             * are opened, inside try-with-resources, not in a finally that
+             * would have to re-derive which of them exist. */
         }
     }
 
     /* Ask for a sync. Coalesced: a second request while one is running is
      * dropped rather than queued, because a sync always sends whatever is
-     * current -- running it twice back to back would achieve nothing. */
-    static void syncSoon() {
+     * current -- running it twice back to back would achieve nothing.
+     *
+     * RETURNS WHETHER THE WORKER TOOK IT, and false for that coalesced drop.
+     * The native scheduler advances its "we have synced up to here" stamp
+     * when it asks, so a dropped ask that reported success left it believing
+     * the newest data was on its way when nothing had been queued -- and with
+     * nothing new arriving afterwards, the next attempt waited out the
+     * six-hour safety interval. A drop is not a failure of the sync, but it
+     * IS a failure of the request, and only the caller can tell the
+     * difference. */
+    static boolean syncSoon() {
         if (sSyncBusy)
-            return;
+            return false;
         sSyncBusy = true;
         pushExec.execute(new Runnable() {
             public void run() {
@@ -394,6 +713,7 @@ public final class Ble {
                 finally { sSyncBusy = false; }
             }
         });
+        return true;
     }
 
     /* A restore is user-initiated from the REMOTE screen and reports the same
@@ -435,8 +755,39 @@ public final class Ble {
      * BOND_BONDED 12 (the framework's own constants, passed through). */
     static native void onBondState(String mac, int state);
 
+    /* Java -> C: the scan of generation `gen` never actually started.
+     *
+     * Separate from every callback above because it is not an event about a
+     * sensor: it is this process learning that its own request was refused. */
+    static native void onScanFailed(int gen, int err);
+
     private static BluetoothLeScanner scanner;
     private static ScanCallback scanCb;
+    /* THE GENERATION OF THE CALLBACK IN scanCb; 0 when none is installed.
+     *
+     * Allocated by native (start_scan) and passed into scan(), so the side that
+     * latches "a scan is running" is the side that names it. Read and written
+     * under scanLock because the failure callback arrives on a Bluetooth binder
+     * thread while the main thread starts and stops scans. */
+    private static int scanGen;
+
+    /* GUARDS scanner, scanCb AND scanGen AS ONE, and nothing else.
+     *
+     * They were main-thread-only fields, which they no longer are: onScanFailed
+     * is delivered on a binder thread and has to decide whether the callback it
+     * is complaining about is still the installed one -- a decision over two
+     * fields at once, so reading them unsynchronised could release a
+     * REPLACEMENT scan's callback while keeping the dead one's generation.
+     *
+     * Its own lock rather than the Ble class monitor: link() is `static
+     * synchronized`, so the class monitor is held on binder threads for every
+     * GATT operation, and a scan failure has no business waiting behind one.
+     *
+     * NEVER HELD ACROSS A CALL INTO NATIVE, for the reason spelt out in
+     * Link.pump: native callbacks take the C driver_lock, which is a spin lock
+     * the main thread also takes, and a lock cycle through JNI burns a core
+     * rather than merely blocking. */
+    private static final Object scanLock = new Object();
 
     /* One independent link per sensor.
      *
@@ -447,6 +798,15 @@ public final class Ble {
      * therefore owns its own gatt, queue and busy flag, and its own callback
      * instance so every event already knows which link it belongs to. */
     static final int MAX_LINKS = 8; /* == LINK_MAX (dexdriver.h); crosschecked */
+
+    /* ONE QUEUED GATT OPERATION, BOUND TO THE CLIENT IT WAS DEQUEUED FOR.
+     *
+     * A Runnable could only close over the Link and re-read L.gatt when it
+     * ran, which is exactly the hazard: between enqueue and run, and between
+     * one statement of the body and the next, a disconnect can clear that
+     * field and a reconnect can replace it. The client and its generation are
+     * arguments now, so an op body has nothing else to reach for. */
+    interface Act { void run(BluetoothGatt g, int gen); }
 
     private static final class Link {
         final int id;
@@ -464,13 +824,19 @@ public final class Ble {
         /* True between connect()'s clear and its publish, so disconnect() can
          * tell "an attempt is in flight" from "nothing to tear down". */
         boolean connecting;
-        final ArrayDeque<Runnable> ops = new ArrayDeque<>();
+        final ArrayDeque<Act> ops = new ArrayDeque<>();
         boolean busy;
         Link(int id) { this.id = id; }
 
-        void enqueue(Runnable r) {
-            synchronized (this) { ops.add(r); }
+        void enqueue(Act a) {
+            synchronized (this) { ops.add(a); }
             pump();
+        }
+        /* Is this still the client the op was handed? Callers use it before
+         * reporting a result, so a failure raised against a replaced client is
+         * never mistaken for a failure of the live one. */
+        synchronized boolean current(int myGen) {
+            return gen == myGen && gatt != null;
         }
         /* Dequeue under the monitor, then run the op OUTSIDE it.
          *
@@ -482,16 +848,50 @@ public final class Ble {
          * burn a core forever rather than merely block. Never hold this monitor
          * across a call into native. */
         void pump() {
-            Runnable r;
+            Act a;
+            BluetoothGatt g;
+            int myGen;
             synchronized (this) {
                 if (busy || ops.isEmpty() || gatt == null) return;
                 busy = true;
-                r = ops.poll();
+                a = ops.poll();
+                /* THE CLIENT AND ITS GENERATION, CAPTURED TOGETHER, HERE.
+                 *
+                 * Every op body used to read L.gatt to find its characteristic
+                 * and then read L.gatt AGAIN to act on it, holding no lock
+                 * across the two. disconnect() and the DISCONNECTED callback
+                 * both run in that window and both null it -- so the second
+                 * read was a NullPointerException on a link that was merely
+                 * disconnecting normally. Worse when a reconnect had already
+                 * published a REPLACEMENT: the two reads then returned
+                 * different clients, and the op read a characteristic off one
+                 * connection and wrote it to another.
+                 *
+                 * Captured under the monitor, both are one decision: the op
+                 * runs against the client it was dequeued for, or against
+                 * nothing. */
+                g = gatt;
+                myGen = gen;
             }
-            try { r.run(); } catch (Throwable t) { Log.i(TAG, "op: " + t); done(); }
+            try {
+                a.run(g, myGen);
+            } catch (Throwable t) {
+                Log.i(TAG, "op: " + t);
+                done(myGen);
+            }
         }
-        void done() {
-            synchronized (this) { busy = false; }
+        /* $myGen is the generation the completing op was dequeued for.
+         *
+         * A completion from a REPLACED client must not advance the current
+         * one. Android allows one operation in flight per client, so clearing
+         * `busy` on behalf of a stale op pumps a queue that already has one
+         * running, and the op it starts is silently dropped -- the link then
+         * stalls, and during first-time pairing nothing recovers it. */
+        void done(int myGen) {
+            synchronized (this) {
+                if (gen != myGen) return;
+                busy = false;
+            }
             pump();
         }
         synchronized void reset() { ops.clear(); busy = false; }
@@ -531,17 +931,22 @@ public final class Ble {
         return "";
     }
 
-    /* ---- scanning (unchanged pipe) ---- */
-    public static String scan(Context ctx) {
+    /* ---- scanning ----
+     *
+     * `gen` identifies this scan for as long as it is the installed one. Native
+     * allocates it and latches its own "scanning" flag against it, so a refusal
+     * that arrives seconds later can be matched to the scan it belongs to
+     * instead of being applied to whichever scan is live by then. */
+    public static String scan(Context ctx, final int gen) {
         try {
             BluetoothManager bm =
                 (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
             BluetoothAdapter ad = (bm == null) ? null : bm.getAdapter();
             if (ad == null)      return "NO BLUETOOTH";
             if (!ad.isEnabled()) return "BLUETOOTH OFF";
-            scanner = ad.getBluetoothLeScanner();
-            if (scanner == null) return "NO LE SCANNER";
-            scanCb = new ScanCallback() {
+            BluetoothLeScanner sc = ad.getBluetoothLeScanner();
+            if (sc == null) return "NO LE SCANNER";
+            ScanCallback cb = new ScanCallback() {
                 @Override public void onScanResult(int type, ScanResult r) {
                     String name = (r.getScanRecord() == null)
                                 ? null : r.getScanRecord().getDeviceName();
@@ -556,13 +961,107 @@ public final class Ble {
                     onAdvert(name == null ? "" : name,
                              r.getDevice().getAddress(), r.getRssi());
                 }
-                @Override public void onScanFailed(int err) { Log.i(TAG, "scan failed: " + err); }
+                /* THIS USED TO BE THE WHOLE HANDLER: one log line.
+                 *
+                 * Native had already latched "a scan is running" -- and every
+                 * recovery path it has starts only when that flag is clear --
+                 * so a scan the platform refused here left the app never
+                 * scanning again for the life of the process, with nothing on
+                 * screen to say so. No sensor reconnect after a dropout, no
+                 * meter noticed when switched on, and a last reading that
+                 * simply stops ageing forward.
+                 *
+                 * `gen`, not "the current scan": by the time this arrives the
+                 * scan may have been replaced, and cancelling a live
+                 * replacement would be the same outage with a different
+                 * cause. */
+                @Override public void onScanFailed(int err) {
+                    scanFailed(gen, err);
+                }
             };
-            scanner.startScan(null,
+            /* PUBLISHED BEFORE THE REQUEST GOES OUT. onScanFailed can be
+             * delivered on a binder thread before startScan() has returned
+             * here, and a failure that found scanCb still unset would be
+             * discarded as "nothing installed" -- leaving native latched on a
+             * scan that had already died. */
+            synchronized (scanLock) { scanner = sc; scanCb = cb; scanGen = gen; }
+            sc.startScan(null,
                 new ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCb);
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), cb);
             return null;
-        } catch (Throwable t) { return t.getClass().getSimpleName(); }
+        } catch (Throwable t) {
+            /* A throw from startScan (SecurityException once BLUETOOTH_SCAN is
+             * revoked) means no registration was ever made, so the callback
+             * published above is not one: drop it, or the next stop() would
+             * report success for a scan that never existed and a later failure
+             * for this generation would be believed. Only if it is still ours
+             * -- nothing else starts a scan while native holds the main
+             * thread here, but the rule is the same rule as everywhere else. */
+            synchronized (scanLock) {
+                if (scanGen == gen) { scanCb = null; scanGen = 0; }
+            }
+            return t.getClass().getSimpleName();
+        }
+    }
+
+    /* THE SCAN THIS PROCESS ASKED FOR NEVER STARTED. Binder thread.
+     *
+     * Called from the installed ScanCallback (and only from there). Clears the
+     * matching registration and hands the failure to native, which resets its
+     * scan state and enters the throttled retry that already exists for a scan
+     * that is down. A failure naming a superseded generation is dropped whole:
+     * it must not clear a replacement's callback, and it must not tell native
+     * that the scan it currently believes in has died.
+     *
+     * Note the qualified `Ble.onScanFailed` below: this class has an anonymous
+     * ScanCallback with its own one-argument onScanFailed, and inside such a
+     * class the outer static of the same NAME is shadowed regardless of
+     * signature -- so routing through this method (rather than calling native
+     * from the override) is what keeps the two apart. */
+    static void scanFailed(int gen, int err) {
+        boolean mine;
+        BluetoothLeScanner s;
+        ScanCallback cb;
+        int installed;
+        synchronized (scanLock) {
+            s = scanner;
+            cb = scanCb;
+            installed = scanGen;
+            mine = BoundaryLogic.scanFailureIsCurrent(gen, installed, cb != null);
+            /* Cleared here, under the lock, so a second failure for the same
+             * generation -- the stack delivers duplicates -- finds nothing
+             * installed and stops. */
+            if (mine) { scanCb = null; scanGen = 0; }
+        }
+        if (!mine) {
+            /* `installed` is the value the decision was made on, not a re-read:
+             * a log line that contradicts the decision it explains is worse
+             * than no log line. */
+            Log.i(TAG, "scan failed " + err + " for gen " + gen
+                       + " (installed " + installed + "); ignored");
+            return;
+        }
+        Log.i(TAG, "scan failed " + err + " for gen " + gen
+                   + "; releasing it and telling native");
+        /* BEST EFFORT, AND THE FAILURE IS NOT FATAL. The registration did not
+         * start scanning, so there is nothing to keep; a platform that also
+         * refuses the cancel (SecurityException after the permission is
+         * revoked) is not holding a registration we could rescue by keeping the
+         * handle, and keeping it would only stop the retry that can recover.
+         * That is the opposite trade-off from stop() -- there the scan is
+         * believed to be LIVE, so a refused cancel must not be treated as a
+         * stopped scan. */
+        if (s != null && cb != null) {
+            final BluetoothLeScanner fs = s;
+            final ScanCallback fcb = cb;
+            if (!BoundaryLogic.stopScan(true, new BoundaryLogic.Attempt() {
+                    @Override public void run() { fs.stopScan(fcb); }
+                }))
+                Log.i(TAG, "scanFailed: the platform refused the cancel too");
+        }
+        /* OUTSIDE scanLock: this takes locks in C (see the scanLock comment). */
+        try { Ble.onScanFailed(gen, err); }
+        catch (Throwable t) { Log.i(TAG, "scanFailed -> native: " + t); }
     }
 
     /* Returns false if the scan could NOT be confirmed stopped.
@@ -578,14 +1077,30 @@ public final class Ble {
      * frequently" block -- the exact sticky failure that self-heal is throttled
      * to avoid. Keep the handle on failure so the next stop can retry it. */
     public static boolean stop() {
-        if (scanner == null || scanCb == null) { scanCb = null; return true; }
-        try {
-            scanner.stopScan(scanCb);
-        } catch (Throwable t) {
-            Log.i(TAG, "stop: " + t);
-            return false;   /* scanCb deliberately retained */
+        final BluetoothLeScanner s;
+        final ScanCallback cb;
+        /* SNAPSHOT UNDER THE LOCK. The failure callback clears these from a
+         * binder thread, so reading scanner and scanCb separately could pair a
+         * live scanner with a callback that has just been released. */
+        synchronized (scanLock) {
+            s = scanner;
+            cb = scanCb;
+            if (s == null || cb == null) { scanCb = null; scanGen = 0; return true; }
         }
-        scanCb = null;
+        boolean stopped = BoundaryLogic.stopScan(true, new BoundaryLogic.Attempt() {
+            @Override public void run() { s.stopScan(cb); }
+        });
+        if (!stopped) {
+            Log.i(TAG, "stop: platform rejected stopScan; retaining callback");
+            return false; /* scanCb and its generation deliberately retained */
+        }
+        /* CLEARED TOGETHER. The generation must go with the callback: a
+         * registration that is gone must not still be nameable, or a failure
+         * the stack delivers for the scan just stopped would be accepted as
+         * current and reset a scan that has since been started again. */
+        synchronized (scanLock) {
+            if (scanCb == cb) { scanCb = null; scanGen = 0; }
+        }
         return true;
     }
 
@@ -843,10 +1358,13 @@ public final class Ble {
         if (had) onDisconnected(id, 0);
     }
 
-    private static BluetoothGattCharacteristic find(Link L, String uuid) {
-        if (L.gatt == null) return null;
+    /* THE CAPTURED CLIENT, not L.gatt. Looking the characteristic up on one
+     * client and acting on whatever L.gatt holds a moment later is the split
+     * this whole change closes. */
+    private static BluetoothGattCharacteristic find(BluetoothGatt g, String uuid) {
+        if (g == null) return null;
         UUID u = UUID.fromString(uuid);
-        for (BluetoothGattService s : L.gatt.getServices()) {
+        for (BluetoothGattService s : g.getServices()) {
             BluetoothGattCharacteristic c = s.getCharacteristic(u);
             if (c != null) return c;
         }
@@ -857,21 +1375,22 @@ public final class Ble {
     public static void subscribe(final int id, final String uuid, final boolean indicate) {
         final Link L = link(id);
         if (L == null) return;
-        L.enqueue(new Runnable() { public void run() {
+        L.enqueue(new Act() { public void run(BluetoothGatt g, int gen) {
             Log.i(TAG, "op subscribe [" + id + "] " + uuid + (indicate ? " IND" : " NOT"));
-            BluetoothGattCharacteristic c = find(L, uuid);
-            if (c == null) { Log.i(TAG, "  char not found"); onWritten(id, uuid, -1); L.done(); return; }
-            L.gatt.setCharacteristicNotification(c, true);
+            BluetoothGattCharacteristic c = find(g, uuid);
+            if (c == null) { Log.i(TAG, "  char not found"); onWritten(id, uuid, -1); L.done(gen); return; }
+            if (!L.current(gen)) { Log.i(TAG, "  client replaced"); onWritten(id, uuid, -1); L.done(gen); return; }
+            g.setCharacteristicNotification(c, true);
             BluetoothGattDescriptor d = c.getDescriptor(CCCD);
-            if (d == null) { Log.i(TAG, "  no CCCD"); onWritten(id, uuid, -1); L.done(); return; }
+            if (d == null) { Log.i(TAG, "  no CCCD"); onWritten(id, uuid, -1); L.done(gen); return; }
             d.setValue(indicate ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                                 : BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
             /* If the stack rejects the write (returns false), onDescriptorWrite
              * never fires — so, like write(), advance the queue ourselves instead
              * of stalling forever (the CCCD is often already enabled on a bonded
              * reconnect, so notifications still flow). */
-            if (!L.gatt.writeDescriptor(d)) {
-                Log.i(TAG, "  writeDescriptor false"); onWritten(id, uuid, -1); L.done();
+            if (!g.writeDescriptor(d)) {
+                Log.i(TAG, "  writeDescriptor false"); onWritten(id, uuid, -1); L.done(gen);
             }
         }});
     }
@@ -882,8 +1401,8 @@ public final class Ble {
     public static void readRssi(final int id) {
         final Link L = link(id);
         if (L == null) return;
-        L.enqueue(new Runnable() { public void run() {
-            if (L.gatt == null || !L.gatt.readRemoteRssi()) L.done();
+        L.enqueue(new Act() { public void run(BluetoothGatt g, int gen) {
+            if (!L.current(gen) || !g.readRemoteRssi()) L.done(gen);
         }});
     }
 
@@ -892,11 +1411,12 @@ public final class Ble {
     public static void read(final int id, final String uuid) {
         final Link L = link(id);
         if (L == null) return;
-        L.enqueue(new Runnable() { public void run() {
-            BluetoothGattCharacteristic c = find(L, uuid);
-            if (c == null) { Log.i(TAG, "op read " + uuid + " -> char not found"); onRead(id, uuid, new byte[0]); L.done(); return; }
+        L.enqueue(new Act() { public void run(BluetoothGatt g, int gen) {
+            BluetoothGattCharacteristic c = find(g, uuid);
+            if (c == null) { Log.i(TAG, "op read " + uuid + " -> char not found"); onRead(id, uuid, new byte[0]); L.done(gen); return; }
             Log.i(TAG, "op read [" + id + "] " + uuid);
-            if (!L.gatt.readCharacteristic(c)) { Log.i(TAG, "  readCharacteristic false"); onRead(id, uuid, new byte[0]); L.done(); }
+            if (!L.current(gen)) { Log.i(TAG, "  client replaced"); onRead(id, uuid, new byte[0]); L.done(gen); return; }
+            if (!g.readCharacteristic(c)) { Log.i(TAG, "  readCharacteristic false"); onRead(id, uuid, new byte[0]); L.done(gen); }
         }});
     }
 
@@ -904,14 +1424,15 @@ public final class Ble {
     public static void write(final int id, final String uuid, final byte[] data, final boolean noResponse) {
         final Link L = link(id);
         if (L == null) return;
-        L.enqueue(new Runnable() { public void run() {
+        L.enqueue(new Act() { public void run(BluetoothGatt g, int gen) {
             Log.i(TAG, "op write [" + id + "] " + uuid + " len=" + data.length + (noResponse ? " NR" : " REQ"));
-            BluetoothGattCharacteristic c = find(L, uuid);
-            if (c == null) { Log.i(TAG, "  char not found"); onWritten(id, uuid, -1); L.done(); return; }
+            BluetoothGattCharacteristic c = find(g, uuid);
+            if (c == null) { Log.i(TAG, "  char not found"); onWritten(id, uuid, -1); L.done(gen); return; }
             c.setWriteType(noResponse ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                                       : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             c.setValue(data);
-            if (!L.gatt.writeCharacteristic(c)) { Log.i(TAG, "  writeCharacteristic false"); onWritten(id, uuid, -1); L.done(); }
+            if (!L.current(gen)) { Log.i(TAG, "  client replaced"); onWritten(id, uuid, -1); L.done(gen); return; }
+            if (!g.writeCharacteristic(c)) { Log.i(TAG, "  writeCharacteristic false"); onWritten(id, uuid, -1); L.done(gen); }
         }});
     }
 
@@ -930,12 +1451,108 @@ public final class Ble {
         synchronized (L) { return L.gen == gen; }
     }
 
+    /* The link's CURRENT generation, for the setup decisions in BoundaryLogic.
+     * isLive() answers the same question, but those decisions need the value
+     * itself: they distinguish IGNORE from FAIL, and a boolean cannot be
+     * logged as "the callback for attempt 4 arrived while 5 is live". */
+    private static int liveGen(Link L) {
+        synchronized (L) { return L.gen; }
+    }
+
+    /* THE SETUP DID NOT COMPLETE: end this attempt, once, under its own
+     * generation.
+     *
+     * This used not to exist, because no setup failure was noticed at all --
+     * see BoundaryLogic's gatt* comment for what the user saw. What it must do
+     * is exactly what the DISCONNECTED branch does, and for the same reasons:
+     *
+     *   - BUMP THE GENERATION FIRST, under the monitor. The g.disconnect()
+     *     below makes the stack deliver DISCONNECTED for this same callback;
+     *     with the generation already bumped, that branch sees a client that
+     *     is no longer the link's and stays silent, so native is told exactly
+     *     ONCE. Told twice, driver_on_disconnected double-counts ctx->fails
+     *     and ctx->authfails -- and authfails >= 3 calls drv_key_clear(),
+     *     which destroys a bond that for a worn sensor cannot be rebuilt;
+     *   - REPORT AS A DISCONNECT, because that is the driver's own recovery
+     *     entry point: it resets the phase, counts the failure and re-arms
+     *     drv_connect (autoConnect, so it waits for the sensor's next advert).
+     *     A setup that can never complete then reaches MAX_FAILS and says
+     *     CONNECTION ERROR on screen -- which is the point: the old behaviour
+     *     showed nothing at all, forever;
+     *   - CLOSE UNCONDITIONALLY, even when the attempt has been superseded.
+     *     The paths that supersede one (disconnect(), connect()'s cleanup of
+     *     `old`) do close it, so this is normally redundant, and a redundant
+     *     close is what the DISCONNECTED branch above already accepts: a
+     *     leaked GATT client interface strands the link for the life of the
+     *     process, while a second close is a logged no-op.
+     *
+     * `status` is passed to native as the framework status when there is one,
+     * and 0 when the failure is a refused request (there is no status for
+     * "the stack declined to issue it"). Native logs it and counts the
+     * failure; nothing branches on the value. */
+    private static void setupFailed(final Link L, final int gen,
+                                    BluetoothGatt g, String why, int status) {
+        final int id = L.id;
+        boolean mine;
+        synchronized (L) {
+            mine = (L.gen == gen);
+            if (mine) {
+                L.gatt = null; L.reset(); L.gen++; L.connecting = false;
+            }
+        }
+        try { if (g != null) { g.disconnect(); g.close(); } }
+        catch (Throwable t) { Log.i(TAG, "setupFailed close: " + t); }
+        if (!mine) {
+            Log.i(TAG, "setup [" + id + "] " + why + " for gen " + gen
+                       + " (live " + liveGen(L) + "); ignored");
+            return;
+        }
+        Log.i(TAG, "setup [" + id + "] FAILED: " + why + " (status " + status
+                   + "); closing and reporting");
+        onDisconnected(id, status);
+    }
+
+    /* Ask for the service table. The ONE path to native onConnected() runs
+     * through the discovery this starts, so a refusal here has to end the
+     * attempt: without a service table find() cannot resolve a single
+     * characteristic, and there is no way to obtain one except this call. */
+    private static void startDiscovery(final Link L, final int gen,
+                                       BluetoothGatt g, String why) {
+        Log.i(TAG, "setup [" + L.id + "] discovering services (" + why + ")");
+        if (BoundaryLogic.gattDiscoverRequested(g.discoverServices())
+                == BoundaryLogic.GATT_FAIL)
+            setupFailed(L, gen, g, "discoverServices refused", 0);
+    }
+
     private static BluetoothGattCallback callbackFor(final Link L, final int gen) {
         final int id = L.id;
         return new BluetoothGattCallback() {
             @Override public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    g.requestMtu(185);       /* enough for a 20-byte-chunked round, +headroom */
+                    /* THE STATUS AND THE GENERATION, BOTH, BEFORE ANYTHING
+                     * ELSE. This branch used to be one line -- requestMtu(185)
+                     * -- which asked the platform for something on behalf of
+                     * an attempt that may already have been replaced, ignored
+                     * a status saying the connection was not to be trusted,
+                     * and threw away the boolean that says whether the request
+                     * was issued at all. */
+                    int act = BoundaryLogic.gattConnected(gen, liveGen(L), status);
+                    if (act == BoundaryLogic.GATT_IGNORE) return;
+                    if (act == BoundaryLogic.GATT_FAIL) {
+                        setupFailed(L, gen, g, "CONNECTED with a bad status",
+                                    status);
+                        return;
+                    }
+                    /* 185: enough for a 20-byte-chunked round, +headroom. A
+                     * refusal is NOT fatal -- see gattMtuRequested: the app's
+                     * messages are chunked to fit the default 23-byte MTU
+                     * anyway, so the fallback is to carry on at that MTU. What
+                     * is fatal is doing nothing, because no onMtuChanged is
+                     * coming and the link would stop here. */
+                    if (BoundaryLogic.gattMtuRequested(g.requestMtu(185))
+                            == BoundaryLogic.GATT_DISCOVER)
+                        startDiscovery(L, gen, g, "requestMtu refused, "
+                                                  + "continuing at the default MTU");
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     try { g.close(); } catch (Throwable t) { /* ignore */ }
                     /* Deliver ONLY for the client this link currently
@@ -978,11 +1595,49 @@ public final class Ble {
              * one op is silently dropped. Either way the link stalls, and
              * during first-time pairing there is no watchdog to recover it. */
             @Override public void onMtuChanged(BluetoothGatt g, int mtu, int status) {
-                if (!isLive(L, gen)) return;
-                g.discoverServices();
+                /* A FAILED NEGOTIATION IS NOT A FAILED LINK, and this is the
+                 * one transition where carrying on is right: the request was
+                 * issued and has completed, so the link is live and simply
+                 * stayed at the default MTU -- which every message this app
+                 * sends already fits, because it is chunked to 20 bytes. What
+                 * this must not do is what it used to do with the RESULT of
+                 * discoverServices(): ignore it. */
+                if (BoundaryLogic.gattMtuChanged(gen, liveGen(L), status)
+                        == BoundaryLogic.GATT_IGNORE)
+                    return;
+                startDiscovery(L, gen, g,
+                    status == BluetoothGatt.GATT_SUCCESS
+                        ? "mtu " + mtu
+                        : "mtu negotiation failed (status " + status
+                          + "), default MTU");
             }
             @Override public void onServicesDiscovered(BluetoothGatt g, int status) {
-                if (!isLive(L, gen)) return;
+                /* THE ONLY DOOR TO NATIVE onConnected(), and it used to be
+                 * open regardless of what discovery reported. A link handed
+                 * over with no service table answers "char not found" to every
+                 * subscribe and read the driver then issues, which it reads as
+                 * a failing sensor: the screen blames hardware that is fine,
+                 * and the state machine advances on a connection that was
+                 * never set up.
+                 *
+                 * The service COUNT is part of the decision, not decoration: a
+                 * success that discovered nothing is a link on which find()
+                 * -- which iterates getServices() -- can never resolve
+                 * anything. getServices() is read defensively because this
+                 * runs on a client that may be closing under us. */
+                int n = 0;
+                try {
+                    java.util.List<BluetoothGattService> svc = g.getServices();
+                    n = (svc == null) ? 0 : svc.size();
+                } catch (Throwable t) { n = 0; }
+                int act = BoundaryLogic.gattDiscovered(gen, liveGen(L), status, n);
+                if (act == BoundaryLogic.GATT_IGNORE) return;
+                if (act == BoundaryLogic.GATT_FAIL) {
+                    setupFailed(L, gen, g, "service discovery failed ("
+                                           + n + " services)", status);
+                    return;
+                }
+                Log.i(TAG, "setup [" + id + "] ready: " + n + " services");
                 onConnected(id);
             }
             @Override public void onCharacteristicChanged(BluetoothGatt g,
@@ -997,18 +1652,18 @@ public final class Ble {
                     BluetoothGattCharacteristic c, int status) {
                 if (!isLive(L, gen)) return;
                 onWritten(id, c.getUuid().toString(), status);
-                L.done();
+                L.done(gen);
             }
             @Override public void onDescriptorWrite(BluetoothGatt g,
                     BluetoothGattDescriptor d, int status) {
                 if (!isLive(L, gen)) return;
                 onWritten(id, d.getCharacteristic().getUuid().toString(), status);
-                L.done();
+                L.done(gen);
             }
             @Override public void onReadRemoteRssi(BluetoothGatt g, int rssi, int status) {
                 if (!isLive(L, gen)) return;
                 if (status == BluetoothGatt.GATT_SUCCESS) onRssi(id, rssi);
-                L.done();
+                L.done(gen);
             }
             @Override public void onCharacteristicRead(BluetoothGatt g,
                     BluetoothGattCharacteristic c, int status) {
@@ -1016,7 +1671,7 @@ public final class Ble {
                 byte[] v = (status == BluetoothGatt.GATT_SUCCESS) ? c.getValue() : null;
                 Log.i(TAG, "onRead [" + id + "] " + c.getUuid() + " status=" + status + " len=" + (v == null ? -1 : v.length));
                 onRead(id, c.getUuid().toString(), v == null ? new byte[0] : v);
-                L.done();
+                L.done(gen);
             }
         };
     }

@@ -2,11 +2,13 @@
 *.pdf
 *.o
 *.d
+
+.cache
 .claude
-data
+__pycache__
+
 build
+data
+tmp
 tools
 lib/sqlite*
-
-# clangd index: generated, and not ours to carry
-.cache/

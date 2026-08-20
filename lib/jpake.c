@@ -23,9 +23,15 @@
  *   cc -DJPAKE_TEST jpake.c p256.c sha256.c rand.c -o t && ./t
  */
 
+/* No "rand.h" here any more, deliberately. Entropy reaches this file only
+ * through p256_sc_rand, which is the one thing that knows what a valid scalar
+ * is; a J-PAKE implementation with a raw byte source in scope is one edit away
+ * from drawing 32 bytes and reducing them again. lib/rand.c is still on the
+ * link line above, because lib/p256.c needs it. */
 #include "jpake.h"
+
+#include "ct.h" /* ct_wipe: a clear the compiler may not delete */
 #include "p256.h"
-#include "rand.h"
 #include "sha256.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -49,17 +55,31 @@ int jpake_init(void)
  * treat that as fatal.
  *
  * Every scalar produced here is a secret whose predictability is total
- * compromise, so there is no safe way to proceed on failure:
- *   - the ECDSA nonce k in app/dexcom.c's key challenge: a k that repeats or is
- *     guessable recovers devkey_priv from the signature outright.
- *   - xA/xB and the ZKP nonces vA/vB/v3 in jpake_new, which are the J-PAKE
- *     secrets the shared key is derived from.
- * Silently signing with stack garbage is strictly worse than refusing to
- * connect: the connection retries, a leaked private key does not un-leak. */
+ * compromise, so there is no safe way to proceed on failure: xA/xB and the ZKP
+ * nonces vA/vB/v3 in jpake_new are the J-PAKE secrets the shared key is derived
+ * from. Silently continuing with stack garbage is strictly worse than refusing
+ * to connect: the connection retries, a leaked private key does not un-leak.
+ *
+ * THE RANGE IS NOT THIS FILE'S BUSINESS ANY MORE. This used to be
+ * `rand_bytes(b, 32)` and then p256_sc_from_be, which is the biased reduction
+ * item 65 is about, and which accepted ZERO. A zero vA/vB/v3 is the sharp case
+ * and it is specific to Schnorr: the proof getproof() emits is
+ * `ran - H*priv`, so with ran == 0 the published proof scalar is exactly
+ * -H*priv, and H is a hash the verifier recomputes itself -- one packet and
+ * anybody watching has the private scalar the proof existed to hide. A zero
+ * xA/xB is milder but still fatal to the exchange.
+ *
+ * Neither has ever been reachable from here, because a zero scalar makes the
+ * emitted point infinite and cert_byteify refuses to encode that (see its
+ * comment), so the round is never transmitted. That is a check in a different
+ * function, added for a different reason, and reading it as this file's defence
+ * against a zero nonce was never justified. p256_sc_rand draws from [1, n-1]
+ * and the reduction below is now the identity on its output -- it stays only
+ * because these scalars are used as limbs. */
 static int rand_scalar(struct u256 *r)
 {
    uint8_t b[32];
-   if (!rand_bytes(b, 32))
+   if (!p256_sc_rand(b))
       return 0;
    p256_sc_from_be(r, b);
    return 1;
@@ -241,25 +261,205 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
    return 1;
 }
 
-/* ---- first-pairing driver: byte-oriented J-PAKE, opaque state ---- */
+/* ---- first-pairing driver: byte-oriented J-PAKE, opaque state ----
+ *
+ * ---- WHY A PEER ROUND IS DECODED INTO A TEMPORARY, WHY A CRYPTOGRAPHIC
+ * ---- FAILURE ENDS THE EXCHANGE FOR GOOD, AND WHY THE TRANSCRIPT HAS A PHASE
+ *
+ * `phase` is this object's answer to "which peer rounds are DONE and
+ * trustworthy" -- jpake_round3 and jpake_shared_key act on it, and it is the
+ * only record that the peer's Schnorr proof was ever checked. So it must mean
+ * "verified", and nothing weaker.
+ *
+ * IT USED TO BE THREE FLAGS, AND THEY USED TO MEAN "ARRIVED".
+ * jpake_peer_round1 decoded the 160 wire bytes straight into p->r1, raised
+ * its flag, and only THEN returned validate_zkp(). Rounds 2 and 3 were
+ * written the same way, so all three had it. After a rejected packet the
+ * object therefore looked, to any later call, exactly like one holding an
+ * accepted round -- except the two ephemeral public keys and the proof scalar
+ * in it were whatever the peer sent, chosen freely, having passed nothing.
+ * WHAT AN ATTACKER GOT FOR IT: peer round 1's pubkey1 is a base point of
+ * round 3 (make_round3 adds it in) and peer round 2's pubkey1 and peer round
+ * 3's pubkey1 are the two inputs shared_key combines, so an accepted-looking
+ * unverified round is a peer-chosen term in the key both sides are supposed
+ * to have proven knowledge of. The proofs are the entire defence against a
+ * man in the middle; a flag that says they passed when they did not is that
+ * defence turned off.
+ *
+ * It was never a return-code bug. The return code was right every time. That
+ * is the whole shape of it: whether the wrong state could be USED depended
+ * only on whether some caller went on touching the object after a failure --
+ * a property of every present and future caller, checked nowhere, rather than
+ * a property of this file. Today no caller does (see the survey below), so
+ * this was latent; the point of fixing it here is that it stops being any
+ * caller's problem to get right.
+ *
+ * THREE MECHANISMS, DELIBERATELY, because they fail independently:
+ *
+ *   1. PUBLISH ONLY ON SUCCESS. Each jpake_peer_round* decodes into a stack
+ *      PCert, verifies THAT, and copies it into p->r* and advances the phase
+ *      only once the proof holds. Persistent state is never written from
+ *      unverified bytes at all, so there is no window in which it is wrong --
+ *      not even one a signal handler or another thread could observe. This is
+ *      the primary fix and it is why the happy path is byte-for-byte the same
+ *      protocol as before: the vectors in cryptotest and in JPAKE_TEST below
+ *      are the evidence for that.
+ *
+ *   2. A CRYPTOGRAPHIC FAILURE IS TERMINAL. A packet that was parsed and
+ *      found wrong -- an off-curve point, a proof that does not hold, an
+ *      infinite combined point -- sets `poisoned`, resets the phase to the
+ *      empty transcript and zeroes r1/r2/r3, and every entry point refuses up
+ *      front while it is set. The object is not merely "flagged" -- it can no
+ *      longer emit a round, accept a round, or hand back a key, so a caller
+ *      that ignores return codes entirely still gets nothing out of it. A
+ *      flag only this file's own guards depend on is the opposite of the flag
+ *      that caused the defect, which was one that callers were implicitly
+ *      trusted to interpret.
+ *
+ *   3. THE TRANSCRIPT HAS A PHASE, and it covers the case the other two do
+ *      not. This paragraph used to read "NOT CHANGED, and flagged here on
+ *      purpose: a SECOND valid round-N packet still replaces the first", on
+ *      the grounds that no caller could send one and that refusing it would
+ *      refuse a sensor's retransmit. Both halves were wrong to rest on. THE
+ *      PEER IS NOT THE CALLER: a second round-1 packet arrives over the air,
+ *      from whoever is transmitting, and mechanisms (1) and (2) do not touch
+ *      it -- a DIFFERENT round-1 packet carrying a VALID proof (anyone can
+ *      compute one; it proves knowledge of a scalar the sender chose, not of
+ *      the password) published its pubkey1 straight over the accepted one.
+ *      That value is a base point of make_round3 and a term in shared_key, so
+ *      a peer could replace a proven term of the derived key at any moment
+ *      before derivation. And "a genuine retransmit" is precisely what must be
+ *      refused rather than re-published: the first copy was already accepted,
+ *      so the second has nothing left to change.
+ *
+ *      `phase` (see jpake.h) is the whole of it: a counter of ACCEPTED peer
+ *      rounds that only counts up, one at a time. Each jpake_peer_round*
+ *      names the one phase it belongs to and refuses anything else BEFORE
+ *      cert_from_bytes -- so a duplicate and an out-of-order packet are the
+ *      same refusal, and neither is parsed, let alone published. It is also
+ *      what makes "exactly one accepted packet of every required round" a
+ *      thing jpake_shared_key can ask for in one comparison.
+ *
+ *      OUT OF PHASE DOES NOT POISON, which is the one place this file departs
+ *      from (2), and deliberately. Nothing was believed, so there is nothing
+ *      to clear; the exchange still holds the round it accepted and can still
+ *      finish. Poisoning would make a repeated packet a denial of service on
+ *      a healthy pairing, and it would erase the very state a test has to
+ *      read to show that the duplicate did NOT overwrite anything.
+ *
+ * The clearing in (2) is what the "explicitly clear the poisoned exchange"
+ * half of that fix asks for, and it is the backstop for (1): if a future entry
+ * point is added and forgets the `poisoned` guard, it still finds the empty
+ * transcript rather than a stale accepted round.
+ *
+ * WHAT (2) COSTS, stated rather than discovered later. An exchange cannot be
+ * retried in place. A caller that wanted "the packet was garbled, ask the
+ * peer to resend the same round" must now allocate a fresh struct jpake and
+ * restart from round 1 -- and in EC-J-PAKE that is not a cheap retry, it is a
+ * new set of ephemerals and a new set of round packets. No caller wants that
+ * today: srv/pair.c calls pair_reset(), app/sync.c breaks out to
+ * jpake_free(), srv/synccli.c exits, and app/dexdriver.c goes to P_FAIL. The
+ * cost is paid entirely by a hypothetical future caller, and it buys the
+ * guarantee that such a caller cannot reintroduce this bug by accident. */
 struct jpake {
    struct u256 xA, xB, vA, vB, v3, pass;
    struct jpoint pA, pB;
    const uint8_t *me, *peer;
    struct PCert r1, r2, r3;
-   int have_r1, have_r2, have_r3;
+   enum jpake_phase phase;
+   int poisoned;
 };
 
+/* THE ONE WAY OUT OF A FAILURE. Every entry point returns through this, so
+ * "an exchange that failed is over" is one line rather than a rule each
+ * function has to remember.
+ *
+ * It returns 0 so the callers read `return jpake_fail(p);` -- the value is
+ * the failure return of every function in this API except the emitters, which
+ * report 160 on success and 0 on failure, so 0 is wrong for none of them.
+ *
+ * It is NOT how an out-of-phase packet is refused. That one returns 0 without
+ * coming through here at all -- see mechanism (3) above.
+ *
+ * The clear is a plain memset, not a wipe primitive: r1/r2/r3 hold the PEER's
+ * public values, which went over the air in the clear and are secret from
+ * nobody. The secrets in this object -- pass, xA, xB, vA, vB, v3 -- are left
+ * alone here and wiped by jpake_free, which is where the non-elidable-wipe
+ * question belongs (TODO item 62) and not here. */
+static int jpake_fail(struct jpake *p)
+{
+   if (!p)
+      return 0;
+   p->poisoned = 1;
+   p->phase    = JPAKE_PHASE_R1; /* back to the empty transcript */
+   memset(&p->r1, 0, sizeof p->r1);
+   memset(&p->r2, 0, sizeof p->r2);
+   memset(&p->r3, 0, sizeof p->r3);
+   return 0;
+}
+
+int jpake_poisoned(const struct jpake *p)
+{
+   return !p || p->poisoned;
+}
+
+enum jpake_phase jpake_phase(const struct jpake *p)
+{
+   /* A poisoned exchange holds nothing, and answering with the phase it had
+    * reached would say otherwise. Same rule as jpake_accepted below, in one
+    * place, so the two can never disagree. */
+   if (jpake_poisoned(p))
+      return JPAKE_PHASE_R1;
+   return p->phase;
+}
+
+/* `phase` counts accepted peer rounds, so "round N is accepted" is exactly
+ * "the count reached N" -- JPAKE_PHASE_R2 is 1, JPAKE_PHASE_R3 is 2,
+ * JPAKE_PHASE_DONE is 3. That identity is why the three flags could go: with
+ * a counter there is no representable state in which round 3 is accepted and
+ * round 1 is not. */
+int jpake_accepted(const struct jpake *p, int round)
+{
+   if (round < 1 || round > 3)
+      return 0;
+   return (int)jpake_phase(p) >= round;
+}
+
+/* The password is validated and converted BEFORE the allocation, so a refused
+ * password costs nothing and there is no half-built object to release. See
+ * jpake.h for the encoding and the exact domain; what belongs here is why each
+ * refusal is a refusal and not a repair.
+ *
+ * `if (passlen > 32) passlen = 32;` is what stood here. It silently kept the
+ * FIRST 32 bytes, so every password sharing its first 32 bytes was one
+ * password -- and the two sides never compare passwords, they compare a
+ * derived key, so the only symptom of two users pairing on a truncated secret
+ * is that it WORKS. There is no length this could be rounded to that a caller
+ * would want; a passphrase this construction cannot hold has to come back as
+ * a failure the caller can act on.
+ *
+ * The zero test is on the SCALAR, after reduction, not on the bytes: the
+ * all-zero password and the 32 bytes of n are different inputs that reduce to
+ * the same invalid secret, and only one test catches both. */
 struct jpake *jpake_new(const uint8_t *pass, size_t passlen, int is_client)
 {
+   if (!pass || passlen == 0 || passlen > JPAKE_PASS_MAX)
+      return NULL;
+   uint8_t pb[32] = {0};
+   memcpy(pb + (32 - passlen), pass, passlen); /* right-justified big-endian */
+   struct u256 pw;
+   p256_sc_from_be(&pw, pb);
+   /* THE PASSPHRASE, OFF THE STACK -- with the wipe primitive, because pb is
+    * a local that is never read again and the function returns just below.
+    * That is the textbook shape for the store being removed. */
+   ct_wipe(pb, sizeof pb);
+   if (p256_sc_is_zero(&pw))
+      return NULL;
+
    struct jpake *p = calloc(1, sizeof(*p));
    if (!p)
       return NULL;
-   uint8_t pb[32] = {0};
-   if (passlen > 32)
-      passlen = 32;
-   memcpy(pb + (32 - passlen), pass, passlen); /* right-justified big-endian */
-   p256_sc_from_be(&p->pass, pb);
+   p->pass = pw;
    p->me   = is_client ? a_bytes : b_bytes;
    p->peer = is_client ? b_bytes : a_bytes;
    /* All five or none. These are the J-PAKE secrets; proceeding with any of
@@ -291,17 +491,35 @@ static int emit_round(const struct jpoint *pub, const struct u256 *priv,
 
 int jpake_round1(struct jpake *p, uint8_t out[160])
 {
-   return emit_round(&p->pA, &p->xA, &p->vA, p->me, out);
+   if (jpake_poisoned(p))
+      return 0;
+   if (!emit_round(&p->pA, &p->xA, &p->vA, p->me, out))
+      return jpake_fail(p);
+   return 160;
 }
 
 int jpake_round2(struct jpake *p, uint8_t out[160])
 {
-   return emit_round(&p->pB, &p->xB, &p->vB, p->me, out);
+   if (jpake_poisoned(p))
+      return 0;
+   if (!emit_round(&p->pB, &p->xB, &p->vB, p->me, out))
+      return jpake_fail(p);
+   return 160;
 }
 
 int jpake_round3(struct jpake *p, uint8_t out[160])
 {
-   if (!p->have_r1 || !p->have_r2)
+   if (jpake_poisoned(p))
+      return 0;
+   /* The two rounds make_round3 builds its base from are PEER rounds, so this
+    * is not a caller-sequencing nicety: it is the check that our round 3 is
+    * built on two proofs that passed. Reaching JPAKE_PHASE_R3 is exactly
+    * "peer rounds 1 and 2 were both accepted, once each".
+    *
+    * A REFUSAL, NOT A POISONING, since this item: asking too early is a
+    * sequencing mistake by our own caller, nothing peer-chosen has been
+    * touched, and there is no state to clear. */
+   if (p->phase < JPAKE_PHASE_R3)
       return 0;
    struct PCert c;
    make_round3(&c, &p->r1.pubkey1, &p->r2.pubkey1, &p->pA, &p->xB, &p->pass,
@@ -309,45 +527,102 @@ int jpake_round3(struct jpake *p, uint8_t out[160])
    /* THE peer-reachable case: make_round3's base is pubA + r1.pubkey1 +
     * r2.pubkey1, and the last two came off the wire. */
    if (!cert_byteify(&c, out))
-      return 0;
+      return jpake_fail(p);
    return 160;
 }
 
+/* The three peer rounds share one shape, and it is the fix: the PHASE TEST
+ * COMES FIRST and refuses without reading the bytes, then `t` on the stack
+ * absorbs the attacker-controlled bytes, verification runs against `t`, and
+ * p->r* and the phase are touched only after the proof holds. Note also that
+ * cert_from_bytes writes pubkey1 before it can discover pubkey2 is not on the
+ * curve -- so even a packet rejected at DECODE used to leave half of an
+ * already-accepted round replaced by peer bytes and its flag still raised.
+ * `t` fixes that case too, and it is the reason the temporary is a whole
+ * PCert rather than a flag reordering. */
 int jpake_peer_round1(struct jpake *p, const uint8_t in[160])
 {
-   if (!cert_from_bytes(&p->r1, in))
+   if (jpake_poisoned(p))
       return 0;
-   p->have_r1 = 1;
-   return validate_zkp(&p256_g, &p->r1, p->peer);
+   /* BEFORE cert_from_bytes, which is the point: a second round-1 packet is
+    * not decoded, not verified and not published, so the accepted round it
+    * would have replaced is still exactly where it was. */
+   if (p->phase != JPAKE_PHASE_R1)
+      return 0;
+   struct PCert t;
+   if (!cert_from_bytes(&t, in) || !validate_zkp(&p256_g, &t, p->peer))
+      return jpake_fail(p);
+   p->r1    = t;
+   p->phase = JPAKE_PHASE_R2;
+   return 1;
 }
 
 int jpake_peer_round2(struct jpake *p, const uint8_t in[160])
 {
-   if (!cert_from_bytes(&p->r2, in))
+   if (jpake_poisoned(p))
       return 0;
-   p->have_r2 = 1;
-   return validate_zkp(&p256_g, &p->r2, p->peer);
+   /* One phase, so this is both "round 1 first" and "round 2 only once". */
+   if (p->phase != JPAKE_PHASE_R2)
+      return 0;
+   struct PCert t;
+   if (!cert_from_bytes(&t, in) || !validate_zkp(&p256_g, &t, p->peer))
+      return jpake_fail(p);
+   p->r2    = t;
+   p->phase = JPAKE_PHASE_R3;
+   return 1;
 }
 
 int jpake_peer_round3(struct jpake *p, const uint8_t in[160])
 {
-   if (!cert_from_bytes(&p->r3, in))
+   if (jpake_poisoned(p))
       return 0;
-   p->have_r3 = 1;
-   return validate_round3(&p->pA, &p->pB, &p->r1, &p->r3, p->peer);
+   /* r1.pubkey1 is an INPUT to round 3's verification -- validate_round3 adds
+    * it into the base the proof is checked against. At any earlier phase that
+    * base would be built from the zero point calloc left behind, i.e. this
+    * would be "verifying" against state no peer ever proved. Every caller does
+    * feed rounds 1 and 2 first; this is what makes that ordering a rule of the
+    * object instead of a convention of four call sites -- and it now also
+    * refuses the SECOND round 3, which used to overwrite the first. */
+   if (p->phase != JPAKE_PHASE_R3)
+      return 0;
+   struct PCert t;
+   if (!cert_from_bytes(&t, in) ||
+       !validate_round3(&p->pA, &p->pB, &p->r1, &t, p->peer))
+      return jpake_fail(p);
+   p->r3    = t;
+   p->phase = JPAKE_PHASE_DONE;
+   return 1;
 }
 
 int jpake_shared_key(struct jpake *p, uint8_t out16[16])
 {
-   if (!p->have_r2 || !p->have_r3)
+   if (jpake_poisoned(p))
       return 0;
-   return shared_key(&p->r2, &p->r3, &p->pass, &p->xB, out16);
+   /* EXACTLY ONE ACCEPTED PACKET OF EVERY REQUIRED ROUND, which is what
+    * JPAKE_PHASE_DONE means and what the old test did not: it read two of the
+    * three flags, so an object that had never accepted a round 1 -- or that
+    * had accepted round 2 twice and round 3 once -- satisfied it. The counter
+    * cannot represent either. */
+   if (p->phase != JPAKE_PHASE_DONE)
+      return 0;
+   /* shared_key returns 0 only when the combined point is infinity, which a
+    * peer can steer -- so it is a failed exchange, not a transient. out16 is
+    * left untouched either way: shared_key writes it last. */
+   if (!shared_key(&p->r2, &p->r3, &p->pass, &p->xB, out16))
+      return jpake_fail(p);
+   return 1;
 }
 
 void jpake_free(struct jpake *p)
 {
    if (p) {
-      memset(p, 0, sizeof(*p));
+      /* ct_wipe, NOT memset. This clear is immediately before free(), so
+       * nothing can read the bytes afterwards through any path the compiler
+       * can see -- which is exactly the condition under which dead-store
+       * elimination deletes the store. The struct holds the password scalar,
+       * both private nonces and the derived key; the whole point of clearing
+       * it is that the next allocation handed this address gets zeroes. */
+      ct_wipe(p, sizeof(*p));
       free(p);
    }
 }

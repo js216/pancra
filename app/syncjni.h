@@ -16,22 +16,26 @@ void syncjni_register_logs(void);
 
 /* The two natives Ble declares. Both BLOCK and are only ever called from
  * Java's push worker. */
-/* Report the outcome of a sync or a pairing to the UI: the LAST SYNC and LAST
- * STATUS rows, and a repaint. Defined in main.c, which owns that state.
- * `ok` stamps the success time; `what` is a short phrase for the status row.
- *
- * Without this the rows are dead text: they used to be fed by the old push
- * path, and when that went, nothing replaced it -- so a working sync and a
- * server that refused every request looked exactly alike. */
-void sync_report(int ok, const char *what);
+/* (sync_report -- the outcome of a sync -- is remote.h's: the module that
+ * performs the sync says how it went, and this one merely calls it.) */
 
 /* A number that changes when any synced file changes: the sum of their sizes.
  * The cheap answer to "is there anything to sync", asked before deciding to
  * ask the server the expensive version of the same question. */
 long syncjni_state_stamp(void);
 
-/* Ask Java's worker to run a sync / a pairing. Return at once. */
-void syncjni_sync_request(void);
+/* Ask Java's worker to run a sync. Returns at once, and says whether the
+ * request was ACCEPTED: 1 if Java has it, 0 if it was dropped.
+ *
+ * IT CAN BE DROPPED, and silently was. There is no JNIEnv on a thread that
+ * never attached, no class if registration has not run yet, no method if the
+ * lookup failed -- and a Java call can throw. Each of those returned without
+ * a word to the caller, and because the answer normally arrives later through
+ * sync_report(), a dropped request produced no report at all: the scheduler
+ * had already advanced its deadlines as though a sync were under way, so the
+ * next attempt waited out the SIX-HOUR safety interval. The caller must not
+ * commit a schedule to a request that was never made. */
+int syncjni_sync_request(void);
 void syncjni_pair_request(const char *email, const char *code);
 
 jint syncjni_run(JNIEnv *e, jobject cls);

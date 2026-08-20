@@ -102,6 +102,29 @@ float AMotionEvent_getX(const void *ev, unsigned long i)
    return 0;
 }
 
+/* One finger, id 0 -- the shape a single-touch gesture sees. These exist so
+ * input.c can be linked on the host at all; nothing here simulates a second
+ * finger, and a second finger is the entire subject of the pointer
+ * bookkeeping. That is WHY the rule lives in app/gesturelogic.c instead of in
+ * this file's caller: a test can hand a pure decision as many fingers as it
+ * likes, in any slot order, without an event object to fake (see
+ * app/test/gesturetest.c). Growing these stubs into a fake multi-touch event
+ * queue was the alternative, and it would have meant faking
+ * AInputQueue_getEvent, the action word and the coordinate arrays -- a mock of
+ * Android to test one comparison. */
+unsigned long AMotionEvent_getPointerCount(const void *ev)
+{
+   (void)ev;
+   return 1;
+}
+
+int AMotionEvent_getPointerId(const void *ev, unsigned long i)
+{
+   (void)ev;
+   (void)i;
+   return 0;
+}
+
 float AMotionEvent_getY(const void *ev, unsigned long i)
 {
    (void)ev;

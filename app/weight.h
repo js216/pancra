@@ -38,13 +38,38 @@ struct wt_rec {
    long g; /* grams */
 };
 
-extern struct wt_rec g_wt[NWT]; /* oldest first; the newest is at the end */
-extern int g_nwt;
-extern char g_wt_path[256];
+/* THE TAIL IS PRIVATE. It used to be `extern struct wt_rec g_wt[NWT]` plus a
+ * count, so every reader depended on the representation (an array, oldest
+ * first, this long), on the invariant (sorted), and on the lifetime (valid
+ * until the next load, which the weight screen triggers) -- and any of them
+ * could write to it. The queries below hand out COPIES, bounded by what the
+ * caller asked for.
+ *
+ * ORDER IS PART OF THE CONTRACT, not of the array: oldest first, newest last,
+ * because that is what the log table and the trend plot both draw. */
+
+/* How many weights the tail holds. */
+int wt_count(void);
+/* The i-th, oldest first. Out of range yields a zeroed record, so a caller
+ * that gets its bounds wrong draws nothing rather than reading past the end. */
+struct wt_rec wt_at(int i);
+/* The newest, or a zeroed record when there is none -- what the LOG WEIGHT
+ * form pre-populates from. */
+struct wt_rec wt_newest(void);
+/* Copy up to `cap` of them, oldest first; returns how many were copied. For
+ * the frame, which needs a snapshot that cannot change while it is drawn. */
+int wt_copy(struct wt_rec *out, int cap);
+const char *weight_path(void);
+/* Point it at the data directory; the filename lives here. */
+/* 1 when every path this module persists to fitted; 0 when one did
+ * not, and then NONE of them is usable -- see data_path in util.h. */
+int weight_paths(const char *dir);
 
 /* Load the tail of the log (the last NWT plausible rows). Safe on a fresh
  * install: a missing file is an empty log. */
-void weight_load(void);
+/* 0 read whole (or nothing to read), -1 a read failed partway: whatever
+ * parsed is kept, and the caller says the record is incomplete. */
+int weight_load(void);
 
 /* Append one weight durably and mirror it into the tail. 0 on success, -1
  * when the write failed (the tail is then left untouched, so memory never
@@ -72,5 +97,28 @@ const char *wt_unit_name(int units); /* "KG" / "LB" */
  * stale tail index can never touch the wrong entry. */
 int weight_update(const struct wt_rec *orig, long t, long g, long tz);
 int weight_delete(const struct wt_rec *orig);
+
+/* ================= THE WEIGHT-ENTRY WORKFLOW ========================
+ *
+ * Like the dose form (insulin.h), the LOG WEIGHT form is a few values and one
+ * rule that matters, and the rule lived in the shell's action dispatcher
+ * where nothing could test it: a fresh form opens on the LAST logged weight,
+ * because a weigh-in moves by ounces and starting from zero would make every
+ * entry a full retype.
+ *
+ * The value is in TENTHS of the DISPLAY unit -- the shape the keypad accepts
+ * -- not in grams, so the form and the keypad cannot disagree about what the
+ * digits mean.
+ *
+ * `edit` is the index being edited, or < 0 for a new entry. */
+struct wt_form {
+   long t;
+   int tenths;
+   int edit;
+};
+
+/* Open a fresh form. `last_g` is the most recent logged weight in grams, or 0
+ * when there is none; `units` is WT_KG / WT_LB; `now` is the clock. */
+void wt_form_open(struct wt_form *f, long last_g, int units, long now);
 
 #endif

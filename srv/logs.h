@@ -10,7 +10,7 @@
 #ifndef LOGS_H
 #define LOGS_H
 
-#include "sync.h" /* struct req, and the protocol constants */
+#include "proto.h" /* struct req, and the protocol constants */
 
 /* ---- logs.c ---------------------------------------------------------- */
 int log_name_ok(const char *s);

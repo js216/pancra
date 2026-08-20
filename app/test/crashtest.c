@@ -121,11 +121,16 @@ int main(void)
     * say "boot" forever. So: move each value AFTER building the context, and
     * require the line to have moved with it. */
    {
-      const volatile char *where = "boot";
-      const char *status         = "READING";
-      int glu                    = 113;
-      int menu                   = 4;
-      int nhist                  = 900;
+      /* _Atomic, matching the field it is bound to: the checkpoint is written
+       * by every thread in the app and read from a signal handler, so the
+       * handler's load has to be indivisible (see crashlog.h). The test holds
+       * the same type the app does, or it would be exercising a different
+       * function signature from the one that ships. */
+      const char *_Atomic where = "boot";
+      const char *status        = "READING";
+      int glu                   = 113;
+      int menu                  = 4;
+      int nhist                 = 900;
       struct crash_ctx ctx;
       ctx.where  = &where;
       ctx.status = status;
