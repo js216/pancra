@@ -5,75 +5,50 @@
 /* NIST P-256 (secp256r1): the field, scalar and point operations this repo
  * needs. No external dependencies.
  *
- * PARTLY CONSTANT-TIME. THE SCALAR'S HIGH BITS NO LONGER LEAK; ITS HAMMING
- * WEIGHT STILL DOES.
+ * THE OPERATION SEQUENCE DOES NOT DEPEND ON ANY SECRET.
  *
- * This header once said "a personal reader talking to its own sensor, not an
- * adversarial setting", which was true when the only caller was the Dexcom
- * J-PAKE over a BLE link to a sensor on the user's own arm. It is not the whole
- * picture: srv/tls.c signs the server's LONG-TERM key with ecdsa_p256_sign on
- * every full TLS handshake, and any stranger on the internet can force those by
- * declining to present a session ticket. It also does an ephemeral ECDHE per
- * handshake with p256_mul.
+ * WHO THIS HAS TO BE TRUE FOR. srv/tls.c signs the server's LONG-TERM key with
+ * ecdsa_p256_sign on every full TLS handshake, and any stranger on the
+ * internet can force those by declining to present a session ticket; it also
+ * does an ephemeral ECDHE per handshake with p256_mul. So the threat model is
+ * a remote attacker who can ask for arbitrarily many signatures -- not the
+ * Dexcom J-PAKE over a BLE link to a sensor on the user's own arm, which is
+ * what this file was written for.
  *
- * Nothing in this file indexes memory at a secret-derived offset -- the only
- * computed indices are limb numbers and the constant reduction tables -- so
- * unlike lib/aes.c it is not exposed to cache attacks, and everything below is
- * about instruction counts and branches, which is the kind of leak that
- * survives a network.
+ * WHAT IS GUARANTEED, AND WHAT IS NOT:
  *
- * FIXED, and how it was checked:
+ *   No branch in this file is steered by a secret, and no memory is read at a
+ *   secret-derived offset -- the only computed indices are limb numbers and
+ *   the constant reduction tables, so nothing here is exposed to a cache
+ *   attack. The scalar multiplication is an always-add
+ *   ladder over a branch-free point addition, so the work done for a scalar
+ *   does not depend on its value: not on its leading zeros, not on its
+ *   Hamming weight, not on its magnitude.
  *
- *   The three claims this header used to make were all true, and it was
- *   missing five more. u256_cmp returned at the first differing limb; mod512's
- *   512 per-bit reductions each branched, which is the whole of the scalar
- *   arithmetic and so of p256_sc_inv, the ECDSA k^-1; modadd and modsub
- *   branched; fast_reduce ended in two data-dependent loops; p256_sc_from_be,
- *   p256_sc_neg and p256_eq each had a secret-dependent early exit. All of
- *   those are now unconditional arithmetic plus a ct_cmov64 from lib/ct.h.
+ *   THAT IS A STATEMENT ABOUT BRANCHES AND OPERATION COUNTS, and it is under
+ *   test rather than asserted: p256.c counts its own limb operations under
+ *   -DP256_COUNT and test/srv/cttest.c requires the count to be identical
+ *   across scalars that differ in exactly the ways a branching implementation
+ *   answers differently for. Built against one, that test fails five
+ *   assertions.
  *
- *   Worst of all, and unnamed here: jdouble returned early for the point at
- *   infinity. p256_mul starts its accumulator at infinity, so a scalar with z
- *   leading zero bits got z nearly-free ladder steps -- and the leading-zero
- *   count of an ECDSA nonce is exactly what the lattice attack on partial
- *   nonce leakage consumes. The general doubling formula already yields Z == 0
- *   from Z == 0, and infinity is represented by Z == 0 alone, so the branch
- *   was deleted rather than masked.
+ *   IT IS NOT A CLAIM OF CONSTANT TIME ON YOUR PROCESSOR. A count cannot see
+ *   an operand-dependent instruction latency or a branch the compiler
+ *   introduced on its own, and this is not a reviewed implementation. That is
+ *   why the closing paragraph below still says what it says.
  *
- *   Measured, not asserted. Counting the limb operations inside one k*G for
- *   scalars of fixed Hamming weight 32 with the top set bit moved from bit 255
- *   down to bit 40: before, 49206 down to 14122 operations, a 3.5x readout of
- *   the leading-zero count; after, 121402 for every one of them, identically.
- *   p256_sc_inv likewise went from a per-input operation mix (its conditional
- *   subtraction fired 1 time for the input 1 and about 54000 times for a random
- *   scalar; 2.39 ms against 3.45 ms of wall clock) to the same 653226
- *   operations for every input. Equivalence was checked by diffing a 38000-line
- *   transcript of every internal and public routine over random and boundary
- *   inputs against the old code, plus p256_selftest and the CAVP vector in
- *   srv/test/cryptotest.c.
+ * WHAT IT COSTS, measured on a fast x86 host, 20 iterations each:
  *
- * WHAT STILL LEAKS:
+ *     k*G                3.74 ms -> 9.06 ms   (2.4x)
+ *     ecdsa_p256_sign   10.50 ms -> 15.24 ms  (1.45x)
+ *     ecdsa_p256_verify 14.76 ms -> 24.96 ms  (1.69x)
  *
- *   - p256_mul is still double-and-add: the add is skipped when the bit is
- *     zero, so the cost is 256 doublings plus one addition per set bit. The
- *     residual signal is the scalar's HAMMING WEIGHT and nothing else -- 101376
- *     operations at weight 1, 183418 at weight 128, a straight line at 646
- *     operations per set bit. That is one aggregate number per signature with
- *     no positional information, which is a far weaker input to a lattice
- *     attack than the leading-zero count it replaces, but it is not zero.
- *     Closing it means an always-add ladder with a masked accumulator, and that
- *     needs a branch-free p256_padd (below) to be worth anything.
- *   - p256_padd still branches on infinity and on point equality. The infinity
- *     branches cannot simply be deleted the way jdouble's could -- the general
- *     formula returns infinity for "infinity + Q" instead of Q -- so this needs
- *     a select over all five outcomes, which roughly doubles its cost. Inside
- *     the ladder the equality cases are unreachable and exactly one addition
- *     per scalar meets an infinite accumulator, so it contributes no positional
- *     leak there; the exposure is p256_padd's other callers.
- *   - The constant-time reductions cost about 10% of a k*G and about 60% of a
- *     p256_sc_inv on a fast x86 host; a full ecdsa_p256_sign went from 7.5 ms
- *     to 10.2 ms there. The ~170 ms this header used to quote is the Milk-V Duo
- *     board, which was not re-measured -- expect the same proportions.
+ *   On the Milk-V Duo the server runs on, measured there: 100 ms per
+ *   signature, which is once per full TLS handshake and not once per request.
+ *
+ * WHAT IT COST, since the question always comes up: k*G 3.74 ms -> 9.06 ms,
+ * ecdsa_p256_sign 10.50 ms -> 15.24 ms, ecdsa_p256_verify 14.76 ms -> 24.96 ms
+ * on an x86 host; 100 ms per signature on the Milk-V Duo the server runs on.
  *
  * modinv is deliberately not on either list: it is square-and-multiply over a
  * PUBLIC exponent (p-2 or n-2), so its operation sequence is fixed and only its
@@ -84,11 +59,14 @@
  * refuses to compile without one, so 32-bit targets and MSVC are out.
  *
  * If you are copying this file: it is fine for a J-PAKE against your own
- * device; behind a public TLS endpoint it is better than it was and still not
- * what a reviewed constant-time implementation would give you. See TODO item
- * 56 for the outstanding decision. */
+ * device; behind a public TLS endpoint it is still not what a reviewed,
+ * audited constant-time implementation would give you. The remaining
+ * decision -- vendor one, or use a platform TLS backend -- is about what this
+ * repo vendors rather than about an edit to this file. */
 #ifndef DEX_P256_H
 #define DEX_P256_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
 #include <stdint.h>
 
 struct u256 { /* little-endian 64-bit limbs */
@@ -99,11 +77,8 @@ struct jpoint { /* Jacobian; Z==0 => infinity */
    struct u256 X, Y, Z;
 };
 
-void p256_init(void); /* call once */
+void p256_init(void); /* IDEMPOTENT: call from anywhere, as often as needed */
 
-/* Checks the fast field reduction against the generic long division it
- * replaces; 0 if they agree. For the test suite -- call after p256_init. */
-int p256_selftest(void);
 
 /* scalars mod n (curve order) */
 void p256_sc_from_be(struct u256 *r,
@@ -112,6 +87,23 @@ void p256_sc_mul(struct u256 *r, const struct u256 *a, const struct u256 *b);
 void p256_sc_add(struct u256 *r, const struct u256 *a, const struct u256 *b);
 void p256_sc_sub(struct u256 *r, const struct u256 *a, const struct u256 *b);
 void p256_sc_neg(struct u256 *r, const struct u256 *a);
+/* THE CANONICAL ENCODING, and the only one. 32 big-endian bytes, most
+ * significant first, from the limb representation `struct u256` uses -- the
+ * exact inverse of p256_sc_from_be's load.
+ *
+ * It lives here because the representation does. A caller that writes its own
+ * loop is encoding a struct whose layout is this file's business, and two
+ * such loops (ECDSA's signature and J-PAKE's proof scalar were each one) can
+ * disagree about byte order in a way nothing catches: both sides of a
+ * signature check are usually the same implementation, so a swapped encoding
+ * verifies against itself and fails only against somebody else's.
+ *
+ * ENCODING IS NOT VALIDATION. This writes whatever the scalar holds,
+ * including zero and values a caller should never have built; the range rule
+ * for a scalar that came from OUTSIDE is p256_sc_from_be_checked below, and
+ * keeping the two apart is deliberate -- an encoder that also judged would
+ * have to answer, and every caller here has already decided. */
+void p256_sc_to_be(const struct u256 *a, uint8_t be[32]);
 void p256_sc_inv(struct u256 *r,
                  const struct u256 *a); /* modular inverse mod n */
 int p256_sc_is_zero(const struct u256 *a);
@@ -150,7 +142,7 @@ int p256_sc_is_zero(const struct u256 *a);
  * `r` is set to ZERO on any refusal rather than left alone, for the same
  * reason p256_sc_rand zeroes its output: zero is the one scalar every
  * consumer in this repo independently refuses, so a caller that ignores the
- * status fails hard downstream instead of proceeding with an alias. */
+ * status fails hard downstream rather than proceeding with an alias. */
 enum p256_scalar {
    P256_SCALAR_OK = 0, /* in [1, n-1]: a scalar */
    P256_SCALAR_ZERO,   /* x == 0 */
@@ -162,8 +154,8 @@ enum p256_scalar {
  * bytes -- which matters because d and k go through it. The caller's one
  * branch on the returned status leaks "this scalar was refused", and that is
  * all it leaks; ecdsa.c says why that disclosure is acceptable there. */
-enum p256_scalar p256_sc_from_be_checked(struct u256 *r, const uint8_t be[32])
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum p256_scalar p256_sc_from_be_checked(struct u256 *r,
+                                                         const uint8_t be[32]);
 
 /* ---- A SECRET SCALAR. THE ONLY WAY TO GET ONE. ------------------------
  *
@@ -172,10 +164,11 @@ enum p256_scalar p256_sc_from_be_checked(struct u256 *r, const uint8_t be[32])
  * and a Schnorr proof nonce alike. Returns 1 on success; on 0 it has written
  * 32 zero bytes and THE CALLER MUST NOT PROCEED.
  *
- * WHAT THIS REPLACES. Four call sites -- lib/jpake.c's five per-exchange
- * scalars, srv/tls.c's ECDHE scalar, srv/tls.c's CertificateVerify nonce and
- * app/dexcom.c's key-challenge nonce -- each did `rand_bytes(b, 32)` and then
- * reduced with p256_sc_from_be. That is biased (the low 2^-32 of the interval
+ * WHY EVERY CALLER GOES THROUGH IT. The four sites that need such a scalar --
+ * lib/jpake.c's five per-exchange scalars, srv/tls.c's ECDHE scalar,
+ * srv/tls.c's CertificateVerify nonce and app/dexcom.c's key-challenge nonce
+ * -- could each do `rand_bytes(b, 32)` and reduce with p256_sc_from_be. That
+ * is biased (the low 2^-32 of the interval
  * comes out twice as often) and, far worse, it ADMITS ZERO: 0 and n both
  * reduce to 0, and a zero ECDHE scalar makes the shared secret a constant
  * while a zero proof nonce publishes the witness it was hiding. lib/p256.c
@@ -196,21 +189,49 @@ int p256_sc_rand(uint8_t out[32]);
 /* The retry cap, exposed so a test can pin it. Rejection needs a second draw
  * with probability 2^-32, so this is never reached by chance -- 64 straight
  * rejections is 2^-2048. It bounds a BROKEN source (stuck bits, a stub
- * returning a constant) into a reported failure instead of a hang. */
+ * returning a constant) into a reported failure rather than a hang. */
 #define P256_SC_RAND_TRIES 64
 
 /* points */
-extern struct jpoint p256_g;
+
+/* THE GENERATOR, AS A COPY. 1 when `*out` is the curve's base
+ * point; 0 -- with `*out` set to the point at infinity -- when p256_init has
+ * not run, which every downstream check then refuses.
+ *
+ * AS A WRITABLE GLOBAL, anything that includes this header can assign to the
+ * base point of the curve, or read it before there is one in it, and neither
+ * shows: J-PAKE's proofs verify perfectly well against a
+ * substituted G at both ends, and a zeroed G makes every public key the
+ * point at infinity. A copy cannot be assigned back, and asking cannot
+ * happen too early without being told. */
+int p256_gen(struct jpoint *out);
+
 void p256_mul(struct jpoint *r, const struct u256 *k,
               const struct jpoint *P);                   /* k*P */
 void p256_mul_g(struct jpoint *r, const struct u256 *k); /* k*G */
 void p256_padd(struct jpoint *r, const struct jpoint *P,
                const struct jpoint *Q);
-int p256_is_inf(const struct jpoint *P);
 int p256_eq(const struct jpoint *A, const struct jpoint *B);
 /* affine X||Y (32+32); returns 1 ok, 0 if infinity / not on curve */
 int p256_to_xy(const struct jpoint *P, uint8_t x[32], uint8_t y[32]);
 int p256_from_xy(struct jpoint *P, const uint8_t x[32], const uint8_t y[32]);
 void p256_uncompressed(const struct jpoint *P, uint8_t out[65]); /* 04||X||Y */
+
+/* ---- THE CONSTANT-TIME REGRESSION HOOK ----------------------------------
+ *
+ * Defined only in a build that passes -DP256_COUNT, which is test/srv/cttest.c
+ * and nothing else. p256.c's limb primitives increment it; the test drives the
+ * public entry points with operands that differ in exactly the ways that used
+ * to change the work done here, and asserts the count does not move.
+ *
+ * A count is not a clock. It cannot see a data-dependent memory access or a
+ * variable-latency instruction, and it is not evidence that this file is
+ * constant-time on any particular processor. What it does catch is the whole
+ * class of regression that has ever actually happened in this file: a branch
+ * that skips work for some inputs. Read it as a lock on the property, not as
+ * proof of it. */
+#ifdef P256_COUNT
+extern unsigned long p256_op_count;
+#endif
 
 #endif

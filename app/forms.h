@@ -59,9 +59,9 @@ enum { LABEL_SENSOR = 0, LABEL_SERVER = 1, LABEL_EMAIL = 2, LABEL_FOOD = 3 };
 
 /* WHAT AN OK-COMMIT FAMILY DECIDED.
  *
- * Three answers, not two, because the single chain this replaced had three
- * exits and one of them was a bare `return` out of menu_action -- which also
- * skipped the repaint at the bottom of it. That is load-bearing behaviour for
+ * Three answers, not two: a single chain has three exits and one of them is
+ * a bare `return` out of menu_action -- which also skips the repaint at the
+ * bottom of it. That is load-bearing behaviour for
  * a refused entry: the family has already cleared the entry and put a message
  * on the keypad, and the screen it wants is the one already on it.
  *
@@ -76,14 +76,14 @@ enum { LABEL_SENSOR = 0, LABEL_SERVER = 1, LABEL_EMAIL = 2, LABEL_FOOD = 3 };
 /* WHAT A CONFIRMED WRITE LEFT ON THE DISK, and therefore whether the form
  * that asked for it may be torn down.
  *
- * CONFIRM used to clear the draft and navigate away whatever the write
- * answered. The draft is the only copy of what the user typed, and for an
+ * CONFIRM must not clear the draft and navigate away whatever the write
+ * answers. The draft is the only copy of what the user typed, and for an
  * EDIT it also carries `orig` -- the copy of the row being rewritten, which
  * is the match key weight_update and insulin_update need. Throwing both away
  * after a write that did NOT happen leaves a populated form that no longer
  * knows which row it is amending, so the next CONFIRM APPENDS a second copy
- * of the dose instead of rewriting the first. A failed delete is the way in:
- * it reported the failure and returned to exactly that form.
+ * of the dose rather than rewriting the first. A failed delete is the way in:
+ * it reports the failure and returns to exactly that form.
  *
  * DONE IS NOT ZERO, deliberately. Each of these is read to decide whether to
  * throw the user's state away, so the value a dropped comparison or a missed
@@ -100,9 +100,6 @@ void keypad_close(void);
 
 /* The two form dispatchers: each returns 1 when the action was one of its
  * own. */
-int ins_action(int action, int ix);
-int wt_action(int action, int ix);
-int food_action(int action, int ix);
 
 /* The keypad's OK, per field. Each returns 1 when it handled the mode. */
 int label_commit(void);
@@ -113,9 +110,9 @@ int kp_commit_datetime(void);
 
 /* ---- OPENING AND DRIVING A FORM, as intents ---------------------------
  *
- * The state above is written through these, not by hand. Every keypad opener
- * used to be three assignments in a row (mode, return screen, clear the
- * entry) repeated at fifteen call sites, and forgetting the third left the
+ * The state above is written through these, not by hand. Spelled out, a
+ * keypad opener is three assignments in a row (mode, return screen, clear the
+ * entry) repeated at fifteen call sites, and forgetting the third leaves the
  * previous entry in the field -- which on the PIN keypad is somebody else's
  * typing. One call cannot forget. */
 
@@ -156,6 +153,14 @@ void forms_kp_text(char *out, int cap);
  * The values are otherwise taken as given: they were validated by the shell
  * against the units and the bounds that were loaded from disk before it got
  * here, which is a question this module cannot ask. */
+/* ONE TAP, THROUGH ONE DOOR. Returns 1 when a typed-entry workflow claimed
+ * the action -- weight, insulin, food or exercise, each in its own file (see
+ * app/formsint.h). The caller does not choose which: the workflows are tried
+ * in a fixed order and the first match wins, exactly as they did when they
+ * were four `||`-ed calls in menu_action, but the ORDER now lives beside the
+ * workflows it orders rather than in the menu. */
+int forms_action(int action, int ix);
+
 void forms_wt_restore(long t, int tenths);
 void forms_ins_restore(long t, int type, int units);
 
@@ -191,10 +196,10 @@ int forms_scrub(void);
 
 /* ---- WHAT A FRAME MAY READ OF THE FORMS ------------------------------
  *
- * A read-only snapshot, for the same two reasons menuview.h gives: the frame
- * used to read fifteen separate globals as it went, so a tap arriving
- * mid-frame could give one frame two different answers; and every one of them
- * was writable by anything that included this header.
+ * A read-only snapshot, for the same two reasons menuview.h gives: a frame
+ * reading fifteen separate globals as it goes can give one frame two
+ * different answers when a tap arrives mid-frame, and every one of those
+ * globals is writable by anything that includes this header.
  *
  * Main thread only, like the forms themselves. */
 struct forms_view {
@@ -222,7 +227,19 @@ struct forms_view {
    long food_t;
    int food_type; /* the chosen type ID, not an index: see ui_foodview */
    int food_g, food_edit;
-   int foodtype_page, foodlog_page;
+   struct food_rec food_orig;
+   /* The EDIT EXERCISE draft: the instant and level it holds, whether it is
+    * open at all (`ex_edit` < 0 = not), and the row it is correcting. */
+   long ex_t;
+   long ex_dur; /* seconds, 0 = not known */
+   int ex_level, ex_edit;
+   /* 1 when the row being edited is the session the button is running now
+    * (exercise_row_running): its length is not settled, so the form shows
+    * ACTIVE there and refuses the field. */
+   int ex_running;
+   const char *ex_err; /* why the last CONFIRM was refused; "" = nothing */
+   struct ex_rec ex_orig;
+   int foodtype_page, foodlog_page, exlog_page;
    int scrub; /* the glucose plot cursor, -1 = none */
    /* the odds and ends */
    int label_field;
@@ -230,26 +247,22 @@ struct forms_view {
    int cal_pending;
 };
 
-/* ================= THE FOOD-ENTRY WORKFLOW =========================
- *
- * Like the dose and weight forms, this is a few values and a couple of rules
- * that matter, kept out of the shell's action dispatcher so they can be
- * tested.
- *
- * WHICH FOOD IS HELD AS AN ID, never as a position in the vocabulary: the
- * picker can ADD a food, which grows that table, and the form has to survive
- * the trip through it. An index would name a different food afterwards, or the
- * same one, depending on where the new name landed -- and nothing on the
- * screen would say which.
- *
- * `edit` is the index being edited, or < 0 for a new entry, matching the other
- * two forms. */
-void forms_food_open(long now);
+/* Open the food form on a NEW entry at instant `t`, discarding whatever the
+ * draft held. This is what both opening the workflow and closing it call: a
+ * form is only ever entered with its whole state stated. */
+void forms_food_open(long t);
+
+/* Open an existing entry for editing; keeps a copy as the rewrite's key. */
+void forms_food_edit(int i);
+
+/* Open an exercise entry for correction. `i` indexes the tail, oldest first;
+ * out of range opens nothing. There is deliberately no opener for a NEW
+ * entry: an exercise record is created by the button and its settling rule,
+ * never by a form -- see uiex.c. */
+void forms_ex_edit(int i);
+
 /* Set the type the form holds; the picker's only side effect on the form. */
 void forms_food_type_set(int type_id);
-/* Which page of the vocabulary the picker is showing. */
-void forms_foodtype_page_set(int page);
-int forms_foodtype_page(void);
 
 /* One consistent copy of all of it. */
 void forms_view_get(struct forms_view *out);

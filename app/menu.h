@@ -47,8 +47,8 @@ int menu_back_code(int *ix);
 void sys_refresh(void);
 
 /* What sys_refresh sampled, and the EXPORT checkboxes, are PRIVATE to menu.c
- * and reach the screen as a read-only snapshot: see menuview.h. They used to
- * be seven writable globals that every file including this header could set,
- * with no chance to sample the system state or to persist a choice. */
+ * and reach the screen as a read-only snapshot: see menuview.h. As seven
+ * writable globals every file including this header could set, there is
+ * nowhere to sample the system state or to persist a choice. */
 
 #endif

@@ -3,8 +3,9 @@
 // Copyright 2026 Jakob Kastelic
 
 /* pancra BLE transport: the thin JNI layer between the Ble.java dumb pipe and
- * the transport-agnostic protocol driver (dexdriver.c). It implements the drv_*
- * hooks via Ble's static methods and forwards Ble's callbacks into the driver.
+ * the transport-agnostic protocol driver (dexproto.c + dexlink.c). It
+ * implements the drv_* hooks via Ble's static methods and forwards Ble's
+ * callbacks into the driver.
  *
  * All driver work happens synchronously inside a native callback (or the pair
  * kickoff). Each transport call resolves a JNIEnv for ITS OWN thread via
@@ -16,10 +17,15 @@
 #include "blejni.h"
 #include "bletrans.h"
 #include "bondtable.h"
-#include "calib.h" /* pancra_cal_result: the sensor's answer to a write */
+#include "calib.h"  /* calib_cal_result: the sensor's answer to a write */
+#include "ct.h"     /* ct_wipe: a refused key must not be left in a buffer */
+#include "devtag.h" /* a log may not carry an address; see there */
 #include "dexdriver.h"
 #include "dexlibc.h"
-#include "jbridge.h" /* jb_checked: the one exception verdict this app has */
+#include "dexport.h"  /* the host port: what the driver asks of us */
+#include "jbridge.h"  /* jb_checked: the one exception verdict this app has */
+#include "linkinfo.h" /* pancra_rssi / pancra_devinfo: the other two hooks */
+#include "log.h"      /* LOGI/LOGW: the ONE declaration */
 #include "meter.h"
 #include "reading.h"
 #include "remote.h" /* pancra_remote_ok: the push worker's acknowledgement */
@@ -37,14 +43,14 @@
  * it is a claim, in the file's own include list, that this translation unit
  * still does something it no longer does. */
 
-int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
-#define LOGW(...) __android_log_print(5, "pancra", __VA_ARGS__)
-
 static jclass g_ble;
 static jobject g_ctx;
 static jmethodID m_connect, m_subscribe, m_write, m_readrssi, m_read,
     m_startsvc, m_disconnect, m_createbond, m_bondwatch;
+/* The platform adapter's class, borrowed from the bridge that owns it (it is
+ * a global ref there, so this one holds nothing of its own). startService is
+ * the only method on it this file calls. */
+static jclass g_plat;
 static char g_keypath[256];
 static char g_macpath[256];
 
@@ -107,9 +113,9 @@ static JNIEnv *any_env(void)
 
 /* Returns 1 only if Java was actually reached.
  *
- * This was void, so failing to reach Alarm.trigger was invisible -- and
- * alarm_apply had already committed the level as "announced", so its
- * idempotence check suppressed every later attempt and the hypo stayed silent
+ * Returning void makes a failure to reach Alarm.trigger invisible -- and
+ * alarm_apply has already committed the level as "announced", so its
+ * idempotence check suppresses every later attempt and the hypo stays silent
  * for its whole duration. That is precisely the failure the staged try/catch
  * inside Alarm.java was written to eliminate, reintroduced one layer below
  * where the staging cannot reach it. Reporting failure lets the caller decline
@@ -272,13 +278,11 @@ void drv_connect(int link, const char *mac)
  * Returns a pointer INTO the caller's string, so there is nothing to free and
  * nothing to size; a MAC too short to trim is returned whole, because a
  * malformed address is a bug worth seeing in full. */
-static const char *mac_tail(const char *mac)
-{
-   int n = 0;
-   while (mac[n])
-      n++;
-   return n > 5 ? mac + n - 5 : mac;
-}
+/* mac_tail IS GONE. It returned the last five characters of the address --
+ * "..:B0:B4" -- which reads as anonymised and is not: two bytes single out one
+ * device among the handful anybody owns, and they are as stable as the whole
+ * address. See devtag.h; every line that used it now carries a per-run tag
+ * instead. */
 
 static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
 {
@@ -289,12 +293,14 @@ static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
    if (!m)
       return;
    bond_state_set(m, (int)state);
-   LOGI("bond: ..%s state=%d", mac_tail(m), (int)state);
+   char dt[DEVTAG_LEN];
+   LOGI("bond: dev %s state=%d", devtag(m, dt), (int)state);
    (*e)->ReleaseStringUTFChars(e, mac, m);
 }
 
 int dexble_create_bond(const char *mac)
 {
+   char dt[DEVTAG_LEN];
    JNIEnv *e = any_env();
    if (!e || !m_createbond || !mac || !mac[0])
       return 0;
@@ -309,12 +315,12 @@ int dexble_create_bond(const char *mac)
       (*e)->ExceptionClear(e);
    (*e)->DeleteLocalRef(e, m);
    if (!err) {
-      LOGI("createBond ..%s: requested", mac_tail(mac));
+      LOGI("createBond dev %s: requested", devtag(mac, dt));
       return 1;
    }
    const char *s = (*e)->GetStringUTFChars(e, err, 0);
    if (s) {
-      LOGI("createBond ..%s: %s", mac_tail(mac), s);
+      LOGI("createBond dev %s: %s", devtag(mac, dt), s);
       set_status(s);
       (*e)->ReleaseStringUTFChars(e, err, s);
    }
@@ -484,7 +490,7 @@ void drv_cal_result(int link, int result, int sensor_id, int mg_dl,
    /* The token is passed straight through: the driver kept it only so this
     * answer could name the write it belongs to, and the queue -- which is the
     * only thing that knows what is queued now -- decides whether it matches. */
-   pancra_cal_result(result, sensor_id, mg_dl, gen);
+   calib_cal_result(result, sensor_id, mg_dl, gen);
 }
 
 int drv_backfill(int link, int mg, int trend, int age)
@@ -492,15 +498,75 @@ int drv_backfill(int link, int mg, int trend, int age)
    return pancra_backfill(link, mg, trend, age);
 }
 
+/* ---- READING A SAVED CREDENTIAL, EXACTLY -----------------------------
+ *
+ * The two files below decide whether this phone reconnects to a sensor
+ * without pairing again, and both are read at startup from storage that can
+ * fail in ordinary ways: a torn write from a power cut mid-save, a card that
+ * returns short reads, a file somebody edited. A loader that takes what it
+ * gets is worse than one that refuses, because what follows a WRONG key or a
+ * WRONG address is not an error message -- it is an app that fails to
+ * authenticate, or bonds to somebody else's Dexcom, with nothing on screen
+ * saying which.
+ *
+ * SO THE RULE IS: exactly the expected bytes, and nothing after them.
+ *
+ * `read` MAY RETURN LESS THAN ASKED for reasons that are not failures -- a
+ * signal (EINTR), a slow device -- so one read is not a length check. This
+ * loops until the buffer is full, the file ends, or the read fails, which is
+ * what makes "the file is exactly N bytes" a statement rather than a guess.
+ * Returns the count, or -1. */
+static long read_full(int fd, void *buf, long want)
+{
+   unsigned char *p = buf;
+   long got         = 0;
+   while (got < want) {
+      long r = read(fd, p + got, (unsigned long)(want - got));
+      if (r > 0) {
+         got += r;
+         continue;
+      }
+      if (r == 0)
+         break; /* end of file: the caller decides whether that is short */
+      if (errno == EINTR)
+         continue; /* not a failure, and not a short file either */
+      return -1;
+   }
+   return got;
+}
+
+/* 1 when `key` holds the saved session key, 0 when it does not -- and on 0
+ * the buffer is CLEARED rather than left holding whatever was read. A caller
+ * that ignored the answer would otherwise authenticate with a prefix of a
+ * key, or with the previous link's, and be refused by the sensor with no
+ * explanation available to anybody. */
 int drv_key_load(int link, uint8_t key[16])
 {
    char pth[264];
    int fd = open(link_path(pth, sizeof pth, g_keypath, link), O_RDONLY);
    if (fd < 0)
       return 0;
-   int ok = (read(fd, key, 16) == 16);
+   uint8_t buf[17]; /* 16 + one byte to prove there is no seventeenth */
+   long r = read_full(fd, buf, (long)sizeof buf);
    close(fd);
-   return ok;
+   /* EXACTLY SIXTEEN. Fewer is a truncated save; more is not this file's
+    * format, and a key file that has grown is a file this app did not write.
+    * Either way the pairing has to be done again -- which is visible, unlike
+    * a key that is silently half right. */
+   if (r != 16) {
+      if (r > 16)
+         LOGW("link %d: saved key is longer than a key -- ignoring it", link);
+      else if (r >= 0)
+         LOGW("link %d: saved key is %ld bytes, not 16 -- ignoring it", link,
+              r);
+      ct_wipe(buf, sizeof buf);
+      ct_wipe(key, 16);
+      return 0;
+   }
+   for (int i = 0; i < 16; i++)
+      key[i] = buf[i];
+   ct_wipe(buf, sizeof buf);
+   return 1;
 }
 
 int drv_key_save(int link, const uint8_t key[16])
@@ -517,25 +583,100 @@ int drv_key_save(int link, const uint8_t key[16])
    return 0;
 }
 
-void drv_key_clear(int link)
+/* ---- FORGETTING A CREDENTIAL IS A DURABLE ACT --------------
+ *
+ * These were `unlink(...)` with the result thrown away, under a caller that
+ * then wiped memory and logged "key/bond dropped". Two different lies were
+ * possible:
+ *
+ *   - the unlink FAILED (a read-only data directory, an I/O error) and the
+ *     file survived. Memory said unpaired, the screen said unpaired, and the
+ *     next launch loaded the key back off the disk and reconnected to a
+ *     sensor the user had told the app to forget.
+ *   - the unlink SUCCEEDED but nothing fsynced the directory, so a power cut
+ *     in the next few seconds left the entry there. Same outcome, rarer.
+ *
+ * ENOENT IS NOT A FAILURE and is the ordinary case: forgetting a sensor that
+ * never paired, or forgetting twice. It is reported as success, because the
+ * file is gone, which is what was asked.
+ *
+ * THE DIRECTORY IS SYNCED, for the same reason atomic_replace does it: on
+ * these filesystems the unlink is a directory operation, and a directory
+ * entry is not durable until the directory is. `make -f test/Makefile
+ * lockcheck` cannot see this one -- what pins it is drivertest, which asserts
+ * that a clear whose unlink fails is REPORTED as a failure.
+ *
+ * 0 = the credential is gone and the disk agrees; -1 = it may still be there.
+ */
+static int credential_clear(const char *path)
+{
+   if (unlink(path) != 0 && errno != ENOENT)
+      return -1;
+   /* A directory that cannot be synced leaves the removal in doubt, and "in
+    * doubt" is a failure here: the caller is about to tell the user the
+    * sensor is forgotten. */
+   return fsync_dir_of(path) == 0 ? 0 : -1;
+}
+
+int drv_key_clear(int link)
 {
    char pth[264];
-   unlink(link_path(pth, sizeof pth, g_keypath, link));
+   if (credential_clear(link_path(pth, sizeof pth, g_keypath, link)) != 0) {
+      LOGW("link %d: session key NOT CLEARED", link); /* no path: see above */
+      return -1;
+   }
+   return 0;
 } /* stale key: force a fresh pairing */
 
 /* Persist the bonded sensor's MAC next to the key, so after a restart we
  * reconnect ONLY to that exact sensor (never grab another Dexcom in range). */
+/* A CANONICAL BLUETOOTH ADDRESS, and nothing else: six pairs of upper-case
+ * hex separated by colons, seventeen characters exactly. It is what Android
+ * hands us and what every comparison in this app is against, so a file
+ * holding anything else -- lower case, a trailing newline, a truncated pair
+ * -- is a file that will never match the device it names, and the sensor
+ * would appear to be gone for ever with nothing to say why. */
+static int mac_text_ok(const char *s, long n)
+{
+   if (n != 17)
+      return 0;
+   for (int i = 0; i < 17; i++) {
+      char c = s[i];
+      if ((i % 3) == 2) {
+         if (c != ':')
+            return 0;
+         continue;
+      }
+      int hex = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+                (c >= 'a' && c <= 'f');
+      if (!hex)
+         return 0;
+   }
+   return 1;
+}
+
+/* 1 when `mac` holds the saved address. On 0 the buffer is emptied: a caller
+ * that went on to use it would reconnect to a partial address, which either
+ * matches nothing or -- worse -- is a prefix another device shares. */
 int drv_mac_load(int link, char *mac, int n)
 {
    char pth[264];
+   if (n < 18)
+      return 0; /* cannot hold an address and its terminator */
    int fd = open(link_path(pth, sizeof pth, g_macpath, link), O_RDONLY);
    if (fd < 0)
       return 0;
-   long r = read(fd, mac, (unsigned)(n - 1));
+   char buf[19]; /* 17 + one byte to prove there is no eighteenth, + NUL */
+   long r = read_full(fd, buf, 18);
    close(fd);
-   if (r <= 0)
+   if (!mac_text_ok(buf, r)) {
+      LOGW("link %d: saved address is not one -- ignoring it", link);
+      mac[0] = 0;
       return 0;
-   mac[r] = 0;
+   }
+   for (int i = 0; i < 17; i++)
+      mac[i] = buf[i];
+   mac[17] = 0;
    return 1;
 }
 
@@ -553,10 +694,14 @@ int drv_mac_save(int link, const char *mac)
    return 0;
 }
 
-void drv_mac_clear(int link)
+int drv_mac_clear(int link)
 {
    char pth[264];
-   unlink(link_path(pth, sizeof pth, g_macpath, link));
+   if (credential_clear(link_path(pth, sizeof pth, g_macpath, link)) != 0) {
+      LOGW("link %d: sensor address NOT CLEARED", link);
+      return -1;
+   }
+   return 0;
 }
 
 /* ---- Ble.java callbacks (each stashes its env, then drives the state machine)
@@ -564,18 +709,18 @@ void drv_mac_clear(int link)
 /* Which protocol owns each link. The link id -- not the characteristic -- is
  * the routing key, so two sensors that share a GATT layout (Stelo and G7 do)
  * can be connected at once without their events being confused. */
-/* (WHICH LINK CARRIES A METER used to be a bitmask here AND a table in
- * meter.c -- the same fact in two places, each written under the driver's
- * lock from another module. It is the driver's now: see
+/* (WHICH LINK CARRIES A METER is not kept here. As a bitmask here AND a table
+ * in meter.c it is the same fact in two places, each written under the
+ * driver's lock from another module. It is the driver's: see
  * driver_link_set_meter, and driver_route_* for the callbacks that read it.)
  */
 static void jni_connected(JNIEnv *e, jclass c, jint link)
 {
    (void)c;
-   /* THE ROUTING IS THE DRIVER'S. This used to read the meter bit here and
-    * branch, holding the driver's lock across both halves -- the decision and
-    * the dispatch have to be one critical section, and doing that from the
-    * transport meant reaching for another module's lock. One call now; what
+   /* THE ROUTING IS THE DRIVER'S. Reading the meter bit here and branching
+    * means holding the driver's lock across both halves -- the decision and
+    * the dispatch have to be one critical section -- and doing that from the
+    * transport is reaching for another module's lock. So: one call, and what
     * is left for this side is whatever reaches Java, which must happen with
     * that lock released. */
    enum driver_after after = driver_route_connected(link);
@@ -636,9 +781,14 @@ static void jni_notify(JNIEnv *e, jclass c, jint link, jstring ju,
       return;
    }
    jsize n = jd ? (*e)->GetArrayLength(e, jd) : 0;
-   uint8_t buf[256];
-   if (n > 256)
-      n = 256;
+   /* THE PORT'S OWN CEILING, ENFORCED AT THE PORT. DEX_NOTIFY_MAX
+    * (app/dexport.h) is what the driver is told a notification can be, and
+    * this is the clamp that makes that true; the two are the same constant so
+    * that a transport with a bigger MTU cannot raise one without the other.
+    * The driver's decoding array is sized from the same number. */
+   uint8_t buf[DEX_NOTIFY_MAX];
+   if (n > (jsize)sizeof buf)
+      n = (jsize)sizeof buf;
    if (n > 0)
       (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
    driver_route_notify(link, u, buf, n);
@@ -785,27 +935,27 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    /* BUILT IN LOCALS, PUBLISHED AS A PAIR, AND ONLY ONCE THE NATIVES ARE ON
     * THE CLASS.
     *
-    * The two global refs used to be assigned straight into g_ble and g_ctx,
-    * unchecked, before anything else was attempted. Three consequences, and
-    * the process never recovers from any of them, because a global reference
+    * Assigning the two global refs straight into g_ble and g_ctx, unchecked,
+    * before anything else is attempted has three consequences, and the
+    * process never recovers from any of them, because a global reference
     * lives as long as the process does:
     *
-    *   - A FAILED NewGlobalRef LEFT AN EXCEPTION PENDING. It fails by running
-    *     out of memory, and then the next line called NewGlobalRef again with
-    *     an OutOfMemoryError pending -- illegal, and under CheckJNI (on for a
-    *     debuggable build and for anyone attached with a debugger) an
-    *     immediate `JNI DETECTED ERROR IN APPLICATION` abort. Somebody whose
-    *     app aborted saw it die on the launch that first hit memory pressure,
-    *     with the tombstone naming NewGlobalRef and no hint that the previous
-    *     one was the failure.
-    *   - A FAILED RegisterNatives KEPT THE REFS ANYWAY. `return 0` left g_ble
-    *     and g_ctx set, so the app that had just reported BLE REG FAILED --
-    *     with no native methods bound at all -- nevertheless held, and
-    *     published through dexble_ctx(), a Context that every later caller
-    *     would take as proof the transport was up.
-    *   - A RETRY OVERWROTE THEM. init_java runs again when the activity is
+    *   - A FAILED NewGlobalRef LEAVES AN EXCEPTION PENDING. It fails by
+    *     running out of memory, and the next line then calls NewGlobalRef
+    *     again with an OutOfMemoryError pending -- illegal, and under CheckJNI
+    *     (on for a debuggable build and for anyone attached with a debugger)
+    *     an immediate `JNI DETECTED ERROR IN APPLICATION` abort. The app dies
+    *     on the launch that first hits memory pressure, with the tombstone
+    *     naming NewGlobalRef and no hint that the previous one was the
+    *     failure.
+    *   - A FAILED RegisterNatives KEEPS THE REFS ANYWAY. `return 0` leaves
+    *     g_ble and g_ctx set, so an app that has just reported BLE REG FAILED
+    *     -- with no native methods bound at all -- nevertheless holds, and
+    *     publishes through dexble_ctx(), a Context that every later caller
+    *     takes as proof the transport is up.
+    *   - A RETRY OVERWRITES THEM. init_java runs again when the activity is
     *     recreated in the same process (a back-press does exactly that), and
-    *     the plain assignment dropped the previous pair on the floor: two
+    *     a plain assignment drops the previous pair on the floor: two
     *     permanently unreachable global refs per relaunch, against a table
     *     with a hard ceiling and an abort behind it.
     *
@@ -852,13 +1002,25 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    m_disconnect = (*e)->GetStaticMethodID(e, ble, "disconnect", "(I)V");
    /* A missed method id leaves a pending NoSuchMethodError; making any further
     * JNI call with one pending is illegal and aborts under CheckJNI. Clear it
-    * here so a lookup failure degrades to a null id instead of taking the
+    * here so a lookup failure degrades to a null id rather than taking the
     * process down on the next call. */
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
    m_read = (*e)->GetStaticMethodID(e, ble, "read", "(ILjava/lang/String;)V");
-   m_startsvc   = (*e)->GetStaticMethodID(e, ble, "startService",
-                                          "(Landroid/content/Context;)V");
+   /* ON THE PLATFORM CLASS, not on Ble. Starting the foreground service is a
+    * platform policy -- it is what keeps this process alive to read a sensor
+    * at all -- and it moved out with the rest of them (PancraPlatform.java).
+    * jb_bind runs before dexble_register (see init_java), so the class is
+    * already bound here; a NULL one leaves m_startsvc NULL, which the caller
+    * below already treats as "not wired". */
+   {
+      jclass plat = jb_platform_class();
+      m_startsvc = plat
+                       ? (*e)->GetStaticMethodID(e, plat, "startService",
+                                                 "(Landroid/content/Context;)V")
+                       : 0;
+      g_plat     = plat;
+   }
    m_createbond = (*e)->GetStaticMethodID(
        e, ble, "createBond",
        "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
@@ -872,12 +1034,13 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
     * needs told about. */
    if (m_bondwatch)
       (*e)->CallStaticVoidMethod(e, g_ble, m_bondwatch, g_ctx);
-   if (m_startsvc)
-      (*e)->CallStaticVoidMethod(e, g_ble, m_startsvc,
+   if (m_startsvc && g_plat)
+      (*e)->CallStaticVoidMethod(e, g_plat, m_startsvc,
                                  g_ctx); /* keep alive in bg */
    (*e)->GetJavaVM(e, &g_vm);
-   /* The sync transport rides the same class and the same VM. */
-   syncjni_wire(e, ble);
+   /* The sync transport has a class of its own now (PancraNet); what it
+    * shares with this file is the VM and the moment. */
+   syncjni_wire(e, g_ctx);
    /* Every id we will later call, not just most of them: a missing
     * m_disconnect would leave dexble_link_close a silent no-op, holding a
     * meter awake past its own power-off -- the one thing otble.h says must
@@ -958,8 +1121,9 @@ int dexble_meter_connect(int link, const char *mac)
       return 0;
    /* Report whether the request actually reached Java. drv_connect is
     * best-effort and returns nothing, so a missing JNIEnv (Bluetooth off, or
-    * before the transport is wired) used to look exactly like success -- and
-    * the caller then recorded the meter as armed forever. */
+    * before the transport is wired) looks exactly like success unless this
+    * says otherwise -- and the caller then records the meter as armed
+    * forever. */
    if (!any_env())
       return 0;
    /* ONE step for both: routing the link to the meter protocol and issuing
@@ -972,10 +1136,10 @@ int dexble_meter_connect(int link, const char *mac)
 
 void dexble_reconnect(int link)
 { /* stall watchdog: force a fresh connect on a SPECIFIC link */
-   /* NAMED, not ambient. driver_kick used to act on whatever context was
-    * selected, and the GATT callbacks selected without restoring -- so with a
-    * second sensor or a meter sync in flight this kicked whichever link a
-    * binder thread last touched, spuriously reconnecting a healthy link while
-    * leaving the stalled one stranded until the next throttle window. */
+   /* NAMED, not ambient. Acting on whatever context was last selected -- and
+    * the GATT callbacks select without restoring -- kicks whichever link a
+    * binder thread last touched whenever a second sensor or a meter sync is
+    * in flight, spuriously reconnecting a healthy link while leaving the
+    * stalled one stranded until the next throttle window. */
    driver_kick(link);
 }

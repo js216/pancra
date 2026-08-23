@@ -2,8 +2,8 @@
 // sesscache.c --- the last-known session clock, per sensor (see sesscache.h)
 // Copyright 2026 Jakob Kastelic
 #include "sesscache.h"
-#include "dexdriver.h" /* struct dex_session: what is cached and restored */
-#include "dexlibc.h"
+#include "csvcur.h"     /* the shared CSV cursor: one grammar, one reader */
+#include "dexdriver.h"  /* struct dex_session: what is cached and restored */
 #include "loadresult.h" /* what a load actually found */
 #include "senslogic.h"  /* sens_cache_*: the rate limit on the write */
 #include "sensors.h"    /* MAX_SLOTS, SENSOR_ACTIVE_S */
@@ -59,11 +59,14 @@ static struct sens_cache g_sessc_state;
  * Every one of the five objects above was a plain global, and three threads
  * reach them:
  *
- *   MAIN     draws. build_model() calls sessc_put() for a link that has a
- *            live session and sessc_restore() for one that has not, once per
- *            row per frame. So the MAIN thread mutates the table, appends to
- *            it (g_nsessc++), and sets the dirty flag -- from the RENDER
- *            path, several times a second.
+ *   MAIN     draws. build_model() calls sessc_restore() for a link with no
+ *            live session yet, once per row per frame -- and, until item
+ *            266, sessc_put() for one that has: the MAIN thread mutated the
+ *            table, appended to it (g_nsessc++) and set the dirty flag from
+ *            the RENDER path, several times a second. The recording moved to
+ *            sensor_reconcile, which does not make the locking below any
+ *            less necessary -- reconcile runs on MAIN and on the service
+ *            thread, and the restore still runs per frame.
  *   MAIN     also flushes: on_timer -> sensor_reconcile -> sess_flush.
  *   SERVICE  the foreground service's "pancra-tick" HandlerThread, which
  *            outlives the activity: shell_service_tick ->
@@ -109,7 +112,7 @@ static struct sens_cache g_sessc_state;
  * it, and only then takes sessfile_lk. That is set_file_lk's shape exactly,
  * and app/settings.c's save_now/write_job split is the worked example this
  * follows, generation reconciliation included. See the rank table in
- * app/thread.h and app/test/lockorder.py, which check the pair. */
+ * app/thread.h and test/app/lockorder.py, which check the pair. */
 #ifdef APP_FAULTS
 void (*sess_fault_gap_here)(void);
 #endif
@@ -254,30 +257,19 @@ static int sess_write(const struct sess_job *j, long now, int mark)
    return bad ? -1 : 0;
 }
 
-int sess_save(void)
-{
-   struct sess_job j;
-   mutex_lock(&sessc_lk);
-   sess_render(&j);
-   mutex_unlock(&sessc_lk);
-   /* No `now`, and no mark: this is the unconditional "write it now" entry.
-    * WHEN the cache is due is sess_flush's business, and clearing the dirty
-    * flag from here would silently cancel a scheduled write. */
-   return sess_write(&j, 0, 0);
-}
-
 /* The session cache's own filename. */
 int sess_paths(const char *dir)
 {
    int ok = 1;
    mutex_lock(&sessfile_lk);
-   ok &= data_path(g_sess_path, sizeof g_sess_path, dir, "/session.cache");
-   /* A NEW FILE HAS NOTHING IN IT, whatever the old one held. Without this
-    * the generation gate would compare the next render against what the
-    * PREVIOUS path already contained and skip the write, leaving the new
-    * file absent. Nothing on the phone repoints this after startup; a test
-    * that runs several fixtures in one process does, and a silently skipped
-    * write is precisely the defect this module was just fixed for. */
+   if (!(data_path(g_sess_path, sizeof g_sess_path, dir, "/session.cache")))
+      ok = 0;
+   /* A NEW FILE HAS NOTHING IN IT, whatever the path before it held. Without
+    * this the generation gate compares the next render against what the
+    * PREVIOUS path contained and skips the write, leaving the new file
+    * absent. Nothing on the phone repoints this after startup; a test that
+    * runs several fixtures in one process does, and a silently skipped write
+    * is exactly what this module must not do. */
    g_sessc_written = 0;
    mutex_unlock(&sessfile_lk);
    mutex_lock(&sessc_lk);
@@ -286,79 +278,153 @@ int sess_paths(const char *dir)
    return ok;
 }
 
+/* ---- THE FILE IS PROVED BEFORE ANY OF IT IS BELIEVED --------
+ *
+ * WHAT A TOLERANT READER COSTS HERE, case by case:
+ *
+ *   TOLERATING ANYTHING. A parse that walks the line accumulating digits and
+ *   counting commas admits "7,,x,,,," and "7" and "7,,,,,,,,,9" as rows --
+ *   absent fields read as zero, which for the CLOCK means "session
+ *   started at the epoch" and for `state` means a state byte the sensor never
+ *   sent. Nothing said which of the six fields the file actually held.
+ *
+ *   IT PUBLISHED AS IT PARSED. Each row was applied to the live table the
+ *   moment it was read, so a file that went wrong halfway left the first half
+ *   applied and returned LOAD_OK. Half a restore is the shape that is hardest
+ *   to notice: the sensors that did load look right and the ones that did not
+ *   look like sensors never seen.
+ *
+ *   IT DROPPED WHAT DID NOT FIT. A file with more rows than the table holds
+ *   quietly kept the first MAX_SLOTS and reported success.
+ *
+ *   AN UNTERMINATED LAST ROW WAS A ROW. A file cut by a power loss mid-write
+ *   ends without its newline, and its surviving digits parse into a plausible
+ *   id and a plausible clock.
+ *
+ * So: read exactly (read_file_exact proves there is nothing past the buffer),
+ * require SIX ranged fields on every row and a newline after every row,
+ * refuse a repeated id, refuse a file with more rows than the table holds,
+ * stage the lot privately, and publish only once all of it is known good.
+ * What the caller gets is a typed answer, and a table that is either the file
+ * or untouched. */
+/* THE TWO BOUNDS THAT ARE ABOUT THE DOMAIN rather than about a machine word.
+ *
+ * SESS_CLOCK_MAX is sixty days of session seconds: a G7 runs ten and a Stelo
+ * fifteen, so anything past two months is not a session clock this app ever
+ * wrote -- and the value is PROJECTED FORWARD on load, so a wild one becomes
+ * a countdown that reads as live.
+ *
+ * SESS_PRED_MAX is the widest glucose the sensor scale expresses with room to
+ * spare; the prediction is drawn on the main screen. */
+#define SESS_CLOCK_MAX (60L * 24 * 3600)
+#define SESS_PRED_MAX  1000L
+
+static int sess_row_ok(const char *p, const char *e, struct sess_cache *out)
+{
+   struct csv_cur c;
+   csv_open(&c, p, e);
+   long v[6];
+   for (int i = 0; i < 6; i++) {
+      enum csv_field why = CSV_FIELD_OK;
+      v[i]               = csv_num(&c, &why);
+      /* EVERY FIELD PRESENT AND WHOLE. An empty field is not a zero and an
+       * overflowed one is not the number that was written. */
+      if (why != CSV_FIELD_OK)
+         return 0;
+      if (i < 5 && !csv_sep(&c))
+         return 0; /* fewer than six fields */
+   }
+   if (c.p != e)
+      return 0; /* a seventh field, or trailing rubbish */
+   /* THE RANGES ARE WHAT THIS PROGRAM WRITES. `id` is a registry id, the two
+    * clocks are seconds, `state` is the sensor's own byte, `predicted` is a
+    * glucose value and `sequence` is a sample counter. A value outside these
+    * did not come from sess_save. */
+   if (v[0] <= 0 || v[0] > 0x7fffffffL)
+      return 0;
+   if (v[1] < 0 || v[1] > 0x7fffffffL)
+      return 0;
+   if (v[2] < 0 || v[2] > SESS_CLOCK_MAX)
+      return 0;
+   if (v[3] < 0 || v[3] > 255)
+      return 0;
+   if (v[4] < 0 || v[4] > SESS_PRED_MAX)
+      return 0;
+   if (v[5] < 0 || v[5] > 0x7fffffffL)
+      return 0;
+   out->id        = (int)v[0];
+   out->clock_t   = v[1];
+   out->clock     = v[2];
+   out->state     = (int)v[3];
+   out->predicted = (int)v[4];
+   out->sequence  = (int)v[5];
+   return 1;
+}
+
 enum load_result sess_load(void)
 {
-   int fd = open(g_sess_path, O_RDONLY, 0);
-   if (fd < 0) {
-      /* A first run has no file, and that is not a failure. Anything else is
-       * a file that is there and cannot be opened. */
-      if (errno == ENOENT)
-         return LOAD_ABSENT;
-      return LOAD_ERROR;
-   }
+   /* ONE EXACT READ: short reads, EINTR and a file longer than
+    * this buffer are all handled in read_file_exact rather than here. */
    char b[1024];
-   int n = (int)read(fd, b, (sizeof b) - 1);
-   close(fd);
-   if (n < 0)
-      return LOAD_ERROR;
-   if (n == 0)
-      return LOAD_CORRUPT; /* created and not written: a torn save */
-   b[n]    = 0;
-   char *p = b;
-   while (*p) {
-      long v[6] = {0, 0, 0, 0, 0, 0};
-      int vi    = 0;
-      int any   = 0;
-      while (*p && *p != '\n') {
-         if (*p >= '0' && *p <= '9') {
-            /* Digit-capped, like every other loader here: an unbounded
-             * accumulation is UB and a wrapped value would restore a
-             * nonsense clock that the projection below then counts on. */
-            if (v[vi] < 100000000000000000L)
-               v[vi] = (v[vi] * 10) + (*p - '0');
-            any = 1;
-         } else if (*p == ',' && vi < 5) {
-            vi++;
-         }
-         p++;
+   int n               = 0;
+   enum load_result rr = read_file_exact(g_sess_path, b, sizeof b, &n);
+   if (rr != LOAD_OK)
+      return rr;
+
+   /* STAGED, NOT PUBLISHED. Nothing below touches the live table until the
+    * whole file has parsed. */
+   struct sess_cache stage[MAX_SLOTS];
+   int nstage = 0;
+   char *p    = b;
+   char *end  = b + n;
+   while (p < end) {
+      char *nl = p;
+      while (nl < end && *nl != '\n')
+         nl++;
+      if (nl == end)
+         return LOAD_CORRUPT; /* the last row has no newline: a cut file */
+      if (nl == p) {
+         p = nl + 1;
+         continue; /* a blank line is not a row and is not damage */
       }
-      if (*p == '\n')
-         p++;
-      if (any && v[0] > 0) {
-         /* UNDER THE LOCK EVEN HERE. This runs once at startup on the MAIN
-          * thread before the service tick exists, so nothing races it today
-          * -- but "every touch of the table is under sessc_lk" is a rule a
-          * reader can check, and "except this one, because of where it is
-          * called from" is an invariant that lives in another module's call
-          * graph. The lock is taken per row rather than around the parse so
-          * that the early returns above stay returns. */
-         mutex_lock(&sessc_lk);
-         struct sess_cache *c = sessc_get((int)v[0], 1);
-         if (c) {
-            c->clock_t   = v[1];
-            c->clock     = v[2];
-            c->state     = (int)v[3];
-            c->predicted = (int)v[4];
-            c->sequence  = (int)v[5];
-         }
-         mutex_unlock(&sessc_lk);
-      }
+      if (nstage >= MAX_SLOTS)
+         return LOAD_CORRUPT; /* more rows than the table holds */
+      struct sess_cache row = {0, 0, 0, 0, 0, 0};
+      if (!sess_row_ok(p, nl, &row))
+         return LOAD_CORRUPT;
+      /* ONE ROW PER SENSOR. Two rows for one id is a file this program did
+       * not write, and "the last one wins" would be a rule invented here. */
+      for (int i = 0; i < nstage; i++)
+         if (stage[i].id == row.id)
+            return LOAD_CORRUPT;
+      stage[nstage++] = row;
+      p               = nl + 1;
    }
+
+   /* AND NOW IT IS THE TABLE, all at once. The generation is NOT bumped: a
+    * load is the state the file already holds, so marking it dirty would
+    * rewrite the file it just read on the next flush. */
+   mutex_lock(&sessc_lk);
+   for (int i = 0; i < nstage; i++)
+      g_sessc[i] = stage[i];
+   g_nsessc = nstage;
+   mutex_unlock(&sessc_lk);
    return LOAD_OK;
 }
 
-/* Record a LIVE session for `id`. Cheap enough to call every frame, but only
- * marks the file dirty when the clock actually moved -- the flush is on the
- * 1 Hz tick, so a redraw storm cannot turn this into a write storm. */
+/* Record a LIVE session for `id`. Only marks the file dirty when the clock
+ * actually moved, and the flush is rate-limited on top of that (senslogic.h)
+ * -- so the 1 Hz tick that calls this cannot turn a clock that changes every
+ * second into a write every second. */
 void sessc_put(int id, const struct dex_session *s, long now)
 {
    if (id <= 0 || !s->have_reading)
       return;
    mutex_lock(&sessc_lk);
    struct sess_cache *c = sessc_get(id, 1);
-   /* ONE CONDITION AND ONE EXIT, rather than the three early returns this
-    * used to be: a `return` from inside the lock walks away holding a
-    * yield-spin with no timeout, and app/test/lockorder.py refuses one. */
+   /* ONE CONDITION AND ONE EXIT, rather than three early returns: a `return`
+    * from inside the lock walks away holding a yield-spin with no timeout,
+    * and test/app/lockorder.py refuses one. */
    if (c && !(c->clock == (long)s->session_seconds && c->state == s->state &&
               c->predicted == s->predicted)) {
       c->clock_t   = now;
@@ -367,9 +433,9 @@ void sessc_put(int id, const struct dex_session *s, long now)
       c->predicted = s->predicted;
       c->sequence  = s->sequence;
       /* THE CHANGE AND ITS GENERATION IN THE SAME CRITICAL SECTION. A
-       * renderer that saw the new row but the old generation would stamp its
-       * job as containing a change it does not, and then mark the cache
-       * saved for it. */
+       * renderer that saw the new row against the previous generation would
+       * stamp its job as containing a change it does not, and then mark the
+       * cache saved for it. */
       g_sessc_gen++;
       sens_cache_touch(&g_sessc_state);
    }

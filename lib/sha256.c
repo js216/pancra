@@ -148,16 +148,24 @@ void sha256_update(struct sha256_ctx *c, const uint8_t *p, size_t n)
 void sha256_final(struct sha256_ctx *c, uint8_t out[32])
 {
    uint64_t bits = c->total * 8;
-   uint8_t pad   = 0x80;
-   sha256_update(c, &pad, 1);
-   uint8_t zero = 0;
-   while (c->used != 56)
-      sha256_update(c, &zero, 1);
-   uint8_t len[8];
+   /* The padding is written straight into the block rather than fed back
+    * through sha256_update: a MAC over a 32-byte message spends most of its
+    * padding on zeros, and a call per zero byte is most of the cost of the
+    * short hashes PBKDF2 is made of.
+    *
+    * `used` is below 64 here -- update compresses the moment it fills -- so
+    * the 0x80 always fits, and only the length field can push past the
+    * block, which is the case the first compression below is for. */
+   c->block[c->used++] = 0x80;
+   if (c->used > 56) {
+      memset(c->block + c->used, 0, 64 - c->used);
+      sha256_compress(c->h, c->block);
+      c->used = 0;
+   }
+   memset(c->block + c->used, 0, 56 - c->used);
    for (unsigned i = 0; i < 8; i++)
-      len[i] = (uint8_t)(bits >> (56U - (8U * i)));
-   c->total -= 9; /* the padding is not message length */
-   sha256_update(c, len, 8);
+      c->block[56 + i] = (uint8_t)(bits >> (56U - (8U * i)));
+   sha256_compress(c->h, c->block);
    for (size_t i = 0; i < 8; i++) {
       out[4 * i]       = (uint8_t)(c->h[i] >> 24U);
       out[(4 * i) + 1] = (uint8_t)(c->h[i] >> 16U);

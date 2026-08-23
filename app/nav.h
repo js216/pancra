@@ -3,19 +3,18 @@
 // Copyright 2026 Jakob Kastelic
 //
 /*
- * WHAT IT REPLACES. Every screen that could be reached from more than one
- * place carried its own "where did I come from" global -- g_sensor_from,
- * g_devices_from, g_pair_from, g_alarm_from, g_ins_from, g_inslog_from,
- * g_wt_from, g_wtlog_from -- captured by hand at each entry and read back by
- * hand at each exit. Eight variables, eight capture rules, and a back key that
- * is wrong the moment one of them is missed.
+ * WHAT IT IS FOR. Without it, every screen reachable from more than one place
+ * carries its own "where did I come from" global -- one per screen, captured
+ * by hand at each entry and read back by hand at each exit. That is as many
+ * variables as there are such screens, as many capture rules, and a back key
+ * that is wrong the moment one of them is missed.
  *
- * They were also each guarded by a condition of the form "capture the origin
- * ONLY on a genuine external entry", because a screen re-entered from one of
- * its OWN sub-screens would otherwise record the sub-screen as its origin and
- * closing it would go round in a circle. That condition is a hand-maintained
- * list of which screens count as "outside" -- and it is exactly the thing that
- * gets forgotten when a new route to a screen appears.
+ * Each of those also needs a guard of the form "capture the origin ONLY on a
+ * genuine external entry", because a screen re-entered from one of its OWN
+ * sub-screens would otherwise record the sub-screen as its origin and closing
+ * it would go round in a circle. That condition is a hand-maintained list of
+ * which screens count as "outside" -- and it is exactly the thing that gets
+ * forgotten when a new route to a screen appears.
  *
  * A PATH MAKES BOTH PROBLEMS GO AWAY. g_nav is the route the user actually
  * took, root first, so:
@@ -24,7 +23,7 @@
  *     below it, which cannot be stale or forgotten;
  *   - going to a screen ALREADY ON THE PATH is a RETURN, and nav_go pops back
  *     to it rather than pushing a second copy. That is the "external entry"
- *     condition, derived instead of maintained.
+ *     condition, derived rather than maintained.
  *
  * The current screen is the top of the path; there is no separate variable for
  * it, because two representations of one fact is how this started.
@@ -44,8 +43,8 @@ enum ui_screen cur_screen(void);
 
 /* Go to `to`: open it on top of the current screen, or -- if it is already on
  * the path -- RETURN to it, discarding everything above. That second case is
- * what replaces the hand-maintained "only capture the origin on a genuine
- * external entry" condition at every call site. */
+ * what makes the hand-maintained "only capture the origin on a genuine
+ * external entry" condition unnecessary at every call site. */
 void nav_go(enum ui_screen to);
 
 /* Close the current screen, returning to whatever opened it. */
@@ -83,10 +82,12 @@ void nav_return_to(int mark);
 int nav_path(enum ui_screen *out, int cap);
 void nav_set_path(const enum ui_screen *p, int n);
 
-/* The current screen as a plain int at a FIXED address, for the crash handler
- * -- which reads its context through pointers and cannot call anything to
- * derive a value (see crashlog.h). A MIRROR, written only by this module, so
- * it cannot drift from the path. */
-extern int g_screen_now;
+/* The current screen as an ATOMIC int at a FIXED address, for the crash
+ * handler -- which reads its context through pointers, cannot call anything
+ * to derive a value, and can interrupt the thread that writes this one
+ * between two instructions (see crashlog.h). A MIRROR, written only by this
+ * module, so it cannot drift from the path. */
+#include <stdatomic.h>
+extern _Atomic int g_screen_now;
 
 #endif

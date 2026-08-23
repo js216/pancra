@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0
-// jbridge.c --- Every call into Ble.java (see jbridge.h)
+// jbridge.c --- Every call into the Java adapters (see jbridge.h)
 // Copyright 2026 Jakob Kastelic
 
 #include "jbridge.h"
@@ -10,7 +10,22 @@
 #include <jni_md.h> /* jint / jlong: the fixed-width JNI scalars */
 #include <stdint.h>
 
-static jclass g_ble; /* global ref to com.jk.pancra.Ble */
+/* THREE CLASSES, BECAUSE THERE ARE THREE ADAPTERS.
+ *
+ * The GATT pipe, the export, the platform policies and the sync transport
+ * are four adapters; behind one class name and one bind they are one
+ * unreadable file. They are separate classes (see PancraExport.java,
+ * PancraPlatform.java, PancraNet.java), and this side names the class each
+ * method actually lives on rather than routing them all through a facade --
+ * a delegating stub on Ble would rebuild the single facade one method deep.
+ *
+ * The natives are the one thing that CANNOT move. RegisterNatives binds them
+ * to a class (app/dexble.c, app/pairing.c, app/scan.c), so the callbacks and
+ * the three sync entry points stay declared on Ble -- which is why jb_class()
+ * still exists and still means that class. */
+static jclass g_ble;      /* global ref to com.jk.pancra.Ble */
+static jclass g_platform; /* ...to com.jk.pancra.PancraPlatform */
+static jclass g_export;   /* ...to com.jk.pancra.PancraExport */
 static jmethodID m_scan, m_stop;
 static jmethodID m_set_orient, m_perm_granted, m_req_perm,
     m_open_settings; /* settings-menu ops */
@@ -25,6 +40,11 @@ static jmethodID
 jclass jb_class(void)
 {
    return g_ble;
+}
+
+jclass jb_platform_class(void)
+{
+   return g_platform;
 }
 
 /* EVERY METHOD THIS BRIDGE NEEDS, as data.
@@ -43,37 +63,48 @@ struct jb_method {
    const char *sig;
 };
 
-static const struct jb_method g_methods[] = {
+/* ONE TABLE PER CLASS, and the class is part of the data. Binding a method
+ * against the wrong class is a NoSuchMethodError at BIND time -- loud, once,
+ * at launch -- which is exactly where a mistake in this file belongs. */
+static const struct jb_method g_ble_methods[] = {
     /* (Context, gen): the generation the started scan owns, so an asynchronous
      * onScanFailed can name which scan died. */
-    {&m_scan,          "scan",                  "(Landroid/content/Context;I)Ljava/lang/String;"},
-    {&m_stop,          "stop",                  "()Z"                                           },
-    {&m_show_glucose,  "showGlucose",
-     "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/"
-     "String;Ljava/lang/String;[IIII)V"                                                         },
-    {&m_set_orient,    "setOrientation",        "(Landroid/content/Context;I)V"                 },
-    {&m_export,        "exportData",            "(Landroid/content/Context;JZZZZ)V"             },
-    {&m_perm_granted,  "permGranted",
-     "(Landroid/content/Context;Ljava/lang/String;)Z"                                           },
-    {&m_req_perm,      "requestPerm",
-     "(Landroid/content/Context;Ljava/lang/String;)V"                                           },
-    {&m_open_settings, "openAppSettings",       "(Landroid/content/Context;)V"                  },
-    {&m_batt_ok,       "isBatteryUnrestricted", "(Landroid/content/Context;)Z"                  },
-    {&m_req_batt,      "requestBatteryOpt",     "(Landroid/content/Context;)V"                  },
-    {&m_bucket,        "standbyBucket",         "(Landroid/content/Context;)I"                  },
-    {&m_bg_restricted, "isBgRestricted",        "(Landroid/content/Context;)Z"                  },
+    {&m_scan,          "scan",         "(Landroid/content/Context;I)Ljava/lang/String;"},
+    {&m_stop,          "stop",         "()Z"                                           },
     {&m_bonded_sensor, "bondedSensor",
-     "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;"                          },
+     "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;"                 },
 };
 
-#define JB_NMETHOD ((int)(sizeof g_methods / sizeof g_methods[0]))
+static const struct jb_method g_platform_methods[] = {
+    {&m_show_glucose,  "showGlucose",
+     "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/"
+     "String;Ljava/lang/String;[IIII)V"                                        },
+    {&m_set_orient,    "setOrientation",        "(Landroid/content/Context;I)V"},
+    {&m_perm_granted,  "permGranted",
+     "(Landroid/content/Context;Ljava/lang/String;)Z"                          },
+    {&m_req_perm,      "requestPerm",
+     "(Landroid/content/Context;Ljava/lang/String;)V"                          },
+    {&m_open_settings, "openAppSettings",       "(Landroid/content/Context;)V" },
+    {&m_batt_ok,       "isBatteryUnrestricted", "(Landroid/content/Context;)Z" },
+    {&m_req_batt,      "requestBatteryOpt",     "(Landroid/content/Context;)V" },
+    {&m_bucket,        "standbyBucket",         "(Landroid/content/Context;)I" },
+    {&m_bg_restricted, "isBgRestricted",        "(Landroid/content/Context;)Z" },
+};
+
+static const struct jb_method g_export_methods[] = {
+    {&m_export, "exportData", "(Landroid/content/Context;JZZZZ)V"},
+};
+
+#define JB_NBLE ((int)(sizeof g_ble_methods / sizeof g_ble_methods[0]))
+#define JB_NPLATFORM                                                           \
+   ((int)(sizeof g_platform_methods / sizeof g_platform_methods[0]))
+#define JB_NEXPORT ((int)(sizeof g_export_methods / sizeof g_export_methods[0]))
 
 /* THE APP'S OWN CLASSLOADER, one checked step at a time. See jbridge.h for
  * why FindClass cannot be used from a native-activity callback at all.
  *
- * SIX CALLS, SIX VERDICTS, ONE EXIT. The version this replaces made all six
- * and looked at the result of ONE -- the last -- which is two separate
- * defects wearing the same shirt:
+ * SIX CALLS, SIX VERDICTS, ONE EXIT. Making all six and looking at the result
+ * of ONE -- the last -- is two separate defects wearing the same shirt:
  *
  *   - A FAILURE WAS CARRIED FORWARD. getClassLoader returning null (it can:
  *     a class loaded by the bootstrap loader has none, and that is precisely
@@ -180,32 +211,18 @@ done:
    return ok;
 }
 
-/* ALL OR NOTHING. A partial bind is the worst of the three outcomes: the app
- * runs, the screen draws, and whichever call lost its id does nothing at all
- * -- which for `stop` means a second scan client stacks on the first, and for
- * showGlucose means the notification the service exists to draw is blank. */
-int jb_bind(JNIEnv *env, jclass ble_local)
+/* Bind one table against one class. Returns 1 with every slot filled, or 0
+ * having filled none of them and said which method failed. */
+static int bind_table(JNIEnv *env, jclass cls, const struct jb_method *tab,
+                      int n)
 {
-   if (!env || !ble_local)
-      return 0;
-   /* Once only. A back-press destroys the activity without ending the
-    * process, so a relaunch re-enters onCreate here -- re-binding would leak
-    * the previous global ref every time. */
-   if (g_ble)
-      return 1;
-   jclass cls = (*env)->NewGlobalRef(env, ble_local);
-   if (!cls) {
-      if ((*env)->ExceptionCheck(env))
-         (*env)->ExceptionClear(env);
-      return 0;
-   }
-   for (int i = 0; i < JB_NMETHOD; i++) {
-      jmethodID id = (*env)->GetStaticMethodID(env, cls, g_methods[i].name,
-                                               g_methods[i].sig);
+   for (int i = 0; i < n; i++) {
+      jmethodID id =
+          (*env)->GetStaticMethodID(env, cls, tab[i].name, tab[i].sig);
       /* BOTH, because they are different failures with the same cure: a NULL
        * id is the lookup saying no, and a pending exception is the VM's
        * NoSuchMethodError -- which, left pending, makes the NEXT unrelated
-       * JNI call fail instead of this one. */
+       * JNI call fail rather than this one. */
       if (!id || (*env)->ExceptionCheck(env)) {
          /* DESCRIBE first: it names the method in logcat, and the whole
           * point of failing here is that somebody can see WHICH one. */
@@ -213,18 +230,111 @@ int jb_bind(JNIEnv *env, jclass ble_local)
             (*env)->ExceptionDescribe(env);
             (*env)->ExceptionClear(env);
          }
-         /* Give the partial state back rather than leaving half a bridge
-          * behind: g_ble is what every call site tests, so leaving it set
-          * would say "bound" for ever. */
-         for (int k = 0; k < JB_NMETHOD; k++)
-            *g_methods[k].slot = 0;
-         (*env)->DeleteGlobalRef(env, cls);
+         LOGI("jbridge: %s did not bind", tab[i].name);
+         for (int k = 0; k < n; k++)
+            *tab[k].slot = 0;
          return 0;
       }
-      *g_methods[i].slot = id;
+      *tab[i].slot = id;
    }
-   g_ble = cls;
    return 1;
+}
+
+/* Every slot in every table, cleared. Used on any failure, so a partial bind
+ * can never be left behind. */
+static void unbind_all(void)
+{
+   for (int i = 0; i < JB_NBLE; i++)
+      *g_ble_methods[i].slot = 0;
+   for (int i = 0; i < JB_NPLATFORM; i++)
+      *g_platform_methods[i].slot = 0;
+   for (int i = 0; i < JB_NEXPORT; i++)
+      *g_export_methods[i].slot = 0;
+}
+
+/* ALL OR NOTHING, ACROSS ALL THREE CLASSES. A partial bind is the worst of
+ * the three outcomes: the app runs, the screen draws, and whichever call lost
+ * its id does nothing at all -- which for `stop` means a second scan client
+ * stacks on the first, and for showGlucose means the notification the service
+ * exists to draw is blank.
+ *
+ * `activity` is needed because two of the three classes are resolved HERE, by
+ * name, through the app's own classloader: only Ble is handed in, since only
+ * Ble has natives to register and main.c needs it for that. */
+int jb_bind(JNIEnv *env, jobject activity, jclass ble_local)
+{
+   if (!env || !activity || !ble_local)
+      return 0;
+   /* Once only. A back-press destroys the activity without ending the
+    * process, so a relaunch re-enters onCreate here -- re-binding would leak
+    * the previous global ref every time. */
+   if (g_ble)
+      return 1;
+
+   jclass plat_local = NULL;
+   jclass exp_local  = NULL;
+   jclass cls        = NULL;
+   jclass gplat      = NULL;
+   jclass gexp       = NULL;
+   int ok            = 0;
+
+   if (!jb_app_class(env, activity, "com.jk.pancra.PancraPlatform",
+                     &plat_local)) {
+      LOGI("jbridge: PancraPlatform NOT found");
+      goto out;
+   }
+   if (!jb_app_class(env, activity, "com.jk.pancra.PancraExport", &exp_local)) {
+      LOGI("jbridge: PancraExport NOT found");
+      goto out;
+   }
+
+   /* THE GLOBAL REFS FIRST AND TOGETHER. NewGlobalRef fails by running out of
+    * memory and leaves an OutOfMemoryError pending, so the next call must not
+    * be made unconditionally -- under CheckJNI that is an abort, not an error
+    * code. */
+   cls = (*env)->NewGlobalRef(env, ble_local);
+   if (cls)
+      gplat = (*env)->NewGlobalRef(env, plat_local);
+   if (gplat)
+      gexp = (*env)->NewGlobalRef(env, exp_local);
+   if (!cls || !gplat || !gexp) {
+      if ((*env)->ExceptionCheck(env))
+         (*env)->ExceptionClear(env);
+      goto out;
+   }
+
+   if (!bind_table(env, cls, g_ble_methods, JB_NBLE) ||
+       !bind_table(env, gplat, g_platform_methods, JB_NPLATFORM) ||
+       !bind_table(env, gexp, g_export_methods, JB_NEXPORT)) {
+      /* Give the partial state back rather than leaving half a bridge
+       * behind: g_ble is what every call site tests, so leaving it set
+       * would say "bound" for ever. */
+      unbind_all();
+      goto out;
+   }
+
+   /* PUBLISHED TOGETHER, at the end: every call site tests its class pointer,
+    * and a class published before its table is bound reads as ready. */
+   g_ble      = cls;
+   g_platform = gplat;
+   g_export   = gexp;
+   cls        = NULL;
+   gplat      = NULL;
+   gexp       = NULL;
+   ok         = 1;
+
+out:
+   if (cls)
+      (*env)->DeleteGlobalRef(env, cls);
+   if (gplat)
+      (*env)->DeleteGlobalRef(env, gplat);
+   if (gexp)
+      (*env)->DeleteGlobalRef(env, gexp);
+   if (plat_local)
+      (*env)->DeleteLocalRef(env, plat_local);
+   if (exp_local)
+      (*env)->DeleteLocalRef(env, exp_local);
+   return ok;
 }
 
 /* --- scan lifecycle --- */
@@ -247,8 +357,11 @@ int jb_scan(JNIEnv *env, jobject clazz, int gen, char *err, int cap)
    if (e) {
       str_snapshot(err, cap, e);
       (*env)->ReleaseStringUTFChars(env, jerr, e);
-   } else if ((*env)->ExceptionCheck(env)) {
-      (*env)->ExceptionClear(env);
+   } else {
+      /* jb_checked rather than a bare ExceptionCheck/Clear pair: it is the
+       * one place that describes the throw to the log, and a failure here is
+       * exactly the kind that is otherwise invisible. */
+      (void)jb_checked(env, "GetStringUTFChars(scan error)");
       str_snapshot(err, cap, "SCAN FAILED");
    }
    (*env)->DeleteLocalRef(env, jerr);
@@ -290,6 +403,8 @@ int jb_checked(JNIEnv *e, const char *what)
    return 0;
 }
 
+/* g_ble stands for ALL THREE classes here: jb_bind publishes them together
+ * or not at all, so one test is the whole question ("is the bridge up"). */
 static JNIEnv *act_env(struct ANativeActivity *a, jmethodID m)
 {
    if (!a || !a->env || !g_ble || !m)
@@ -302,7 +417,8 @@ int jb_set_orientation(struct ANativeActivity *a, int mode)
    JNIEnv *e = act_env(a, m_set_orient);
    if (!e)
       return 0;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_set_orient, a->clazz, (jint)mode);
+   (*e)->CallStaticVoidMethod(e, g_platform, m_set_orient, a->clazz,
+                              (jint)mode);
    return jb_checked(e, "setOrientation");
 }
 
@@ -312,7 +428,7 @@ int jb_export_data(struct ANativeActivity *a, long cutoff, int glu, int dev,
    JNIEnv *e = act_env(a, m_export);
    if (!e)
       return 0;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_export, a->clazz, (jlong)cutoff,
+   (*e)->CallStaticVoidMethod(e, g_export, m_export, a->clazz, (jlong)cutoff,
                               (jboolean)(glu != 0), (jboolean)(dev != 0),
                               (jboolean)(ins != 0), (jboolean)(wt != 0));
    return jb_checked(e, "exportData");
@@ -330,9 +446,9 @@ int jb_perm_granted(struct ANativeActivity *a, const char *perm, int *granted)
       (void)jb_checked(e, "NewStringUTF(perm)");
       return 0;
    }
-   jboolean r =
-       (*e)->CallStaticBooleanMethod(e, g_ble, m_perm_granted, a->clazz, p);
-   int ok = jb_checked(e, "permGranted");
+   jboolean r = (*e)->CallStaticBooleanMethod(e, g_platform, m_perm_granted,
+                                              a->clazz, p);
+   int ok     = jb_checked(e, "permGranted");
    (*e)->DeleteLocalRef(e, p);
    if (!ok)
       return 0; /* r is zero-because-it-threw, not zero-because-denied */
@@ -351,7 +467,7 @@ int jb_request_perm(struct ANativeActivity *a, const char *perm)
       (void)jb_checked(e, "NewStringUTF(perm)");
       return 0;
    }
-   (*e)->CallStaticVoidMethod(e, g_ble, m_req_perm, a->clazz, p);
+   (*e)->CallStaticVoidMethod(e, g_platform, m_req_perm, a->clazz, p);
    int ok = jb_checked(e, "requestPerm");
    (*e)->DeleteLocalRef(e, p);
    return ok;
@@ -362,7 +478,7 @@ int jb_open_settings(struct ANativeActivity *a)
    JNIEnv *e = act_env(a, m_open_settings);
    if (!e)
       return 0;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_open_settings, a->clazz);
+   (*e)->CallStaticVoidMethod(e, g_platform, m_open_settings, a->clazz);
    return jb_checked(e, "openSettings");
 }
 
@@ -373,7 +489,10 @@ static int call_bool(struct ANativeActivity *a, jmethodID m, const char *what,
    JNIEnv *e = act_env(a, m);
    if (!e)
       return 0;
-   jboolean r = (*e)->CallStaticBooleanMethod(e, g_ble, m, a->clazz);
+   /* Both callers are platform-policy questions; the class is named here
+    * rather than assumed, so a future third caller on another adapter is a
+    * compile error and not a silent lookup on the wrong class. */
+   jboolean r = (*e)->CallStaticBooleanMethod(e, g_platform, m, a->clazz);
    if (!jb_checked(e, what))
       return 0;
    if (out)
@@ -396,7 +515,7 @@ int jb_request_battery(struct ANativeActivity *a)
    JNIEnv *e = act_env(a, m_req_batt);
    if (!e)
       return 0;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_req_batt, a->clazz);
+   (*e)->CallStaticVoidMethod(e, g_platform, m_req_batt, a->clazz);
    return jb_checked(e, "requestBattery");
 }
 
@@ -405,7 +524,7 @@ int jb_standby_bucket(struct ANativeActivity *a, int *bucket)
    JNIEnv *e = act_env(a, m_bucket);
    if (!e)
       return 0;
-   jint r = (*e)->CallStaticIntMethod(e, g_ble, m_bucket, a->clazz);
+   jint r = (*e)->CallStaticIntMethod(e, g_platform, m_bucket, a->clazz);
    if (!jb_checked(e, "standbyBucket"))
       return 0; /* 0 from a throw is "ACTIVE", the most reassuring answer
                  * there is, and it would have been shown as a fact */
@@ -419,9 +538,15 @@ int jb_bonded_sensor(JNIEnv *env, jobject clazz, const char *prefix, char *mac,
 {
    if (!env || !g_ble || !m_bonded_sensor || !mac || cap <= 0)
       return 0;
-   mac[0]       = 0;
+   mac[0] = 0;
+   /* CHECKED, NOT JUST NULL-TESTED. NewStringUTF does not merely return NULL
+    * when the heap is exhausted -- it leaves an OutOfMemoryError PENDING on
+    * this thread, and the next JNI call anybody makes with one pending is
+    * undefined behaviour that in practice aborts the VM. Returning 0 here
+    * without clearing therefore turns a recoverable allocation failure into a
+    * crash in whatever unrelated code makes the next call. */
    jstring jpfx = (*env)->NewStringUTF(env, prefix);
-   if (!jpfx)
+   if (!jb_checked(env, "NewStringUTF(bonded prefix)") || !jpfx)
       return 0;
    jstring jm =
        (*env)->CallStaticObjectMethod(env, g_ble, m_bonded_sensor, clazz, jpfx);
@@ -433,11 +558,17 @@ int jb_bonded_sensor(JNIEnv *env, jobject clazz, const char *prefix, char *mac,
    (*env)->DeleteLocalRef(env, jpfx);
    if (!jm)
       return 0;
+   /* SAME FOR THE CHARS. GetStringUTFChars answers NULL on OOM with the
+    * exception pending; the DeleteLocalRef below is one of the few calls the
+    * JNI spec allows with one outstanding, but the caller's next call is not,
+    * and this function's contract is that it returns to ordinary C code. */
    const char *bm = (*env)->GetStringUTFChars(env, jm, NULL);
-   if (bm)
+   if (!jb_checked(env, "GetStringUTFChars(bonded mac)"))
+      bm = NULL;
+   if (bm) {
       str_snapshot(mac, cap, bm);
-   if (bm)
       (*env)->ReleaseStringUTFChars(env, jm, bm);
+   }
    (*env)->DeleteLocalRef(env, jm);
    return mac[0] ? 1 : 0;
 }
@@ -446,7 +577,7 @@ void jb_show_glucose(JNIEnv *e, jobject ctx, const char *title,
                      const char *text, const char *val, const uint32_t *px,
                      int w, int h, int lockscr)
 {
-   if (!e || !ctx || !g_ble || !m_show_glucose || !px || w <= 0 || h <= 0)
+   if (!e || !ctx || !g_platform || !m_show_glucose || !px || w <= 0 || h <= 0)
       return;
    jstring jt    = (*e)->NewStringUTF(e, title);
    jstring js    = (*e)->NewStringUTF(e, text);
@@ -457,8 +588,9 @@ void jb_show_glucose(JNIEnv *e, jobject ctx, const char *title,
     * rather than pass one through. */
    if (jt && js && jv && arr) {
       (*e)->SetIntArrayRegion(e, arr, 0, w * h, (const jint *)px);
-      (*e)->CallStaticVoidMethod(e, g_ble, m_show_glucose, ctx, jt, js, jv, arr,
-                                 (jint)w, (jint)h, (jint)(lockscr ? 1 : 0));
+      (*e)->CallStaticVoidMethod(e, g_platform, m_show_glucose, ctx, jt, js, jv,
+                                 arr, (jint)w, (jint)h,
+                                 (jint)(lockscr ? 1 : 0));
    }
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);

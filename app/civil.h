@@ -10,9 +10,10 @@
  * two are not the same kind of thing, and the conversion between them is not
  * a subtraction.
  *
- * It was written as one. forms.c split an instant with `g_tz_off`, replaced
- * the date, and recombined with `g_tz_off` again -- TODAY's offset, applied
- * to a day that may be the other side of a DST boundary. Editing a dose to a
+ * It is easy to write as one: split an instant with the CURRENT offset,
+ * replace the date, and recombine with the current offset again -- today's
+ * offset applied to a day that may be the other side of a DST boundary.
+ * Editing a dose to a
  * date in the other half of the year therefore persisted it an hour wrong,
  * and persisted today's offset in its tz column so nothing downstream could
  * tell.
@@ -69,7 +70,7 @@
  * transitions in a test. Must be a pure function of `t`: civil_resolve calls
  * it several times for one answer and compares the results, so a callback
  * that reads a mutable "current offset" makes the comparison meaningless (it
- * is precisely the bug this module replaces). */
+ * is precisely the comparison this module has to be able to make). */
 typedef long (*zone_off_fn)(void *ctx, long t);
 
 /* How many instants the asked-for civil time named. */
@@ -91,9 +92,11 @@ struct civil_res {
 };
 
 /* Days since 1970-01-01 for a proleptic Gregorian y-m-d, and back. Howard
- * Hinnant's algorithm, the same one uidraw.c's fmt_date and the server's
- * date parser use; here because a civil time has to become a day count
- * before it can become an instant. */
+ * Hinnant's algorithm, and THE only copy of it on the app side: uidraw.c's
+ * fmt_date calls civil_ymd rather than carrying its own, so the
+ * date on the screen and the date a record is keyed by cannot drift apart at
+ * an era boundary or a century leap year. The server's date parser is the
+ * other copy, and it is on the other side of a wire. */
 long civil_days(long y, long m, long d);
 void civil_ymd(long z, long *y, long *m, long *d);
 
@@ -130,7 +133,8 @@ enum civil_edit {
  * date, and there is no other date to land on.
  *
  * CIVIL_EDIT_TIME drops the seconds, because HHMM is all the keypad can say
- * and keeping the old seconds would make an edited time differ from the
+ * and keeping the original seconds would make an edited time differ from
+ * the
  * displayed one by up to 59 seconds. */
 struct civil_res civil_reaim(long t, int what, int a, int b, zone_off_fn zone,
                              void *ctx);

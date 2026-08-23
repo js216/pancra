@@ -84,8 +84,8 @@ void meter_tick_eval(int busy, long start, const long *idle_since, int nlinks,
  * by a fixed-point iteration, which always settled on the SAME one of the two
  * -- so a fingerstick at 01:30 PDT and another at 01:30 PST, a real hour
  * apart, both became the same instant. The reading log dedups a BGM by exact
- * timestamp, so the second fingerstick was not stored an hour wrong, it was
- * not stored at all. And 01:45 PDT followed by 01:15 PST came out in the
+ * timestamp, so the second fingerstick is not stored an hour wrong, it is
+ * not stored at all. And 01:45 PDT followed by 01:15 PST comes out in the
  * wrong ORDER, which puts a fingerstick before the meal it followed.
  *
  * WHAT DECIDES IT. The records themselves. The meter walks its memory by

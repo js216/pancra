@@ -39,7 +39,7 @@
  * ROUTE_NUM_DIGITS): no errno to forget to read, no locale, no end pointer,
  * and the OVERFLOW answer is a fact about the string's width rather than a
  * side effect the caller has to go and ask about. */
-enum route_num route_number(const char *s, long *out)
+enum route_num route_number(const char *s, int64_t *out)
 {
    if (!s || !*s)
       return ROUTE_NUM_BAD;
@@ -62,7 +62,7 @@ enum route_num route_number(const char *s, long *out)
       return ROUTE_NUM_OVERFLOW;
    /* Cannot overflow: nd <= 18 digits is at most 999999999999999999, and
     * proto.h refuses to compile anywhere `long` is narrower than 64 bits. */
-   long v = 0;
+   int64_t v = 0;
    for (const char *p = s; *p; p++)
       v = (v * 10) + (*p - '0');
    *out = v;
@@ -97,13 +97,22 @@ unsigned route_allow(enum route_kind kind)
 
 void route_of(const char *path, struct route *out)
 {
+   /* A NULL DESTINATION IS NOT SOMETHING TO CLEAR. This memset ran before
+    * anything was checked, so a caller that passed no output got a write
+    * through a null pointer -- in the function every request goes through
+    * FIRST, before authentication, on a path a stranger chose. Every caller
+    * today passes a stack struct; the guard costs one branch and removes the
+    * question. A null PATH is already handled below: it is RT_NONE, which is
+    * a real answer. */
+   if (!out)
+      return;
    memset(out, 0, sizeof *out);
    out->kind = RT_NONE;
    if (!path)
       return;
 
    if (!strncmp(path, "/v1/pair/", 9)) {
-      long round = 0;
+      int64_t round = 0;
       /* ONE answer for all three refusals: a pairing path whose round is not
        * one of the four is not a route at all (404), whether the field was
        * decorated, too wide, or a perfectly good 5. Unlike the bucket route
@@ -115,7 +124,7 @@ void route_of(const char *path, struct route *out)
        * whole of why this cast is safe: `round` is known to be 1..4 by the
        * time it becomes an int. Moving the cast up -- which is what
        * srv/rowdec.c had done to its offset field -- would make the bound
-       * guard the narrowed value instead of the parsed one, and 4294967297
+       * guard the narrowed value rather than the parsed one, and 4294967297
        * would be round 1. */
       if (route_number(path + 9, &round) != ROUTE_NUM_OK || round < 1 ||
           round > 4)
@@ -163,7 +172,7 @@ void route_of(const char *path, struct route *out)
       size_t n = (size_t)(slash - p);
       if (n == 0 || n > LOGNAME_MAX)
          return;
-      long bucket = 0;
+      int64_t bucket = 0;
       /* TWO REFUSALS, ONE STATUS. Both of these leave RT_BUCKET_BAD standing
        * and the dispatcher answers 400 either way, but they are not the same
        * fault and the code says so: the first is "that is not a number this

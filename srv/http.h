@@ -12,6 +12,8 @@
 #ifndef HTTP_H
 #define HTTP_H
 
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
+
 #include <stddef.h>
 #include <sys/types.h> /* ssize_t */
 
@@ -27,6 +29,18 @@
 /* The TLS budget is longer: the handshake alone is several round trips, and
  * an HTTPS client is by definition NOT on the LAN. */
 #define HTTPS_DEADLINE_S 8
+
+/* THE DEPLOYMENT'S CEILING OVER EITHER OF THOSE, and it can only SHORTEN.
+ *
+ * Both numbers above are the transport's own, and both are the only thing
+ * that ends a request whose peer declares a body and then stops sending it --
+ * so they are also the only way to observe what the server does with one, and
+ * observing it otherwise means waiting out the production number. Set
+ * PANCRA_HTTP_DEADLINE_S to lower them; a value outside the accepted range is
+ * ignored, loudly, and no value can raise them (a knob that lengthened the
+ * deadline would be a way to hold every worker in the pool for as long as one
+ * liked). Pass the transport's own budget and take back the one in force. */
+double http_deadline_capped(double budget);
 
 struct http_conn; /* defined below; the transport speaks on one */
 
@@ -68,9 +82,9 @@ struct http_conn {
    /* The transport's own per-connection state, opaque here. TLS keeps its
     * keys, sequence numbers and buffered plaintext in one; plain HTTP has
     * none. It lives on the CONNECTION because that is what it belongs to --
-    * it used to be a thread-local inside tls.c that the hooks reached for by
-    * implication, so "which connection" was answered by whichever one this
-    * worker happened to have handshaken last. */
+    * as a thread-local inside tls.c that the hooks reach for by implication,
+    * "which connection" is answered by whichever one this worker happened to
+    * handshake last. */
    void *tp_state;
    /* HOW THIS CONNECTION IS SERVED, carried WITH it rather than looked up in
     * a process global. Policy was a static filled by an ordered setter call
@@ -106,11 +120,10 @@ void http_text(const struct http_conn *c, int code, const char *reason,
 
 /* ---- WHICH METHODS A ROUTE ALLOWS, AND THE ONE WAY TO REFUSE THE REST ----
  *
- * THE BUG THIS EXISTS TO MAKE UNSPELLABLE. Both routers used to ask the same
- * question the same wrong way: `int get = !strcmp(r->method, "GET")`, and then
- * treat !get as POST. That is not a method check, it is a two-way sort of
- * every method that has ever been invented, and everything that is not GET
- * landed on the side that CHANGES THINGS. So on the browser half:
+ * WHAT THIS MAKES UNSPELLABLE. `int get = !strcmp(r->method, "GET")` with
+ * !get treated as POST is not a method check: it is a two-way sort of every
+ * method that has ever been invented, and everything that is not GET lands on
+ * the side that CHANGES THINGS. On the browser half:
  *
  *   PUT    /login              ran the login POST: session minted, cookie set,
  *                              the login-failure counter written
@@ -124,19 +137,19 @@ void http_text(const struct http_conn *c, int code, const char *reason,
  *
  * None of that needed a signature, a new secret or a protocol flaw. It needed
  * a method nobody had thought about, which is the whole class of defect this
- * replaces: a route now DECLARES the methods it answers, in one table per
- * router, and everything else is refused here.
+ * closes: a route DECLARES the methods it answers, in one table per router,
+ * and everything else is refused here.
  *
  * A MASK, not a string comparison at the call site. The refusal and the
  * `Allow` header are both generated from the same mask, so the two cannot
- * drift -- the three refusals this replaces each typed their own list ("GET\n",
- * "GET or PUT\n", "POST only\n") next to their own strcmp, which is two places
- * to state one rule, three times over, in two files.
+ * drift. Hand-written refusals each type their own list ("GET\n", "GET or
+ * PUT\n", "POST only\n") next to their own strcmp, which is two places to
+ * state one rule, once per route, across two files.
  *
  * HEAD HAS A BIT AND NO ROUTE GRANTS IT. That is deliberate and it is a
  * decision, not an oversight -- see http_method_not_allowed below for why HEAD
  * is refused rather than served. It is recognised here so that it is refused
- * BY NAME with a correct Allow header, instead of falling through the
+ * BY NAME with a correct Allow header, rather than falling through the
  * unrecognised-method path by luck.
  *
  * An unrecognised method (PATCH, DELETE, OPTIONS, TRACE, anything a stranger
@@ -179,8 +192,7 @@ void http_allow_list(unsigned allow, char *out, size_t cap);
  *      into the POST logic above. Refusing it by name is the answer that
  *      cannot become wrong by accident later.
  *
- * A monitor that wants to know this server is alive should GET a page, which is
- * what srv/test/testlib.sh's wait_ready does. */
+ * A monitor that wants to know this server is alive should GET a page. */
 void http_method_not_allowed(const struct http_conn *c, unsigned allow);
 
 /* ---- ONE EXACT REQUEST-LINE GRAMMAR, AND NOTHING ELSE -------------------
@@ -206,18 +218,18 @@ void http_method_not_allowed(const struct http_conn *c, unsigned allow);
  *                                   the request was routed on it
  *   "GET  / HTTP/1.1\r\n"           two spaces: the target became empty
  *
- * WHY THAT IS A SECURITY DEFECT AND NOT UNTIDINESS. Item 29 settled that this
- * deployment has a configurable front door (PANCRA_FRONT: direct, NAT, or a
- * named proxy), so something else may parse these bytes before this server
- * does. Request smuggling is precisely two parsers disagreeing about where
- * one request ends: a fronting proxy that rejects "GET / HTTP/1.1 x" and this
- * origin that serves it -- or, far worse, a proxy that reads "GET /\r\nHost:
- * evil\r\n" as one request with a Host header while this origin read the Host
- * line as part of the TARGET and went looking for the NEXT request inside
- * what the proxy considered headers. From there an attacker prefixes bytes
- * onto the next client's request: their session cookie, their POST body,
- * their CSRF token. The fix is not to guess which reading is right; it is to
- * refuse every shape the two could read differently.
+ * WHY THAT IS A SECURITY DEFECT AND NOT UNTIDINESS. This deployment has a
+ * configurable front door (PANCRA_FRONT: direct, NAT, or a named proxy), so
+ * something else may parse these bytes before this server does. Request
+ * smuggling is precisely two parsers disagreeing about where one request ends:
+ * a fronting proxy that rejects "GET / HTTP/1.1 x" and this origin that serves
+ * it -- or, far worse, a proxy that reads "GET /\r\nHost: evil\r\n" as one
+ * request with a Host header while this origin read the Host line as part of
+ * the TARGET and went looking for the NEXT request inside what the proxy
+ * considered headers. From there an attacker prefixes bytes onto the next
+ * client's request: their session cookie, their POST body, their CSRF token.
+ * The answer is not to guess which reading is right; it is to refuse every
+ * shape the two could read differently.
  *
  * ONLY HTTP/1.1 IS SUPPORTED, deliberately, and HTTP/1.0 is refused with 505
  * rather than served. Every response this server writes says "HTTP/1.1", and
@@ -247,8 +259,8 @@ enum reqline {
 /* The caps struct req (srv/proto.h) holds these in. They live here as well so
  * that the request line can be validated in http.c BEFORE any header is
  * looked at, using buffers of the same size the router will later use -- a
- * validator that accepted a longer target than the router can hold would move
- * the refusal back into the router, which is where it was. */
+ * validator that accepted a longer target than the router can hold would
+ * move the refusal back into the router. */
 #define HTTP_METHOD_MAX 8
 #define HTTP_TARGET_MAX 640
 
@@ -258,9 +270,9 @@ enum reqline {
  * route an empty path rather than a half-parsed one.
  *
  * warn_unused_result because the whole point is the refusal. */
-enum reqline http_reqline(const char *req, char *method, size_t mcap,
-                          char *target, size_t tcap)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum reqline http_reqline(const char *req, char *method,
+                                          size_t mcap, char *target,
+                                          size_t tcap);
 
 /* One connection: read the request, hand it to `handle`.
  *   req      NUL-terminated request text (headers, and the body that
@@ -302,7 +314,7 @@ int http_serve(int port, const char *name, http_handler handle,
                const struct http_policy *pol, void *user);
 
 /* The value a response's `Connection:` header must carry right now, for a
- * handler that writes its own header block instead of calling http_respond.
+ * handler that writes its own header block rather than calling http_respond.
  * Hand-writing "close" there bypasses the connection accounting and retires a
  * pooled connection the server was willing to keep. */
 const char *http_conn_value(const struct http_conn *c);

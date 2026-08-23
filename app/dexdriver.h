@@ -8,6 +8,8 @@
  * on the phone and by a mock harness in the offline tests. */
 #ifndef DEXDRIVER_H
 #define DEXDRIVER_H
+
+#include "compiler.h"  /* PANCRA_MUST_USE: the annotation, portably */
 #include "scanlogic.h" /* struct live_stamp + the four liveness deadlines */
 #include <stdint.h>
 
@@ -32,112 +34,24 @@
  * controller's simultaneous-connection count, which is around 7-8 on typical
  * phones, and asking for more than the controller can hold makes connects
  * fail rather than queue. 8 covers every realistic set-up; past that,
- * link_for_slot returns -1 and the caller says so instead of connecting on
+ * link_for_slot returns -1 and the caller says so rather than connecting on
  * another device's link. Ble.java's MAX_LINKS must match -- the Makefile's
  * crosscheck target fails the build if it does not. */
 #define LINK_MAX 8
 
-/* Dexcom GATT characteristic UUIDs. */
-#define U_CTRL  "f8083534-849e-531c-c594-30f1f86a4ea5"
-#define U_AUTH  "f8083535-849e-531c-c594-30f1f86a4ea5"
-#define U_DATA  "f8083536-849e-531c-c594-30f1f86a4ea5"
-#define U_ROUND "f8083538-849e-531c-c594-30f1f86a4ea5"
-
-/* ---- provided BY the transport layer (dexble.c / test harness) ---- */
-void drv_connect(int link, const char *mac);
-void drv_subscribe(int link, const char *uuid, int indicate);
-void drv_write(int link, const char *uuid, const uint8_t *data, int n,
-               int no_resp);
-void drv_status(const char *s);
-
-/* ONE LIVE READING, AND WHETHER THE APP KEPT IT.
- *
- * Returns 1 when the reading entered the authoritative history -- past the
- * value and age gate in ingest.c, past per-link source attribution, and
- * inserted (not deduplicated away) by store_record -- and 0 when it did not.
- *
- * The return value is the whole reason this is not `void`. The driver used to
- * set `streamed` and persist the sensor's address the moment a 0x4e DECODED,
- * which is a statement about the wire, not about the app: a frame carrying a
- * 5,000 mg/dL value, or an age of 65535 seconds, or one arriving on a link no
- * registered slot claims yet, is refused downstream and never becomes a
- * reading. To the person holding the phone that connection produced NOTHING
- * -- the number on screen did not move and the plot gained no point -- while
- * the driver counted it as a success, cleared the failure streak that exists
- * to notice a sensor going bad, and wrote the address into the file that
- * decides which sensor future launches reconnect to. A sensor that can
- * decode but whose every value is rejected could therefore be adopted
- * permanently on the strength of nothing.
- *
- * The hook is declared warn_unused_result BECAUSE OF THAT HISTORY: a caller
- * that drops the answer is back to trusting the decode, and the compiler is
- * the only thing that reliably notices. */
-#if defined(__GNUC__) || defined(__clang__)
-#define DRV_MUST_USE __attribute__((warn_unused_result))
-#else
-#define DRV_MUST_USE
-#endif
-DRV_MUST_USE int drv_glucose(int link, int mg_dl, int trend,
-                             int age_s); /* live reading; 1 = accepted */
-/* Outcome of a calibration write we sent: 0 accepted, >0 rejected by the
- * sensor. Lets the shell clear or surface its durably-queued calibration.
- *
- * THE TOKEN OF THE WRITE THAT WAS ANSWERED TRAVELS WITH THE ANSWER, and this
- * is the whole of the fix for it. The driver used to carry one BOOLEAN --
- * "a calibration we sent is awaiting a reply" -- and the shell resolved
- * whatever calibration was queued at the moment the reply landed. Those are
- * not the same calibration whenever the user has changed their mind:
- *
- *   the user takes a fingerstick, types 100, confirms; the driver writes 0x34
- *   for 100. Before the sensor answers -- the reply is one connection interval
- *   away at best, and a whole reconnect away at worst -- they realise they
- *   misread the meter, cancel, and type 180. The sensor's answer to the 100
- *   arrives, ACCEPTED, and the shell marks the 180 accepted. The row says
- *   "LAST CAL 180 APPLIED". The sensor holds 100, and will go on reporting
- *   against 100 until the next calibration. The one number the user is
- *   entitled to believe -- what the sensor was actually told -- is wrong on
- *   the screen, and a CGM calibrated to a value nobody chose misreports
- *   glucose for as long as the session lasts.
- *
- * So a transmitted calibration is identified by the three things that make it
- * the one it is: the SENSOR it was for, the VALUE written, and the queue
- * GENERATION it came from. The generation is a counter the calibration module
- * bumps on every queue (it is NOT a clock -- see the deadline block in
- * calib.c; a clock would make the identity of a write depend on an NTP step),
- * so re-queueing the same value for the same sensor is a different write and
- * is told apart from the first. All three come back here, and the shell
- * resolves ONLY on an exact match with what is queued RIGHT NOW. Anything
- * else is discarded, loudly. */
-void drv_cal_result(int link, int result, int sensor_id, int mg_dl,
-                    unsigned gen);
-/* One recovered older reading. 1 when it entered the authoritative history,
- * exactly as for drv_glucose above -- and for the same reason: a backfill
- * batch of 28 records every one of which is refused is not a batch that
- * proves the sensor is streaming. */
-DRV_MUST_USE int drv_backfill(int link, int mg_dl, int trend,
-                              int age_s);    /* 1 = accepted */
-int drv_key_load(int link, uint8_t key[16]); /* 1 if a key was loaded */
-int drv_key_save(int link, const uint8_t key[16]);
-void drv_key_clear(int link); /* delete the stored key (force re-pair) */
-int drv_mac_load(int link, char *mac,
-                 int n); /* bonded sensor's MAC; 1 if one was saved */
-int drv_mac_save(int link, const char *mac); /* the sensor we bonded to */
-void drv_mac_clear(int link);                /* forget it (re-pair) */
-
 /* ---- driver API (called by the transport layer) ---- */
-/* SELECTION IS NOT PART OF THIS INTERFACE ANY MORE.
+/* SELECTION IS NOT PART OF THIS INTERFACE.
  *
- * An ambient "select this link" call used to be here, and the comment above it
- * said the transport calls it before dispatching any callback "so the rest of
- * the API needs no link parameter". That is what ambient state always
- * promises: fewer parameters, in exchange for every reader having to know
- * which call last ran. The cost was real and is documented all over this
- * tree -- callbacks that selected and never restored, so a dozen unrelated
- * places had to "select explicitly" first; restores that put back an assumed
- * LINK_CGM rather than what was actually selected; and a stall watchdog that
- * kicked whichever link a binder thread last touched.
+ * An ambient "select this link" call -- the transport calls it before
+ * dispatching any callback, "so the rest of the API needs no link parameter"
+ * -- is what ambient state always promises: fewer parameters, in exchange for
+ * every reader having to know which call last ran. The cost is concrete:
+ * callbacks that select and never restore, so a dozen unrelated places must
+ * "select explicitly" first; restores that put back an assumed LINK_CGM
+ * rather than what was actually selected; and a stall watchdog that kicks
+ * whichever link a binder thread last touched.
  *
- * What replaced it:
+ * What this interface has instead:
  *   driver_enter/driver_leave  -- validate the link, take the lock, and hand
  *                                 back THAT link's context;
  *   driver_session_of/_cal_of  -- read ONE named link, moving nothing.
@@ -161,7 +75,7 @@ void drv_mac_clear(int link);                /* forget it (re-pair) */
  * This costs almost nothing in radio terms: the real per-link concurrency
  * lives in Ble.java's per-link operation queues, and the sections guarded here
  * are short and CPU-only. */
-/* (The lock itself is NOT here. It is in dexdriver.c, reached only through the
+/* (The lock itself is NOT here. It is in dexlink.c, reached only through the
  * files that run inside GATT callbacks -- see that header. Everything else
  * uses the operations below, each of which takes the lock itself.) */
 
@@ -242,18 +156,31 @@ struct dex_cal {
    int result;    /* the last 0x34 outcome; -1 = none seen this process */
 };
 
-/* (driver_get_cal and driver_get_session are gone from this interface. They
- * read whichever context was last SELECTED, which is a question no caller
- * outside the driver can answer -- "the link a binder thread happened to
- * touch" is not an identity. The two below take the link by name and take the
- * lock themselves.) */
+/* THE TWO READERS BELOW NAME THE LINK, and take the lock themselves. A
+ * reader that instead served whichever context was last selected would be
+ * answering a question no caller outside the driver can answer: "the link a
+ * binder thread happened to touch" is not an identity. */
 
-/* This LINK's calibration state, read as one snapshot.
+/* This LINK's calibration state, read as one snapshot. 1 if `*out` holds it.
  *
- * Reading another link's used to be "select it, read, select back": three
- * steps with a file-wide variable in the middle, on a shell that walks all
- * LINK_MAX of them every frame. */
-void driver_cal_of(int link, struct dex_cal *out);
+ * The alternative is "select it, read, select back": three steps with a
+ * file-wide variable in the middle, on a shell that walks all LINK_MAX of
+ * them every frame.
+ *
+ * TOTAL, AND FALLIBLE OUT LOUD. These were void, and on a link
+ * this driver does not have they returned having touched NOTHING -- leaving
+ * the caller's struct exactly as its stack found it, while the caller went on
+ * to read it as a snapshot. Uninitialised is the worst possible answer here:
+ * a garbage `have_reading` and a garbage glucose are indistinguishable from a
+ * sensor that just reported, and this is the path the screen and the alarm
+ * read. So: `*out` is ZEROED before anything can fail, which makes the
+ * refusal safe by construction, and the answer is RETURNED so a caller can
+ * tell "no such link" from "a link with nothing in it" -- the two are
+ * different, and only one of them is a bug in the caller.
+ *
+ * warn_unused_result, because a caller that ignores this is back where it
+ * started: reading a struct without knowing whether anything filled it. */
+PANCRA_MUST_USE int driver_cal_of(int link, struct dex_cal *out);
 
 /* Snapshot of what we know about a connected sensor and its session. */
 struct dex_session {
@@ -264,7 +191,14 @@ struct dex_session {
    uint32_t session_seconds; /* LIVE sensor session time: the clock from the
                                 last 4e projected forward by wall time, so
                                 countdowns tick per second between responses */
-   int state; /* raw session-state byte from the last 4e (0 = none seen) */
+   /* THE SENSOR'S OWN STATE BYTE, and it stays a byte on purpose.
+    * It comes off the wire: SENSOR_STATE_* names the three values this app
+    * acts on, and a sensor is free to send others -- a firmware revision
+    * this build has never seen is not a value to invent an enumerator for,
+    * and an enum here would claim the domain is closed when it is not. 0 is
+    * "no 0x4e decoded yet", which is why every reader tests for a NAMED
+    * state rather than for non-zero. */
+   int state;
    int glucose, trend, age, predicted, sequence;
    /* WHEN THE LAST ACCEPTED READING ARRIVED, ON BOTH CLOCKS, AND BOTH ARE
     * LOAD-BEARING. See the liveness block in scanlogic.h.
@@ -303,10 +237,10 @@ void driver_snapshot(struct dex_session sess[LINK_MAX], int cal_link,
 /* ---- PER-LINK ROLE AND ARMING, which the driver owns because its own
  * callbacks read them.
  *
- * These used to be two arrays in meter.c and a bitmask in dexble.c -- the
- * same fact in two places -- each guarded by reaching for the DRIVER's lock
- * from another module. They live here now, with the lock, and every caller
- * gets an operation instead. */
+ * Split across two arrays in meter.c and a bitmask in dexble.c they are the
+ * same fact in two places, each guarded by reaching for the DRIVER's lock
+ * from another module. They live here, with the lock, and every caller gets
+ * an operation instead. */
 
 /* Is this link carrying a meter rather than a sensor? Set when a meter is
  * armed on it, cleared when the link is given back. */
@@ -326,10 +260,10 @@ int driver_link_of_mac(const char *mac);
 /* ---- ROUTING ONE CALLBACK, decision and dispatch together ------------
  *
  * Every GATT callback belongs to exactly one of two state machines: the
- * Dexcom protocol, or the OneTouch one. The transport used to make that
- * decision itself -- read the routing bit, then branch -- and had to hold the
- * DRIVER's lock across both halves, because the shell arms and releases links
- * from the main thread and a decision split from its dispatch sends a meter's
+ * Dexcom protocol, or the OneTouch one. A transport that makes that decision
+ * itself -- read the routing bit, then branch -- has to hold the DRIVER's
+ * lock across both halves, because the shell arms and releases links from the
+ * main thread and a decision split from its dispatch sends a meter's
  * write-ack into the sensor state machine.
  *
  * The decision and the dispatch are one operation here, inside the lock that
@@ -343,6 +277,13 @@ struct driver_meter_ops {
    void (*on_connected)(void);
    void (*on_disconnected)(void);
    void (*on_notify)(const unsigned char *data, int n);
+   /* A WRITE OR A SUBSCRIBE COMPLETED, and `status` is the transport's own
+    * (0 = the bytes went out; anything else = they did not). DISCARDED for a
+    * meter link -- driver_route_written calling nothing -- a refused write
+    * leaves the meter protocol waiting for an
+    * answer to a request that was never sent, with the link held open and the
+    * meter held awake. */
+   void (*on_written)(const char *uuid, int status);
 };
 
 /* What the TRANSPORT must do once the routing above has returned and the
@@ -376,8 +317,8 @@ void driver_meter_connect(int link, const char *mac,
  * The queue (what the user typed, whether it has been sent, how it ended) is
  * read and written from BOTH the reading path -- a binder thread already
  * inside a driver callback -- and the menus on the main thread. It is
- * therefore serialised with the driver's own state, and the calibration
- * module used to achieve that by taking the driver's lock itself.
+ * therefore serialised with the driver's own state -- which the calibration
+ * module must not do by taking the driver's lock itself.
  *
  * The same shape as the meter routing above: the calibration module supplies
  * WHAT to do, the driver decides WHEN it is safe to do it. Nothing outside
@@ -404,8 +345,8 @@ int driver_cal_queued_for(int sensor_id);
 /* Seed the meter protocol's record index for the link being armed. The
  * protocol's own state is touched by the driver's callbacks, so setting it
  * from the main thread is the driver's step, not the caller's: without it a
- * newly paired meter kept whatever index the previously synced one left, and
- * its oldest records were skipped -- then persisted as skipped. */
+ * newly paired meter keeps whatever index the last synced one left, and its
+ * oldest records are skipped -- then persisted as skipped. */
 void driver_meter_seed_index(int index);
 
 /* Claim a FREE link for `mac`, leaving `reserve` links for CGMs that have not
@@ -414,26 +355,46 @@ void driver_meter_seed_index(int index);
  * before the caller uses it would be handed to two devices at once. */
 int driver_link_claim(const char *mac, int reserve);
 
-/* Bind this link to `mac` DURABLY: write the address the driver reads back on
- * the next launch, and set it as the reconnect target, as one step. Done
- * separately -- with a lock the caller took by hand -- a GATT callback
- * landing between the two saw the new address with the old target still set.
- */
-void driver_bind_mac(int link, const char *mac);
+/* WAS THE RECOVERED ADDRESS MADE PERMANENT? The two states are not "worked"
+ * and "did not": BIND_NOT_SAVED means the reconnect target is UNCHANGED --
+ * whatever it was before is still what this link will dial -- and the address
+ * is held for driver_bind_retry. Nothing is half-applied either way. */
+enum bind_mac { BIND_PUBLISHED, BIND_NOT_SAVED };
 
-/* This LINK's session. Same reasoning as driver_cal_of. */
-void driver_session_of(int link, struct dex_session *out);
+/* Bind this link to `mac` DURABLY: write the address the driver reads back on
+ * the next launch, and only then set it as the reconnect target. Done
+ * separately -- with a lock the caller took by hand -- a GATT callback
+ * landing between the two sees the new address against the old target.
+ *
+ * The ORDER is the contract and so is the answer. Publishing an address the
+ * file system refused is a sensor that works until the process dies and is
+ * unknown afterwards, while the one path that discovers it (the bond-list
+ * walk at startup) runs once per launch -- so a dropped failure here does not
+ * degrade, it loses the sensor. Ignore the result and that is what happens,
+ * hence PANCRA_MUST_USE. */
+PANCRA_MUST_USE enum bind_mac driver_bind_mac(int link, const char *mac);
+
+/* Try again for every link that owes a save, at most once per 30 s. Cheap
+ * and a no-op when nothing is pending, so the link watchdog can just call it.
+ * A retry that succeeds publishes the address exactly as an immediate save
+ * would. */
+void driver_bind_retry(void);
+
+
+/* This LINK's session. Same reasoning as driver_cal_of, and the same
+ * contract: `*out` is zeroed first, 1 means it was filled from the link. */
+PANCRA_MUST_USE int driver_session_of(int link, struct dex_session *out);
 
 /* ---- THE PER-LINK RETRY DEADLINES, CLAIMED RATHER THAN READ --------------
  *
- * Two throttles that used to be file statics in reading.c, stamped from
+ * Two throttles, rather than file statics in reading.c stamped from
  * realtime_s(). They are here for two reasons, and the second is the one that
  * matters:
  *
- * 1. They are facts about a LINK, and the driver owns links. A throttle that
- *    lived beside the reading path had to be indexed by link anyway, and one
- *    of them was a single global before that -- so one sensor's DIS request
- *    blocked every other sensor's for a minute.
+ * 1. They are facts about a LINK, and the driver owns links. A throttle
+ *    beside the reading path has to be indexed by link anyway, and a single
+ *    global one lets one sensor's DIS request block every other sensor's for
+ *    a minute.
  *
  * 2. CLAIM, not test-then-set. pancra_link_watchdog runs on BOTH the
  *    activity's 1 Hz timer and the foreground service's 20 s tick. With a
@@ -466,8 +427,8 @@ int driver_dis_claim(int link);
  * if it were live -- and a forward jump turns into "never fresh", which drops
  * the signal column out of the log for as long as the jump lasts.
  *
- * PER LINK, like everything else the driver holds: the process-global stamp
- * it replaces meant one sensor's connect refreshed the other's window. */
+ * PER LINK, like everything else the driver holds: one process-global stamp
+ * would let one sensor's connect refresh the other's window. */
 void driver_rssi_note(int link); /* an RSSI was just measured on this link */
 int driver_rssi_fresh(int link); /* ...recently enough to be this connection */
 
@@ -485,6 +446,5 @@ int driver_link_of_identity_in(const struct dex_session *sess,
 int driver_link_of_identity(const char *identity);
 /* A free CGM link at this rank among the free ones, or -1. */
 int driver_free_cgm_link_in(const struct dex_session *sess, int rank);
-int driver_free_cgm_link(int rank);
 
 #endif

@@ -39,10 +39,8 @@ void dexble_pair(int link, const char *mac, const char *code);
  * Ble.createBond for why auto-accepting the dialog is not available to us.
  * Returns 1 if the request went out (or the device was already bonded). */
 int dexble_create_bond(const char *mac);
-/* Latest OS bond state seen for `mac`, using the framework's own constants:
- * 0 = never heard, 10 = NONE, 11 = BONDING, 12 = BONDED. Fed by Ble's
- * ACTION_BOND_STATE_CHANGED receiver. */
-int dexble_bond_state(const char *mac);
+/* For the latest OS bond state seen for an address, include bondtable.h --
+ * dexble_bond_state is declared there, beside the setter that feeds it. */
 void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */
 /* Read one link's Device Information Service (model, firmware, manufacturer).
  * LINK-ADDRESSED, and only that: the ambient no-argument version that assumed
@@ -50,7 +48,7 @@ void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */
  * append-only. */
 void dexble_request_devinfo_link(int link);
 /* Drop one link. The meter driver uses this the moment it has what it needs,
- * so the meter can power itself down instead of being held awake. */
+ * so the meter can power itself down rather than being held awake. */
 void dexble_link_close(int link);
 /* Link-addressed GATT operations (the drv_* hooks wrap these for LINK_CGM). */
 void dexble_subscribe(int link, const char *uuid, int indicate);
@@ -59,8 +57,6 @@ void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
 /* Connect to a OneTouch meter on `link`, and mark that link as carrying a
  * meter so the transport routes its events to the otble driver. */
 int dexble_meter_connect(int link, const char *mac);
-/* Tell the transport whether `link` carries a meter (1) or a CGM (0). */
-void dexble_set_meter_link(int link, int on);
 
 /* THE NOISES. They are transport operations because the Java side owns the
  * player and the vibrator, not because they have anything to do with BLE. */

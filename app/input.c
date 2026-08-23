@@ -5,8 +5,11 @@
 #include "input.h"
 #include "alarm.h"
 #include "clock.h"
+#include "exercise.h" /* the exercise tail the scrub must be able to pick */
+#include "food.h"
 #include "forms.h"
 #include "gesturelogic.h" /* which finger this event belongs to */
+#include "insrow.h"       /* INS_*: what a dose row can say */
 #include "insulin.h"
 #include "jbridge.h"
 #include "menu.h" /* menu_action: a press dispatches one */
@@ -15,6 +18,7 @@
 #include "ndk.h"
 #include "plot.h"
 #include "plotdata.h"
+#include "readingrec.h" /* struct reading: one stored sample */
 #include "scan.h"
 #include "sensors.h"
 #include "settings.h"
@@ -25,6 +29,7 @@
 #include "uiact.h"
 #include "uimodel.h"
 #include "weight.h"
+#include <stdint.h>
 
 /* ---- act-on-RELEASE ----
  * A press only ARMS the control under the finger; the action fires on the
@@ -62,11 +67,6 @@ static int g_arm_x, g_arm_y;      /* where it last touched it (finds the box) */
  * longer where the user is looking; firing on the new one acts on a device
  * they never chose. */
 static int g_arm_dev = -1;
-
-void input_arm_row(int action, int row)
-{
-   g_arm_dev = ma_names_device_row(action) ? model_snap_id(row) : -1;
-}
 
 int input_row_value(int action, int row, int *val)
 {
@@ -114,17 +114,6 @@ static void press_arm(int kind, int code, int arg, int x, int y)
    shell_repaint();
 }
 
-/* Drop any armed press without firing (a stale arm must never shade or fire
- * on a later screen -- called when a DOWN lands on nothing, and by the back
- * key, which can change the screen under a held finger). */
-void press_cancel(void)
-{
-   g_arm_kind = ACT_NONE;
-   g_arm_code = 0;
-   g_arm_in   = 0;
-   g_arm_dev  = -1;
-}
-
 /* MOVE: is the finger still on the armed control? Repaint only when the
  * answer changes, so a drag can't saturate the main thread with draws. */
 static void press_track(int x, int y)
@@ -147,7 +136,7 @@ static void press_track(int x, int y)
 /* ---- THE FINGER THIS GESTURE BELONGS TO --------------------------------
  *
  * -1 between gestures. Latched on ACTION_DOWN and released on UP/CANCEL, so
- * every event in between can ask "where is MY pointer" instead of trusting
+ * every event in between can ask "where is MY pointer" rather than trusting
  * slot 0. Main thread only, like the hit list.
  *
  * This holds the id; gesture_resolve (gesturelogic.h) decides what each event
@@ -214,7 +203,7 @@ static int press_release(int up, int x, int y)
 /* THE SAME CONFIGURATION THE RENDERER USED, out of the frame it recorded it
  * in (struct hits). plot_hit and plot_point_xy have to reproduce the render's
  * mapping exactly, and both inputs to it -- the vertical scale and the marker
- * radius -- used to be process globals the renderer wrote and this path read
+ * radius -- are NOT process globals the renderer writes and this path reads
  * back afterwards. The radius is derived from the screen scale and the span,
  * so this side cannot recompute it; it is recorded, like the scrub rectangle
  * beside it. */
@@ -343,10 +332,10 @@ int on_input(int fd, int events, void *data)
           * section, inside alarm_silence_tap -- see alarm.h. Doing it here,
           * around an unsynchronized read, could swallow a tap meant for the
           * UI or kill an alarm that had just legitimately started. */
-         /* (The old mid-gesture "touch swallow" is gone: actions now fire on
-          * the RELEASE, so a menu can no longer change under a still-held
-          * finger -- and the back key, the one remaining way it can, cancels
-          * any armed press explicitly.) */
+         /* (Actions fire on the RELEASE, so no mid-gesture "touch swallow"
+          * is needed: a menu cannot change under a still-held finger, and the
+          * back key -- the one way it can -- cancels any armed press
+          * explicitly.) */
          int was_sounding = 0;
          if (action == AMOTION_EVENT_ACTION_DOWN)
             was_sounding = alarm_silence_tap();
@@ -400,8 +389,14 @@ int on_input(int fd, int events, void *data)
                        ty < g_hits.box[i].y ||
                        ty >= g_hits.box[i].y + g_hits.box[i].h))
                      break; /* the press began outside the plot */
+                  /* THE WHOLE SEQUENCE, not build_model alone. This ran on
+                   * the main thread with no snapshot and no history lock,
+                   * walking the very array a BLE reading inserts into. A
+                   * frame the lock could not be taken for is skipped: this
+                   * finger will produce another MOVE within milliseconds. */
                   struct screen sm;
-                  build_model(&sm);
+                  if (!model_frame(&sm))
+                     break;
                   int pick = ui_wt_hit(&sm, g_hits.box[i].x, g_hits.box[i].w,
                                        g_hits.box[i].arg, tx);
                   if (pick >= 0) {
@@ -495,8 +490,8 @@ int on_input(int fd, int events, void *data)
             int fy = (int)(ay / n);
             static struct plot_pt pts[UI_PTS_MAX];
             /* SIZED FOR THE SAME LOOP AS pts, not for the live window.
-             * This was left at NHIST when pts grew to hold a long span, so
-             * scrubbing 7D or 30D wrote up to PLOT_LONG_MAX ints into a
+             * Left at NHIST while pts holds a long span, scrubbing 7D or
+             * 30D writes up to PLOT_LONG_MAX ints into a
              * 5040-int array -- 176 kB straight through the statics that
              * follow it, which is what silently emptied the stats ring
              * minutes after every restart. */
@@ -523,17 +518,18 @@ int on_input(int fd, int events, void *data)
                   np++;
                }
             } else {
-               store_lock();
-               np = hist_count() < NHIST ? hist_count() : NHIST;
+               /* ONE SNAPSHOT, rather than a count and NHIST indexed reads
+                * with the store lock taken by hand around them. */
+               static struct reading snap[NHIST];
+               np = hist_copy(snap, NHIST);
                for (int i = 0; i < np; i++) {
-                  pts[i].t      = hist_at(i).t;
-                  pts[i].glu    = hist_at(i).glu;
+                  pts[i].t      = snap[i].t;
+                  pts[i].glu    = snap[i].glu;
                   pts[i].marker = 0;
                   pts[i].col    = 0;
                   pts[i].hidden = 0;
-                  psrc[i]       = hist_at(i).src;
+                  psrc[i]       = snap[i].src;
                }
-               store_unlock();
             }
             /* A HIDDEN device (marker OFF) is off the plot, so its points
              * must not be scrub-selectable either. plot_hit skips
@@ -582,6 +578,53 @@ int on_input(int fd, int events, void *data)
                pts[np].hidden   = 0; /* weights have no hide toggle */
                np++;
             }
+            /* FOOD, last, because build_model appends it last -- glucose,
+             * doses, weights, food. THE ORDER IS THE CONTRACT: plot_hit
+             * returns an INDEX into this array and the scrub reads that index
+             * out of m->plot.hist, so the two lists must be built in the same
+             * order or a tap on a food entry reads out somebody else's
+             * record. Nothing checks that at compile time; it is why both
+             * loops name the order they follow.
+             *
+             * Food shares the doses' fixed y, so it lands in the same bottom
+             * band and the aiming rule below picks it up with no extra case
+             * -- exactly as the weights above do. Without this the F markers
+             * drew perfectly and could not be selected, which is the bug the
+             * weights had and the comment above records. */
+            int nfd = food_count();
+            for (int i = 0; i < nfd && np < UI_PTS_MAX; i++) {
+               struct food_rec fr = food_at(i);
+               pts[np].t          = fr.t;
+               pts[np].glu        = 60; /* the renderer's fixed bottom line */
+               pts[np].marker     = 0;
+               pts[np].col        = 0;
+               pts[np].size       = 0;
+               pts[np].hidden     = 0; /* food has no hide toggle */
+               np++;
+            }
+            /* EXERCISE, after food, because build_model appends it last --
+             * glucose, doses, weights, food, exercise. The order IS the
+             * contract, for the reason spelled out above: plot_hit returns an
+             * index into THIS array and the scrub reads that index out of
+             * m->plot.hist, so a kind appended here in a different place
+             * would read out somebody else's record.
+             *
+             * `span` is left at zero deliberately. It changes how a point is
+             * DRAWN and not where it is, and the hit test picks by position;
+             * a span here would be a second copy of a number this array has
+             * no other use for. */
+            int nexr = ex_count();
+            for (int i = 0; i < nexr && np < UI_PTS_MAX; i++) {
+               struct ex_rec er = ex_at(i);
+               pts[np].t        = er.t;
+               pts[np].glu      = 60; /* the renderer's fixed bottom line */
+               pts[np].marker   = 0;
+               pts[np].col      = 0;
+               pts[np].size     = 0;
+               pts[np].hidden   = 0; /* exercise has no hide toggle */
+               pts[np].span     = 0;
+               np++;
+            }
             /* plot_hit picks by TIME alone, which would leave a dose
              * between two 5-minute CGM points a sliver of reachability.
              * Aim by finger HEIGHT instead: in the insulin band (twice the
@@ -608,7 +651,7 @@ int on_input(int fd, int events, void *data)
                 * finger. Asking merely "is there a dose in this window"
                 * meant that on a 30-day span a single marker at one edge
                 * captured a press at the far edge, and the scrub then
-                * jumped to a dose an inch away instead of reading the
+                * jumped to a dose an inch away rather than reading the
                 * glucose under the fingertip. About half an inch of x
                 * either side -- an eighth of the plot -- is roughly a
                 * fingertip's own width. */
@@ -750,4 +793,20 @@ void input_press_overlay(struct ANativeWindow_Buffer *buf)
     * whose hit zone out-sizes their glyph (see add_glow) */
    ui_press_overlay(buf, g_hits.box[bi].gx, g_hits.box[bi].gy,
                     g_hits.box[bi].gw, g_hits.box[bi].gh);
+}
+
+void input_arm_row(int action, int row)
+{
+   g_arm_dev = ma_names_device_row(action) ? model_snap_id(row) : -1;
+}
+
+/* Drop any armed press without firing (a stale arm must never shade or fire
+ * on a later screen -- called when a DOWN lands on nothing, and by the back
+ * key, which can change the screen under a held finger). */
+void press_cancel(void)
+{
+   g_arm_kind = ACT_NONE;
+   g_arm_code = 0;
+   g_arm_in   = 0;
+   g_arm_dev  = -1;
 }

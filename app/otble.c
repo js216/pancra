@@ -20,11 +20,8 @@
  * with glucose 0 and a non-zero tail, which is what that check rejects. */
 #include "otble.h"
 #include "clock.h"
+#include "log.h" /* LOGI/LOGW: the ONE declaration */
 #include <stdint.h>
-
-int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
-#define LOGW(...) __android_log_print(5, "pancra", __VA_ARGS__)
 
 enum {
    P_IDLE = 0,
@@ -35,6 +32,33 @@ enum {
    P_READ,   /* walking records forward */
    P_DONE
 };
+
+/* ---- WHAT IS OUTSTANDING, AND SINCE WHEN -------------------
+ *
+ * `awaiting` said that a request had been HANDED TO the transport. It did not
+ * say that the transport accepted it, and nothing told this driver when it
+ * did not: ot_drv_write was void, the routing dropped a meter link's write
+ * callbacks on the floor, and the phase had already advanced by the time the
+ * bytes failed to go out. The exchange then sat in that phase for ever --
+ * with the meter held awake by the open link -- until the meter powered
+ * itself off, and the next connect started the same walk again.
+ *
+ * Three things fix that, and all three are needed:
+ *
+ *   req_gen   names the outstanding request, so a completion that arrives for
+ *             one already abandoned (a link that dropped and reconnected, a
+ *             late callback) cannot resolve or fail the CURRENT one.
+ *   req_at    when it went out, on the caller's MONOTONIC clock, so ot_tick
+ *             can give up on a request whose answer never came. A meter that
+ *             stops answering mid-walk is ordinary -- it powers off on its
+ *             own schedule -- and before this there was no timeout at all.
+ *   the write's own ACCEPTANCE, reported by ot_on_written below.
+ *
+ * NOTHING HERE ADVANCES THE DURABLE RECORD INDEX. A request that failed to go
+ * out, or timed out, leaves last_index where it stands: the records this
+ * session did not read are read by the next one. */
+static unsigned req_gen;
+static long req_at; /* mono seconds; 0 = nothing outstanding */
 
 static int phase;
 static int last_index;  /* highest record index already stored */
@@ -59,8 +83,8 @@ static int retry_from;
  *     session is no longer in, and a non-0x06 status called finish() again --
  *     repeating the teardown, re-reporting the record count and re-issuing
  *     the disconnect, after the session had already ended;
- *   - a SECOND frame for a request already answered was consumed as the
- *     answer to whatever had been asked since.
+ *   - a SECOND frame for a request already answered is consumed as the
+ *     answer to whatever was asked since.
  *
  * `awaiting` is what a request being outstanding means: set when a command
  * goes out, cleared by the frame that answers it. A frame with nothing
@@ -101,11 +125,11 @@ static void send_cmd(const uint8_t *payload, int n)
    f[3] = 0x00;
    /* ctl is a constant 0x04 for every command the official app sends in the
     * command set we use (T-counter 0a0206, record read b3xxxx) -- verified
-    * against the btsnoop pairing+sync capture 2026-07-19. An earlier version
-    * alternated 0x03/0x04 per command starting at 0x03; that pattern appears in
-    * NO captured session (the app uses 0x03 only for the 0a0208/0a0207 device
-    * counters, which we never send), so our very first command went out with a
-    * ctl byte the meter never sees from the real app. */
+    * against the btsnoop pairing+sync capture 2026-07-19. Alternating
+    * 0x03/0x04 per command starting at 0x03 is a pattern that appears in NO
+    * captured session (the app uses 0x03 only for the 0a0208/0a0207 device
+    * counters, which we never send), so our very first command would go out
+    * with a ctl byte the meter never sees from the real app. */
    f[4] = 0x04;
    for (int i = 0; i < n; i++)
       f[5 + i] = payload[i];
@@ -113,6 +137,22 @@ static void send_cmd(const uint8_t *payload, int n)
    uint16_t c = crc16(f + 1, n + 5);
    f[6 + n]   = (uint8_t)c;
    f[7 + n]   = (uint8_t)(c >> 8U);
+   /* THE REQUEST IS RECORDED BEFORE THE WRITE, not after: ot_drv_write can
+    * complete synchronously (the transport calls back into ot_on_written from
+    * inside it when the stack refuses the characteristic outright), and a
+    * completion for a request nothing had recorded yet would be discarded as
+    * stale. */
+   req_gen++;
+   /* MONOTONIC, because the only question asked of this stamp is "has the
+    * answer taken too long" -- an interval. On the wall clock a correction
+    * forward abandons an exchange that is going perfectly, and one backward
+    * makes the timeout never fire. mono_try's failure leaves req_at 0, which
+    * this file reads as "no deadline": a clock that cannot be read must not
+    * invent one. */
+   req_at = 0;
+   if (mono_try(&req_at) != MONO_GET_OK)
+      req_at = 0;
+   awaiting = 1;
    ot_drv_write(f, total);
 }
 
@@ -126,7 +166,6 @@ static void send_cmd(const uint8_t *payload, int n)
  * exactly as the meter expects. */
 static void ask_time(void)
 {
-   awaiting                    = 1;
    static const uint8_t cmd[2] = {0x20, 0x02};
    phase                       = P_TIME;
    ot_drv_status("METER: HELLO");
@@ -135,7 +174,6 @@ static void ask_time(void)
 
 static void ask_rcount(void)
 {
-   awaiting                    = 1;
    static const uint8_t cmd[2] = {0x27, 0x00};
    phase                       = P_RCOUNT;
    send_cmd(cmd, 2);
@@ -145,7 +183,6 @@ static void ask_rcount(void)
  * capture shows this returning 76 while records 70..76 were readable. */
 static void ask_count(void)
 {
-   awaiting                    = 1;
    static const uint8_t cmd[3] = {0x0a, 0x02, 0x06};
    phase                       = P_COUNT;
    ot_drv_status("METER: COUNT");
@@ -154,7 +191,6 @@ static void ask_count(void)
 
 static void ask_record(int idx)
 {
-   awaiting       = 1;
    uint8_t cmd[3] = {0xb3, (uint8_t)idx, (uint8_t)((unsigned)idx >> 8U)};
    want_index     = idx;
    phase          = P_READ;
@@ -173,6 +209,7 @@ void ot_init(int last)
 {
    phase       = P_IDLE;
    awaiting    = 0;
+   req_at      = 0;
    last_index  = last;
    want_index  = 0;
    top_index   = 0;
@@ -189,6 +226,8 @@ int ot_last_index(void)
 void ot_on_connected(void)
 {
    phase       = P_SUB;
+   req_at      = 0;
+   awaiting    = 0;
    new_records = 0;
    walked      = 0;
    retry_from  = -1;
@@ -231,7 +270,7 @@ void ot_on_disconnected(void)
 }
 
 /* Finish: report, then drop the link immediately so the meter can power down
- * on its own schedule instead of being held awake by us. */
+ * on its own schedule rather than being held awake by us. */
 static void finish(void)
 {
    /* REWIND to the first timestamp refusal, so a later sync retries it -- the
@@ -261,7 +300,7 @@ static void finish(void)
    /* IDEMPOTENT. finish() reports the session's result, hands the count up
     * and drops the link; running it twice re-reports a sync that already
     * happened and disconnects a link that may since belong to another
-    * exchange. A late frame used to be able to do exactly that. */
+    * exchange -- which is exactly what a late frame would do. */
    if (phase == P_DONE)
       return;
    rewind_refused();
@@ -269,6 +308,90 @@ static void finish(void)
    awaiting = 0;
    ot_drv_status(new_records ? "METER: SYNCED" : "METER: NOTHING NEW");
    ot_drv_done(new_records);
+   ot_drv_disconnect();
+}
+
+/* ---- THE TRANSPORT SAYS WHETHER THE REQUEST WENT OUT --------
+ *
+ * `ok` is 0 when the stack refused the write or the CCCD outright: the
+ * characteristic was not found, the link had been replaced under us, or
+ * writeCharacteristic returned false. Java reports each of those as a
+ * completion with a failure status (see Ble.write / Ble.subscribe), and the
+ * routing now hands a meter link's completions here rather than dropping them.
+ *
+ * WHAT WE DO WITH A FAILURE: end the session, keeping the durable index. The
+ * meter cannot be asked again on this link -- the write that would ask never
+ * reached it -- and holding the link open only keeps the meter awake. The
+ * next advert reconnects and the walk resumes from that index,
+ * because nothing here moves last_index.
+ *
+ * A SUCCESS RESOLVES NOTHING. The request is still outstanding until its
+ * ANSWER arrives on the notify characteristic; all a successful write says is
+ * that the bytes left the phone.
+ *
+ * `gen` is the request this completion belongs to. A completion for an
+ * abandoned request -- the link dropped and reconnected, a late callback from
+ * a previous exchange -- must not end the current one. */
+void ot_on_written(unsigned gen, int ok)
+{
+   if (ok)
+      return;
+   if (!awaiting || gen != req_gen) {
+      LOGI("meter: a failed write for an old request (gen %u, live %u) is "
+           "not this exchange's",
+           gen, req_gen);
+      return;
+   }
+   LOGW("meter: the transport could not send the request in phase %d; "
+        "ending the session with index %d kept",
+        phase, last_index);
+   awaiting = 0;
+   req_at   = 0;
+   ot_drv_status("METER: LINK FAILED");
+   /* NOT finish(): finish reports a completed sync and would say NOTHING NEW
+    * on a session that failed to ask. This one ends with no claim. */
+   if (phase != P_IDLE && phase != P_DONE) {
+      rewind_refused();
+      ot_drv_done(0);
+   }
+   phase = P_DONE;
+   ot_drv_disconnect();
+}
+
+unsigned ot_request_gen(void)
+{
+   return req_gen;
+}
+
+/* ---- A REQUEST WHOSE ANSWER NEVER COMES ---------------------
+ *
+ * There was no timeout at all: a meter that stopped answering mid-walk left
+ * the exchange in its phase with the link open, and the only thing that ever
+ * ended it was the meter powering itself off -- which takes about
+ * thirty-five seconds from the last fingerstick and does not happen at all
+ * while something keeps the link busy.
+ *
+ * `now_mono` is the caller's clock, so this file stays testable without one.
+ * A zero req_at means no deadline: either nothing is outstanding, or the
+ * clock refused to answer when the request went out, and inventing a deadline
+ * from a clock that does not work is how a working exchange gets killed. */
+void ot_tick(long now_mono)
+{
+   if (!awaiting || req_at <= 0)
+      return;
+   if (now_mono - req_at < OT_REPLY_S)
+      return;
+   LOGW("meter: no answer in %d s (phase %d); ending the session with index "
+        "%d kept",
+        OT_REPLY_S, phase, last_index);
+   awaiting = 0;
+   req_at   = 0;
+   ot_drv_status("METER: NO ANSWER");
+   if (phase != P_IDLE && phase != P_DONE) {
+      rewind_refused();
+      ot_drv_done(0);
+   }
+   phase = P_DONE;
    ot_drv_disconnect();
 }
 
@@ -513,13 +636,13 @@ void ot_on_notify(const uint8_t *buf, int n)
        * same silent total data loss this gate has now caused twice. Leave the
        * index where it is so a later sync, with a correct clock, picks them
        * up. The session still walks forward, so this cannot loop. */
-      /* Always advance the WALK; the rewind happens once, at finish(). An
-       * earlier version skipped the assignment on a rejection, which was wrong
-       * twice over: `last_index = want_index` is an assignment rather than a
-       * max, so a rejection followed by any good record advanced past it
-       * anyway (the retry promise only ever held for the LAST record of a
-       * session), and a run of rejections longer than OT_MAX_WALK made every
-       * future session re-walk the same window forever, losing every later
+      /* Always advance the WALK; the rewind happens once, at finish(). Skip
+       * the assignment on a rejection and it is wrong twice over:
+       * `last_index = want_index` is an assignment rather than a max, so a
+       * rejection followed by any good record advances past it anyway (the
+       * retry promise would hold only for the LAST record of a session), and
+       * a run of rejections longer than OT_MAX_WALK makes every future
+       * session re-walk the same window forever, losing every later
        * fingerstick permanently. */
       last_index = want_index;
       if (ts_reject && retry_from < 0) {
@@ -533,9 +656,9 @@ void ot_on_notify(const uint8_t *buf, int n)
          finish();
          return;
       }
-      /* Bound how long ONE connection holds the meter awake. Previously only a
-       * first-ever sync was windowed, so a stale stored index against a large
-       * counter meant tens of thousands of sequential round-trips -- the
+      /* Bound how long ONE connection holds the meter awake. Windowing only
+       * a first-ever sync leaves a stale stored index against a large counter
+       * meaning tens of thousands of sequential round-trips -- the
        * opposite of the connect-check-disconnect battery policy in otble.h.
        * Stopping here rather than skipping forward loses nothing: last_index
        * has advanced, so the next advertisement resumes exactly where this one

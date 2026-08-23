@@ -14,24 +14,133 @@
 #include <stdint.h>
 #include <string.h> /* memset: zero affine outputs on the infinity path */
 
-/* THIS FILE NEEDS A 64x64 -> 128 MULTIPLY.
+/* ---- THIS FILE NEEDS A 64x64 -> 128 MULTIPLY, AND C HAS NO SUCH TYPE ----
  *
- * The limb arithmetic below carries through a 128-bit accumulator, which C
- * has no standard type for: `unsigned __int128` is a GCC and Clang
- * extension. That was used unguarded and unmentioned in a file whose header
- * line said "Portable", which is the one construct here that most needed
- * saying out loud -- `gcc -std=c11 -pedantic` reports "ISO C does not support
- * '__int128' types", and a 32-bit target or MSVC cannot build this at all.
+ * The limb arithmetic below carries through a 128-bit accumulator.
+ * `unsigned __int128` is a GCC and Clang EXTENSION -- `gcc -std=c11
+ * -pedantic` says "ISO C does not support '__int128' types" -- and it does
+ * not exist at all on a 32-bit target or under MSVC. Used unguarded -- or
+ * guarded by an #error -- in a file whose header line says "Portable", it
+ * makes a curve implementation that refuses to compile anywhere but on two
+ * compilers' 64-bit targets.
  *
- * Named once, so a compiler that lacks it says so in a sentence instead of a
- * parse error two hundred lines down. There is deliberately no fallback: a
- * 32x32 -> 64 implementation would be a second arithmetic core to keep
- * correct, and nothing this repo targets needs one. */
-#ifndef __SIZEOF_INT128__
-#error                                                                         \
-    "lib/p256.c needs a 64x64->128 multiply (GCC/Clang unsigned __int128). No fallback is provided."
+ * So the three things the accumulator was doing are named -- add with carry,
+ * subtract with borrow, and multiply wide -- and there are TWO
+ * implementations of each:
+ *
+ *   the __int128 one, used when the compiler has it, which is what every
+ *   target this repo builds for actually uses; and
+ *
+ *   a portable one in plain C99, which splits each 64-bit operand into two
+ *   32-bit halves. Slower (four multiplies and a handful of shifts where the
+ *   other has one instruction) and correct on any conforming compiler.
+ *
+ * BOTH ARE BRANCH-FREE, which is not a nicety here: every one of them is
+ * reached from the scalar multiplication, and a comparison compiled as a
+ * branch is a timing signal about a secret. The portable carry uses the
+ * standard unsigned trick -- a sum that wrapped is smaller than either
+ * operand -- and nothing below tests a secret and jumps.
+ *
+ * THE FALLBACK IS EXERCISED, not merely present: `make -f test/Makefile
+ * p256portable` builds the curve's own vectors and its constant-time
+ * assertions with P256_NO_INT128 defined, so both cores are held to the same
+ * answers and the same operation counts. A fallback nothing runs is a
+ * fallback that does not work.
+ *
+ * P256_NO_INT128 forces the portable path on a compiler that has the
+ * extension. That is what makes the two comparable at all: without it the
+ * only way to run the fallback would be to find a machine that cannot run the
+ * other one. */
+#if defined(__SIZEOF_INT128__) && !defined(P256_NO_INT128)
+#define P256_HAVE_INT128 1
+__extension__ typedef unsigned __int128 u128;
+#else
+#define P256_HAVE_INT128 0
 #endif
-typedef unsigned __int128 u128;
+
+/* a + b + carry_in, as (sum, carry_out). Carry in and out are 0 or 1. */
+static uint64_t addc64(uint64_t a, uint64_t b, uint64_t cin, uint64_t *sum)
+{
+#if P256_HAVE_INT128
+   u128 t = (u128)a + b + cin;
+   *sum   = (uint64_t)t;
+   return (uint64_t)(t >> 64U);
+#else
+   /* A SUM THAT WRAPPED IS SMALLER THAN EITHER OPERAND, and that comparison
+    * is the carry. Two of them, because adding the carry can wrap again --
+    * a + b == UINT64_MAX with cin == 1. */
+   uint64_t s  = a + b;
+   uint64_t c1 = (uint64_t)(s < a);
+   uint64_t t  = s + cin;
+   uint64_t c2 = (uint64_t)(t < s);
+   *sum        = t;
+   return c1 | c2; /* both cannot be 1: c1 == 1 leaves s <= a, and then
+                    * s + 1 can only wrap if s == UINT64_MAX, which c1 == 1
+                    * already excludes */
+#endif
+}
+
+/* a - b - borrow_in, as (difference, borrow_out). */
+static uint64_t subb64(uint64_t a, uint64_t b, uint64_t bin, uint64_t *diff)
+{
+#if P256_HAVE_INT128
+   u128 t = (u128)a - b - bin;
+   *diff  = (uint64_t)t;
+   return (uint64_t)((t >> 64U) & 1U);
+#else
+   uint64_t d  = a - b;
+   uint64_t b1 = (uint64_t)(a < b);
+   uint64_t e  = d - bin;
+   uint64_t b2 = (uint64_t)(d < bin);
+   *diff       = e;
+   return b1 | b2;
+#endif
+}
+
+/* a * b as (hi, lo). */
+static void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
+{
+#if P256_HAVE_INT128
+   u128 t = (u128)a * b;
+   *lo    = (uint64_t)t;
+   *hi    = (uint64_t)(t >> 64U);
+#else
+   /* SCHOOLBOOK ON 32-BIT HALVES. Every partial product fits in 64 bits
+    * (0xFFFFFFFF^2 < 2^64), and the middle column is accumulated in one
+    * 64-bit word: (p00 >> 32) + lo32(p01) + lo32(p10) is at most
+    * 0xFFFFFFFF + 2 * 0xFFFFFFFF, which does not overflow. */
+   uint64_t a0 = a & 0xFFFFFFFFU, a1 = a >> 32U;
+   uint64_t b0 = b & 0xFFFFFFFFU, b1 = b >> 32U;
+   uint64_t p00 = a0 * b0, p01 = a0 * b1;
+   uint64_t p10 = a1 * b0, p11 = a1 * b1;
+   uint64_t mid = (p00 >> 32U) + (p01 & 0xFFFFFFFFU) + (p10 & 0xFFFFFFFFU);
+   *lo          = (p00 & 0xFFFFFFFFU) | (mid << 32U);
+   *hi          = p11 + (p01 >> 32U) + (p10 >> 32U) + (mid >> 32U);
+#endif
+}
+
+/* ---- THE OPERATION COUNTER, and why a constant-time claim needs one ------
+ *
+ * A routine that says it is constant-time and has no way to be caught lying is
+ * worth very little: the transformations below are the kind that a later edit
+ * undoes by accident -- one early return put back for speed and the property
+ * is gone with nothing failing. So the limb-level primitives count themselves
+ * when P256_COUNT is defined, and test/srv/cttest.c drives the public entry
+ * points with scalars chosen to differ in exactly the ways that show up here
+ * (leading zeros, Hamming weight, small values) and asserts that the count is
+ * IDENTICAL. That is not a timing measurement -- it cannot see a
+ * data-dependent memory access or a variable-latency instruction -- but every
+ * leak this file has had was a branch that did fewer limb operations, and
+ * this sees those exactly.
+ *
+ * Compiled out entirely by default: no counter, no global, no store in the
+ * hot loop. */
+#ifdef P256_COUNT
+unsigned long p256_op_count;
+#define P256_TICK() (p256_op_count++)
+#else
+#define P256_TICK() ((void)0)
+#endif
 
 /* ---- 256-bit little-endian limb arithmetic ---- */
 static int u256_iszero(const struct u256 *a)
@@ -42,6 +151,7 @@ static int u256_iszero(const struct u256 *a)
 /* r = c ? b : a, limb by limb and without a branch. c must be 0 or 1. */
 static void u256_cmov(struct u256 *a, const struct u256 *b, uint64_t c)
 {
+   P256_TICK();
    for (int i = 0; i < 4; i++)
       a->v[i] = ct_cmov64(a->v[i], b->v[i], c);
 }
@@ -51,17 +161,18 @@ static void u256_cmov(struct u256 *a, const struct u256 *b, uint64_t c)
  * wrapped difference can never reach that bit by accident. */
 static uint64_t u64_lt(uint64_t x, uint64_t y)
 {
-   return (uint64_t)((((u128)x - y) >> 127U) & 1U);
+   uint64_t d = 0;
+   return subb64(x, y, 0, &d); /* the borrow IS "it went negative" */
 }
 
 /* -1, 0 or 1, in time that does not depend on WHERE the two values differ.
  *
- * This used to walk the limbs from the top down and return at the first
- * difference, which made the comparison's cost a function of how many leading
- * limbs matched. That is the same shape of leak as memcmp on a MAC, except
- * that the operands here are secrets rather than guesses -- it is reached from
- * every modular reduction, so a scalar multiplication ran it thousands of
- * times per signature.
+ * Walking the limbs from the top down and returning at the first difference
+ * makes the comparison's cost a function of how many leading limbs matched.
+ * That is the same shape of leak as memcmp on a MAC, except that the operands
+ * here are secrets rather than guesses -- it is reached from every modular
+ * reduction, so a scalar multiplication runs it thousands of times per
+ * signature.
  *
  * Constant time instead: walk from the LEAST significant limb upwards and let
  * each differing limb overwrite the verdict, so the most significant
@@ -70,6 +181,7 @@ static int u256_cmp(const struct u256 *a, const struct u256 *b)
 {
    uint64_t lt = 0;
    uint64_t gt = 0;
+   P256_TICK();
    for (int i = 0; i < 4; i++) {
       const uint64_t l  = u64_lt(a->v[i], b->v[i]);
       const uint64_t g  = u64_lt(b->v[i], a->v[i]);
@@ -80,28 +192,37 @@ static int u256_cmp(const struct u256 *a, const struct u256 *b)
    return (int)gt - (int)lt;
 }
 
+/* 1 iff a == b, in time that does not depend on which limb differs. Separate
+ * from u256_cmp because the callers below want a MASKABLE 0/1 rather than an
+ * ordering, and because folding all four limbs into one accumulator is both
+ * cheaper and harder to get subtly wrong than reading a sign. */
+static uint64_t u256_eq1(const struct u256 *a, const struct u256 *b)
+{
+   uint64_t d = 0;
+   P256_TICK();
+   for (int i = 0; i < 4; i++)
+      d |= a->v[i] ^ b->v[i];
+   return 1U - ct_nz64(d);
+}
+
 static uint64_t u256_add(struct u256 *r, const struct u256 *a,
                          const struct u256 *b)
 { /* returns carry */
-   u128 c = 0;
-   for (int i = 0; i < 4; i++) {
-      c += (u128)a->v[i] + b->v[i];
-      r->v[i] = (uint64_t)c;
-      c >>= 64U;
-   }
-   return (uint64_t)c;
+   uint64_t c = 0;
+   P256_TICK();
+   for (int i = 0; i < 4; i++)
+      c = addc64(a->v[i], b->v[i], c, &r->v[i]);
+   return c;
 }
 
 static uint64_t u256_sub(struct u256 *r, const struct u256 *a,
                          const struct u256 *b)
 { /* returns borrow */
-   u128 br = 0;
-   for (int i = 0; i < 4; i++) {
-      u128 t  = (u128)a->v[i] - b->v[i] - br;
-      r->v[i] = (uint64_t)t;
-      br      = (t >> 64U) & 1U;
-   }
-   return (uint64_t)br;
+   uint64_t br = 0;
+   P256_TICK();
+   for (int i = 0; i < 4; i++)
+      br = subb64(a->v[i], b->v[i], br, &r->v[i]);
+   return br;
 }
 
 static void u256_from_be(struct u256 *r, const uint8_t b[32])
@@ -125,6 +246,14 @@ static void u256_to_be(const struct u256 *a, uint8_t b[32])
    }
 }
 
+/* See p256.h: the one canonical encoder, exported because the layout it
+ * encodes is this file's. u256_to_be is the internal spelling and stays
+ * static -- callers get the scalar-shaped name, which is what they mean. */
+void p256_sc_to_be(const struct u256 *a, uint8_t be[32])
+{
+   u256_to_be(a, be);
+}
+
 static int u256_bit(const struct u256 *a, int i)
 {
    return (int)((a->v[(unsigned)i >> 6U] >> ((unsigned)i & 63U)) & 1U);
@@ -146,14 +275,24 @@ static void u256_mul(const struct u256 *a, const struct u256 *b,
                      struct u256 *lo, struct u256 *hi)
 {
    uint64_t r[8] = {0};
+   P256_TICK();
    for (int i = 0; i < 4; i++) {
-      u128 carry = 0;
+      uint64_t carry = 0;
       for (int j = 0; j < 4; j++) {
-         u128 t   = ((u128)a->v[i] * b->v[j]) + r[i + j] + carry;
-         r[i + j] = (uint64_t)t;
-         carry    = t >> 64U;
+         /* t = a[i]*b[j] + r[i+j] + carry, as a 128-bit value in two words.
+          * NEITHER ADDITION CAN OVERFLOW THE PAIR: the product is at most
+          * (2^64-1)^2, and adding two more 64-bit words keeps it under
+          * 2^128 -- (2^64-1)^2 + 2*(2^64-1) = 2^128 - 1 exactly. */
+         /* ph/pl, not hi/lo: those are the OUTPUTS. */
+         uint64_t ph = 0;
+         uint64_t pl = 0;
+         mul64(a->v[i], b->v[j], &ph, &pl);
+         uint64_t c1 = addc64(pl, r[i + j], 0, &pl);
+         uint64_t c2 = addc64(pl, carry, 0, &pl);
+         r[i + j]    = pl;
+         carry       = ph + c1 + c2;
       }
-      r[i + 4] += (uint64_t)carry;
+      r[i + 4] += carry;
    }
    for (int i = 0; i < 4; i++) {
       lo->v[i] = r[i];
@@ -356,13 +495,12 @@ static void fast_reduce(struct u256 *out, const struct u256 *lo,
 
    /* THE CORRECTION RUNS A FIXED NUMBER OF TIMES.
     *
-    * This used to be two `while` loops, and their trip counts were a direct
-    * readout of the product's magnitude: p256.h named this as one of the three
-    * places the curve code leaks, and it is the hottest of them -- every field
-    * multiply in every ladder step passes through here. Measured over 200
-    * signatures plus the 4000 boundary products in p256_selftest, `top` landed
-    * in [-4, 4] and each loop ran at most 4 times, so the old code's cost
-    * varied by up to eight 4-limb add/subtracts depending on the operands.
+    * As two `while` loops their trip counts are a direct readout of the
+    * product's magnitude, and this is the hottest such site in the file --
+    * every field multiply in every ladder step passes through here. Measured
+    * over 200 signatures plus the 4000 boundary products in p256_selftest,
+    * `top` lands in [-4, 4] and each loop would run at most 4 times: a cost
+    * varying by up to eight 4-limb add/subtracts with the operands.
     *
     * The counts below are the analytic worst case, not the measured one, and
     * both loops are no-ops once their condition goes false, so overshooting is
@@ -409,51 +547,6 @@ static void fmul(struct u256 *r, const struct u256 *a, const struct u256 *b)
    fast_reduce(r, &lo, &hi);
 }
 
-/* Cross-check the fast path against the long division it replaces. The curve
- * tests would catch a wrong answer eventually, but only for the word patterns
- * their fixed inputs happen to produce; this walks the carry and borrow
- * corrections with values chosen to land on the edges. */
-int p256_selftest(void)
-{
-   struct u256 a = zero;
-   struct u256 b = zero;
-   uint64_t x    = 0x243F6A8885A308D3ULL; /* any spread of bits will do */
-
-   for (int i = 0; i < 4000; i++) {
-      for (int j = 0; j < 4; j++) {
-         x ^= x << 13U;
-         x ^= x >> 7U;
-         x ^= x << 17U;
-         a.v[j] = x;
-         b.v[j] = x * 0x9E3779B97F4A7C15ULL;
-      }
-      /* Every eighth pair is forced to a boundary: all ones, p itself, p-1,
-       * zero -- the inputs most likely to expose a mis-handled carry. */
-      switch (i % 8) {
-         case 1: a = field_p; break;
-         case 2: b = field_p; break;
-         case 3:
-            a.v[0] = a.v[1] = a.v[2] = a.v[3] = ~0ULL;
-            b.v[0] = b.v[1] = b.v[2] = b.v[3] = ~0ULL;
-            break;
-         case 4: u256_sub(&a, &field_p, &one); break;
-         case 5: b = zero; break;
-         default: break;
-      }
-
-      struct u256 lo;
-      struct u256 hi;
-      struct u256 fast;
-      struct u256 slow;
-      u256_mul(&a, &b, &lo, &hi);
-      fast_reduce(&fast, &lo, &hi);
-      mod512(&lo, &hi, &field_p, &slow);
-      if (u256_cmp(&fast, &slow) != 0)
-         return 1;
-   }
-   return 0;
-}
-
 static void finv(struct u256 *r, const struct u256 *a)
 {
    modinv(r, a, &field_p, fmul);
@@ -461,10 +554,48 @@ static void finv(struct u256 *r, const struct u256 *a)
 
 /* ---- curve ---- */
 static struct u256 curve_b;
-struct jpoint p256_g;
+
+/* THE GENERATOR IS PRIVATE, AND SO IS THE FACT THAT IT IS READY.
+ *
+ * It was an extern `struct jpoint` named for this curve -- a WRITABLE
+ * global, filled at
+ * runtime by p256_init and read directly by J-PAKE, so every file that
+ * included p256.h could overwrite the base point of the curve or read it
+ * before anything had put a curve in it. Neither failure announces itself:
+ * an overwritten G still produces points, still passes the on-curve test if
+ * the attacker picked a curve point, and the zero-knowledge proofs J-PAKE
+ * builds over it still verify against the same wrong G at the other end of
+ * the exchange. A G of all zeroes -- the pre-init state -- is the point at
+ * infinity, and every scalar multiple of it is infinity too.
+ *
+ * So: static here, handed out only as a COPY, and only once init has run.
+ * `curve_ready` is the guard, and it is what makes p256_init idempotent as
+ * well -- it is called from four entry points (the driver, the TLS
+ * credentials, jpake_init, and the tests) and none of them knows about the
+ * others. */
+static struct jpoint curve_g;
+static int curve_ready;
+
+int p256_gen(struct jpoint *out)
+{
+   if (!out)
+      return 0;
+   if (!curve_ready) {
+      /* ZEROED, WHICH IS INFINITY. A caller that ignores the answer gets a
+       * point every downstream check refuses (p256_to_xy, validate_zkp)
+       * rather than one that looks usable. */
+      struct jpoint z = {0};
+      *out            = z;
+      return 0;
+   }
+   *out = curve_g;
+   return 1;
+}
 
 void p256_init(void)
 {
+   if (curve_ready)
+      return;
    static const uint8_t p_be[32] = {
        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0,    0,    0,
        0,    0,    0,    0,    0,    0,    0,    0,    0,    0xff, 0xff,
@@ -488,38 +619,36 @@ void p256_init(void)
    u256_from_be(&field_p, p_be);
    u256_from_be(&order_n, n_be);
    u256_from_be(&curve_b, b_be);
-   u256_from_be(&p256_g.X, gx);
-   u256_from_be(&p256_g.Y, gy);
-   p256_g.Z = one;
-}
-
-int p256_is_inf(const struct jpoint *P_)
-{
-   return u256_iszero(&P_->Z);
+   u256_from_be(&curve_g.X, gx);
+   u256_from_be(&curve_g.Y, gy);
+   curve_g.Z = one;
+   /* LAST, AFTER EVERY CONSTANT IS IN PLACE. p256_gen and p256_mul_g both
+    * read this flag, and a reader that saw it set while the generator was
+    * still half-written would get a point that is not on the curve. */
+   curve_ready = 1;
 }
 
 /* Jacobian doubling, a = -3.
  *
  * THERE IS NO EARLY RETURN FOR INFINITY, AND THAT IS THE POINT.
  *
- * This used to begin `if (Z == 0 || Y == 0) return infinity;`, which cost
- * almost nothing while the general case costs nine field multiplies. p256_mul
- * starts its accumulator at infinity, so a scalar with z leading zero bits
- * took the cheap path for its first z ladder steps -- and the number of
- * leading zeros of an ECDSA nonce is precisely the quantity the lattice attack
- * on partial nonce leakage needs. Measured on this machine before the change,
- * k*G took 3.35 ms for a full-width scalar and 0.78 ms for one with 192
- * leading zeros: a 13 us signal per leading zero bit, and a factor of four
- * over the range. That is not a subtle leak, it is the loudest one in the file,
- * and p256.h described it only as "the work per scalar bit depends on the bit".
+ * Beginning `if (Z == 0 || Y == 0) return infinity;` costs almost nothing
+ * while the general case costs nine field multiplies. p256_mul starts its
+ * accumulator at infinity, so a scalar with z leading zero bits takes the
+ * cheap path for its first z ladder steps -- and the number of leading zeros
+ * of an ECDSA nonce is precisely the quantity the lattice attack on partial
+ * nonce leakage needs. It is the loudest leak this file can have: measured
+ * on the branching version, 49206 limb operations falling to 14122 as the
+ * top set bit moves from bit 255 to bit 40 -- a 3.5x readout of the
+ * leading-zero count.
  *
- * Deleting the branch is exact rather than approximate, because the general
- * formula already computes the right answer for both cases it was catching:
+ * Having no branch is exact rather than approximate, because the general
+ * formula computes the right answer for both cases such a branch catches:
  *
  *   Z == 0 (infinity): Z' = 2YZ = 0, so the result is again a Z == 0 point.
  *   Infinity is represented by Z == 0 alone -- p256_is_inf, p256_padd,
  *   p256_to_xy and p256_eq all test only that -- so the X and Y that come out
- *   are meaningless but harmless, exactly as the (1, 1, 0) they replace.
+ *   are meaningless but harmless, exactly as a returned (1, 1, 0) would be.
  *
  *   Y == 0 with Z != 0 would be a point of order two. P-256's group order is
  *   an odd prime, so no such point exists on the curve and p256_from_xy will
@@ -574,34 +703,43 @@ static void jdouble(struct jpoint *r, const struct jpoint *p)
    r->Z = zr;
 }
 
-/* Jacobian add.
+/* r = c ? b : a, all three coordinates, no branch. c must be 0 or 1. */
+static void jpoint_cmov(struct jpoint *a, const struct jpoint *b, uint64_t c)
+{
+   u256_cmov(&a->X, &b->X, c);
+   u256_cmov(&a->Y, &b->Y, c);
+   u256_cmov(&a->Z, &b->Z, c);
+}
+
+/* Jacobian add, BRANCH-FREE over all five outcomes.
  *
- * STILL BRANCHES, and unlike jdouble it cannot simply stop doing so. The
- * general formula gives Z3 = Z1*Z2*h, which is zero when either input is
- * infinity -- so for "infinity + Q" it answers infinity where the right answer
- * is Q. Deleting the guards would be wrong, not merely slower. Making this
- * branch-free means computing the general case AND a doubling unconditionally
- * and selecting between five outcomes, which roughly doubles the cost of the
- * hottest routine in the file; see p256.h for why that is being left as a
- * decision rather than taken.
+ * The general formula alone is not enough and never was: it gives
+ * Z3 = Z1*Z2*h, which is zero when either input is infinity -- so it answers
+ * infinity for "infinity + Q" where the answer is Q -- and it divides by
+ * nothing but produces 0/0 in the shape of h == 0 when the two points are
+ * equal or opposite. So all five answers are COMPUTED and then selected:
  *
- * Inside p256_mul the exceptional cases carry no positional information: the
- * accumulator is an even multiple of P and the addend is P, so u1 == u2 needs
- * 2m = +-1 mod n and never happens, and exactly one addition per scalar meets
- * an infinite accumulator whatever the scalar's shape. The exposure is the
- * other callers -- lib/jpake.c and ecdsa_p256_verify -- and for both of those
- * the operands are the peer's public values, not our secrets. */
+ *   P infinite         -> Q
+ *   Q infinite         -> P
+ *   u1 == u2, s1 == s2 -> 2P   (the same point; the general formula
+ * degenerates) u1 == u2, s1 != s2 -> infinity  (opposite points) otherwise ->
+ * the general formula
+ *
+ * The selects run in that order of increasing priority, so an infinite operand
+ * wins over everything -- which is what makes "infinity + infinity" come out
+ * as infinity rather than as the doubling case it also matches.
+ *
+ * THE COST is a doubling on top of every addition: about 27 field multiplies
+ * where the branching version did 16, and it is paid on every addition
+ * including the ones inside p256_mul. That is the price of the property, and
+ * p256.h quotes what it comes to end to end. What it buys is that the
+ * exception cases are not observable. An attacker cannot steer them inside the
+ * ladder (the accumulator is an even multiple of P), but jpake.c and
+ * ecdsa_p256_verify add points an attacker chooses, and there the shape of the
+ * operands would be readable in the timing. */
 void p256_padd(struct jpoint *r, const struct jpoint *P_,
                const struct jpoint *Q)
 {
-   if (u256_iszero(&P_->Z)) {
-      *r = *Q;
-      return;
-   }
-   if (u256_iszero(&Q->Z)) {
-      *r = *P_;
-      return;
-   }
    struct u256 z1z1;
    struct u256 z2z2;
    struct u256 u1;
@@ -617,16 +755,6 @@ void p256_padd(struct jpoint *r, const struct jpoint *P_,
    fmul(&s1, &P_->Y, &t);
    fmul(&t, &P_->Z, &z1z1);
    fmul(&s2, &Q->Y, &t);
-   if (u256_cmp(&u1, &u2) == 0) {
-      if (u256_cmp(&s1, &s2) == 0) {
-         jdouble(r, P_);
-         return;
-      }
-      r->X = one;
-      r->Y = one;
-      r->Z = zero;
-      return; /* infinity */
-   }
    struct u256 h;
    struct u256 rr;
    struct u256 h2;
@@ -652,24 +780,57 @@ void p256_padd(struct jpoint *r, const struct jpoint *P_,
    fsub(&y3, &y3, &s1h3);
    fmul(&z3, &P_->Z, &Q->Z);
    fmul(&z3, &z3, &h);
-   r->X = x3;
-   r->Y = y3;
-   r->Z = z3;
+
+   /* THE FIVE OUTCOMES, computed and then chosen. `dbl` is unconditional: it
+    * is the one answer the general formula cannot produce, and computing it
+    * only when it is needed is exactly the branch this routine exists without.
+    */
+   struct jpoint dbl;
+   jdouble(&dbl, P_);
+   struct jpoint inf;
+   inf.X = one;
+   inf.Y = one;
+   inf.Z = zero;
+
+   const uint64_t p_inf =
+       1U - ct_nz64(P_->Z.v[0] | P_->Z.v[1] | P_->Z.v[2] | P_->Z.v[3]);
+   const uint64_t q_inf =
+       1U - ct_nz64(Q->Z.v[0] | Q->Z.v[1] | Q->Z.v[2] | Q->Z.v[3]);
+   const uint64_t same_u = u256_eq1(&u1, &u2);
+   const uint64_t same_s = u256_eq1(&s1, &s2);
+
+   struct jpoint out;
+   out.X = x3;
+   out.Y = y3;
+   out.Z = z3;
+   jpoint_cmov(&out, &inf, same_u & (1U - same_s)); /* P + (-P) */
+   jpoint_cmov(&out, &dbl, same_u & same_s);        /* P + P */
+   jpoint_cmov(&out, P_, q_inf);
+   jpoint_cmov(&out, Q, p_inf);
+   *r = out;
 }
 
-/* k*P by double-and-add, most significant bit first.
+/* k*P by double-AND-ADD, most significant bit first: 256 doublings and 256
+ * additions, whatever k is.
  *
- * THE COST IS NOW 256 DOUBLINGS PLUS ONE ADDITION PER SET BIT, and nothing
- * else. With jdouble's infinity shortcut gone and the reductions unconditional,
- * the leading zeros of k are indistinguishable from any other zero bits, so the
- * remaining signal is the Hamming weight of k -- one aggregate number, no
- * positions. Verified by counting limb operations: 121402 for every scalar of
- * weight 32 regardless of where its top set bit sits, against 49206..14122 for
- * the same scalars before.
+ * EVERY ITERATION DOES THE SAME WORK. The addition happens on a zero bit too
+ * and its result is thrown away by a masked select rather than by an `if`, so
+ * the cost of a scalar multiplication no longer depends on the scalar in any
+ * way this file can express: not on its leading zeros (jdouble's infinity
+ * shortcut went first), and now not on its Hamming weight either. The count
+ * that test/srv/cttest.c asserts is one number for every scalar it tries.
  *
- * The `if` is left in rather than made an always-add with a masked assignment,
- * because an always-add costs a full p256_padd per bit -- doubling the work --
- * and buys nothing until p256_padd itself is branch-free. See p256.h. */
+ * That last step is only sound because p256_padd is itself branch-free. An
+ * always-add over a branching p256_padd moves the leak rather than closing
+ * it: the discarded additions still take the cheap infinity path for the
+ * leading zeros and the expensive one elsewhere.
+ *
+ * WHAT IT COSTS is one addition per bit rather than one per SET bit, each
+ * carrying a doubling of its own -- about 2.4x the field multiplies of a
+ * conditional-add ladder. p256.h has the end-to-end numbers.
+ * The alternative to paying it is a windowed or Montgomery ladder, which is
+ * less work per bit but needs a constant-time table read to stay honest, and
+ * that is the one primitive lib/ct.h deliberately does not provide. */
 void p256_mul(struct jpoint *r, const struct u256 *k, const struct jpoint *P_)
 {
    struct jpoint acc;
@@ -680,18 +841,24 @@ void p256_mul(struct jpoint *r, const struct u256 *k, const struct jpoint *P_)
       struct jpoint d;
       jdouble(&d, &acc);
       acc = d;
-      if (u256_bit(k, i)) {
-         struct jpoint a;
-         p256_padd(&a, &acc, P_);
-         acc = a;
-      }
+      struct jpoint a;
+      p256_padd(&a, &acc, P_);
+      jpoint_cmov(&acc, &a, (uint64_t)u256_bit(k, i));
    }
    *r = acc;
 }
 
 void p256_mul_g(struct jpoint *r, const struct u256 *k)
 {
-   p256_mul(r, k, &p256_g);
+   /* THE GENERATOR THROUGH ITS OWN ACCESSOR, so this cannot outrun the
+    * initialisation either: before p256_init the copy is infinity, k times
+    * infinity is infinity, and p256_to_xy refuses it. That is the same
+    * answer this always gave for an uninitialised curve -- what is new is
+    * that it is now a stated one rather than a consequence of a global
+    * happening to be zero. */
+   struct jpoint g;
+   (void)p256_gen(&g);
+   p256_mul(r, k, &g);
 }
 
 int p256_to_xy(const struct jpoint *P_, uint8_t x[32], uint8_t y[32])
@@ -737,13 +904,14 @@ int p256_eq(const struct jpoint *A, const struct jpoint *B)
    uint8_t yb[32];
    p256_to_xy(A, xa, ya);
    p256_to_xy(B, xb, yb);
-   /* Accumulate the difference instead of returning at the first one, so the
+   /* Accumulate the difference rather than returning at the first one, so the
     * time taken does not say how many leading bytes agreed. Spelled out here
     * rather than calling ct_eq because several link lines compile this file
     * without lib/ct.c; see the note in ct.h. */
-   uint8_t d = 0;
+   unsigned d = 0;
    for (int i = 0; i < 32; i++)
-      d |= (uint8_t)((xa[i] ^ xb[i]) | (ya[i] ^ yb[i]));
+      d |= ((unsigned)xa[i] ^ (unsigned)xb[i]) |
+           ((unsigned)ya[i] ^ (unsigned)yb[i]);
    return d == 0;
 }
 
@@ -875,25 +1043,24 @@ enum p256_scalar p256_sc_from_be_checked(struct u256 *r, const uint8_t be[32])
 
 /* ---- THE ONE SECRET-SCALAR GENERATOR ----------------------------------
  *
- * See p256.h for the contract and for the two defects this replaces. What
- * belongs here is why it is shaped like this and not like the four call sites
- * it came from.
+ * See p256.h for the contract and for the two defects a per-call-site
+ * generator has. What belongs here is why this one is shaped as it is.
  *
- * WHY REJECTION AND NOT A REDUCTION. Every caller used to do the same two
- * lines: 32 bytes from rand_bytes, then p256_sc_from_be to fold them into
- * [0, n-1]. That fold is one conditional subtraction, so the 2^256 - n values
+ * WHY REJECTION AND NOT A REDUCTION. The obvious two lines -- 32 bytes from
+ * rand_bytes, then p256_sc_from_be to fold them into [0, n-1] -- fold with
+ * one conditional subtraction, so the 2^256 - n values
  * at the top of the range land on the 2^256 - n residues at the BOTTOM, and
  * those residues come out twice as often as every other. 2^256 - n is
  * 0xffffffff00000000000000004319055258e8617b0c46353d039cdaaf, just over
  * 2^223, so the doubled band is a 2^-32 fraction of the interval: a scalar
- * falls in it with probability 2^-31 instead of 2^-32. Nobody attacks P-256
+ * falls in it with probability 2^-31 rather than 2^-32. Nobody attacks P-256
  * with that. It is still measurable, it is still a deviation from the uniform
  * scalar every proof about ECDSA and J-PAKE assumes, and rejection costs
  * nothing (below), so there is no reason to keep it.
  *
- * ZERO IS THE HALF THAT MATTERS, and it was admitted. p256_sc_from_be maps
- * both 0 and n to 0 and hands it back as a perfectly ordinary scalar. What
- * that would have meant for somebody whose key it was:
+ * ZERO IS THE HALF THAT MATTERS. p256_sc_from_be maps both 0 and n to 0 and
+ * hands it back as a perfectly ordinary scalar. What that means for somebody
+ * whose key it is:
  *
  *   - a zero TLS ECDHE scalar (srv/tls.c) makes our key share the point at
  *     infinity and the ECDHE shared point the identity, so the handshake
@@ -944,12 +1111,12 @@ int p256_sc_rand(uint8_t out[32])
 {
    /* ZEROED FIRST, so that every failure return below leaves the same value
     * behind. rand.h says a failed draw leaves the buffer UNDEFINED, and the
-    * whole point of item 65 is that a refusal here must not turn into a
+    * whole point of a refusal here is that it must not turn into a
     * caller keying with stack contents. Zero is the deliberate choice: it is
     * the one scalar that every consumer in this repo independently refuses
     * (ecdsa_p256_sign's is_zero check, and p256_to_xy on the infinite point
     * everywhere else), so a caller that ignores the return code fails hard
-    * downstream instead of proceeding with something that looks like a key. */
+    * downstream rather than proceeding with something that looks like a key. */
    memset(out, 0, 32);
    for (int i = 0; i < P256_SC_RAND_TRIES; i++) {
       uint8_t b[32];
@@ -962,14 +1129,36 @@ int p256_sc_rand(uint8_t out[32])
          return 0;
       u256_from_be(&t, b);
       /* borrow == 1 means t < n, read exactly as in p256_sc_from_be. */
-      if (u256_sub(&diff, &t, &order_n) == 0)
-         continue; /* t >= n: the biased tail. Draw again. */
-      if (u256_iszero(&t))
-         continue; /* t == 0: the invalid scalar. Draw again. */
+      if (u256_sub(&diff, &t, &order_n) == 0 || u256_iszero(&t)) {
+         /* REJECTED, AND WIPED ON THE WAY OUT. t >= n is the biased tail and
+          * t == 0 is the invalid scalar; both are draws from the same source
+          * as the accepted one, and a rejected secret left on the stack is
+          * exactly as readable as an accepted one. The next iteration
+          * overwrites these, but the LAST iteration does not. */
+         ct_wipe(b, sizeof b);
+         ct_wipe(&t, sizeof t);
+         ct_wipe(&diff, sizeof diff);
+         continue;
+      }
       /* `b` is already the canonical big-endian encoding of a value in
        * [1, n-1] -- that is what the two tests just established -- so there
        * is nothing to reduce and nothing to re-serialise. */
       memcpy(out, b, 32);
+      /* AND THE COPIES ON THE STACK GO. `b` and `t` hold the private scalar
+       * this function exists to produce -- an ECDSA nonce or a J-PAKE secret
+       * -- and a stack frame is not private memory: it is reused by whatever
+       * runs next, and it is in the core dump, the crash report and the
+       * hibernation image. The caller wipes its own copy when it is done;
+       * these are the ones nobody else can reach to clear.
+       *
+       * ct_wipe rather than memset because nothing reads them afterwards,
+       * which is precisely the condition under which an optimiser deletes a
+       * memset. Every loop exit wipes -- the `continue` paths above draw into
+       * the same buffers next time round and the final one falls out of scope
+       * with the rejected draw still in it. */
+      ct_wipe(b, sizeof b);
+      ct_wipe(&t, sizeof t);
+      ct_wipe(&diff, sizeof diff);
       return 1;
    }
    return 0;

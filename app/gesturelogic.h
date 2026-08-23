@@ -26,7 +26,7 @@
  * host stubs cannot express is a second finger (see stub_android.c), which is
  * precisely the case that matters -- so the decision is lifted out to where a
  * test can hand it as many fingers as it likes, in any slot order. See
- * app/test/gesturetest.c.
+ * test/app/gesturetest.c.
  *
  * Pure: no globals, no clock, no event, no JNI. The caller reads the pointer
  * ids out of the event and passes them in; it holds the latch and updates it
@@ -59,7 +59,7 @@ enum gesture_verdict {
     * no longer tell what the user meant. */
    GEST_ABANDON,
    /* Somebody else's finger, in an event that says nothing about ours: swallow
-    * it and leave the gesture exactly as it was. */
+    * it and leave the gesture untouched. */
    GEST_IGNORE,
 };
 
@@ -69,7 +69,7 @@ struct gesture_in {
     * in the low byte AND, for the POINTER_DOWN/POINTER_UP pair, the INDEX of
     * the pointer that came or went in the second byte. Raw, not pre-masked,
     * because that index is half of what this has to decide with -- masking it
-    * off and dropping it is the bug this file exists to close. */
+    * off and dropping it is what this file exists to prevent. */
    int32_t action;
    /* The pointer id this gesture owns; -1 between gestures. */
    int latched;

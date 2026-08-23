@@ -11,4 +11,4 @@ build
 data
 tmp
 tools
-lib/sqlite*
+srv/deploy/duo.env

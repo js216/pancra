@@ -31,11 +31,11 @@ import android.util.Log;
 
 public final class Alarm {
     private static final String CH = "pancra-alarm";
-    /* BoundaryLogic owns every notification id (see the list there). This used
+    /* NotifPolicy owns every notification id (see the list there). This used
      * to be a local `2` whose comment said "distinct from the service's id 1"
      * -- true, and blind to PancraService's stopped-monitoring notice, which
      * was also 2. */
-    private static final int NID = BoundaryLogic.NOTIF_ALARM;
+    private static final int NID = NotifPolicy.NOTIF_ALARM;
     private static MediaPlayer player;
     /* trigger() runs on a BLE binder thread, silence() on the main looper.
      * Unsynchronized, silence() could read `player` as null (the binder thread
@@ -220,7 +220,7 @@ public final class Alarm {
      * block, for the same reason trigger() is staged: a throw from one must
      * not be able to suppress the other.
      *
-     * kind: 0 = crossed the nudge LOW, 1 = crossed the nudge HIGH. */
+     * kind: KIND_LOW = crossed the nudge LOW, KIND_HIGH = the nudge HIGH. */
     private static final int NUDGE_NOTE_MS = 150;
     private static final int NUDGE_GAP_MS = 70;
     private static final int NUDGE_PAD_MS = 40;   /* see CHIRP_PAD_MS */
@@ -254,8 +254,15 @@ public final class Alarm {
                 int ng = (rate * NUDGE_GAP_MS) / 1000;
                 int pad = (rate * NUDGE_PAD_MS) / 1000;
                 short[] pcm = new short[(2 * nn) + ng + pad]; /* gap+tail stay 0 */
-                double first = (kind == 0) ? NUDGE_HI_HZ : NUDGE_LO_HZ;
-                double second = (kind == 0) ? NUDGE_LO_HZ : NUDGE_HI_HZ;
+                /* A nudge has only two kinds, and anything else is not a
+                 * nudge: falling down to HIGH's pair of notes would be a
+                 * sound the user learns to read wrongly. */
+                if (kind != KIND_LOW && kind != KIND_HIGH) {
+                    Log.i("pancra", "nudge: unknown kind " + kind);
+                    return;
+                }
+                double first = (kind == KIND_LOW) ? NUDGE_HI_HZ : NUDGE_LO_HZ;
+                double second = (kind == KIND_LOW) ? NUDGE_LO_HZ : NUDGE_HI_HZ;
                 note(pcm, 0, nn, first, rate);
                 note(pcm, nn + ng, nn, second, rate);
                 android.media.AudioTrack tr = playPcm(pcm, rate, "nudge", AudioAttributes.USAGE_ALARM);
@@ -289,17 +296,31 @@ public final class Alarm {
         nm.createNotificationChannel(c);
     }
 
-    /* kind: 0 = glucose low, 1 = glucose high, 2 = stale/disconnected */
+    /* ---- THE ALARM KINDS: ONE PROTOCOL, NAMED ON BOTH SIDES -----------
+     *
+     * These numbers come from C (alarm_java_kind, app/alarmlogic.h) and mean
+     * nothing on their own. They were written here as bare 0/1/2 inside
+     * nested conditionals, which made two problems: the two lists agreed only
+     * by inspection -- renumber one and a safety notification is silently
+     * relabelled -- and the chain ENDED IN "Glucose LOW", so any kind it did
+     * not recognise announced a hypoglycaemic emergency. A fourth alarm added
+     * on the C side would have done exactly that.
+     *
+     * Named here, named AJ_* there, and `make -f test/Makefile javacheck`
+     * compares the two lists literally, so neither can move alone. */
+    public static final int KIND_LOW   = 0;
+    public static final int KIND_HIGH  = 1;
+    public static final int KIND_STALE = 2;
     /* THE AUDIBLE PARTS GO FIRST, AND EACH STAGE HAS ITS OWN CATCH.
      *
-     * This whole method used to be one try block with the notification built
-     * first. Anything that threw before the MediaPlayer block -- and the
-     * notification path is by far the most throw-prone thing here, touching
-     * NotificationManager, PendingIntent and a channel the user can alter --
-     * jumped straight to the catch, so the sound and the vibration never ran.
-     * The C side has already committed g_alarm_want by then, so alarm_apply
-     * considers the alarm RAISED and never retries: a hypo that produces one
-     * log line and no sound. Three independent stages means a failure in one
+     * As ONE try block with the notification built first, anything that
+     * throws before the MediaPlayer block -- and the notification path is by
+     * far the most throw-prone thing here, touching NotificationManager,
+     * PendingIntent and a channel the user can alter -- jumps straight to the
+     * catch, so the sound and the vibration never run. The C side has already
+     * committed g_alarm_want by then, so alarm_apply considers the alarm
+     * RAISED and never retries: a hypo that produces one log line and no
+     * sound. Three independent stages means a failure in one
      * cannot silence the others, and the ones that actually wake the user are
      * attempted before the one that merely informs them. */
     public static synchronized void trigger(Context ctx, int kind, boolean sound, boolean vibrate) {
@@ -361,11 +382,27 @@ public final class Alarm {
             open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             PendingIntent pi = PendingIntent.getActivity(app, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            /* EXHAUSTIVE, WITH NO FALL-THROUGH TO "LOW". An unknown kind
+             * says so rather than claiming a hypo; the sound and vibration
+             * above have already run, so the user is woken either way and the
+             * text is the only thing that admits it does not know. */
+            String title;
+            String text = "Open the app to silence";
+            switch (kind) {
+                case KIND_LOW:   title = "Glucose LOW"; break;
+                case KIND_HIGH:  title = "Glucose HIGH"; break;
+                case KIND_STALE:
+                    title = "Sensor disconnected";
+                    text = "No recent readings - tap to open";
+                    break;
+                default:
+                    Log.i("pancra", "alarm trigger: unknown kind " + kind);
+                    title = "Glucose alarm";
+                    break;
+            }
             Notification n = new Notification.Builder(app, CH)
-                .setContentTitle(kind == 2 ? "Sensor disconnected"
-                               : kind == 1 ? "Glucose HIGH" : "Glucose LOW")
-                .setContentText(kind == 2 ? "No recent readings - tap to open"
-                                          : "Open the app to silence")
+                .setContentTitle(title)
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setCategory(Notification.CATEGORY_ALARM)
                 .setContentIntent(pi)
@@ -377,10 +414,10 @@ public final class Alarm {
 
     /* Staged for the same reason as trigger(), and it matters MORE here.
      *
-     * These three used to share one try block with the vibrator first, so a
-     * throw from v.cancel() skipped stopSound() and left a LOOPING
-     * USAGE_ALARM MediaPlayer running. The C side clears g_alarm_sounding
-     * either way, so nothing would ever call silence() again: a tone that
+     * Sharing one try block with the vibrator first, a throw from v.cancel()
+     * skips stopSound() and leaves a LOOPING USAGE_ALARM MediaPlayer
+     * running. The C side clears g_alarm_sounding either way, so nothing
+     * would ever call silence() again: a tone that
      * plays until the process dies, which is precisely the un-silenceable
      * alarm the locking around these calls exists to prevent. Stop the sound
      * FIRST and unconditionally. */
@@ -397,17 +434,17 @@ public final class Alarm {
          * The sound, the vibration and the notification are separate ways the
          * user is being alerted, and silencing is not partly done: a throw
          * from any one of them must not stop the others, because the two that
-         * still work are the two the user can still hear and feel. This was a
-         * sequence of separate try blocks that happened to be right;
+         * still work are the two the user can still hear and feel. A
+         * sequence of separate try blocks happens to be right;
          * runIndependent makes it a property the host test can assert, along
          * with the ORDER -- sound first, because it is the loudest. */
-        BoundaryLogic.runIndependent(
-            new BoundaryLogic.Attempt() { @Override public void run() {
+        ServicePolicy.runIndependent(
+            new ScanPolicy.Attempt() { @Override public void run() {
                 stopSound(); } },
-            new BoundaryLogic.Attempt() { @Override public void run() {
+            new ScanPolicy.Attempt() { @Override public void run() {
                 Vibrator v = c.getSystemService(Vibrator.class);
                 if (v != null) v.cancel(); } },
-            new BoundaryLogic.Attempt() { @Override public void run() {
+            new ScanPolicy.Attempt() { @Override public void run() {
                 NotificationManager nm = c.getSystemService(NotificationManager.class);
                 if (nm != null) nm.cancel(NID); } });
     }
@@ -422,9 +459,9 @@ public final class Alarm {
     private static void stopSound() {
         final MediaPlayer p = player;
         if (p == null) return;
-        /* THE POLICY IS BoundaryLogic's, so the host test exercises the same
+        /* THE POLICY IS NotifPolicy's, so the host test exercises the same
          * code this does rather than a parallel copy of it. */
-        boolean released = BoundaryLogic.stopPlayer(new BoundaryLogic.Player() {
+        boolean released = ServicePolicy.stopPlayer(new ServicePolicy.Player() {
             @Override public void stop() { p.stop(); }
             @Override public void release() { p.release(); }
         });

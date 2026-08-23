@@ -54,12 +54,12 @@
  *      fallback is safe; here it is not, so the mitigation is that the spins
  *      yield and that a JNI call is the ONLY blocking thing under them.
  *
- *      The history lock is not on that list any more: it used to be held
- *      across the compositor's dequeueBuffer, and now covers a model build
- *      and nothing else. See draw() in main.c.
+ *      The history lock is NOT on that list: it covers a model build and
+ *      nothing else, never the compositor's dequeueBuffer. See draw() in
+ *      main.c.
  *   6. THE LOCK ORDER, when more than one is held:
  *
- *          driver_lk  (dexdriver.c)  ->  reg_lk  (sensors.c)  ->  g_hist_lk
+ *          driver_lk  (dexlink.c)   ->  reg_lk  (sensors.c)  ->  g_hist_lk
  *          alarm_lk   (alarm.c)      is taken ALONE
  *
  *      ...and then THE LEAVES, every one of which is taken innermost and is
@@ -69,14 +69,31 @@
  *          cal_lk    (calib.c)        mrt_lk    (meterstore.c)
  *          bond_lk   (bondtable.c)    g_cfg_lk  (sync.c)
  *          sessc_lk  (sesscache.c)
+ *          ins_lk    (insulin.c)      wt_lk     (weight.c)
+ *          food_lk   (food.c)         extail_lk (exercise.c)
+ *          ex_lk     (exercise.c)
  *          the dis / meter-dis / append locks
+ *
+ *      THE FOUR LOG LOCKS are the newest of them. Each guards
+ *      one log's published state -- the tail, and for food the vocabulary
+ *      and the picker order with it -- and each is taken by a reader on the
+ *      MAIN thread and by a loader on the SYNC WORKER, which is the pairing
+ *      that made them necessary: a restore reloads every log, and it does
+ *      not run on the thread that draws them. None is held across file I/O:
+ *      every writer appends or rewrites first and takes the lock only to
+ *      bring memory into line, and every loader builds a separate state and
+ *      publishes it with one assignment.
+ *
+ *      exercise.c has TWO leaves -- extail_lk over the log and ex_lk over
+ *      the shortcut button's pending state -- and nothing in that file ever
+ *      holds one while taking the other.
  *
  *      THIS LIST DRIFTED, which is the failure this table exists to prevent:
  *      bond_lk, g_cfg_lk and the two below were each added with their leaf
- *      claim written only beside their declaration -- which is precisely
- *      where the comment this table replaced used to live. A leaf documented
- *      only in its own file is a leaf nobody can check against the others.
- *      app/test/lockorder.py is the machine-checked copy; keep both.
+ *      claim written only beside their declaration, which is where such a
+ *      claim naturally goes. A leaf documented only in its own file is a leaf
+ *      nobody can check against the others.
+ *      test/app/lockorder.py is the machine-checked copy; keep both.
  *
  *      Two more sit BETWEEN the two groups for the same reason calfile_lk
  *      does: set_file_lk (settings.c) is taken with set_lk RELEASED and held
@@ -95,17 +112,26 @@
  *      binder callbacks; MAIN never reaches it. Neither file lock is ever
  *      taken by a reader, and nothing takes a state lock while holding one.
  *
- *      One lock sits BETWEEN those two groups: calfile_lk (calib.c) is taken
- *      OUTSIDE cal_lk and is the only one held across file I/O. That is the
- *      point of it -- cal_lk is what a frame takes, so the fsyncs and the
- *      rename a save ends in must happen with cal_lk released and calfile_lk
- *      still held.
+ *      THE REGISTRY HAS ONE TOO, and it is the odd one in this list because
+ *      it sits ABOVE a ranked lock rather than beside a leaf: regfile_lk
+ *      (sensors.c) is taken OUTSIDE reg_lk and held from the render -- or the
+ *      id reservation -- through the write to the publish, with reg_lk
+ *      RELEASED across the flash. That is what keeps a frame (which takes
+ *      reg_lk through sensors_view_get) from waiting on an fsync while still
+ *      making an id unique for ever: two mints cannot both read the same
+ *      maxid, because the second does not begin until the first has
+ *      published. Order: driver -> regfile_lk -> reg_lk -> history.
  *
- *      Written here because it used to be written in a comment inside
- *      sensors.c and nowhere else, which is not where somebody adding a lock
- *      to main.c would look, and because the leaves were being added one at a
- *      time with their order stated only in the file that declared them.
- *      app/test/lockorder.py checks this table against the code. The alarm
+ *      One lock sits BETWEEN the two groups below: calfile_lk (calib.c) is
+ *      taken OUTSIDE cal_lk and is the only one held across file I/O. That is
+ * the point of it -- cal_lk is what a frame takes, so the fsyncs and the rename
+ * a save ends in must happen with cal_lk released and calfile_lk still held.
+ *
+ *      Written HERE rather than in a comment inside sensors.c, which is not
+ *      where somebody adding a lock to main.c would look, and because leaves
+ *      get added one at a time with their order stated only in the file that
+ *      declares them.
+ *      test/app/lockorder.py checks this table against the code. The alarm
  *      lock is outside this order on purpose: it is held across blocking JNI
  *      (MediaPlayer), so nesting anything inside it would put a JNI call
  *      under two locks.
@@ -168,7 +194,7 @@ static inline void flag_clear(struct flag *s)
  * The existing reconcile/sync/notify paths already had this shape and had it
  * right; it is named here so the next one is not re-invented. The difference
  * from a lock is the whole point: a caller that cannot enter returns at once
- * instead of queueing behind work that is already being done for it.
+ * rather than queueing behind work that is already being done for it.
  */
 struct flight {
    atomic_int running;

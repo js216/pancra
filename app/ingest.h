@@ -45,15 +45,15 @@
 /* What a CGM can physically report is CAL_MIN_MGDL..CAL_MAX_MGDL -- the range
  * a Dexcom sensor clamps to. The window here is deliberately WIDER, so a
  * genuine extreme is recorded rather than discarded, and derived from that
- * pair rather than written out again: the two are the same fact, and they
- * used to be two sets of literals three thousand lines apart. */
+ * pair rather than written out again: the two are the same fact, and as two
+ * sets of literals they sit three thousand lines apart. */
 #define INGEST_GLU_MIN (CAL_MIN_MGDL / 2)     /* 20 */
 #define INGEST_GLU_MAX (CAL_MAX_MGDL * 3 / 2) /* 600 */
 
 /* How old a live 0x4e reading may be.
  *
- * `age` arrives as a full uint16 off the wire (dexdata.c), and only the
- * glucose used to be checked. A frame carrying age=65535 backdates the
+ * `age` arrives as a full uint16 off the wire (dexdata.c), so checking the
+ * glucose alone is not enough. A frame carrying age=65535 backdates the
  * reading 18.2 hours: into the history, into the time-in-range and average,
  * and into readings.csv -- a file that is never rewritten and whose only
  * load-time guard is t > 0, so it comes back on every restart.

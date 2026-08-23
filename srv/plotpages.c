@@ -4,15 +4,17 @@
  */
 #include "db.h"
 #include "http.h"
+#include "oops.h" /* a scan that did not finish is not an empty archive */
 #include "page.h"
 #include "plots.h"
+#include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
 #include "util.h"
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <time.h> /* timegm/gmtime_r: a named day is a calendar date */
+#include <time.h> /* time_t, struct tm: a named day is a calendar date */
 
 /* ---- the plot pages ----
  *
@@ -28,7 +30,88 @@ static const char *const MON[12] = {
     "January", "February", "March",     "April",   "May",      "June",
     "July",    "August",   "September", "October", "November", "December"};
 
-void h_plots(struct req *r, long owner)
+/* ---- THE ARCHIVE, WRITTEN A ROW AT A TIME ----------------------------
+ *
+ * These callbacks are what replaced a `static int64_t days[4096]`
+ * in each of the two pages below: the query streams, and each row becomes a
+ * line of HTML on the way past. The arrays held every day the account had
+ * ever recorded -- eleven years' worth, after which the oldest months
+ * silently disappeared from the navigation while the page reported itself
+ * complete.
+ *
+ * `any` is the "did anything come back" flag the old `first`/`any` locals
+ * were, carried in the context because the loop is now a callback. */
+struct month_ctx {
+   struct sb *s;
+   const char *who;
+   int any;
+};
+
+static int month_link(void *ctx, int year, int mon)
+{
+   struct month_ctx *m = ctx;
+   if (!m->any) {
+      sb_add(m->s, "<b>MONTHS</b>\n");
+      m->any = 1;
+   }
+   sb_add(m->s, "<a href=\"/plots-%04d%02d%s\" style=display:block>%s %d</a>\n",
+          year, mon, m->who, MON[(mon - 1) % 12], year);
+   return 0;
+}
+
+struct day_ctx {
+   struct sb *s;
+   const char *who;
+   int any;
+};
+
+static int day_link(void *ctx, int64_t day)
+{
+   struct day_ctx *d = ctx;
+   struct tm tm;
+   /* A day the calendar cannot express is not a day. The query bounded the
+    * range, so this can only be a bucket a restore put there. */
+   if (!sys_gmtime((time_t)(day * 86400), &tm))
+      return 0;
+   d->any = 1;
+   sb_add(d->s,
+          "<b>%04d-%02d-%02d</b>\n"
+          "<a href=\"/day-%04d%02d%02d%s\">"
+          "<img src=\"/plot-%04d%02d%02d.gif%s\" alt=\"plot\" width=%d"
+          " height=%d style=\"display:block;width:100%%;max-width:%dpx;"
+          "height:auto;margin:0 0 2em 0\"></a>\n",
+          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, /* the heading */
+          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, d->who, /* /day- */
+          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, d->who, /* the gif */
+          PLOT_IMG_W, PLOT_IMG_H, PLOT_IMG_W);
+   return 0;
+}
+
+/* THE MONTH AS A HALF-OPEN RANGE OF BUCKETS, [*day0, *day1). 0 if the month
+ * is not one the calendar has -- which is a URL somebody typed, not a state
+ * this server can produce. */
+static int month_days(int year, int mon, int64_t *day0, int64_t *day1)
+{
+   if (year < 1970 || year > 9998 || mon < 1 || mon > 12)
+      return 0;
+   struct tm a = {0};
+   struct tm b = {0};
+   a.tm_year   = year - 1900;
+   a.tm_mon    = mon - 1;
+   a.tm_mday   = 1;
+   b.tm_year   = (mon == 12 ? year + 1 : year) - 1900;
+   b.tm_mon    = (mon == 12 ? 1 : mon + 1) - 1;
+   b.tm_mday   = 1;
+   time_t t0   = sys_timegm(&a);
+   time_t t1   = sys_timegm(&b);
+   if (t0 == (time_t)-1 || t1 == (time_t)-1 || t1 <= t0)
+      return 0;
+   *day0 = (int64_t)t0 / 86400;
+   *day1 = (int64_t)t1 / 86400;
+   return 1;
+}
+
+void h_plots(struct req *r, int64_t owner)
 {
    struct sb s = {0};
    sb_add(&s,
@@ -39,66 +122,48 @@ void h_plots(struct req *r, long owner)
           "margin:0 0 2em 0\"></a>\n",
           r->who, r->who, PLOT_IMG_W, PLOT_IMG_H, PLOT_IMG_W);
 
-   /* One link per month with data, newest first. */
-   static long days[4096];
-   int nd = plot_days(r->db, owner, days, (int)(sizeof days / sizeof days[0]));
-   if (nd < 0)
-      nd = 0; /* an incomplete day list is not a day list */
-   long prev_ym = -1;
-   int first    = 1;
-   for (int i = 0; i < nd; i++) {
-      time_t tt = (time_t)(days[i] * 86400);
-      struct tm tm;
-      if (!gmtime_r(&tt, &tm))
-         continue;
-      long ym = ((tm.tm_year + 1900L) * 100) + tm.tm_mon + 1;
-      if (ym == prev_ym)
-         continue;
-      prev_ym = ym;
-      if (first) {
-         sb_add(&s, "<b>MONTHS</b>\n");
-         first = 0;
-      }
-      sb_add(&s,
-             "<a href=\"/plots-%04d%02d%s\" style=display:block>%s %d</a>\n",
-             tm.tm_year + 1900, tm.tm_mon + 1, r->who, MON[tm.tm_mon],
-             tm.tm_year + 1900);
+   /* One link per month with data, newest first -- grouped by the DATABASE
+    * and written straight into the page. Nothing here holds a list
+    * of days, so nothing here has a lifetime ceiling. */
+   struct month_ctx mc = {&s, r->who, 0};
+   if (plot_months(r->db, owner, month_link, &mc) != 0) {
+      /* THE SCAN DID NOT FINISH. "No days with data yet" would be a claim
+       * about this person's record that nothing here is in a position to
+       * make -- see the same distinction at newest_reading in home.c. */
+      sb_free(&s);
+      oops(r);
+      return;
    }
-   if (first)
+   if (!mc.any)
       sb_add(&s, "<p>No days with data yet.</p>\n");
    sub_page(r, "Plots", s.p ? s.p : "");
    sb_free(&s);
 }
 
 /* /plots-YYYYMM: one plot per day of that month, newest first. */
-void h_plots_month(struct req *r, long owner, int year, int mon)
+void h_plots_month(struct req *r, int64_t owner, int year, int mon)
 {
    struct sb s = {0};
-   static long days[4096];
-   int nd = plot_days(r->db, owner, days, (int)(sizeof days / sizeof days[0]));
-   if (nd < 0)
-      nd = 0;
-   int any = 0;
-   for (int i = 0; i < nd; i++) {
-      time_t tt = (time_t)(days[i] * 86400);
-      struct tm tm;
-      if (!gmtime_r(&tt, &tm))
-         continue;
-      if (tm.tm_year + 1900 != year || tm.tm_mon + 1 != mon)
-         continue;
-      any = 1;
-      sb_add(&s,
-             "<b>%04d-%02d-%02d</b>\n"
-             "<a href=\"/day-%04d%02d%02d%s\">"
-             "<img src=\"/plot-%04d%02d%02d.gif%s\" alt=\"plot\" width=%d"
-             " height=%d style=\"display:block;width:100%%;max-width:%dpx;"
-             "height:auto;margin:0 0 2em 0\"></a>\n",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, /* the heading */
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, r->who, /* /day- */
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, r->who, /* the gif */
-             PLOT_IMG_W, PLOT_IMG_H, PLOT_IMG_W);
+   /* THE MONTH IS ASKED FOR BY ITS BUCKET RANGE, rather than by walking every
+    * day the account has ever had and skipping the ones that do not match
+    *. A bucket IS floor(instant / 86400) in UTC, so the range is
+    * exact arithmetic on the same calendar the buckets were assigned with. */
+   int64_t day0 = 0, day1 = 0;
+   if (!month_days(year, mon, &day0, &day1)) {
+      sb_add(&s, "<p>No data in that month.</p>\n");
+      char t0[32];
+      (void)snprintf(t0, sizeof t0, "%s %d", MON[(mon - 1) % 12], year);
+      sub_page(r, t0, s.p ? s.p : "");
+      sb_free(&s);
+      return;
    }
-   if (!any)
+   struct day_ctx dc = {&s, r->who, 0};
+   if (plot_days_in(r->db, owner, day0, day1, day_link, &dc) != 0) {
+      sb_free(&s);
+      oops(r);
+      return;
+   }
+   if (!dc.any)
       sb_add(&s, "<p>No data in that month.</p>\n");
    char title[32];
    (void)snprintf(title, sizeof title, "%s %d", MON[(mon - 1) % 12], year);
@@ -108,7 +173,8 @@ void h_plots_month(struct req *r, long owner, int year, int mon)
 
 /* The datapoints behind a plot, as text: the same list the main page shows,
  * for a chosen window. */
-void h_data(struct req *r, long owner, long t0, long t1, const char *title)
+void h_data(struct req *r, int64_t owner, int64_t t0, int64_t t1,
+            const char *title)
 {
    int tz = tz_of(r->db, owner);
    sqlite3_stmt *st =
@@ -127,7 +193,7 @@ void h_data(struct req *r, long owner, long t0, long t1, const char *title)
          const char *ln = (const char *)sqlite3_column_text(st, 0);
          if (!ln || *ln < '0' || *ln > '9')
             continue;
-         long t = strtol(ln, NULL, 10);
+         int64_t t = strtoll(ln, NULL, 10);
          if (t <= t0 || t > t1)
             continue;
          const char *c1 = strchr(ln, ',');
@@ -135,7 +201,8 @@ void h_data(struct req *r, long owner, long t0, long t1, const char *title)
             continue;
          char when[64];
          stamp_local(t, tz, when, sizeof when);
-         sb_add(&s, "%s %4ld\n", when, strtol(c1 + 1, NULL, 10));
+         sb_add(&s, "%s %4" PRIwire "\n", when,
+                (int64_t)strtoll(c1 + 1, NULL, 10));
          n++;
       }
       /* "nothing in this window" and "the scan stopped" are different
@@ -157,12 +224,12 @@ void h_data(struct req *r, long owner, long t0, long t1, const char *title)
  *
  * EXACTLY `n` DIGITS, AND NOTHING STRTOL WOULD FORGIVE.
  *
- * The date fields used to go through strtol, which skips leading whitespace,
+ * The date fields do NOT go through strtol, which skips leading whitespace,
  * accepts a sign, and stops wherever it likes while reporting the prefix it
- * managed. r->path is percent-DECODED, so a client could put those characters
+ * managed. r->path is percent-DECODED, so a client can put those characters
  * in a path: "/day-2025%2B131" arrives as "/day-2025+131", which is the right
- * length, and strtol read "+1" as January and "31" as the day. The page then
- * came up as 2025-01-31 under a URL that is not that day's URL. A date is
+ * length, and strtol reads "+1" as January and "31" as the day. The page then
+ * comes up as 2025-01-31 under a URL that is not that day's URL. A date is
  * eight digits or it is not a date. */
 static int digits_n(const char *s, int n, int *out)
 {
@@ -191,13 +258,13 @@ static int month_len(int year, int mon)
 
 /* YYYYMMDD -> a date that EXISTS, or 0.
  *
- * The bound used to be 1..31 for every month, and the date was then handed to
- * timegm, whose job is to NORMALISE: February 31 became March 3, April 31
- * became May 1, and a non-leap February 29 became March 1. The window moved;
- * the title did not, because the title was built from the digits that were
- * asked for. So /day-20250231 rendered a page headed 2025-02-31 showing March
- * 3rd's readings -- the wrong data under a confident label, which is worse
- * than no page at all.
+ * A bound of 1..31 for every month leaves the date to timegm, whose job is to
+ * NORMALISE: February 31 becomes March 3, April 31 becomes May 1, and a
+ * non-leap February 29 becomes March 1. The window moves; the title does not,
+ * because the title is built from the digits that were asked for. So
+ * /day-20250231 renders a page headed 2025-02-31 showing March 3rd's readings
+ * -- the wrong data under a confident label, which is worse than no page at
+ * all.
  *
  * Month-specific bounds rather than a timegm round-trip: the bounds are the
  * calendar, decided here and the same on every platform, whereas what timegm
@@ -239,13 +306,13 @@ static int month_parse(const char *ms, int *y, int *mo)
  * or a month of the archive. One function because they all answer the same
  * two questions first -- whose record, and in which time zone -- and differ
  * only in how they read a date out of the path. */
-void h_plot_route(struct req *r, long me)
+void h_plot_route(struct req *r, int64_t me)
 {
-   long owner = viewed_owner(r, me, NULL);
+   int64_t owner = viewed_owner(r, me, NULL);
    if (!owner)
       return; /* it already answered: not shared, or no such record */
-   int tz   = tz_of(r->db, owner);
-   long now = (long)time(NULL);
+   int tz      = tz_of(r->db, owner);
+   int64_t now = (int64_t)time(NULL);
    if (!strcmp(r->path, "/plots")) {
       h_plots(r, owner);
       return;
@@ -277,16 +344,16 @@ void h_plot_route(struct req *r, long me)
       tm.tm_year      = y - 1900;
       tm.tm_mon       = mo - 1;
       tm.tm_mday      = d;
-      time_t midnight = timegm(&tm);
+      time_t midnight = sys_timegm(&tm);
       /* The date exists; this says the ARITHMETIC survived it. timegm reports
        * failure as (time_t)-1, and gmtime_r can fail too -- neither may be
        * allowed to become a window silently labelled with the date asked
        * for. */
       struct tm back;
-      if (midnight != (time_t)-1 && gmtime_r(&midnight, &back) &&
+      if (midnight != (time_t)-1 && sys_gmtime(midnight, &back) &&
           back.tm_year + 1900 == y && back.tm_mon + 1 == mo &&
           back.tm_mday == d) {
-         long day_utc = (long)midnight - ((long)tz * 60);
+         int64_t day_utc = (int64_t)midnight - ((int64_t)tz * 60);
          if (want_gif)
             h_plot_gif(r, owner, day_utc, day_utc + 86400, 24, tz);
          else {

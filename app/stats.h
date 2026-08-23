@@ -4,11 +4,69 @@
 
 #ifndef PANCRA_STATS_H
 #define PANCRA_STATS_H
+#include <stdbool.h>
+
+#include "loadresult.h" /* what a load actually found */
 
 /* O(1) per reading via hourly buckets; O(days*24) to read a rolling window. */
-void stat_add(long t, int glu);
-/* time-in-range (%) and average over the rolling last `days`; returns 0
- * (=>"--") until the data reaches back far enough to cover the whole window. */
+/* Record one reading in the statistics. `unsure` marks a reading counted on
+ * the strength of an inference rather than a measured warm-up state -- see
+ * warm_decide in sensors.h. */
+/* The time-in-range band, in mg/dL: the published one, not the user's alarm
+ * thresholds. See stat_in_range. */
+#define STAT_TIR_LO 70
+#define STAT_TIR_HI 180
+
+/* Is this reading inside that band? */
+bool stat_in_range(int glu);
+
+/* Did the load fall short of the whole history? Every window answers blank
+ * while this is true. */
+bool stat_degraded(void);
+
+void stat_add(long t, int glu, int unsure);
+/* The same, with the caller naming `now` -- for a test that owns the clock. */
+void stat_add_at(long t, int glu, int unsure, long now);
+
+/* ---- HOW MUCH OF THE WINDOW WAS ACTUALLY MEASURED ----------
+ *
+ * "THE OLDEST READING IS OLD ENOUGH" is a statement about ONE timestamp. Two
+ * readings ninety days apart satisfy it, and the screen then prints a 90-DAY
+ * TIME IN RANGE and A1C computed from two samples -- indistinguishable, in
+ * every pixel, from the same figures
+ * over three months of continuous wear. A percentage is only as good as the
+ * data under it, and nothing said how much there was.
+ *
+ * COVERAGE IS COUNTED, in the unit the buckets already use: an hour with any
+ * reading in it is a covered hour. A CGM samples every five minutes, so a
+ * worn sensor covers essentially every hour; a phone left off overnight
+ * costs eight; a sensor change costs two.
+ *
+ * THE BAR IS HALF THE WINDOW, and deliberately no higher. The clinical
+ * consensus for a meaningful TIR is 70% of 14 days, but this figure sits on
+ * a phone screen beside the live number rather than in a clinic letter, and
+ * blanking it for somebody whose phone was off for a night would be a worse
+ * answer than showing it. Half is far above "two readings" and far below
+ * "ordinary life".
+ *
+ * THE LONGEST GAP IS REPORTED BUT NOT GATED ON: a fortnight away from the
+ * phone leaves a real 90-day figure that is still worth showing, and the
+ * caller can say so if it wants to. */
+struct stat_cov {
+   int hours;     /* hours in the window that hold at least one reading */
+   int of_hours;  /* the window's length in hours */
+   int gap_hours; /* the longest run of empty hours inside it */
+   /* HOW MUCH OF THIS RESTS ON AN INFERENCE. Readings counted
+    * whose warm-up state nothing measured -- rows written before the sensor
+    * answered, or before the column existed -- and which the activation rule
+    * then let through. They are ordinary glucose in every other respect; what
+    * is uncertain is only whether they were uncalibrated warm-up, which is
+    * the one thing that would put them in these figures wrongly. */
+   int unsure;
+   int counted; /* readings in the window, so `unsure` has a denominator */
+};
+
+/* The same question without the metadata. */
 int stat_window(int days, int *tir, int *avg);
 /* The time-in-range band, in mg/dL: the ADA/ATTD international consensus
  * range. Named so the figure and its provenance travel together, and so a
@@ -16,8 +74,20 @@ int stat_window(int days, int *tir, int *avg);
 #define TIR_LOW_MGDL  70
 #define TIR_HIGH_MGDL 180
 
-/* seed the buckets from the tail of the readings CSV at `readings_path`. */
-void stat_load(const char *readings_path);
+
+/* SEED THE BUCKETS FROM THE READINGS LOG, and say what happened.
+ *
+ * LOAD_OK      the whole log was read; the windows below are a summary of it.
+ * LOAD_ABSENT  there is no log yet -- a first run, and a complete answer.
+ * LOAD_ERROR   the log exists and could not be read whole. What was read is
+ *              kept (it is all this run knows) but stat_window answers
+ *              NOTHING while it stands, because a percentage over a PREFIX of
+ *              a record is indistinguishable from the same percentage over
+ *              all of it -- and the screen has no way to say which it is
+ *              looking at. The caller reports the degradation; the figures
+ *              stay blank rather than plausible. */
+enum load_result stat_load(const char *readings_path);
+
 
 /* ============ THROW THE BUCKETS AWAY AND REBUILD THEM FROM THE LOG =========
  *
@@ -49,15 +119,16 @@ void stat_load(const char *readings_path);
  * (app/thread.h, rule 6), and the caller that wants this -- pancra_logs_reload
  * -- is holding the HISTORY lock across store_load. Parsing under that lock
  * would take the registry INSIDE the history, the exact inversion behind two
- * phone freezes in one day, and app/test/lockorder.py refuses it.
+ * phone freezes in one day, and test/app/lockorder.py refuses it.
  *
  * So the work is split where the locks say it must be:
  *
  *   stat_reload_prepare()   parses the log into a PRIVATE ring. Call with NO
  *                           history lock held. It reads the registry; it
  *                           touches none of the live buckets, so a frame
- *                           drawing beside it still renders the OLD numbers,
- *                           whole and consistent, rather than a half-built
+ *                           drawing beside it still renders the published
+ *                           numbers, whole and consistent, rather than a
+ *                           half-built
  *                           ring reading TIR 0 over a record that is entirely
  *                           in range. Returns 0 if the private ring could not
  *                           be allocated, in which case there is nothing to
@@ -80,10 +151,9 @@ void stat_reload_publish(void);
  * where an over-old reading would alias onto a live bucket. */
 #define STAT_HOURS 2200
 
-/* Injectable-clock forms. The public calls above are these with
- * realtime_s(); tests drive these directly so the hour boundaries -- where the
- * aliasing bug lived -- are reachable deterministically. */
-void stat_add_at(long t, int glu, long now);
-int stat_window_at(int days, int *tir, int *avg, long now);
+/* ...and the same with the coverage metadata, for a test that owns the clock
+ * and for anything that wants to say WHY a window is blank. */
+int stat_window_cov_at(int days, int *tir, int *avg, struct stat_cov *cov,
+                       long now);
 
 #endif

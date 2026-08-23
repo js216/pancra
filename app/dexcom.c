@@ -95,9 +95,10 @@ int dexcom_getchallenge(const uint8_t *challenge, size_t clen,
    return 0;
 }
 
-/* Verify raw r||s over SHA256(challenge[2:18]) with the device public key.
- * Nothing in the driver needs this -- the sensor does the verifying -- but
- * it is what makes the signer testable against a fixed challenge. */
+/* THE VERIFYING SIDE, against the embedded public key. The sensor is what
+ * runs this in production; here it closes the loop on the signer, so a
+ * signature can be checked against a fixed challenge rather than only
+ * against a sensor that is not on the desk. */
 int dexcom_verify_challenge(const uint8_t *challenge, size_t clen,
                             const uint8_t sig64[64])
 {
@@ -105,12 +106,14 @@ int dexcom_verify_challenge(const uint8_t *challenge, size_t clen,
       return 0;
    uint8_t hash[32];
    sha256(challenge + 2, 16, hash);
+   /* devkey_pub is 04||X||Y, the uncompressed SEC1 encoding, so the two
+    * coordinates start one byte in. */
    return ecdsa_p256_verify(devkey_pub + 1, devkey_pub + 33, hash, sig64,
                             sig64 + 32);
 }
 
 #ifdef DEXCOM_TEST
-#include <stdio.h> /* p256.h is included unconditionally above now */
+#include <stdio.h>
 
 int main(void)
 {

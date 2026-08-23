@@ -80,15 +80,15 @@ static long plot_log_size(const char *path)
  * a datapoint. Legacy short rows carry no source or kind; they read as the
  * unattributed CGM trace, exactly as they do everywhere else.
  *
- * THE CURSOR, NOT A FIFTH HAND-ROLLED DIGIT LOOP. Every field after glucose
- * used to be accumulated with a bare `n = n * 10 + digit` and NO CAP AT ALL.
- * Two things were wrong with that, and the second is the one that reaches the
- * screen:
+ * THE CURSOR, NOT A FIFTH HAND-ROLLED DIGIT LOOP. Accumulating each field
+ * after glucose with a bare `n = n * 10 + digit` and NO CAP AT ALL is wrong
+ * twice over, and the second is the one that reaches the screen:
  *
- *   1. Signed overflow is undefined behaviour, and it happened while PARSING
- *      -- before any range check below could refuse the value. readings.csv
- *      is append-only and a torn write or a hand-edit can leave a long digit
- *      run in it, so this was reachable from a file rather than from a peer.
+ *   1. Signed overflow is undefined behaviour, and it happens while PARSING
+ *      -- before any range check below can refuse the value. readings.csv
+ *      is append-only and a torn write or a hand-edit can leave a long
+ *      digit run in it, so it is reachable from a file rather than from a
+ *      peer.
  *      At -O2 that is not "a wrong number": it is the whole translation unit
  *      losing its meaning, and this is the translation unit the 30- and
  *      90-day glucose plots are drawn from.
@@ -131,8 +131,8 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
    if (c.p >= c.e || *c.p < '0' || *c.p > '9')
       return 0;
 
-   enum csv_field why;
-   long tv = csv_num(&c, &why);
+   enum csv_field why = CSV_FIELD_OK;
+   long tv            = csv_num(&c, &why);
    if (why != CSV_FIELD_OK)
       return 0;
    if (!csv_sep(&c))
@@ -188,9 +188,9 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
           * KIND_BGM so it draws as a CGM line point. The log is append-only,
           * so a row admitted once is redrawn at every launch.
           *
-          * `n` IS STILL A LONG HERE, and that is the whole repair: this
-          * comparison is the bound, and it used to sit downstream of the
-          * wrap that produced the value it was checking. */
+          * `n` IS STILL A LONG HERE, and that is the whole point: this
+          * comparison is the bound, and narrowed first it would sit
+          * downstream of the wrap that produced the value it checks. */
          kindv = (n == KIND_BGM) ? KIND_BGM : KIND_CGM;
       }
    }

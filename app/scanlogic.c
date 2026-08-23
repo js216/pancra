@@ -5,6 +5,7 @@
 /* See scanlogic.h. Pure by design: no globals, no clock, no locks, no JNI.
  * (It names enum mono_get, which is a TYPE from clock.h; it calls nothing.) */
 #include "scanlogic.h"
+#include "clock.h"
 
 int scan_should_start(const struct scan_state *s)
 {

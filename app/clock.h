@@ -17,9 +17,9 @@
  * person -- and mono_s() measures an INTERVAL: watchdogs, retry backoffs,
  * cooldowns, the radio-quiet hold around a pairing.
  *
- * They used to be the same call. A wall-clock correction -- a phone coming
- * back from being off, or finding a network -- then moved every deadline in
- * the app at once: forward an hour fires the meter's 90-second sync watchdog
+ * They are NOT one call. Made one, a wall-clock correction -- a phone coming
+ * back from being off, or finding a network -- moves every deadline in the
+ * app at once: forward an hour fires the meter's 90-second sync watchdog
  * immediately and tears down a working exchange; backward an hour postpones
  * it, so a wedged link is never recovered at all. `make clockcheck` keeps
  * deadlines off the wall clock.
@@ -27,9 +27,20 @@
 #ifndef PANCRA_CLOCK_H
 #define PANCRA_CLOCK_H
 
-long long now_ms(void); /* CLOCK_MONOTONIC milliseconds */
-long mono_s(void);      /* CLOCK_MONOTONIC seconds: for DEADLINES */
-long realtime_s(void);  /* CLOCK_REALTIME seconds (epoch): for INSTANTS */
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
+
+#include "wireint.h" /* int64_t: an instant is 64 bits on every machine */
+
+/* EXACT WIDTHS, NOT `long`. An instant from realtime_s() is written into the
+ * record files and travels to the server as decimal text, and a 32-bit `long`
+ * stops being able to hold one in 2038 -- with no build error, since the code
+ * compiles perfectly. The wire's scalars are int64_t (lib/wireint.h) for that
+ * reason, and the clock they come from must be at least as wide or the
+ * truncation simply happens one call earlier. On the shipped target
+ * (arm64-v8a, LP64) int64_t IS long, so no caller changes. */
+long long now_ms(void);   /* CLOCK_MONOTONIC milliseconds */
+int64_t mono_s(void);     /* CLOCK_MONOTONIC seconds: for DEADLINES */
+int64_t realtime_s(void); /* CLOCK_REALTIME seconds (epoch): for INSTANTS */
 
 /* ---- WHEN THE CLOCK ITSELF DOES NOT ANSWER --------------------------------
  *
@@ -60,11 +71,7 @@ enum mono_get {
  *
  * warn_unused_result on purpose: the whole point of the outcome is that a
  * caller which drops it is back to treating a failed clock as second zero,
- * which is the bug this exists to make unwritable. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((warn_unused_result))
-#endif
-enum mono_get
-mono_try(long *out);
+ * which is what the outcome exists to make unwritable. */
+PANCRA_MUST_USE enum mono_get mono_try(int64_t *out);
 
 #endif

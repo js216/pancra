@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 // syncreport.h --- how a sync went, reported back
 // Copyright 2026 Jakob Kastelic
+#include "syncstat.h" /* enum sync_outcome: what is being reported */
+
 #ifndef PANCRA_SYNCREPORT_H
 #define PANCRA_SYNCREPORT_H
 
@@ -22,9 +24,8 @@
  * not a sentence, so the screen can colour it and the scheduler can tell a
  * failure worth retrying from one only the user can fix.
  *
- * Without this the rows are dead text: they used to be fed by the old push
- * path, and when that went, nothing replaced it -- so a working sync and a
- * server that refused every request looked exactly alike. */
-void sync_report(int outcome);
+ * Without this the rows are dead text, and a working sync and a server that
+ * refuses every request look exactly alike. */
+void sync_report(enum sync_outcome outcome);
 
 #endif

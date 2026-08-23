@@ -10,7 +10,6 @@
 #ifndef PANCRA_UIKEYPAD_H
 #define PANCRA_UIKEYPAD_H
 
-int ui_label_nchars(void);
 
 /* (The per-mode slot-count wrapper is gone. It was a function wrapping
  * kp_slots(enum keypad_mode) -- a published interface with exactly ONE
@@ -18,5 +17,7 @@ int ui_label_nchars(void);
  * keypad mode through an int on the last hop to the renderer. Its comment
  * said the shell asked it through this header; the shell called kp_slots
  * directly. Ask keypad.h.) */
+
+int ui_label_nchars(void);
 
 #endif

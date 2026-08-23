@@ -9,6 +9,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* THE RECORD'S SHAPE, WHICH IS ALL THIS DECODER KNOWS ABOUT SIZE.
+ *
+ * A record COUNT lived here too, defined as 28 -- 256/9 --
+ * where 256 was the byte ceiling app/dexble.c's jni_notify puts on ONE
+ * Android notification. That made a reusable decoder's API carry a number
+ * belonging to one app's JNI transport: a second transport with a different
+ * MTU would silently keep decoding 28, and anyone reading this header would
+ * have no way to know why 28. The decoder now knows a record is 9 bytes and
+ * nothing else; HOW MANY of them can arrive at once is the transport's fact,
+ * declared where that limit is enforced (DEX_NOTIFY_MAX in app/dexport.h),
+ * and the CAPACITY is the caller's, passed in. */
+#define DEX_RECORD_LEN 9
+
 /* One backfill/EGV record (9 bytes on the wire). */
 struct dex_record {
    uint32_t timestamp; /* seconds since session start */
@@ -30,14 +43,15 @@ struct dex_egv {
    uint16_t predicted; /* predicted glucose, 10-bit */
 };
 
-int dexdata_record(const uint8_t rec[9], struct dex_record *out);
-/* Most 9-byte records one notification can carry: the JNI layer clamps a
- * notification to 256 bytes (dexble.c jni_notify), so 256/9 = 28. Callers
- * size their arrays from this rather than a literal, because decoding fewer
- * than arrive drops backfill points permanently -- a re-request returns the
- * same frame and truncates identically. */
-#define DEX_MAX_RECORDS 28
 
+/* Decode one 9-byte backfill/EGV record. */
+int dexdata_record(const uint8_t rec[9], struct dex_record *out);
+
+/* Decode up to `max` records out of `buf`. THE CAPACITY IS THE CALLER'S: it
+ * knows what its transport can deliver in one frame, and sizing an array
+ * smaller than that drops backfill points PERMANENTLY -- a re-request returns
+ * the same frame and truncates identically. See the array in notify_stream
+ * (app/dexproto.c), which is sized from the transport's own ceiling. */
 int dexdata_records(const uint8_t *buf, size_t len, struct dex_record *out,
                     int max);
 int dexdata_egv(const uint8_t *p, size_t len, struct dex_egv *out);

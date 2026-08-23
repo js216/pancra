@@ -5,7 +5,7 @@
 /* See metersess.h for why this is a module rather than five variables. The
  * whole implementation is "take the lock, touch the struct, drop the lock":
  * the value is that the compound decisions -- claim, end, drop -- are inside
- * one critical section instead of being spelled out again at every caller,
+ * one critical section rather than being spelled out again at every caller,
  * where one of them will eventually be spelled out differently. */
 #include "metersess.h"
 #include "thread.h"
@@ -110,15 +110,6 @@ int msess_src(void)
    return src;
 }
 
-void msess_mac(char *out, int cap)
-{
-   if (!out || cap <= 0)
-      return;
-   mutex_lock(&msess_lk);
-   str_snapshot(out, cap, g_mac);
-   mutex_unlock(&msess_lk);
-}
-
 int msess_busy(void)
 {
    mutex_lock(&msess_lk);
@@ -151,18 +142,5 @@ void msess_idle_copy(long *out, int n)
    mutex_lock(&msess_lk);
    for (int i = 0; i < n; i++)
       out[i] = (i < MSESS_LINKS_MAX) ? g_idle[i] : 0;
-   mutex_unlock(&msess_lk);
-}
-
-void msess_reset(void)
-{
-   mutex_lock(&msess_lk);
-   g_busy   = 0;
-   g_link   = -1;
-   g_src    = 0;
-   g_start  = 0;
-   g_mac[0] = 0;
-   for (int i = 0; i < MSESS_LINKS_MAX; i++)
-      g_idle[i] = 0;
    mutex_unlock(&msess_lk);
 }

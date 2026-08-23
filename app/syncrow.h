@@ -23,6 +23,7 @@
 #ifndef PANCRA_SYNCROW_H
 #define PANCRA_SYNCROW_H
 
+#include "wireint.h" /* int64_t and PRIwire: the wire's scalars, exactly */
 #include "wirevec.h" /* WV_LIMIT_ROW_MAX: a row is the WIRE's row */
 #include <stddef.h>
 #include <stdint.h>
@@ -53,7 +54,7 @@ struct row {
 
 /* strlen/strchr are not in the freestanding shim, and adding them there would
  * mean adding symbols to stub_c.c for two one-line loops. */
-long s_len(const char *p);
+int64_t s_len(const char *p);
 const char *s_chr(const char *p, char c);
 
 /* `n` bytes as 2n lowercase hex characters plus a terminator. */
@@ -62,7 +63,7 @@ void hexify(const uint8_t *in, int n, char *out);
  * which is a refusal, not a zero byte. */
 int unhex(const char *in, int hexchars, uint8_t *out);
 /* The protocol's hash: the first 16 hex characters of SHA-256, terminated. */
-void hash16(const char *data, long len, char out[17]);
+void hash16(const char *data, int64_t len, char out[17]);
 
 /* Order two rows by their bytes, then by length: the total order the
  * canonical form of a bucket is sorted into. */
@@ -71,8 +72,8 @@ void row_sort(const char *base, struct row *r, int n);
  * question, not a tidiness one. */
 int row_ok(const char *p, int len);
 /* Which UTC day a row belongs to, from its leading decimal field. */
-long row_bucket(const char *p, size_t len, int bucketed);
+int64_t row_bucket(const char *p, size_t len, int bucketed);
 /* Is bucket `b` in the list of `nwant` buckets? */
-int want_has(const long *want, int nwant, long b);
+int want_has(const int64_t *want, int nwant, int64_t b);
 
 #endif

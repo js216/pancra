@@ -43,13 +43,13 @@ static int g_bond_n;
 
 /* ITS OWN LOCK, AND THE TABLE IS NEVER READ WITHOUT IT.
  *
- * This used to be unsynchronised, with a comment arguing that the worst case
- * was "one frame of a stale label": the state is one int, the writer is a
- * binder thread, the reader is the main loop, and a torn int is a wrong
- * status string for a moment.
+ * Unsynchronised, the argument for it is that the worst case is "one frame of
+ * a stale label": the state is one int, the writer is a binder thread, the
+ * reader is the main loop, and a torn int is a wrong status string for a
+ * moment.
  *
- * THAT ARGUMENT WAS ABOUT THE WRONG FIELD, and there are two races here
- * rather than the one it dismissed.
+ * THAT ARGUMENT IS ABOUT THE WRONG FIELD, and there are two races here rather
+ * than the one it dismisses.
  *
  * THE COUNT. Insertion read `g_bond_n < BOND_SLOTS`, incremented it, and only
  * then wrote the MAC -- so between those two statements the table advertised
@@ -76,11 +76,10 @@ static int g_bond_n;
  * a driver operation reaches the lookup with driver_lk still down
  * (driver_kick -> drv_connect -> set_status -> update_screen -> draw ->
  * build_model -> fill_sensor -> dexble_bond_state, all on the main thread
- * from on_timer's watchdog). app/test/lockorder.py ranks this lock below the
- * driver's for that reason and reports the pair. The cost the old comment
- * worried about -- a BLE callback waiting on the DRIVER mutex for a cosmetic
- * value -- is still not what this is: the only thing a callback can wait on
- * here is another lookup. */
+ * from on_timer's watchdog). test/app/lockorder.py ranks this lock below the
+ * driver's for that reason and reports the pair. What this is NOT is a BLE
+ * callback waiting on the DRIVER mutex for a cosmetic value: the only thing a
+ * callback can wait on here is another lookup. */
 static struct mutex bond_lk = MUTEX_INIT;
 
 int dexble_bond_state(const char *mac)

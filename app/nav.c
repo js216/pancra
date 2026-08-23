@@ -4,23 +4,32 @@
 
 #include "nav.h"
 #include "uimodel.h"
+#include <stdatomic.h> /* the crash handler reads g_screen_now: see nav.h */
 
 static enum ui_screen g_nav[NAV_MAX] = {SCR_MAIN};
 
 static int g_nav_n = 1;
-/* The current screen as a plain int at a FIXED address, for the crash handler
- * -- which reads its context through pointers and cannot call anything to
- * derive a value (see crashlog.h). It is a MIRROR, not a second source of
- * truth: nav_depth() below is the only thing that writes it, so it cannot
- * drift from the path. */
-int g_screen_now = SCR_MAIN;
+/* The current screen as an ATOMIC int at a FIXED address, for the crash
+ * handler -- which reads its context through pointers and cannot call
+ * anything to derive a value (see crashlog.h).
+ *
+ * A MIRROR, not a second source of truth: nav_depth() below is the only thing
+ * that writes it, so it cannot drift from the path.
+ *
+ * ATOMIC because of WHO READS IT. The path is walked on the main looper; the
+ * reader here is a signal handler that can interrupt any thread between two
+ * instructions, and C gives no meaning at all to a plain int shared that way.
+ * A relaxed store beside the assignment costs the same instruction and needs
+ * no argument about what the hardware would probably have done. */
+_Atomic int g_screen_now = SCR_MAIN;
 
 /* The one writer. Every change to the path goes through here, which is what
  * keeps the mirror above honest. */
 static void nav_depth(int n)
 {
-   g_nav_n      = n;
-   g_screen_now = (int)g_nav[n - 1];
+   g_nav_n = n;
+   atomic_store_explicit(&g_screen_now, (int)g_nav[n - 1],
+                         memory_order_relaxed);
 }
 
 /* The screen showing now. SCR_MAIN means no modal is open. */
@@ -66,9 +75,9 @@ void nav_home(void)
 
 /* 1 when `s` is on the path -- the user came THROUGH it to get here.
  *
- * This is what the old code was really asking when it compared an origin
- * global against a screen ("was this reached from DEVICES?"). Asking the path
- * answers it for every route, including ones added later. */
+ * This is the question an origin global compared against a screen is really
+ * asking ("was this reached from DEVICES?"). Asking the path answers it for
+ * every route, including ones added later. */
 int nav_has(enum ui_screen s)
 {
    for (int i = 0; i < g_nav_n; i++)

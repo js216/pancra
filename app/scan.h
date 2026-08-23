@@ -19,9 +19,9 @@
  *    place, reachable only from a later successful stop, and the self-heal is
  *    itself gated on it. The 1 Hz tick retries until Java confirms.
  * 3. NEITHER MUST A FAILURE THE PLATFORM REPORTS LATE. startScan succeeds and
- *    then fails on a binder thread, which used to be logged and nothing else
- *    -- the same permanent dead state as rule 2, reached without anybody
- *    calling stop. Ble.scanFailed hands the failure back with the GENERATION
+ *    then fails on a binder thread; logged and nothing else, that is the
+ *    same permanent dead state as rule 2, reached without anybody calling
+ *    stop. Ble.scanFailed hands the failure back with the GENERATION
  *    of the scan it belongs to (see scanlogic.h), so the live scan's failure
  *    resets the state and backs off, and a failure belonging to a scan that
  *    has since been replaced changes nothing.

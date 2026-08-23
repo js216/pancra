@@ -2,10 +2,9 @@
 // clock.c --- the two clocks (see clock.h)
 // Copyright 2026 Jakob Kastelic
 #include "clock.h"
+#include "sysabi.h" /* the clock ids, declared once for the whole app */
+#include <stdint.h>
 #include <time.h>
-
-#define CLOCK_REALTIME  0
-#define CLOCK_MONOTONIC 1
 
 /* ts is ZERO-INITIALISED and the return is checked, in both of these.
  *
@@ -19,7 +18,7 @@
 long long now_ms(void)
 {
    struct timespec ts = {0, 0};
-   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+   if (clock_gettime(SYS_CLOCK_MONOTONIC, &ts) != 0)
       return 0;
    return (ts.tv_sec * 1000LL) + (ts.tv_nsec / 1000000);
 }
@@ -37,9 +36,9 @@ long long now_ms(void)
  * was working; a correction backwards postpones it by an hour, so a genuinely
  * wedged link is never recovered. Neither is rare -- a phone that has been
  * off, or has just found a network, does exactly this. */
-long mono_s(void)
+int64_t mono_s(void)
 {
-   long t = 0;
+   int64_t t = 0;
    /* The lossy form, kept for the callers that only want a number: a failed
     * read reads as second zero. Every DEADLINE goes through mono_try()
     * instead, because for a deadline that conflation is the whole bug --
@@ -57,19 +56,19 @@ long mono_s(void)
  * outcome despite warn_unused_result then keeps whatever it had, which for a
  * re-read of an already-stamped deadline is the previous instant -- stale,
  * but not a fabricated "second zero" that makes every age look enormous. */
-enum mono_get mono_try(long *out)
+enum mono_get mono_try(int64_t *out)
 {
    struct timespec ts = {0, 0};
-   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+   if (clock_gettime(SYS_CLOCK_MONOTONIC, &ts) != 0)
       return MONO_GET_FAIL;
    *out = ts.tv_sec;
    return MONO_GET_OK;
 }
 
-long realtime_s(void)
+int64_t realtime_s(void)
 {
    struct timespec ts = {0, 0};
-   if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+   if (clock_gettime(SYS_CLOCK_REALTIME, &ts) != 0)
       return 0;
    return ts.tv_sec;
 }

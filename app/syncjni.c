@@ -18,24 +18,22 @@
 #include "exercise.h"
 #include "food.h"
 #include "insulin.h"
-#include "jbridge.h" /* jb_checked: the one exception verdict this app has */
-#include "reading.h" /* pancra_logs_reload: a restore rewrote the files */
+#include "jbridge.h"  /* jb_checked: the one exception verdict this app has */
+#include "log.h"      /* LOGI/LOGW: the ONE declaration */
+#include "logsload.h" /* pancra_logs_reload: a restore rewrote the files */
+#include "remotecfg.h"
 #include "sensors.h"
-#include "settings.h"
 #include "store.h"
 #include "sync.h"
 #include "syncreport.h" /* sync_report: how the sync went */
 #include "syncstat.h"
 #include "util.h"
 #include "weight.h"
-#include <jni.h>    /* JNIEnv, jstring, jbyteArray: this file IS the bridge */
-#include <jni_md.h> /* jint, jbyte: the JDK puts the scalar types here */
-#include <stdint.h> /* uint8_t: the pairing key crosses as raw bytes */
+#include "wireint.h" /* PRIwire: the wire's scalars, printed exactly */
+#include <jni.h>     /* JNIEnv, jstring, jbyteArray: this file IS the bridge */
+#include <jni_md.h>  /* jint, jbyte: the JDK puts the scalar types here */
+#include <stdint.h>  /* uint8_t: the pairing key crosses as raw bytes */
 #include <stdio.h>
-
-int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-
-#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
 
 static JavaVM *g_vm;
 static jclass g_cls;            /* Ble, global ref */
@@ -106,7 +104,7 @@ static int jni_http(const char *method, const char *path, const char *hdr,
                     const char *body, int blen, char *out, int outcap)
 {
    /* ONE snapshot of where this goes and as whom. Taken as two reads, a
-    * request could be addressed to the old server carrying the new account's
+    * request can be addressed to one server carrying another account's
     * signature -- see remote_config_get. */
    struct remote_config rc;
    remote_config_get(&rc);
@@ -133,13 +131,12 @@ static int jni_http(const char *method, const char *path, const char *hdr,
 
    /* ONE ALLOCATION, ONE VERDICT, AND NOTHING AFTER A FAILED ONE.
     *
-    * These five used to be made back to back with no check between them, and
-    * the results tested -- three of the five -- only when it was time to
-    * call. Three separate things went wrong with that, and they get worse in
-    * order:
+    * Made back to back with no check between them, with the results tested
+    * -- three of the five -- only when it is time to call, three separate
+    * things go wrong, and they get worse in order:
     *
-    *   1. IT ENTERED JAVA WITH A NULL BODY. `jb` was never tested. So a
-    *      NewByteArray that failed with blen > 0 left jb NULL and the call
+    *   1. IT ENTERS JAVA WITH A NULL BODY. With `jb` untested, a
+    *      NewByteArray that fails with blen > 0 leaves jb NULL and the call
     *      went ahead: Ble.syncHttp reads `body != null && body.length > 0`,
     *      finds null, sets no output stream, and posts the request WITH NO
     *      BODY AT ALL. The server then answers a well-formed empty push, and
@@ -218,8 +215,8 @@ static int jni_http(const char *method, const char *path, const char *hdr,
 
    /* A REPLY THAT DOES NOT FIT IS A FAILED REQUEST, not a short one.
     *
-    * This used to clamp to outcap-1 and still hand back 200. The caller
-    * cannot tell: a truncated body is exactly outcap-1 bytes, which is also
+    * Clamping to outcap-1 and handing back 200 leaves the caller unable to
+    * tell: a truncated body is exactly outcap-1 bytes, which is also
     * what a legitimate body of that length looks like, and sync_fetch_bucket
     * checks only `len < cap`. So a bucket between the phone's own buffer
     * (SYNC_BUF_MAX) and the wire's ceiling (BODY_MAX) was accepted with rows
@@ -228,7 +225,7 @@ static int jni_http(const char *method, const char *path, const char *hdr,
     * hold less than the wire allows and must then DECLINE, never truncate. */
    if (r) {
       jsize len = (*e)->GetArrayLength(e, (jbyteArray)r);
-      if (outcap <= 0 || (long)len > (long)outcap - 1) {
+      if (outcap <= 0 || (int64_t)len > (int64_t)outcap - 1) {
          too_long = 1;
       } else {
          n = (int)len;
@@ -289,21 +286,34 @@ unwind:
  * splitting them would buy nothing. */
 void syncjni_register_logs(void)
 {
-   sync_clear_logs();
-   (void)sync_add_log("readings", store_path(), 1);
-   (void)sync_add_log("insulin", insulin_path(), 1);
-   (void)sync_add_log("weight", weight_path(), 1);
-   (void)sync_add_log("food", food_path(), 1);
-   (void)sync_add_log("exercise", exercise_path(), 1);
-   /* THE FOOD VOCABULARY IS NOT BUCKETED, and it is the one log here whose
-    * rows do not begin with a timestamp -- they are "<id>,<name>". Bucketing
-    * splits on the leading field read as a UTC day, so asking for it here
-    * would file every food under whichever day its ID happened to look like.
-    * It is also small and rewritten by append only, so a single bucket costs
-    * nothing, exactly as for slots below. */
-   (void)sync_add_log("foodtypes", food_types_path(), 0);
-   (void)sync_add_log("sensors", sensors_path(), 1);
-   (void)sync_add_log("slots", slots_path(), 0);
+   /* ONE LIST, PUBLISHED IN ONE STORE. A clear() and eight adds, each taking
+    * the configuration lock on its own, let a sync that starts while they run
+    * take a snapshot of three logs, upload three logs, and then agree with the
+    * server that both sides matched. See sync_set_logs. */
+   const struct sync_log_spec specs[] = {
+       {"readings",  store_path(),      1},
+       {"insulin",   insulin_path(),    1},
+       {"weight",    weight_path(),     1},
+       {"food",      food_path(),       1},
+       {"exercise",  exercise_path(),   1},
+       /* THE FOOD VOCABULARY IS NOT BUCKETED, and it is the one log here
+        * whose rows do not begin with a timestamp -- they are "<id>,<name>".
+        * Bucketing splits on the leading field read as a UTC day, so asking
+        * for it here would file every food under whichever day its ID
+        * happened to look like. It is also small and rewritten by append
+        * only, so a single bucket costs nothing, exactly as for slots
+        * below. */
+       {"foodtypes", food_types_path(), 0},
+       {"sensors",   sensors_path(),    1},
+       {"slots",     slots_path(),      0},
+   };
+   /* A REFUSAL IS SAID OUT LOUD. It can only mean a path too long for the
+    * registry's field or a list longer than SYNC_MAX_LOGS -- both of which
+    * leave the PREVIOUS registry standing, so the app keeps syncing whatever
+    * it was syncing rather than nothing. Silently, that is a phone that
+    * uploads an out-of-date list of logs for the rest of the run. */
+   if (sync_set_logs(specs, (int)(sizeof specs / sizeof specs[0])) != 0)
+      LOGI("sync: the log registry was REFUSED -- the previous one stands");
 }
 
 /* HAS ANYTHING CHANGED SINCE THE LAST SYNC?
@@ -324,19 +334,19 @@ void syncjni_register_logs(void)
  * here would have been that bug, twice.
  *
  * Cheap either way: an open/lseek pair per file and a counter, no reading. */
-long syncjni_state_stamp(void)
+int64_t syncjni_state_stamp(void)
 {
-   const char *paths[] = {store_path(),  insulin_path(),    weight_path(),
-                          food_path(),   food_types_path(), exercise_path(),
+   const char *paths[] = {store_path(),   insulin_path(),    weight_path(),
+                          food_path(),    food_types_path(), exercise_path(),
                           sensors_path(), slots_path()};
-   long total          = 0;
+   int64_t total       = 0;
    for (int i = 0; i < (int)(sizeof paths / sizeof paths[0]); i++) {
       if (!paths[i] || !paths[i][0])
          continue;
       int fd = open(paths[i], O_RDONLY, 0);
       if (fd < 0)
          continue;
-      long n = lseek(fd, 0, SEEK_END);
+      int64_t n = lseek(fd, 0, SEEK_END);
       close(fd);
       if (n > 0)
          total += n;
@@ -346,23 +356,35 @@ long syncjni_state_stamp(void)
    return (total * 1000003L) + record_generation();
 }
 
-void syncjni_wire(JNIEnv *e, jclass ble)
+void syncjni_wire(JNIEnv *e, jobject activity)
 {
-   if (!e || !ble)
+   if (!e || !activity)
       return;
+   /* THE TRANSPORT'S OWN CLASS, which is PancraNet (PancraNet.java). The only
+    * part of the transport that lives on Ble is the three natives, which
+    * RegisterNatives binds to that class and which PancraNet calls as
+    * ordinary static methods. Resolved through the app's own classloader for
+    * the reason jbridge.h gives: FindClass in a native-activity callback
+    * cannot see our classes.dex at all. */
+   jclass net = NULL;
+   if (!jb_app_class(e, activity, "com.jk.pancra.PancraNet", &net) || !net) {
+      LOGI("sync transport NOT wired: PancraNet not found");
+      return;
+   }
    (*e)->GetJavaVM(e, &g_vm);
    /* CHECKED BEFORE ANYTHING ELSE IS ASKED FOR. NewGlobalRef fails only by
     * running out of memory, and when it does it leaves an OutOfMemoryError
-    * PENDING -- so the six GetStaticMethodID calls that used to follow it
-    * unconditionally were six illegal JNI calls, the first of which aborts
-    * under CheckJNI. Leaving with g_cls NULL is the honest outcome: every
+    * PENDING -- so six unconditional GetStaticMethodID calls after it are six
+    * illegal JNI calls, the first of which aborts under CheckJNI. Leaving
+    * with g_cls NULL is the honest outcome: every
     * entry point in this file tests it, so the sync degrades to "no
     * transport" (jni_http returns -1, the run is reported failed and retried)
-    * instead of taking the launch down. */
-   jclass gcls = (*e)->NewGlobalRef(e, ble);
+    * rather than taking the launch down. */
+   jclass gcls = (*e)->NewGlobalRef(e, net);
    if (!gcls) {
-      (void)jb_checked(e, "NewGlobalRef(Ble) for the sync transport");
-      LOGI("sync transport NOT wired: no global reference for Ble");
+      (void)jb_checked(e, "NewGlobalRef(PancraNet) for the sync transport");
+      LOGI("sync transport NOT wired: no global reference for PancraNet");
+      (*e)->DeleteLocalRef(e, net);
       return;
    }
    /* SWAPPED, NOT OVERWRITTEN. dexble_register calls this, and init_java calls
@@ -376,17 +398,18 @@ void syncjni_wire(JNIEnv *e, jclass ble)
          (*e)->DeleteGlobalRef(e, old);
    }
    m_synchttp = (*e)->GetStaticMethodID(
-       e, ble, "syncHttp",
+       e, net, "syncHttp",
        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;"
        "Ljava/lang/String;[B)[B");
-   m_synccode    = (*e)->GetStaticMethodID(e, ble, "syncCode", "()I");
-   m_syncfail    = (*e)->GetStaticMethodID(e, ble, "syncFail", "()I");
-   m_syncsoon    = (*e)->GetStaticMethodID(e, ble, "syncSoon", "()Z");
-   m_restoresoon = (*e)->GetStaticMethodID(e, ble, "syncRestoreSoon", "()V");
+   m_synccode    = (*e)->GetStaticMethodID(e, net, "syncCode", "()I");
+   m_syncfail    = (*e)->GetStaticMethodID(e, net, "syncFail", "()I");
+   m_syncsoon    = (*e)->GetStaticMethodID(e, net, "syncSoon", "()Z");
+   m_restoresoon = (*e)->GetStaticMethodID(e, net, "syncRestoreSoon", "()V");
    m_pairsoon    = (*e)->GetStaticMethodID(
-       e, ble, "syncPairSoon", "(Ljava/lang/String;Ljava/lang/String;)V");
+       e, net, "syncPairSoon", "(Ljava/lang/String;Ljava/lang/String;)V");
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
+   (*e)->DeleteLocalRef(e, net);
    sync_set_http(jni_http);
    syncjni_register_logs();
 }
@@ -407,8 +430,8 @@ jint syncjni_run(JNIEnv *e, jobject cls)
    int ok = sync_run() == 0;
    /* One line per sync, not per request: a sync is dozens of requests, and a
     * log entry each turned the app's log into its own traffic. */
-   LOGI("sync %s (uid %ld, %s:%d)", ok ? "ok" : "FAILED", rc.uid, rc.server,
-        rc.port);
+   LOGI("sync %s (uid %" PRIwire ", %s:%d)", ok ? "ok" : "FAILED", rc.uid,
+        rc.server, rc.port);
    sync_report(ok ? SYNC_OK : why_failed());
    return ok ? 1 : 0;
 }
@@ -444,7 +467,7 @@ jint syncjni_restore(JNIEnv *e, jobject cls)
    }
    g_why = SYNC_IDLE;
    int n = sync_restore();
-   LOGI("restore %s (uid %ld, %d bucket(s))",
+   LOGI("restore %s (uid %" PRIwire ", %d bucket(s))",
         n == SYNC_RESTORE_UNSYNCED ? "UNSYNCED"
         : n >= 0                   ? "ok"
                                    : "FAILED",
@@ -477,13 +500,13 @@ jint syncjni_pair(JNIEnv *e, jobject cls, jstring email, jstring code)
    const char *em = email ? (*e)->GetStringUTFChars(e, email, 0) : 0;
    const char *cd = code ? (*e)->GetStringUTFChars(e, code, 0) : 0;
    uint8_t key[SYNC_KEY_LEN];
-   long uid = 0;
-   int rc   = -1;
-   g_why    = SYNC_IDLE;
+   int64_t uid = 0;
+   int rc      = -1;
+   g_why       = SYNC_IDLE;
    if (em && cd)
       rc = sync_pair(em, cd, key, &uid);
    if (rc == 0) {
-      if (sync_key_save(uid, key) == 0) {
+      if (remote_key_save(uid, key) == 0) {
          sync_report(SYNC_PAIRED);
       } else {
          sync_report(SYNC_KEY_NOT_SAVED);

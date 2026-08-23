@@ -6,11 +6,11 @@
 #include "bletrans.h"
 #include "clock.h"
 #include "dexdriver.h"
+#include "linkinfo.h"
 #include "log.h"
 #include "meter.h"
 #include "nav.h"
 #include "notify.h"
-#include "reading.h"
 #include "reconcile.h"
 #include "selection.h"
 #include "sensors.h"
@@ -21,11 +21,11 @@
  * slot may not be calibrated.
  *
  * It selects nothing and locks nothing: the driver takes a link as an
- * argument and scopes its own lock around the operation. This used to return
- * the PREVIOUS selection for the caller to restore, and to hand back with the
- * driver lock HELD, because a calibration write had to be atomic with the
- * ambient selection that aimed it. There is no ambient selection to aim, so
- * there is nothing here to hold. */
+ * argument and scopes its own lock around the operation. With an ambient
+ * selection to aim, this would have to return the PREVIOUS one for the caller
+ * to restore, and hand it back with the driver lock HELD, because a
+ * calibration write must be atomic with the selection that aims it. There is
+ * no such selection, so there is nothing here to hold. */
 int cal_link(void)
 {
    /* BY ID from end to end. This decides whether a CALIBRATION -- the most
@@ -133,7 +133,7 @@ void device_retire(int id)
           * confirm screen draws no status line (only the main screen does),
           * so returning from here left the failure completely invisible: the
           * user taps DISCONNECT and nothing happens at all. Nothing has been
-          * torn down, so the device is exactly as it was. */
+          * torn down, so the device is untouched. */
          sel_set_device(-1);
          nav_back();
          return;
@@ -157,7 +157,7 @@ void device_retire(int id)
           * carrying the FORGOTTEN sensor's model and firmware, in a
           * provenance row that is never rewritten and whose fields are
           * part of the id-reuse key. */
-         reading_forget_dis(flink); /* takes the DIS lock itself */
+         linkinfo_forget_dis(flink); /* takes the DIS lock itself */
          /* GIVE THE LINK BACK. Nothing else here did, and for a METER
           * that leaked the link permanently: the armed table kept the
           * forgotten meter's MAC and the routing bit stayed set, which
@@ -171,18 +171,18 @@ void device_retire(int id)
           * Every meter retired therefore burned one of LINK_MAX links for
           * the life of the process.
           *
-          * UN-ARM, DO NOT RELEASE. An earlier version called
-          * meter_release_link here, which clears the routing bit -- and a
-          * disconnect callback still in flight (the meter really was
-          * connected when forgotten) then landed in the CGM branch and
-          * posted a spurious CONNECTION ERROR. The split exists for
+          * UN-ARM, DO NOT RELEASE. meter_release_link here clears the
+          * routing bit -- and a disconnect callback still in flight (the
+          * meter really was connected when forgotten) then lands in the CGM
+          * branch and posts a spurious CONNECTION ERROR. The split exists
+          * for
           * exactly this: un-arm frees the meter pool now, the routing bit
           * stays until the callback lands (meter_hook_disconnected
           * releases fully), and if no callback is coming -- the normal
           * case, a PENDING connect on a switched-off meter -- the
           * teardown stamp below lets the stranded-link recovery in
           * meter_sync_watchdog give the link back after
-          * METER_TEARDOWN_MAX. A 3-minute bounded hold instead of a
+          * METER_TEARDOWN_MAX. A 3-minute bounded hold rather than a
           * permanent leak, and no misrouting either way.
           *
           * The tick cannot re-arm meanwhile: it skips retired slots, and
@@ -211,12 +211,29 @@ void device_retire(int id)
       store_unlock();
       notify_mark();
       sel_set_device(-1);
-      /* Return to WHERE THE SENSOR SCREEN WAS OPENED FROM, not a
-       * hardcoded SETTINGS: the detail screen is reachable from the
-       * main-screen STATE/SESSION table (g_sensor_from == SCR_MAIN) as
-       * well as from the settings DEVICES list, and disconnecting from
-       * the former must land back on the main screen, not somewhere the
-       * user never was. */
-      nav_back();
+      /* CLOSE BOTH SCREENS THIS RAN FROM, and close them because of what
+       * they are about rather than by counting steps.
+       *
+       * The confirmation sits on top of the retired device's OWN screen, and
+       * both read the selection that was just cleared. Popping once left the
+       * user on that detail screen with nothing selected, where the range
+       * guard in render_sensor returns before drawing anything: a black
+       * screen, with only the escape band at the top responding to a tap, one
+       * confirmed DISCONNECT away from the main screen.
+       *
+       * Landing place, once both are off the path: WHERE THE SENSOR SCREEN
+       * WAS OPENED FROM, which the path holds and no caller has to name. The
+       * detail screen is reachable from the main-screen STATE/SESSION table
+       * as well as from the settings DEVICES list, and disconnecting from the
+       * former must land back on the main screen, not somewhere the user
+       * never was.
+       *
+       * TESTED, NOT COUNTED. Two bare nav_back() calls would be right for
+       * this one route and wrong for any other way in; asking what is on top
+       * is right for every route, including ones added later. */
+      if (cur_screen() == SCR_FORGET)
+         nav_back();
+      if (cur_screen() == SCR_SENSOR)
+         nav_back();
    }
 }

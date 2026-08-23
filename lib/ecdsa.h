@@ -14,8 +14,8 @@
  * d_be AND k_be MUST BE CANONICAL: 32 big-endian bytes holding a value in
  * [1, n-1], which is exactly what p256_sc_rand emits. They are CHECKED, not
  * reduced -- d == n is refused rather than quietly signed with d == 0 -- so a
- * caller that used to hand over 32 arbitrary bytes and rely on the reduction
- * now gets a refusal instead of a signature under a key it did not choose.
+ * caller handing over 32 arbitrary bytes and relying on the reduction gets a
+ * refusal rather than a signature under a key it did not choose.
  * The message hash is NOT a scalar and IS reduced, per FIPS 186-4 6.4.
  *
  * k MUST come from a cryptographic RNG and MUST NOT repeat across
@@ -31,12 +31,12 @@ int ecdsa_p256_sign(const uint8_t d_be[32], const uint8_t hash[32],
 /* 1 iff (r,s) is a valid signature by the public key (qx,qy) over hash.
  *
  * r_be AND s_be ARE CHECKED AGAINST [1, n-1] BEFORE ANYTHING ELSE, and that
- * is a security property rather than input hygiene. They used to be reduced,
- * which made r and r + n the same signature: for any signature whose r or s
- * is below 2^256 - n, THREE distinct 32-byte encodings verified and only one
- * of them had ever been produced by the signer. Anything that treats a
- * signature's bytes as an identity -- a cache key, a replay table, a
- * transcript hash computed elsewhere -- was defeated by re-encoding it. */
+ * is a security property rather than input hygiene. Reduced instead, r and
+ * r + n are the same signature: for any signature whose r or s is below
+ * 2^256 - n, THREE distinct 32-byte encodings verify and only one of them was
+ * ever produced by the signer. Anything that treats a signature's bytes as an
+ * identity -- a cache key, a replay table, a transcript hash computed
+ * elsewhere -- is defeated by re-encoding it. */
 int ecdsa_p256_verify(const uint8_t qx[32], const uint8_t qy[32],
                       const uint8_t hash[32], const uint8_t r_be[32],
                       const uint8_t s_be[32]);

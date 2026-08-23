@@ -4,11 +4,11 @@
  *
  * See ct.h. It lives in lib/ rather than beside one of its callers because
  * every one of them is crypto: the server's password and MAC checks, the
- * pairing confirmation, and the TLS binder and Finished. It used to be
- * declared in srv/proto.h, which srv/tls.c cannot include -- tls.h exists so
- * the TLS implementation depends on nothing above it -- so the TLS layer
- * compared its two authenticators with memcmp instead, which is the one place
- * in the program where the timing is handed straight to a stranger.
+ * pairing confirmation, and the TLS binder and Finished. Declared in
+ * srv/proto.h it is out of reach of srv/tls.c -- tls.h exists so the TLS
+ * implementation depends on nothing above it -- leaving the TLS layer to
+ * compare its two authenticators with memcmp, which is the one place in the
+ * program where the timing is handed straight to a stranger.
  */
 #include "ct.h"
 #include <stddef.h> /* size_t: the length this compares over */

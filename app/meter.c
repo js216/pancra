@@ -7,7 +7,9 @@
 #include "blejni.h"
 #include "bletrans.h"
 #include "clock.h"
+#include "devtag.h" /* a log may not carry an address; see there */
 #include "dexdriver.h"
+#include "loadresult.h" /* the four answers a stored file can give */
 #include "log.h"
 #include "meterlogic.h"
 #include "metersess.h"
@@ -79,9 +81,9 @@ static int sess_link(void)
 
 /* Which links carry a meter, mirroring what the transport was told. The
  * shell needs its own copy because several CGM-only passes below iterate the
- * links and must skip meters -- a check that used to be `l == LINK_METER` and
- * is now a per-link fact. Written only through link_set_meter, so the two
- * copies cannot drift. */
+ * links and must skip meters. A per-link FACT rather than a fixed link
+ * number: any link can carry a meter. Written only through link_set_meter, so
+ * the two copies cannot drift. */
 /* (The per-link ROLE and ARMING tables moved into the driver: its own
  * callbacks read them, so they belong with its lock -- see dexdriver.h's
  * driver_link_* operations. What is left here is this module's own
@@ -112,18 +114,18 @@ static int sess_link(void)
  * links outright. A lost disconnect callback would therefore strand the link
  * armed forever and that meter would never sync again until a restart. */
 
-/* Give a link back: no longer armed, and no longer a METER link.
+/* Give a link back: un-armed, and not a METER link any more.
  *
- * Clearing the meter bit is the part that was missing. link_set_meter was
- * only ever called with 1, so a link stayed marked "meter" for the life of
- * the process -- and since the link pool is shared, a CGM that later landed
+ * CLEARING THE METER BIT IS HALF THE JOB. Set and never cleared, a link stays
+ * marked "meter" for the life of the process -- and since the link pool is
+ * shared, a CGM that later lands
  * on it would have had its notifications routed into the OneTouch parser.
  * Releasing is the other half of arming and has to undo both facts. */
 
 /* (The RSSI of the sync connection is recorded PER METER, in the runtime
- * table keyed by registry id -- meter_rssi_of. A second, process-global copy
- * used to be kept here as well and was read by nothing at all: three more
- * fields written from a binder thread for no reader.) */
+ * table keyed by registry id -- meter_rssi_of, and only there. A second
+ * process-global copy would be three more fields written from a binder thread
+ * for no reader.) */
 static char g_meter_model[24], g_meter_fw[24];
 /* AND THE LOCK THEY BELONG TO. These were CLEARED under the registry lock and
  * written and read under nothing at all -- a lock borrowed from another module
@@ -141,17 +143,8 @@ static struct mutex mdis_lk = MUTEX_INIT;
  * a time (msess_claim), so one of these is enough. */
 static struct meter_seq g_mseq;
 
-/* THE LINK'S ROLE, which decides where its GATT callbacks go. Kept by the
- * driver because the driver's own callbacks read it -- a str_snapshot racing
- * a strcmp really can be read half-written, which would mis-identify the
- * meter that just connected. */
-void meter_link_set(int link, int on)
-{
-   driver_link_set_meter(link, on);
-}
-
-/* Un-arm: this meter no longer has a connection outstanding, so the tick may
- * arm it again. The link keeps its METER ROUTING BIT -- see below. */
+/* Un-arm: this meter has no connection outstanding, so the tick may arm it
+ * again. The link keeps its METER ROUTING BIT -- see below. */
 void meter_unarm_link(int link)
 {
    if (link < 0 || link >= LINK_MAX)
@@ -160,7 +153,7 @@ void meter_unarm_link(int link)
    driver_link_arm(link, "");
 }
 
-/* Give the link back completely: un-armed AND no longer routed to otble.
+/* Give the link back completely: un-armed AND unrouted from otble.
  *
  * Only correct once the GATT disconnect has actually ARRIVED. Clearing the
  * routing bit at the moment we ASK for a close is too early: the callback is
@@ -181,8 +174,8 @@ void meter_release_link(int link)
  * anywhere outranks anything -- alarm_zone_merge). The DISPLAY belongs to
  * the primary; the ALARM watches every sensor the user wears, so a low on
  * the non-primary sensor rings too. Stranded is merged the same way, so an
- * out-of-range sensor going silent sustains the alarm no matter which one
- * it was. With no CGM registered at all (a pre-registry install) the
+ * out-of-range sensor going silent sustains the alarm whichever one it is.
+ * With no CGM registered at all (a pre-registry install) the
  * current reading -- src-0 legacy data -- is judged instead.
  *
  * Gathering takes the registry lock, then hist_lock, SEQUENTIALLY -- and
@@ -202,9 +195,9 @@ int meter_armed(const char *mac)
 
 /* A free link a meter may take, or -1.
  *
- * Shared by the arming path and by pairing a NEW meter. Pairing used to go
- * through link_for_slot, whose free-link search knows nothing about armed
- * meters and will happily hand back LINK_CGM. Two callers, one rule. */
+ * Shared by the arming path and by pairing a NEW meter: two callers, one
+ * rule. NOT link_for_slot, whose free-link search knows nothing about armed
+ * meters and will happily hand back LINK_CGM. */
 int meter_alloc_link(const char *mac)
 {
    /* CGMS COME FIRST. A CGM only claims its link when it next advertises,
@@ -231,12 +224,13 @@ int meter_alloc_link(const char *mac)
 
 void meter_sync_start(int mid, const char *mac)
 {
+   char dt[DEVTAG_LEN];
    /* Its OWN link, from the shared pool. Every registered meter holds one, so
     * all of them can carry a standing connect at once -- with a single
     * reserved link only the last-used meter could, and the others were back
     * to catching a two-second advertisement. */
    /* Already armed? Keep the SAME link. Re-allocating would strand the
-    * pending connect on the old one and hand this meter a second. */
+    * pending connect on the first one and hand this meter a second. */
    int link = meter_link_of(mac);
    if (link < 0) {
       /* A free link: claimed by no other meter, and carrying no CGM session.
@@ -258,7 +252,7 @@ void meter_sync_start(int mid, const char *mac)
       long now = mono_s(); /* a throttle, not an instant */
       if (now - last_warn > 60) {
          last_warn = now;
-         LOGI("meter %s (id %d): no free link", mac, mid);
+         LOGI("meter id %d (dev %s): no free link", mid, devtag(mac, dt));
          set_status("NO FREE LINK");
       }
       return;
@@ -278,17 +272,18 @@ void meter_sync_start(int mid, const char *mac)
     * armed forever with nothing behind it. */
    driver_link_arm(link, mac);
    if (!dexble_meter_connect(link, mac)) {
-      LOGI("meter %s (id %d): connect did not reach the transport", mac, mid);
+      LOGI("meter id %d (dev %s): connect did not reach the transport", mid,
+           devtag(mac, dt));
       meter_release_link(link);
       return;
    }
    /* DO NOT STAMP LAST SYNC HERE.
     *
-    * This used to set rt->sync_t, which was truthful while the only caller
-    * was the advert path -- an advertisement means the meter really is
-    * switched on and in range. Arming a STANDING connect means nothing of
-    * the kind: it is issued for every registered meter on a timer, whether
-    * the meter is off, in another room, or a mile away. Stamping here made
+    * Stamping rt->sync_t is truthful on the ADVERT path -- an advertisement
+    * means the meter really is switched on and in range. Arming a STANDING
+    * connect means nothing of the kind: it is issued for every registered
+    * meter on a timer, whether the meter is off, in another room, or a mile
+    * away. Stamping here would make
     * all three read "SYNCED a few seconds ago" at once, which is a plain lie
     * about whether a fingerstick has been captured -- exactly the fact the
     * user is looking at that row to learn. The stamp belongs where contact
@@ -305,7 +300,7 @@ void meter_sync_start(int mid, const char *mac)
     * B's id, in an append-only file that is never rewritten. The state is
     * seeded when a meter actually ANSWERS instead -- meter_hook_connected
     * -- which is the only moment exactly one meter owns it. */
-   LOGI("meter %s (id %d) armed on link %d", mac, mid, link);
+   LOGI("meter id %d (dev %s) armed on link %d", mid, devtag(mac, dt), link);
 }
 
 /* A meter link dropped. 1 if it owned the current exchange, 0 if it was an
@@ -332,6 +327,7 @@ static int meter_hook_disconnected(int link)
  * connect callback, under driver_lock. */
 static int meter_hook_connected(int link)
 {
+   char dt[DEVTAG_LEN];
    if (link < 0 || link >= LINK_MAX)
       return 0;
    /* Which meter is this? FROM THE ARMED TABLE -- the address we issued the
@@ -372,7 +368,21 @@ static int meter_hook_connected(int link)
     * one made each sync read the other's counter as "gone backwards", so
     * they reset each other forever and one meter's records were never
     * reached. */
-   ot_init(meter_index_load(mid)); /* caller holds driver_lock */
+   /* SEED FROM THE STORED INDEX, AND KNOW WHEN THERE IS NONE.
+    * ABSENT is a first sync and -1 is exactly right; ERROR is a file that
+    * exists and did not answer, and walking from the beginning then re-reads
+    * a window of records already imported, holding the meter awake for a
+    * sync that will import nothing. Decline instead: the next advert tries
+    * again, and the file usually reads. */
+   int seed             = -1;
+   enum load_result how = meter_index_load(mid, &seed);
+   if (how == LOAD_ERROR) {
+      LOGW("meter %d: the stored index could not be read; not syncing this "
+           "cycle rather than re-walking its records",
+           mid);
+      return 0;
+   }
+   ot_init(seed); /* caller holds driver_lock */
    /* The walk's timestamp evidence starts empty with the walk. Carrying the
     * previous meter's last instant into this one would let it decide a
     * repeated-hour record it has nothing to do with. The ambiguity count is
@@ -387,18 +397,18 @@ static int meter_hook_connected(int link)
    g_meter_model[0] = 0;
    g_meter_fw[0]    = 0;
    mutex_unlock(&mdis_lk);
-   LOGI("meter %s (id %d) answered on link %d -> sync in flight", mac, mid,
-        link);
+   LOGI("meter id %d (dev %s) answered on link %d -> sync in flight", mid,
+        devtag(mac, dt), link);
    return 1;
 }
 
 /* Runs on the 1 Hz tick (and the service heartbeat, so it survives the
  * activity being destroyed). Two jobs:
  *
- *   - release a sync that has WEDGED. Now that the session is claimed only
- * when the meter answers, this 90 s measures a real exchange rather than a
- *     standing connect's wait, so it can no longer tear down a pending
- * connect that is behaving exactly as intended.
+ *   - release a sync that has WEDGED. The session is claimed only when the
+ * meter answers, so this 90 s measures a real exchange rather than a
+ *     standing connect's wait, and it cannot tear down a pending connect
+ * that is behaving exactly as intended.
  *   - keep exactly one standing connect ARMED. This is what makes a sync
  *     survive a restart, a Bluetooth toggle, or the app being swiped away:
  *     nothing else re-establishes it, and without it the first fingerstick
@@ -419,8 +429,24 @@ static void meter_sync_watchdog_locked(void)
    msess_idle_copy(idle, MSESS_LINKS_MAX);
    /* MONOTONIC. These are elapsed-time decisions -- has this exchange run
     * too long, has this link waited too long for its teardown -- and a
-    * wall-clock correction used to fire or postpone both. */
-   meter_tick_eval(s.busy, s.start, idle, LINK_MAX, mono_s(), &mt);
+    * wall-clock correction would fire or postpone both. */
+   long now_mono = mono_s();
+   /* THE PROTOCOL'S OWN DEADLINE FIRST. The watchdog below judges
+    * the SESSION -- has this exchange run too long overall -- and it is
+    * deliberately generous. A single request whose answer never arrives is a
+    * different failure and a much shorter one, and only the protocol knows a
+    * request is outstanding. Both are wanted: this ends a wedged exchange
+    * while the meter is still awake to be asked again, and the watchdog is
+    * still the backstop for everything it cannot see. */
+   ot_tick(now_mono);
+   /* THE WRITE THAT DID NOT LAND, TRIED AGAIN. Non-blocking and
+    * throttled to once per 30 s, and a no-op the rest of the time -- this
+    * tick runs on the MAIN thread, where meterstore.c's rule is that nobody
+    * waits on the save's lock (see the note above msync_lk). A retry that
+    * finds a real writer holding the file leaves it to them. */
+   if (meter_sync_retry(now_mono) == SYNC_STILL_DIRTY)
+      LOGW("meter last-sync file still refusing writes");
+   meter_tick_eval(s.busy, s.start, idle, LINK_MAX, now_mono, &mt);
    if (mt.drop_sync) {
       /* Drop FIRST, and take the link back from the same step that cleared
        * it: reading it again afterwards would read -1. */
@@ -520,7 +546,15 @@ void pancra_meter_rssi(int rssi)
    if (src > 0) {
       long now = realtime_s();
       meter_rt_rssi(src, rssi, now, now);
-      meter_sync_save(); /* connect confirmed: persist the last-sync time */
+      /* TWO DIFFERENT ANSWERS, AND BOTH ARE READ. The line above
+       * says the live observation was accepted; this one says it is on disk.
+       * Dropped, the refusal would make a meter whose last-sync time could
+       * not be written look identical to one whose could -- until the next
+       * launch, where it has never been seen at all. Saying so is all this
+       * caller can do; the table stays dirty and the tick's meter_sync_retry
+       * keeps trying. */
+      if (meter_sync_save() != 0)
+         LOGW("meter %d: last-sync time NOT SAVED -- will retry", src);
    }
    LOGI("meter rssi %d dbm", rssi);
    shell_repaint();
@@ -549,11 +583,10 @@ void ot_drv_subscribe(void)
 /* The protocol exchange is over. Ask for the link to close and drop the busy
  * latch -- but DO NOT un-arm, and do not treat this as the meter being gone.
  *
- * This used to call meter_unarm_link here, justified by the claim that "the
- * meter has powered itself off by now" and a gate that was described in the
- * comment but never actually written. An HCI capture falsified both. A Verio
- * stays awake about THIRTY-FIVE SECONDS after a fingerstick (observed:
- * connected 07:07:50, supervision timeout 07:08:25), and un-arming while it
+ * NOT meter_unarm_link. "The meter has powered itself off by now" is the
+ * tempting justification and an HCI capture falsifies it: a Verio stays awake
+ * about THIRTY-FIVE SECONDS after a fingerstick (observed: connected 07:07:50,
+ * supervision timeout 07:08:25), and un-arming while it
  * is still connected makes meter_armed() false -- so the 1 Hz tick calls
  * meter_sync_start again, reconnects, and re-runs the whole exchange. The
  * capture shows 29 complete syncs in 29 seconds inside ONE connection, each
@@ -597,7 +630,7 @@ void ot_drv_status(const char *s)
    set_status(s);
    /* Record the driver's live phase text against the meter that currently
     * owns the sync, so its per-device STATE row can show a descriptive step
-    * ("COUNT", "READING", "NOTHING NEW") instead of a flat "SYNCING". The
+    * ("COUNT", "READING", "NOTHING NEW") rather than a flat "SYNCING". The
     * "METER: " prefix is stripped -- the row is already known to be a meter.
     */
    int src = msess_src();
@@ -650,11 +683,9 @@ int ot_drv_reading(long naive, int mg_dl)
     * edge. */
    /* Generous, because this is measured against the PHONE's clock, which can
     * legitimately be wrong (a flat battery before NTP, a dead RTC, a
-    * hand-set date). A tight bound here rejected perfectly good records
-    * whenever the phone was slow -- and otble.c used to persist its walk
-    * past the rejection, so those fingersticks were destroyed permanently.
-    * It no longer does, but the bound should still only catch records wrong
-    * by more than any plausible clock skew or timezone. */
+    * hand-set date). A tight bound here rejects perfectly good records
+    * whenever the phone's clock is off, so this catches only records wrong by
+    * more than any plausible clock skew or timezone. */
    if (t <= 0 || t > realtime_s() + (15L * 3600)) {
       LOGI("meter reading at %ld (raw %ld) implausible, rejected", t, naive);
       g_mseq = seq_before; /* it is not evidence about anything */
@@ -696,11 +727,14 @@ int ot_drv_reading(long naive, int mg_dl)
                                 .rescale_pm = 1000,
                                 .prime      = sensor_primary_id()};
    struct reading_result mrr = store_record(&mev, CHIRP_MAX_GAP_S);
-   int isnew                 = mrr.inserted;
-   if (isnew && !mrr.persisted)
+   /* WHAT HAPPENED TO IT, as its own type: a fingerstick that
+    * lands OLDER than the display window is still a record, and a duplicate
+    * is not one. Both were `isnew` and read as a truth value. */
+   enum hist_insert_result got = mrr.inserted;
+   if (hist_kept(got) && !mrr.persisted)
       set_status("METER: WRITE FAILED");
    LOGI("meter reading %d mg/dL at %ld (raw %ld)%s", mg_dl, t, naive,
-        isnew ? "" : " (already stored)");
+        hist_kept(got) ? "" : " (already stored)");
    shell_ui_dirty();
    return 1;
 }
@@ -731,11 +765,11 @@ void ot_drv_done(int new_records)
    if (src && dmodel[0] && dfw[0]) {
       /* COMPLETE the row, do not re-mint it.
        *
-       * This used to mint with the model/fw filled in and rebind the slot if
-       * the id came back different -- but a device is identified by (type,
-       * MAC) ALONE, so the mint always returns the id we already have and
-       * `id != meter_src()` was never true. The rebind was dead code and a
-       * meter's provenance row kept its empty model and firmware forever,
+       * A device is identified by (type, MAC) ALONE, so minting again with
+       * the model and firmware filled in returns the id we already have --
+       * the mint cannot carry them onto the existing row. Without an explicit
+       * complete, a meter's provenance row keeps its empty model and firmware
+       * forever,
        * exactly contrary to what this block claims to do -- and the
        * reconcile completion pass walks CGM links, so nothing else filled
        * them either. sensor_complete is the mechanism the CGM path already
@@ -763,13 +797,12 @@ void ot_drv_done(int new_records)
 }
 
 /* THE ZONE, as the one question civil.h asks: what was the offset at this
- * instant. It used to be a fixed-point iteration over the same call -- guess
- * with the offset at the naive value, ask again with the result -- which
- * settles on ONE of the two answers inside the repeated hour and cannot
- * report that there were two. That is the whole of TODO 132; the iteration
- * has moved into civil_resolve, which solves rather than converges.
+ * instant. SOLVED, not converged: civil_resolve answers it directly. A
+ * fixed-point iteration -- guess with the offset at the naive value, ask again
+ * with the result -- settles on ONE of the two answers inside the repeated
+ * hour and cannot report that there were two.
  *
- * A PURE FUNCTION OF `t`, and it must stay one: g_tz_off is only the
+ * A PURE FUNCTION OF `t`, and it must stay one: the cached offset is only the
  * fallback, used when there is no VM to ask, because a conversion that
  * depends on WHEN it ran gives a re-imported record a different timestamp and
  * BGM dedup matches on the exact timestamp.
@@ -783,7 +816,7 @@ static long meter_zone(void *ctx, long t)
 {
    (void)ctx; /* the env is the calling thread's, so it cannot be passed in */
    JNIEnv *env = dexble_env();
-   return env ? tz_offset_at(env, t) : g_tz_off;
+   return env ? tz_offset_at(env, t) : tz_off_now();
 }
 
 /* --- what the rest of the app is allowed to ask (see meter.h) --- */
@@ -791,11 +824,6 @@ static long meter_zone(void *ctx, long t)
 int meter_src(void)
 {
    return msess_src();
-}
-
-void meter_mac(char *out, int cap)
-{
-   msess_mac(out, cap);
 }
 
 void meter_bind(int id, const char *mac)
@@ -825,32 +853,9 @@ int meter_link_is(int link)
    return driver_link_is_meter(link);
 }
 
-int meter_link_armed(int link)
-{
-   if (link < 0 || link >= LINK_MAX)
-      return 0;
-   return driver_link_armed(link);
-}
-
-void meter_link_arm_mac(int link, char *out, int cap)
-{
-   if (link < 0 || link >= LINK_MAX) {
-      if (cap > 0)
-         out[0] = 0;
-      return;
-   }
-   driver_link_armed_mac(link, out, cap);
-}
-
 void meter_link_idle(int link, long when)
 {
    msess_idle_set(link, when);
-}
-
-long meter_seen(int id)
-{
-   struct meter_rt rt;
-   return meter_rt_read(id, &rt) ? rt.sync_t : 0;
 }
 
 int meter_note_advert(int id, int rssi, long now, long window)
@@ -862,16 +867,21 @@ int meter_note_advert(int id, int rssi, long now, long window)
     * The two clocks are taken here rather than passed through, so a caller
     * cannot mix them up (see meterstore.h): `now` is the wall clock the
     * screen shows, mono_s() is the interval the throttle measures. Reading
-    * the stamp, deciding, and recording used to be three steps in the
-    * caller, and two scan callbacks for one meter -- which is exactly what a
-    * meter waking up delivers -- could both pass.
+    * READ, DECIDE AND RECORD IN ONE STEP, here: as three steps in the caller,
+    * two scan callbacks for one meter -- which is exactly what a meter waking
+    * up delivers -- can both pass the throttle.
     *
     * Whether the advert carried a usable RSSI at all is this caller's fact
     * (a scan result can arrive with none); whether the NUMBER is a plausible
     * signal is the store's, and it applies that rule to every write. */
    if (!meter_rt_advert_turn(id, now, mono_s(), rssi, 1, now, window))
       return 0;
-   meter_sync_save(); /* survives a restart */
+   /* "survives a restart" is a CLAIM, and it is this call that either makes
+    * it true or does not. An advert is delivered once: there is no second
+    * copy of this observation to write later, which is why the failure is
+    * said out loud and why the table remembers it is owed. */
+   if (meter_sync_save() != 0)
+      LOGW("meter %d: advert not persisted -- will retry", id);
    return 1;
 }
 
@@ -880,12 +890,12 @@ void meter_ui_of(int id, struct meter_ui *out)
    if (!out)
       return;
    /* ONE COPY, and everything the row shows comes out of it -- including the
-    * signal, which used to be a SECOND read (meter_rssi_of) taken after this
-    * one. Two reads of a record a binder thread is writing put a time from
-    * one instant beside a signal from another, on the same row.
+    * signal. A second read (meter_rssi_of) of a record a binder thread is
+    * writing puts a time from one instant beside a signal from another, on
+    * the same row.
     *
-    * The phase text is copied INTO the caller's struct for the same reason:
-    * it used to be a pointer into the table itself. */
+    * The phase text is copied INTO the caller's struct for the same reason: a
+    * pointer into the table is a string that changes while it is drawn. */
    struct meter_rt rt;
    int have     = meter_rt_read(id, &rt);
    out->sync_t  = have ? rt.sync_t : 0;
@@ -902,9 +912,9 @@ void meter_ui_of(int id, struct meter_ui *out)
 
 /* THE METER'S OWN DEVICE-INFORMATION STRINGS, set through here.
  *
- * These used to be handed out as raw `char *` for the reading path to write
- * into, which put the sanitising rule -- and the knowledge of how long the
- * buffer is -- in a different file from the buffer. The value arrives from a
+ * A SETTER, not a raw `char *` handed to the reading path: that would put the
+ * sanitising rule -- and the knowledge of how long the buffer is -- in a
+ * different file from the buffer. The value arrives from a
  * GATT characteristic on a binder thread: it is a stranger's bytes. A comma
  * would split the provenance row it is written into, a control character
  * would corrupt the single-line file, and either survives forever in an
@@ -931,6 +941,35 @@ void meter_set_dis(int which, const char *val)
    mutex_unlock(&mdis_lk);
 }
 
+/* THE TRANSPORT'S ANSWER TO A REQUEST THE METER PROTOCOL MADE.
+ *
+ * DROPPED FOR A METER LINK, these completions leave a write the stack refused
+ * -- characteristic not found, link replaced, writeCharacteristic false --
+ * with otble waiting for an answer to a request that never went out.
+ *
+ * ONLY OT_WRITE's OWN COMPLETIONS ARE THE PROTOCOL'S. The same link also
+ * carries the CCCD write behind ot_drv_subscribe (reported under the NOTIFY
+ * characteristic's uuid) and the Device Information reads queued beside it; a
+ * failure on any of those is not a failed COMMAND, and treating it as one
+ * would end a session that is proceeding perfectly well. A subscribe that
+ * fails is reported for OT_NOTIFY and matters just as much, so it is passed
+ * on too -- the protocol is in P_SUB then and has a request outstanding.
+ *
+ * The generation is read HERE rather than carried through Java: the transport
+ * has no idea what a request is, and the only thing that can go stale between
+ * the write and its completion is another exchange starting -- which bumps
+ * the generation, so passing the CURRENT one means a completion arriving
+ * after that is matched against a request that has gone and is ignored,
+ * which is exactly the intent. */
+static void meter_hook_written(const char *uuid, int status)
+{
+   if (!uuid)
+      return;
+   if (strcmp(uuid, OT_WRITE) != 0 && strcmp(uuid, OT_NOTIFY) != 0)
+      return;
+   ot_on_written(ot_request_gen(), status == 0);
+}
+
 /* The two files the meter runtime owns (see meterstore.h). */
 /* THE METER'S HALF OF THE ROUTING, registered once so the driver can dispatch
  * a callback to whichever state machine owns the link without knowing what a
@@ -942,6 +981,7 @@ static const struct driver_meter_ops g_meter_ops = {
     .on_connected    = ot_on_connected,
     .on_disconnected = ot_on_disconnected,
     .on_notify       = ot_on_notify,
+    .on_written      = meter_hook_written,
 };
 
 void meter_register_ops(void)
@@ -954,15 +994,29 @@ int meter_paths(const char *dir)
    int ok = 1;
    char idx[256];
    char sync[256];
-   ok &= data_path(idx, sizeof idx, dir, "/meter.idx");
-   ok &= data_path(sync, sizeof sync, dir, "/meter.sync");
+   if (!(data_path(idx, sizeof idx, dir, "/meter.idx")))
+      ok = 0;
+   if (!(data_path(sync, sizeof sync, dir, "/meter.sync")))
+      ok = 0;
    meter_store_paths(idx, sync);
    return ok;
 }
 
-void meter_state_load(void)
+/* ---- WHAT THE METER'S OWN FILES SAID ------------------------
+ *
+ * THE TYPED ANSWER REACHES STARTUP. A wrapper that swallowed it -- `void
+ * meter_state_load(void) { meter_sync_load(); }` -- would make a meter.sync
+ * that could not be read look exactly like a first run. What that costs: LAST
+ * SEEN and the signal beside it come back blank or wrong, the re-arm throttle
+ * loses its cooldown and re-syncs a meter
+ * that has just been synced, and nothing anywhere says the file was the
+ * problem.
+ *
+ * The answer travels now, and startup folds it into the same load_worse
+ * aggregate every other file's answer goes through (main.c). */
+enum load_result meter_state_load(void)
 {
-   meter_sync_load();
+   return meter_sync_load();
 }
 
 /* PAIR a meter that has just been registered: seed its record index, take a
@@ -982,15 +1036,30 @@ void meter_state_load(void)
  * time. */
 int meter_pair(int id, const char *mac)
 {
-   /* Seed THIS meter's stored index. Without it the driver kept whatever
-    * last_index the previously synced meter left in its static state, so a
-    * newly paired meter with a higher counter had its oldest records skipped
-    * -- and ot_drv_done then persisted that skipped index under the new
+   char dt[DEVTAG_LEN];
+   /* Seed THIS meter's stored index. Without it the driver keeps whatever
+    * last_index the last synced meter left in its static state, so a
+    * newly paired meter with a higher counter has its oldest records skipped
+    * -- and ot_drv_done then persists that skipped index under the new
     * meter's id, making the loss permanent.
     *
     * otble's statics are otherwise only touched under driver_lock, from
     * jni_notify / jni_disconnected on a binder thread. */
-   driver_meter_seed_index(meter_index_load(id));
+   {
+      /* The same distinction as meter_sync_start's: a file that
+       * could not be read is not "nothing stored". Here the seed only
+       * REPLACES what otble already holds for this link, so an unreadable
+       * file leaves the driver's current index alone rather than resetting
+       * it to -1. */
+      int seed             = -1;
+      enum load_result how = meter_index_load(id, &seed);
+      if (how != LOAD_ERROR)
+         driver_meter_seed_index(seed);
+      else
+         LOGW("meter %d: the stored index could not be read; the driver "
+              "keeps the index it has",
+              id);
+   }
    mutex_lock(&mdis_lk); /* the lock pancra_devinfo writes these under */
    g_meter_model[0] = 0;
    g_meter_fw[0]    = 0;
@@ -998,9 +1067,9 @@ int meter_pair(int id, const char *mac)
 
    int mlink = meter_alloc_link(mac);
    /* BOTH bounds, as meter_sync_start does: the arm table is indexed by this
-    * below, and only the lower one used to be checked. */
+    * below, so a value at or past LINK_MAX is a write off the end. */
    if (mlink < 0 || mlink >= LINK_MAX) {
-      LOGI("meter %s: no free link to pair on", mac);
+      LOGI("meter dev %s: no free link to pair on", devtag(mac, dt));
       return 0;
    }
    meter_link_set(mlink, 1);
@@ -1016,12 +1085,22 @@ int meter_pair(int id, const char *mac)
     * prompts for it, and a prompt that arrives while the user is still
     * looking at this screen is one they can actually answer. */
    dexble_create_bond(mac);
-   LOGI("registered meter id=%d mac=%s on link %d; connecting to bond", id, mac,
-        mlink);
+   LOGI("registered meter id=%d dev %s on link %d; connecting to bond", id,
+        devtag(mac, dt), mlink);
    if (dexble_meter_connect(mlink, mac))
       return 1;
-   LOGI("meter %s: pairing connect did not reach the transport", mac);
+   LOGI("meter dev %s: pairing connect did not reach the transport",
+        devtag(mac, dt));
    meter_release_link(mlink);
    msess_end(mlink, 0);
    return 0;
+}
+
+/* THE LINK'S ROLE, which decides where its GATT callbacks go. Kept by the
+ * driver because the driver's own callbacks read it -- a str_snapshot racing
+ * a strcmp really can be read half-written, which would mis-identify the
+ * meter that just connected. */
+void meter_link_set(int link, int on)
+{
+   driver_link_set_meter(link, on);
 }

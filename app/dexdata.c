@@ -29,17 +29,6 @@ static uint16_t le16(const uint8_t *p)
    return (uint16_t)((unsigned)p[0] | (unsigned)p[1] << 8U);
 }
 
-/* Decode one 9-byte backfill/EGV record. */
-int dexdata_record(const uint8_t rec[9], struct dex_record *out)
-{
-   out->timestamp    = le32(rec);
-   uint16_t g        = le16(rec + 4);
-   out->display_only = ((unsigned)g & 0xf000U) != 0;
-   out->glucose      = (unsigned)g & 0x0fffU;
-   memcpy(out->status, rec + 6, 3);
-   return 1;
-}
-
 /* Decode a stream of concatenated 9-byte records (a backfill notification may
  * hold several). Writes up to max records; returns the count. */
 int dexdata_records(const uint8_t *buf, size_t len, struct dex_record *out,
@@ -68,6 +57,17 @@ int dexdata_egv(const uint8_t *p, size_t len, struct dex_egv *out)
    out->state        = p[14];
    out->trend        = (int8_t)p[15];
    out->predicted    = (unsigned)le16(p + 16) & 0x03ffU;
+   return 1;
+}
+
+/* Decode one 9-byte backfill/EGV record. */
+int dexdata_record(const uint8_t rec[9], struct dex_record *out)
+{
+   out->timestamp    = le32(rec);
+   uint16_t g        = le16(rec + 4);
+   out->display_only = ((unsigned)g & 0xf000U) != 0;
+   out->glucose      = (unsigned)g & 0x0fffU;
+   memcpy(out->status, rec + 6, 3);
    return 1;
 }
 

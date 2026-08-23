@@ -3,12 +3,10 @@
  * Copyright 2026 Jakob Kastelic
  *
  * `sync` is the third program in this repo and the only one that knows about
- * users. The single-user viewer this replaced served ONE person's text files
- * with no notion of who is asking; sync holds many people's records in one
- * sqlite file, takes them from a paired phone over an authenticated channel,
- * and shows them behind a login. It runs on its OWN port and touches neither
- * data.txt nor units.txt, so the old pair keeps running untouched until this
- * one has earned the swap.
+ * users. It holds many people's records in one sqlite file, takes them from
+ * a paired phone over an authenticated channel, and shows them behind a
+ * login. It runs on its OWN port and touches neither data.txt nor units.txt,
+ * so the single-user viewer beside it keeps running untouched.
  *
  * THE SPECIFICATION IS lib/wirevec.h, and it is EXECUTABLE. This header is
  * the server's half of the protocol; the app implements the same protocol
@@ -23,19 +21,17 @@
  * that are NOT routes, and the wire's limits.
  *
  * AND BOTH IMPLEMENTATIONS CONSUME IT THROUGH THE CODE THAT SHIPS, which is
- * the part that is easy to get wrong: srv/test/wiretest.c drives the
- * server's own route grammar (route.c), its own signing string (sigstr.c)
- * and the label and length constants below; app/test/interoptest.c drives
- * the app's canonicaliser, path builders, signing string and confirmation
- * tags, and then sends every route vector to a running server. Checked
- * against a copy of the rule written in the test instead, a vector cannot
- * notice a change made to BOTH implementations at once -- which is the only
- * drift two independent implementations cannot catch by themselves.
- * srv/test/synctest.sh pins the bucket hash from the server side.
+ * the part that is easy to get wrong: a vector is worth something only when it
+ * is fed to the server's own route grammar (route.c) and signing string
+ * (sigstr.c), and to the app's own canonicaliser, path builders and
+ * confirmation tags. Checked against a copy of the rule written out beside the
+ * vector instead, it cannot notice a change made to BOTH implementations at
+ * once -- which is the only drift two independent implementations cannot catch
+ * by themselves.
  *
  * The limits below are _Static_asserted against it, so a bound cannot be
- * raised here while a phone in the field goes on refusing what it was built
- * to refuse.
+ * raised here while a phone in the field goes on refusing what its own build
+ * refuses.
  *
  * A vector is PERMANENT. Changing one is changing the protocol, which every
  * phone already in the field disagrees with. Do not edit a vector to make a
@@ -52,40 +48,49 @@
  * a ring through all of them. The protocol is not the program. */
 struct http_conn;
 
+#include "pairtag.h" /* the key-confirmation tag: ONE construction */
+#include "wireint.h" /* int64_t and PRIwire: the wire's scalars, exactly */
 #include "wirevec.h" /* WV_LIMIT_*: the wire's own numbers, pinned */
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
-/* ---- THE MACHINE THIS PROTOCOL ASSUMES ------------------------------
+/* ---- THE MACHINE THIS PROTOCOL ASSUMES: NONE ------------------------
  *
- * DECLARED, NOT DISCOVERED. Every id, timestamp and bucket in this protocol
- * is a C `long`: the app writes them into signed request text and into rows,
- * the server binds them to sqlite's 64-bit integers, and both sides print and
- * parse them with %ld. That is correct on LP64 -- aarch64-linux-android and
- * every supported server target -- and quietly wrong anywhere `long` is 32
- * bits, where a bucket number is fine, a user id is fine for a while, and a
- * timestamp stops being representable in 2038 while the code still compiles
- * and the tests still pass. A boundary that is real but unstated is one
- * somebody crosses by building on a machine nobody tried.
+ * ASSUMING LP64 -- every id, timestamp and bucket a C `long`, printed and
+ * parsed with %ld, with a _Static_assert(sizeof(long) >= 8) on each half to
+ * make that safe by REFUSING TO BUILD anywhere else -- is sound reasoning to
+ * a backwards conclusion. The wire is decimal text: it carries no widths, no
+ * ABI and no data model, and the one thing an interchange format must not
+ * depend on is a property of the two machines exchanging it. Such an
+ * assertion buys a guarantee that a 32-bit build cannot be wrong, at the
+ * price of never being able to exist -- and the failure it defends against (a
+ * timestamp that stops being representable in 2038, with the code still
+ * compiling and the tests still passing) is a consequence of the TYPE, not of
+ * the machine.
  *
- * So it is stated here, and the compiler enforces it on BOTH halves (the app
- * asserts the same thing in app/sync.h). The alternative -- migrating every
- * persisted and wire value to int64_t and verifying each ABI -- is a larger
- * change than the one this program needs; what it needs is to fail loudly on
- * a machine it was never going to work on.
+ * So these domains are int64_t, printed and parsed with PRIwire/SCNwire from
+ * lib/wireint.h, which both halves include -- the app cannot use
+ * <inttypes.h> at all, being freestanding, and one spelling shared by two
+ * independent implementations is the point of lib/wirevec.h.
  *
- * The Android artifact is arm64-v8a ALONE, for the same reason: it is the
- * only ABI this is built and tested for, apkcheck.sh refuses a package with
- * any other, and a 32-bit armeabi-v7a build would be exactly the silent
- * 2038 case. */
-_Static_assert(sizeof(long) >= 8,
-               "LP64 only: every id, timestamp and bucket on this wire is a "
-               "C long, and a 32-bit one stops representing a timestamp in "
-               "2038 without failing to compile");
+ * THE WIRE AND THE FILES ARE UNAFFECTED: the text is decimal digits either
+ * way, so every stored row, every signed request and every phone in the field
+ * parses identically. This is a statement about C types, and the format has
+ * no opinion about those.
+ *
+ * A leftover %ld is only VISIBLE when the protocol units are compiled for a
+ * data model this program does not run on (an ILP32 or an LLP64 one): on LP64,
+ * %ld and PRIwire are the same three characters and no diagnostic is
+ * possible.
+ *
+ * The Android artifact is arm64-v8a ALONE -- the only ABI this is built and
+ * tested for -- but that is a packaging decision rather than a correctness
+ * one. */
 _Static_assert(sizeof(time_t) >= 8,
                "a 32-bit time_t is the 2038 problem, and this program stores "
-               "instants");
+               "instants -- note this is about the SERVER'S clock, not the "
+               "wire: what travels is int64_t (lib/wireint.h)");
 _Static_assert((char)-1 < 0 || 1,
                "signedness of char is not assumed anywhere here");
 
@@ -122,14 +127,14 @@ _Static_assert(USER_ROWS == WV_LIMIT_USER_ROWS, "rows per account moved");
  * truncating differently on one side makes pairing fail against every phone
  * and succeed against a partner with the same bug, which is what the vectors
  * in lib/wirevec.h exist to catch. */
-#define CONFIRM_HEX 32
-/* THE TWO LABELS the tags are taken over. Named, not typed out at the call
- * site: they are protocol constants, they are the only thing distinguishing
- * the two tags, and a typo in one of them fails against every correct phone
- * while succeeding against a partner with the same typo. lib/wirevec.h pins
- * them and srv/test/wiretest.c compares these against it. */
-#define CONFIRM_LABEL_SERVER "pancra-confirm-server"
-#define CONFIRM_LABEL_CLIENT "pancra-confirm-client"
+/* THE LENGTH AND THE LABELS ARE lib/pairtag.h's, and so is the
+ * construction. This side and the app's had a copy each -- four places for
+ * one rule -- and the copies checked nothing about each other; what checks
+ * them is lib/wirevec.h, which both sides compare against. The names below
+ * stay because this header is what the server's own code reads. */
+#define CONFIRM_HEX          PAIR_TAG_HEX
+#define CONFIRM_LABEL_SERVER PAIR_TAG_LABEL_SERVER
+#define CONFIRM_LABEL_CLIENT PAIR_TAG_LABEL_CLIENT
 _Static_assert(PAIR_PKT == WV_LIMIT_PAIR_PKT, "the pairing packet moved");
 _Static_assert(CONFIRM_HEX == WV_D_CONFIRM_HEX,
                "the key-confirmation tag changed length");
@@ -150,9 +155,9 @@ _Static_assert(NONCE_MAX == WV_LIMIT_NONCE_MAX, "the nonce ceiling moved");
 #define VALIDATOR_HEX 32 /* chars: the half only its hash is kept */
 /* HOW MANY LIVE COOKIES ONE ACCOUNT MAY HOLD AT ONCE, and why this number.
  *
- * A session row is a bearer credential that lasts a YEAR, and until now
- * nothing ever removed one except the browser that held it presenting it
- * again -- so signing in from a machine you never open again left a live
+ * A session row is a bearer credential that lasts a YEAR, and the only
+ * thing that removes one is the browser that holds it presenting it again --
+ * so signing in from a machine you never open again would leave a live
  * credential behind for twelve months, invisible to its owner. The cap is
  * what turns "sessions I have forgotten about" into a bounded set.
  *
@@ -162,10 +167,10 @@ _Static_assert(NONCE_MAX == WV_LIMIT_NONCE_MAX, "the nonce ceiling moved");
  * tablet, laptop, desktop, one machine at work -- and each of those can hold
  * more than one (Safari and Chrome on the same phone are two), while clearing
  * a cookie jar or using a private window mints a row without retiring the one
- * it replaces. Five is therefore too low: it would sign people out of devices
- * they are still using, which is the failure that makes a cap worse than none.
- * Much higher and it bounds nothing a year of ordinary use would ever reach,
- * which is a cap that exists only in the source.
+ * it stands in for. Five is therefore too low: it would sign people out of
+ * devices they are still using, which is the failure that makes a cap worse
+ * than none. Much higher and it bounds nothing a year of ordinary use would
+ * ever reach, which is a cap that exists only in the source.
  *
  * WHICH ONE GOES is decided by `last_seen`, so the row revoked is literally
  * the credential that has gone longest without being used -- the closest this
@@ -189,12 +194,10 @@ _Static_assert(NONCE_MAX == WV_LIMIT_NONCE_MAX, "the nonce ceiling moved");
  * aged out two weeks ago cannot keep its owner from minting a new one. */
 #define MAX_LIVE_TOKENS MAX_FOLLOWERS
 #define TOKEN_HEX       32
-/* What `sync invite` prefixes a token with. The server cannot discover its own
- * public name -- nothing in a request is trustworthy enough to build a link
- * people click -- so it is a build-time default, overridable at run time with
- * SYNC_BASE_URL for anyone running their own instance. */
-#define BASE_URL_DEFAULT "https://pancra.org"
-#define TOKEN_TTL        (14 * 24 * 3600L)
+/* (THE INVITATION LINK'S ORIGIN IS NOT HERE: one installation has one public
+ * name, and it is public_origin() in srv/util.h, read from PANCRA_ORIGIN and
+ * validated once at startup. Every link printed anywhere is built from it.) */
+#define TOKEN_TTL (14 * 24 * 3600L)
 
 /* Password hashing. PBKDF2-HMAC-SHA256 because the board has ~19 MB free:
  * argon2 at any honest memory cost does not fit, and the server is
@@ -224,6 +227,18 @@ _Static_assert(NONCE_MAX == WV_LIMIT_NONCE_MAX, "the nonce ceiling moved");
  * login may be, it is the line past which the value cannot have been written
  * by this program. The floor is the smallest count anyone could deliberately
  * have configured, and it is still far above zero. */
+/* ---- WHICH KDF MADE A STORED HASH ---------------------------
+ *
+ * The row carries this so a future algorithm can coexist with today's during
+ * a rolling upgrade: each row is verified by ITS OWN function, and a
+ * successful login re-derives it under the current one. Never renumber -- the
+ * number is in every user row this server has ever written.
+ *
+ *   1  PBKDF2-HMAC-SHA256, pw_iters rounds, PW_SALT_LEN salt, PW_HASH_LEN out
+ */
+#define PW_KDF_PBKDF2_SHA256 1
+#define PW_KDF_CURRENT       PW_KDF_PBKDF2_SHA256
+
 #define PW_ITERS_MIN 1000
 #define PW_ITERS_MAX 1000000
 #define PW_SALT_LEN  16
@@ -238,13 +253,13 @@ struct db; /* db.h; a request names the database it is about */
 
 struct req {
    /* WHICH DATABASE this request is about. Handed to the server at startup
-    * and copied in here per request, so a handler cannot reach storage it was
-    * not given -- it used to reach the one process-wide database that
-    * existed, because there was no way to ask for any other. */
+    * and copied in here per request, so a handler cannot reach storage
+    * nothing gave it. Held process-wide instead, there is no way for a handler
+    * to name any database but the one that exists. */
    struct db *db;
    /* THE CONNECTION, not just its socket. A bare fd does not say whether the
-    * bytes written to it need encrypting -- that used to be answered by a
-    * process-wide global. */
+    * bytes written to it need encrypting, and a process-wide global answers
+    * it for every connection at once. */
    const struct http_conn *c;
    /* A RESPONSE BUILT UNDER THE PAGE LOCK AND SENT WITHOUT IT.
     *
@@ -272,12 +287,12 @@ struct req {
    char *hdr;        /* the header block, NUL-terminated at the blank line */
    char *body;
    size_t body_len;
-   long uid; /* authenticated user, or 0 */
+   int64_t uid; /* authenticated user, or 0 */
    /* "?who=<id>" when this request is viewing SOMEONE ELSE'S record, else "".
     * Every link that must stay on that record appends it. Without it a
     * follower lost the record at the first click: /units and /plots resolved
     * to the viewer's own (empty) record and showed nothing. */
-   char who[32]; /* fits "?who=" + any long */
+   char who[32]; /* fits "?who=" + any int64_t */
 };
 
 #endif

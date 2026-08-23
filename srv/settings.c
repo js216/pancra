@@ -2,12 +2,15 @@
  * settings.c --- the settings page
  * Copyright 2026 Jakob Kastelic
  */
-#include "auth.h"
+#include "authsess.h"
+#include "authshare.h"
+#include "authuser.h"
 #include "db.h"
 #include "http.h"
 #include "oops.h"
 #include "page.h"
 #include "pair.h"
+#include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
 #include "util.h"
 #include <sqlite3.h>
 #include <stdio.h>
@@ -27,9 +30,9 @@ static const int TZ_MIN[] = {-720, -660, -600, -570, -540, -480, -420, -360,
 
 /* ---- IS THIS ONE OF THE OFFSETS WE OFFER? -----------------------------
  *
- * The handler used to do `strtol(tz, NULL, 10)` and store the result: no end
- * pointer, no range test, no membership test, then narrowed to int and reported
- * as "Time zone saved." So every one of these was accepted and persisted:
+ * `strtol(tz, NULL, 10)` and store the result -- no end pointer, no range
+ * test, no membership test, narrowed to int and reported as "Time zone saved."
+ * -- accepts and persists every one of these:
  *
  *   "5abc"      -> 5      (strtol stops at the letter and does not say so)
  *   "  -60"     -> -60    (leading space)
@@ -79,8 +82,8 @@ static int tz_canonical(const char *s, int *out)
     * anything is decoration. */
    if (*p == '0' && (p[1] || neg))
       return 0;
-   long v = 0;
-   int nd = 0;
+   int64_t v = 0;
+   int nd    = 0;
    for (; *p; p++) {
       if (*p < '0' || *p > '9')
          return 0; /* trailing text: "5abc" is not 5 */
@@ -92,12 +95,11 @@ static int tz_canonical(const char *s, int *out)
        * NOT REACHABLE THROUGH THE ONLY CALLER TODAY, and deliberately kept
        * anyway. The handler reads the field into `char tz[16]`, and
        * form_field REFUSES anything that would not fit rather than truncating
-       * it (it used to truncate; see util.h), so at most fifteen digits ever
-       * arrive here and fifteen cannot overflow a long -- the membership scan
-       * would refuse them all on its own. That means no end-to-end case can
-       * distinguish this line from its absence (srv/test/synctest.sh cannot
-       * kill it, and says so). It stays because it is what makes the FUNCTION
-       * safe rather than the buffer: widen tz[] to 24 bytes for any reason, and
+       * it (see util.h), so at most fifteen digits ever arrive here and
+       * fifteen cannot overflow a long -- the membership scan
+       * would refuse them all on its own. No end-to-end case can distinguish
+       * this line from its absence. It stays because it is what makes the
+       * FUNCTION safe rather than the buffer: widen tz[] to 24 bytes for any reason, and
        * without this line the accumulator overflows on input a stranger
        * chooses. */
       if (++nd > 4)
@@ -117,10 +119,18 @@ static int tz_canonical(const char *s, int *out)
    return 0;
 }
 
-void h_settings(struct req *r, long me, const char *cookie, const char *note)
+void h_settings(struct req *r, int64_t me, const char *cookie, const char *note)
 {
    char email[256], esc[300] = {0}, csrf[64];
-   email_of(r->db, me, email, sizeof email);
+   /* THE PAGE IS ABOUT THIS ACCOUNT, so it cannot be drawn without knowing
+    * which one. It also carries the DELETE form, whose confirmation is typing
+    * the address -- rendering that form beside a blank identity invites
+    * somebody to confirm a deletion for an account the server could not
+    * name. */
+   if (email_of(r->db, me, email, sizeof email) == DB_GET_FAIL) {
+      oops_busy(r);
+      return;
+   }
    html_esc(esc, sizeof esc, email);
    csrf_token(cookie, csrf, sizeof csrf);
 
@@ -131,9 +141,21 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
       sb_add(&s, "<p><strong>%s</strong></p>", note);
    sb_add(&s, "<p>Signed in as %s</p>", esc);
 
-   /* The paired app. */
+   /* ---- THE PAIRED APP, AND THE THIRD ANSWER ---------------
+    *
+    * pair_is_paired answers 1 / 0 / -1, and this said `if (...)`. A database
+    * that could not be read therefore rendered as PAIRED -- which is the one
+    * answer that blocks recovery: the page then offers "unpair first" and no
+    * code, so a user whose app is NOT paired cannot pair it, and the reason
+    * is a storage fault nothing on the page mentions. */
    sb_add(&s, "<h2>App</h2>");
-   if (pair_is_paired(r->db, me)) {
+   int paired = pair_is_paired(r->db, me);
+   if (paired < 0) {
+      sb_add(&s, "<p>The pairing state could NOT BE READ from the database, "
+                 "so this page cannot say whether an app is paired. Nothing "
+                 "has been changed. Reload in a moment; if it persists, the "
+                 "server's storage is the place to look.</p>");
+   } else if (paired) {
       sb_add(&s,
              "<p>An app is paired. To pair a different one, unpair first.</p>"
              "<form method=post action=\"/settings/unpair\">"
@@ -144,21 +166,21 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
       sqlite3_stmt *st =
           db_prep(r->db, "SELECT code,expires_at FROM pairing WHERE user_id=?");
       char code[16] = {0};
-      long exp      = 0;
+      int64_t exp   = 0;
       if (st) {
          sqlite3_bind_int64(st, 1, me);
          if (sqlite3_step(st) == SQLITE_ROW) {
             const char *c = (const char *)sqlite3_column_text(st, 0);
             snprintf(code, sizeof code, "%s", c ? c : "");
-            exp = (long)sqlite3_column_int64(st, 1);
+            exp = (int64_t)sqlite3_column_int64(st, 1);
          }
          sqlite3_finalize(st);
       }
-      if (code[0] && exp > (long)time(NULL))
+      if (code[0] && exp > (int64_t)time(NULL))
          sb_add(&s,
                 "<p class=code>%s</p><p>Type this into the app within "
-                "%ld minutes.</p>",
-                code, (exp - (long)time(NULL) + 59) / 60);
+                "%" PRIwire " minutes.</p>",
+                code, (exp - (int64_t)time(NULL) + 59) / 60);
       sb_add(&s,
              "<form method=post action=\"/settings/pair\">"
              "<input type=hidden name=csrf value=\"%s\">"
@@ -211,12 +233,12 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
 
    /* Live share links, shown as the invited person will receive them.
     *
-    * FROM THE CONFIGURED ORIGIN, NEVER THE REQUEST'S. This used to read the
-    * request's own `Host` header, on the argument that the server "has no other
+    * FROM THE CONFIGURED ORIGIN, NEVER THE REQUEST'S. Reading the request's own
+    * `Host` header is tempting, on the argument that the server "has no other
     * way to know what it is called from outside" -- which is true, and is
-    * exactly why it has to be told rather than asked. The value was escaped for
-    * HTML, so it was never an injection; it was worse than that. These links
-    * carry a LIVE SINGLE-USE TOKEN, so an authenticated request arriving with
+    * exactly why it has to be told rather than asked. Escaping the value for
+    * HTML makes it not an injection; the problem is worse than that. These
+    * links carry a LIVE SINGLE-USE TOKEN, so an authenticated request with
     * `Host: evil.example` -- through a permissive proxy, or a second name
     * pointed at this address -- rendered `https://evil.example/invite/<token>`
     * on the owner's own settings page. The owner copies what the page shows and
@@ -236,7 +258,7 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
                       " AND expires_at>? ORDER BY created_at DESC");
    if (tk) {
       sqlite3_bind_int64(tk, 1, me);
-      sqlite3_bind_int64(tk, 2, (long)time(NULL));
+      sqlite3_bind_int64(tk, 2, (int64_t)time(NULL));
       int any = 0;
       int trc;
       while ((trc = sqlite3_step(tk)) == SQLITE_ROW) {
@@ -267,7 +289,7 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
    /* The STORED setting, not the resolved one: the box showed the offset the
     * app happened to be reporting, so "follow the phone" looked like a
     * deliberate choice of UTC. */
-   long tz_set = 0;
+   int64_t tz_set = 0;
    /* THE SETTINGS PAGE IS THE ONE PAGE THAT MUST NOT GUESS. A database that
     * cannot report the stored offset is not a user who has not chosen one:
     * shown as "not set" the page presents "follow the phone" as a deliberate
@@ -356,12 +378,20 @@ void h_settings(struct req *r, long me, const char *cookie, const char *note)
  * including `password`, `delete` and `revoke` -- reachable by PUT, PATCH,
  * DELETE and HEAD. There is no per-action method check to forget, because there
  * is no per-action method: this handler is only ever reached by POST. */
-void h_settings_post(struct req *r, long me, const char *cookie,
+void h_settings_post(struct req *r, int64_t me, const char *cookie,
                      const char *what)
 {
    if (!strcmp(what, "pair")) {
       char code[16];
-      if (pair_is_paired(r->db, me))
+      /* THE THIRD ANSWER IS NOT "PAIRED". Read as one, a database
+       * fault told the user to unpair an app that may not exist -- and
+       * unpairing is the one action that would then also fail, so the
+       * recovery it points at is a dead end. A 500 says what happened and
+       * invites the retry that is actually the right move. */
+      int paired = pair_is_paired(r->db, me);
+      if (paired < 0)
+         oops(r);
+      else if (paired)
          h_settings(r, me, cookie, "Unpair the current app first.");
       else if (pair_code_new(r->db, me, code, sizeof code))
          h_settings(r, me, cookie, "Type the code into the app.");
@@ -377,9 +407,9 @@ void h_settings_post(struct req *r, long me, const char *cookie,
        * pair_reset(), which jpake_free()s the in-flight object: a use-after-
        * free on a crypto context while another worker is mid-round. Clicking
        * Unpair on the website while a phone was pairing was enough. */
-      pair_lock();
+      /* NO LOCK HERE: pair_unpair takes it, so a handler cannot forget to --
+       * which is the use-after-free described above. */
       int unpaired = pair_unpair(r->db, me);
-      pair_unlock();
       /* SAY WHAT HAPPENED. "The app is unpaired" after a failed delete is a
        * revocation the user believes in and the server did not perform: the
        * phone's key goes on signing requests. */
@@ -407,19 +437,18 @@ void h_settings_post(struct req *r, long me, const char *cookie,
        * for everything but FORM_OK. */
       /* FIVE ANSWERS NOW, AND ONLY ONE OF THEM IS A SETTING.
        *
-       * `present` used to be the decoder's single bit. The distinction it drew
-       * -- "tz=" (the <select>'s deliberate "follow the data" choice) versus
-       * no tz field at all (a body this form never produces) -- is still
-       * exactly the FORM_OK/FORM_ABSENT distinction, and is preserved.
+       * `present` is the FORM_OK/FORM_ABSENT distinction, which is the one a
+       * single decoder bit can draw: "tz=" (the <select>'s deliberate "follow
+       * the data" choice) versus no tz field at all (a body this form never
+       * produces).
        *
-       * What it could not draw is the other three. tz is a `char[16]`, so
-       * item 47 measured the truncation case here: a value longer than 15
-       * bytes was CLIPPED, and it happened not to be able to clip into
-       * something tz_canonical accepts, because the clip lands in the
-       * still-encoded text and a cut "%"-escape decodes to literal
-       * characters. That was a fact about where the cut fell, not a rule.
-       * FORM_TOO_LONG makes it a rule, and it now refuses instead of
-       * validating the wrong string. */
+       * The other three it cannot draw. tz is a `char[16]`, and the
+       * truncation case was measured here: a value longer than 15 bytes gets
+       * CLIPPED, and it happens not to be able to clip into something
+       * tz_canonical accepts, because the clip lands in the still-encoded
+       * text and a cut "%"-escape decodes to literal characters. That is a
+       * fact about where the cut falls, not a rule. FORM_TOO_LONG makes it a
+       * rule: refused, rather than validating the wrong string. */
       enum form_field ftz =
           form_field(r->body, r->body_len, "tz", tz, sizeof tz);
       int present = ftz == FORM_OK;
@@ -512,7 +541,14 @@ void h_settings_post(struct req *r, long me, const char *cookie,
                     "was deleted.");
          return;
       }
-      email_of(r->db, me, mine, sizeof mine);
+      /* AND THE CONFIRMATION ITSELF. The comment below is about "" == ""
+       * comparing equal; this is the other half of it -- a database that
+       * could not answer must not reach that comparison at all, whatever it
+       * left in the buffer. */
+      if (email_of(r->db, me, mine, sizeof mine) != DB_GET_VALUE) {
+         oops_busy(r);
+         return;
+      }
       /* BOTH must be non-empty, not merely equal.
        *
        * email_of writes "" and returns on any failure -- no row, a prepare
@@ -521,23 +557,22 @@ void h_settings_post(struct req *r, long me, const char *cookie,
        * every table cascading with it, on a request that proved nothing. The
        * typed-confirmation is the strongest guard in the product; it must not
        * be satisfiable by two absences. */
-      if (!mine[0] || !typed[0] || strcasecmp(typed, mine)) {
+      if (!mine[0] || !typed[0] || !sys_caseeq(typed, mine)) {
          h_settings(r, me, cookie,
                     "That is not your email; nothing was deleted.");
          return;
       }
-      /* One statement: every other table references user(id) with ON
-       * DELETE CASCADE, so the rows, the pairing, the sessions and the
-       * shares in BOTH directions go with it. */
-      sqlite3_stmt *st = db_prep(r->db, "DELETE FROM user WHERE id=?");
-      if (!st) {
-         oops(r);
-         return;
-      }
-      sqlite3_bind_int64(st, 1, me);
-      int ok = sqlite3_step(st) == SQLITE_DONE;
-      sqlite3_finalize(st);
-      if (!ok) {
+      /* THE OPERATION IS auth.c's, AND SO IS THE OPERATOR CLI's.
+       * Every other table references user(id) with ON DELETE CASCADE, so the
+       * rows, the pairing, the sessions and the shares in BOTH directions go
+       * with it -- and that being one statement is exactly why both surfaces
+       * must call the same one rather than each writing it out.
+       *
+       * NO SUCH ACCOUNT IS NOT AN ERROR HERE: this request arrived with a
+       * session for `me`, so the account being gone means somebody else
+       * deleted it in between -- and the answer to "delete my account" is
+       * then the same either way. */
+      if (user_delete_account(r->db, me) == USER_DELETE_FAIL) {
          oops(r);
          return;
       }
@@ -567,8 +602,8 @@ void h_settings_post(struct req *r, long me, const char *cookie,
                     "That is not an email address; no link was created.");
          return;
       }
-      /* THE INSERT USED TO BE RIGHT HERE, on its own, and nothing anywhere
-       * removed the row it made. share_token_mint prunes the dead rows and
+      /* THE INSERT IS NOT HERE ON ITS OWN, because nothing would then remove
+       * the row it makes. share_token_mint prunes the dead rows and
        * enforces the owner's quota in the same transaction; see auth.c for
        * why the quota REFUSES rather than replacing the oldest link. */
       switch (share_token_mint(r->db, me, email, token, sizeof token)) {
@@ -606,9 +641,9 @@ void h_settings_post(struct req *r, long me, const char *cookie,
    if (!strcmp(what, "revoke-link")) {
       char tok[TOKEN_HEX + 1];
       /* BEFORE THE DELETE. sqlite3_bind_text with -1 measures the value with
-       * strlen, so an embedded NUL made the row that is deleted differ from
+       * strlen, so an embedded NUL makes the row that is deleted differ from
        * the token that was sent -- and the buffer is exactly TOKEN_HEX + 1,
-       * so anything longer used to be clipped to a token-shaped prefix. */
+       * so anything longer would be clipped to a token-shaped prefix. */
       if (form_field(r->body, r->body_len, "token", tok, sizeof tok) !=
           FORM_OK) {
          h_settings(r, me, cookie,
@@ -647,7 +682,7 @@ void h_settings_post(struct req *r, long me, const char *cookie,
       int ok = 0; /* did the statement actually run? */
       if (st) {
          sqlite3_bind_int64(st, 1, me);
-         sqlite3_bind_int64(st, 2, strtol(who, NULL, 10));
+         sqlite3_bind_int64(st, 2, strtoll(who, NULL, 10));
          /* And it must have matched a row. SQLITE_DONE alone is true of a
           * DELETE that found nothing, so this reported a revocation that had
           * not happened -- see the note below. */

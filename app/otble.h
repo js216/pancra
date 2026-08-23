@@ -3,9 +3,9 @@
 // Copyright 2026 Jakob Kastelic
 
 /* Driver for the BLE OneTouch meters (Verio Flex / Reflect / Select Plus Flex
- * / Ultra Plus Flex). Like dexdriver.c this has NO Android/JNI dependency: the
- * transport supplies the ot_* hooks below, so the protocol can be exercised on
- * the host.
+ * / Ultra Plus Flex). Like the Dexcom driver this has NO Android/JNI
+ * dependency: the transport supplies the ot_* hooks below, so the protocol can
+ * be exercised on the host.
  *
  * A meter is not a CGM. It is only reachable while the user has it switched on
  * and advertising, and connecting keeps it awake past its own auto-power-off,
@@ -42,6 +42,27 @@ int ot_last_index(void);
 void ot_on_connected(void);
 void ot_on_disconnected(void);
 void ot_on_notify(const uint8_t *buf, int n);
+
+/* THE TRANSPORT'S ANSWER TO A REQUEST THIS DRIVER MADE. `ok` is 0
+ * when the write or the CCCD was refused outright -- the bytes never left the
+ * phone -- and `gen` names the request it belongs to (ot_request_gen at the
+ * time it was issued), so a completion from an abandoned exchange cannot end
+ * the live one. A failure ends the session WITHOUT advancing the durable
+ * record index: the next connect resumes the same walk. */
+void ot_on_written(unsigned gen, int ok);
+unsigned ot_request_gen(void);
+
+/* Give up on a request whose answer never arrived. `now_mono` is the caller's
+ * MONOTONIC clock (this file keeps none of its own, so it stays host-
+ * testable). Ends the session the same way a refused write does. */
+void ot_tick(long now_mono);
+
+/* How long an outstanding request may go unanswered. A meter answers in
+ * milliseconds when it answers at all; ten seconds is far past any real
+ * exchange and far short of the ~35 s a Verio stays awake after a
+ * fingerstick, so a wedged session ends while the meter is still there to be
+ * asked again. */
+#define OT_REPLY_S 10
 
 /* Seconds between the meter's epoch (2000-01-01) and the Unix epoch. Exposed
  * so the host can convert: utc = naive + OT_EPOCH - tz_offset. */

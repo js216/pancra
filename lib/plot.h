@@ -26,6 +26,17 @@ struct plot_pt {
    int hidden; /* 1 = do not draw (HIDE marker) */
    int size;   /* per-device marker size 1..N; 0 = default */
    uint32_t col;
+   /* HOW LONG THIS POINT LASTED, in seconds. 0 for everything that is an
+    * instant -- a reading, a dose, a weight -- which is all of them but
+    * exercise.
+    *
+    * A nonzero span draws a thin horizontal rule from the marker's right edge
+    * to where the span ENDS on the same axis the marker was placed on, so the
+    * plot shows a workout as something with a length rather than as a moment.
+    * It is deliberately drawn only when the span is wider than about two
+    * glyphs: shorter than that the rule is a smudge against the letter and
+    * says less than the letter alone. */
+   long span;
 };
 
 /* A drawn letter W, for logged body weights on the doses line.
@@ -40,6 +51,9 @@ struct plot_pt {
  * of the MARK_* shape codes, for the same reason that one is: these are
  * lettered glyphs the app asks for by name, not styling a user can choose. */
 #define PLOT_MARK_F 101
+/* A letter E, for a logged EXERCISE entry, numbered beside the other two and
+ * for the same reason. Unlike them it can carry a LENGTH: see `span`. */
+#define PLOT_MARK_E 102
 
 /* Vertical scale runs PLOT_GLU_MIN..(runtime max, default PLOT_GLU_MAX) mg/dL.
  */
@@ -167,7 +181,7 @@ void plot_render(struct plot_fb fb, struct plot_rect r,
  *
  * `split` deals markers that share one pixel column out to adjacent free
  * columns FOR THE PICK ONLY -- nothing moves on screen -- so two logged at the
- * same minute are both reachable instead of one shadowing the other. Pass it
+ * same minute are both reachable rather than one shadowing the other. Pass it
  * for a SPARSE series (the doses line: insulin and weights), never for the
  * glucose trace, where hundreds of samples legitimately share a column on a
  * multi-day span and the pick must stay a plain nearest-in-time. */

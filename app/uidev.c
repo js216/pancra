@@ -82,7 +82,7 @@ static int device_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
    char name[4 + sizeof s->label];
    (void)snprintf(name, sizeof name, "   %s", s->label);
    menu_row_at(fb, h, y, g->sc, g->lh, g->vrx, name, val,
-               s->connected ? 0xFF33FF88 : 0xFFAAAAAA, MA_SENSOR, i);
+               s->connected ? UI_OK : UI_FAINT, MA_SENSOR, i);
    /* The PRIMARY checkbox, for a CGM whose session is not over. Recorded
     * AFTER the row's own target and inside it: ui_hit_idx scans backwards,
     * so the box wins its own rectangle while the rest of the row still
@@ -90,19 +90,21 @@ static int device_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * neither can own the big number, and sensor_set_primary refuses both,
     * so offering the control would be a lie. */
    /* CENTRED ON THE ROW'S GLYPH, and drawn at row height rather than at
-    * letter height: the unticked box used to be a 5x7 outline in a grey
-    * that the eye simply skipped past, so the only box anyone could see was
-    * the ticked one -- and a radio column where only the current choice is
-    * visible offers no choice at all. */
+    * letter height. At letter height the unticked box is a 5x7 outline in a
+    * grey the eye skips past, so the only box anyone sees is the ticked one
+    * -- and a radio column where only the current choice is visible offers no
+    * choice at all. */
    if (s->kind == KIND_CGM && !cgm_expired(s)) {
       draw_checkbox(px, fb, g->cbx, y - ((g->cbs - g->gh) / 2), g->cbs, g->sc,
-                    s->primary, s->primary ? 0xFF33FF88 : 0xFFAAAAAA);
+                    s->primary, s->primary ? UI_OK : UI_FAINT);
       /* The target is the box's own rectangle, not a fixed line height:
        * the box is taller than a line now, and a target that stopped short
        * of it would leave its bottom edge dead. It still ends well above
        * the next row's target (pitch 24*g->sc), so no row is stolen. */
-      add_hit_ix(h, g->cbh, y - ((g->cbs - g->gh) / 2), fb->width - g->cbh,
-                 g->cbs, MA_PRIM_PICK, i);
+      add_hit_ix(h,
+                 ui_rect(g->cbh, y - ((g->cbs - g->gh) / 2), fb->width - g->cbh,
+                         g->cbs),
+                 MA_PRIM_PICK, i);
    }
    if (s->marker != MARK_HIDE) { /* hidden-from-plot draws no glyph */
       /* Centred in the reserved cell (text starts at 4*g->sc; the cell is the
@@ -127,9 +129,9 @@ static int device_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
  *
  * Its own function because it is a wrapper, not a layout: forty lines of
  * character arithmetic sitting in the middle of a screen renderer, sharing
- * nothing with it but `y`. The lines used to be hand-broken against a guessed
- * column budget, and the guess was a quarter too narrow on every geometry --
- * measuring beats guessing, and it self-corrects instead of being right once.
+ * nothing with it but `y`. Hand-breaking the lines against a guessed column
+ * budget runs a quarter too narrow on every geometry -- measuring beats
+ * guessing, and it self-corrects rather than being right once.
  */
 static int devices_explainer(struct ANativeWindow_Buffer *fb, int x, int rx,
                              int sc, int gh, int y)
@@ -174,7 +176,7 @@ static int devices_explainer(struct ANativeWindow_Buffer *fb, int x, int rx,
       for (int k = 0; k < n; k++)
          ln[k] = pexp[i + k];
       ln[n] = 0;
-      draw_str(px, fb, x, y, sc, ln, 0xFF888888);
+      draw_str(px, fb, x, y, sc, ln, UI_MUTED);
       y += gh + (2 * sc);
       i += take;
       while (pexp[i] == ' ')
@@ -198,9 +200,10 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx  = fb->width - (4 * sc);
    int y   = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "DEVICES", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_DEVICES_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "DEVICES", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_DEVICES_BACK,
+              0);
    y += 3 * lh; /* the DISPLAY menu's title gap -- the house style */
 
    /* THE PRIMARY COLUMN'S GEOMETRY, settled before anything that has to keep
@@ -244,12 +247,12 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * so the real sc is smaller and about a quarter more characters fit. The
     * paragraph ran short of the edge on every screen and needed a line it did
     * not need. Measuring beats guessing, and it self-corrects on any geometry
-    * instead of being right on one. */
+    * rather than being right on one. */
    y = devices_explainer(fb, x, rx, sc, gh, y);
 
-   /* The row the column header used to occupy, kept EMPTY. It is the air that
-    * separates the paragraph from the first device, and the list read as one
-    * more line of prose without it. Kept as a row rather than shrunk to a gap
+   /* ONE EMPTY ROW where a column header would go. It is the air that
+    * separates the paragraph from the first device, and without it the list
+    * reads as one more line of prose. Kept as a row rather than shrunk to a gap
     * so UI_DEV_ABOVE still counts exactly what the renderer spends.
     *
     * Below it: a checkbox per eligible CGM at the right edge, with rows
@@ -264,19 +267,19 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
       /* Too short a screen to show even the minimum honestly. Say so rather
        * than silently truncating, which would read as "these are all of them".
        */
-      draw_str(px, fb, x, y, sc, "SCREEN TOO SHORT", 0xFF4466FF);
+      draw_str(px, fb, x, y, sc, "SCREEN TOO SHORT", UI_DANGER);
       y += lh;
-      draw_str(px, fb, x, y, sc, "FOR DEVICE LIST", 0xFF4466FF);
+      draw_str(px, fb, x, y, sc, "FOR DEVICE LIST", UI_DANGER);
       return;
    }
    /* PAGINATE the live list, the same way OLD DEVICES does.
     *
-    * This used to draw the first `cap` devices and then a red "N MORE NOT
-    * SHOWN" row -- honest about the truncation, but it left those devices
-    * genuinely UNREACHABLE: there is no scrolling anywhere in this UI, so a
-    * device past the cut had no row, no tap target and no way to be opened,
-    * renamed, calibrated or forgotten. Naming the problem is not the same as
-    * not having it. Collect the live indices first, then show one page. */
+    * Drawing the first `cap` devices and then a red "N MORE NOT SHOWN" row is
+    * honest about the truncation and still leaves those devices genuinely
+    * UNREACHABLE: there is no scrolling anywhere in this UI, so a device past
+    * the cut has no row, no tap target and no way to be opened, renamed,
+    * calibrated or forgotten. Naming the problem is not the same as not having
+    * it. Collect the live indices first, then show one page. */
    int idxs[UI_MAX_SLOTS];
    int nlive_i = 0;
    int nold    = 0;
@@ -304,30 +307,34 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (m->dev.pend_type > 0) {
       /* An ARMED pairing: registered intent, no sensor on the air yet. The
        * row is the visible promise that the code was accepted and the app is
-       * watching -- and the tap is the way to change one's mind. */
+       * watching. Tapping it opens the STOP WAITING? confirmation -- the row
+       * wears a device's clothes, so a finger reaching for the new sensor
+       * must not be able to throw the pairing away on the way past. */
       char pn[24];
       (void)snprintf(pn, sizeof pn, " %s", sensor_type_name(m->dev.pend_type));
-      menu_row(fb, h, y, sc, lh, pn, "PENDING...", 0xFF00CCFF, MA_PEND_CANCEL,
-               0);
+      menu_row(fb, h, y, sc, lh, pn, "PENDING...", UI_WARN, MA_PEND_CANCEL, 0);
       y += lh;
    }
    int nlive = m->dev.nsensors - nold;
-   /* PAGE NAV, in place of the old "N MORE NOT SHOWN". Same shape as OLD
-    * DEVICES: "<" and ">" with the page count between them, drawn only when
-    * there IS more than one page so a short list stays quiet. */
+   /* PAGE NAV, rather than an "N MORE NOT SHOWN" the user cannot act on.
+    * Same shape as OLD DEVICES: "<" and ">" with the page count between them,
+    * drawn only when there IS more than one page so a short list stays
+    * quiet. */
    if (npages > 1) {
       if (page > 0) {
-         draw_str(px, fb, x, y, sc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, y - (3 * sc), fb->width / 3, lh, MA_DEVPAGE_PREV, 0);
+         draw_str(px, fb, x, y, sc, "<", UI_TEXT);
+         add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width / 3, lh),
+                    MA_DEVPAGE_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, y, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * sc), y, sc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, (2 * fb->width) / 3, y - (3 * sc), fb->width / 3, lh,
-                    MA_DEVPAGE_NEXT, 0);
+         draw_str(px, fb, rx - (6 * sc), y, sc, ">", UI_TEXT);
+         add_hit_ix(
+             h, ui_rect((2 * fb->width) / 3, y - (3 * sc), fb->width / 3, lh),
+             MA_DEVPAGE_NEXT, 0);
       }
       y += lh;
    }
@@ -340,7 +347,7 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
       char od[32];
       (void)snprintf(od, sizeof od, "OLD DEVICES (%d)", nold);
       y += lh;
-      menu_row(fb, h, y, sc, lh, od, ">", 0xFFAAAAAA, MA_OLDDEV_OPEN, 0);
+      menu_row(fb, h, y, sc, lh, od, ">", UI_FAINT, MA_OLDDEV_OPEN, 0);
       y += 2 * lh;
    }
    if (nlive < UI_MAX_SLOTS) {
@@ -348,7 +355,7 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
        */
       y += lh; /* separate it from the device list above */
       menu_button(fb, h, x, y, fb->width - (2 * x), sc, "ADD NEW DEVICE",
-                  0xFFFFFFFF, MA_ADDSENSOR, 0);
+                  UI_TEXT, MA_ADDSENSOR, 0);
    }
 }
 
@@ -365,9 +372,9 @@ void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "PERMISSIONS", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_PERMS_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "PERMISSIONS", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_PERMS_BACK, 0);
    /* 3*lh after the title and 2*lh between rows -- the DISPLAY menu's spacing,
     * which is the house style for a settings submenu. This screen was the only
     * one still packed at the bare line height, so six rows of GRANTED / DENIED
@@ -380,22 +387,22 @@ void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
    for (int i = 0; i < 3; i++) {
       int g = m->sys.perm[i];
       menu_row(fb, h, y, sc, lh, ui_perm_lbl[i], g ? "GRANTED" : "DENIED",
-               g ? 0xFF33FF88 : 0xFF4466FF, MA_PERM, i);
+               g ? UI_OK : UI_DANGER, MA_PERM, i);
       y += 2 * lh;
    }
    menu_row(fb, h, y, sc, lh, "BATTERY",
             m->sys.batt_ok ? "UNRESTRICTED" : "OPTIMIZED",
-            m->sys.batt_ok ? 0xFF33FF88 : 0xFF4466FF, MA_BATTERY, 0);
+            m->sys.batt_ok ? UI_OK : UI_DANGER, MA_BATTERY, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "STANDBY", ui_bucket_label(m->sys.standby_bucket),
             (m->sys.standby_bucket > 0 && m->sys.standby_bucket <= 20)
-                ? 0xFF33FF88
+                ? UI_OK
                 : 0xFFAA8844,
             -1, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "BG EXEC",
             m->sys.bg_restricted ? "RESTRICTED" : "ALLOWED",
-            m->sys.bg_restricted ? 0xFF4466FF : 0xFF33FF88, MA_BGEXEC, 0);
+            m->sys.bg_restricted ? UI_DANGER : UI_OK, MA_BGEXEC, 0);
 }
 
 /* ---- ALARM submenu (opened from SETTINGS, or straight from the main
@@ -432,24 +439,24 @@ static int sensor_identity_rows(struct ANativeWindow_Buffer *fb,
    (void)px;
    (void)m;
    /* Identity: type + name (+ PRIMARY for a CGM), no section title. */
-   menu_row(fb, h, y, g->sc, g->lh, "TYPE", sensor_disp_name(s->type),
-            0xFFFFFFFF, -1, 0);
+   menu_row(fb, h, y, g->sc, g->lh, "TYPE", sensor_disp_name(s->type), UI_TEXT,
+            -1, 0);
    y += g->lh;
-   menu_row(fb, h, y, g->sc, g->lh, "NAME", s->label, 0xFFFFFFFF, MA_LABEL, 0);
+   menu_row(fb, h, y, g->sc, g->lh, "NAME", s->label, UI_TEXT, MA_LABEL, 0);
    y += g->lh;
    if (s->kind == KIND_CGM && !s->old) {
       /* PRIMARY only for a LIVE CGM -- a disconnected one cannot own the big
        * number. */
       menu_row(fb, h, y, g->sc, g->lh, "PRIMARY", s->primary ? "YES" : "NO",
-               s->primary ? 0xFF33FF88 : 0xFFFFFFFF, MA_PRIMARY, 0);
+               s->primary ? UI_OK : UI_TEXT, MA_PRIMARY, 0);
       y += g->lh;
    }
    /* One MARKER row -- shows the ACTUAL glyph (in the device's colour), not a
     * name; shape + size + colour all live in its combined menu. */
-   draw_str(px, fb, g->x, y, g->sc, "MARKER", 0xFFCCCCCC);
+   draw_str(px, fb, g->x, y, g->sc, "MARKER", UI_TEXT_DIM);
    if (s->marker == MARK_HIDE) {
       int lw = str_len("OFF") * 6 * g->sc;
-      draw_str(px, fb, g->rx - lw, y, g->sc, "OFF", 0xFFAAAAAA);
+      draw_str(px, fb, g->rx - lw, y, g->sc, "OFF", UI_FAINT);
    } else {
       /* Glyph reflects the configured SIZE too (same scaling as the plot). */
       int gr = (2 * g->sc * s->size) / MARK_SIZE_DEF;
@@ -461,7 +468,7 @@ static int sensor_identity_rows(struct ANativeWindow_Buffer *fb,
                         g->rx - (6 * g->sc), y + (3 * g->sc), gr, s->marker,
                         ui_sensor_color(s->color));
    }
-   add_hit_ix(h, 0, y - (3 * g->sc), fb->width, g->lh, MA_MARKER, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * g->sc), fb->width, g->lh), MA_MARKER, 0);
    y += g->lh;
    return y;
 }
@@ -478,14 +485,14 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
    (void)m;
    /* --- read-only --- */
    y += g->lh; /* blank line between sections, matching the SETTINGS menu */
-   draw_str(px, fb, g->x, y, g->sc, "STATUS", 0xFF888888);
+   draw_str(px, fb, g->x, y, g->sc, "STATUS", UI_MUTED);
    y += g->lh;
    /* A disconnected device reads EXPIRED (red); otherwise its live status. */
-   uint32_t stcol = 0xFFAAAAAA;
+   uint32_t stcol = UI_FAINT;
    if (s->old)
-      stcol = 0xFF4466FF;
+      stcol = UI_DANGER;
    else if (s->connected)
-      stcol = 0xFF33FF88;
+      stcol = UI_OK;
    menu_row(fb, h, y, g->sc, g->lh, "STATE", s->old ? "EXPIRED" : s->status,
             stcol, -1, 0);
    y += g->lh;
@@ -496,8 +503,7 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
          (void)snprintf(rs, sizeof rs, "%d DB", s->rssi);
       else
          (void)snprintf(rs, sizeof rs, "--");
-      menu_row(fb, h, y, g->sc, g->lh, "SIGNAL STRENGTH", rs, 0xFFFFFFFF, -1,
-               0);
+      menu_row(fb, h, y, g->sc, g->lh, "SIGNAL STRENGTH", rs, UI_TEXT, -1, 0);
       y += g->lh;
    }
    {
@@ -515,7 +521,7 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
       } else {
          (void)snprintf(val, sizeof val, "--");
       }
-      menu_row(fb, h, y, g->sc, g->lh, "LAST SEEN", val, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "LAST SEEN", val, UI_TEXT, -1, 0);
       y += g->lh;
       /* A meter's fingerstick time is DISTINCT from its sync, so it keeps a
        * separate LAST DATA row; a CGM's LAST SEEN already IS its data time. */
@@ -527,7 +533,7 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
          } else {
             (void)snprintf(val, sizeof val, "--");
          }
-         menu_row(fb, h, y, g->sc, g->lh, "LAST DATA", val, 0xFFFFFFFF, -1, 0);
+         menu_row(fb, h, y, g->sc, g->lh, "LAST DATA", val, UI_TEXT, -1, 0);
          y += g->lh;
       }
    }
@@ -543,16 +549,31 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
       char rel[12];
       char val[36];
       /* An OLD device has no live session clock, so its STARTED/ENDS/ELAPSED
-       * come from the PERSISTED activation instant instead of `now - clock`.
+       * come from the PERSISTED activation instant rather than `now - clock`.
        * A live one uses the running clock as before. */
       int have_session = 0;
       long began       = 0;
-      if (s->old) {
+      if (!s->old && s->session_seconds > 0) {
+         /* THE LIVE CLOCK WHEN THERE IS ONE: it comes off the sensor's own
+          * 0x4e response and ticks per second, so it is exact. */
+         have_session = 1;
+         began        = m->now - s->session_seconds;
+      } else {
+         /* THE RECORDED ACTIVATION OTHERWISE, for a live sensor exactly as
+          * for a retired one.
+          *
+          * A live sensor has no session clock until its first 0x4e of the
+          * process, and it loses it again on every reconnect -- so between
+          * them this screen answered STARTED, ENDS, ELAPSED and REMAINING
+          * with "--" for a sensor that had been running for two weeks. The
+          * instant it started is not something the link has to re-learn: it
+          * is minted once and kept in the provenance row, which is the same
+          * durable fact the retired-device branch has always used and is
+          * where an ended session's timings come from. The live clock is
+          * preferred only because it is exact to the second, not because it
+          * is the only thing that knows. */
          have_session = (s->activation > 0);
          began        = s->activation;
-      } else {
-         have_session = (s->session_seconds > 0);
-         began        = m->now - s->session_seconds;
       }
       long len = s->wear_len; /* per-device: override / model / type */
       /* STARTED shows the absolute instant only. The relative age lives in the
@@ -561,43 +582,56 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
          fmt_date(began, m->tz_off, when, sizeof when);
       else
          (void)snprintf(when, sizeof when, "--");
-      menu_row(fb, h, y, g->sc, g->lh, "STARTED", when, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "STARTED", when, UI_TEXT, -1, 0);
       y += g->lh;
       if (len > 0) {
          /* ENDS shows the absolute instant only; REMAINING (below) carries the
           * relative countdown, mirroring STARTED/ELAPSED. */
-         if (have_session)
+         /* AND NOT WHILE THE WEAR LENGTH IS A GUESS. `len` is the type
+          * default until the sensor reports its model, so an instant
+          * computed from it states a 10-day end for what may be a 15-day
+          * sensor -- the WEAR row above refuses to name that length, and a
+          * date derived from it is the same claim wearing a timestamp. */
+         if (have_session && !s->wear_prov)
             fmt_date(began + len, m->tz_off, when, sizeof when);
          else
             (void)snprintf(when, sizeof when, "--");
          menu_row(fb, h, y, g->sc, g->lh, "ENDS", when,
-                  (have_session && began + len < m->now) ? 0xFF4466FF
-                                                         : 0xFFFFFFFF,
+                  (have_session && !s->wear_prov && began + len < m->now)
+                      ? UI_DANGER
+                      : UI_TEXT,
                   -1, 0);
          y += g->lh;
       }
       /* ELAPSED: a live device's running clock; an old device's final run
        * (last reading minus its start), which is how long it actually lasted.
        */
-      long elapsed = s->session_seconds;
+      /* Measured from `began`, so it follows whichever source above supplied
+       * it -- with a live clock the two are the same number by construction.
+       * An OLD device stopped, so its run ends at its last reading. */
+      long elapsed = m->now - began;
       if (s->old)
          elapsed = (s->last > began) ? s->last - began : len;
       if (have_session)
          fmt_dur(elapsed, b, sizeof b);
       else
          (void)snprintf(b, sizeof b, "--");
-      menu_row(fb, h, y, g->sc, g->lh, "ELAPSED", b, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "ELAPSED", b, UI_TEXT, -1, 0);
       y += g->lh;
-      /* REMAINING: relative time to session end, replacing the old ENDS
-       * parenthetical. EXPIRED (red) once the session length is exceeded. */
+      /* REMAINING: relative time to session end, which is the question being
+       * asked -- not an absolute ENDS timestamp to subtract by hand. EXPIRED
+       * (red) once the session length is exceeded. */
       if (len > 0) {
          long ends     = began + len;
-         uint32_t rcol = 0xFFFFFFFF;
+         uint32_t rcol = UI_TEXT;
          if (s->old) {
             /* A disconnected device is done -- no countdown, just EXPIRED. */
             (void)snprintf(val, sizeof val, "EXPIRED");
-            rcol = 0xFF4466FF;
-         } else if (!have_session) {
+            rcol = UI_DANGER;
+         } else if (!have_session || s->wear_prov) {
+            /* No session yet, or no known wear length to count against (see
+             * ENDS above): both are "unknown", and neither may become a
+             * countdown the user plans a sensor change around. */
             (void)snprintf(val, sizeof val, "--");
          } else if (ends >= m->now) {
             /* Imminence carries colour here too: YELLOW inside the last day
@@ -605,13 +639,13 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
              * the final two hours. */
             long left = ends - m->now;
             if (left < 86400)
-               rcol = (left < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+               rcol = (left < 2L * 3600) ? UI_DANGER : UI_WARN;
             fmt_dur(left, rel, sizeof rel);
             (void)snprintf(val, sizeof val, "%s", rel);
          } else if (s->sess_state == SENSOR_STATE_ENDED) {
             /* The sensor's own verdict, same rule as the main screen. */
             (void)snprintf(val, sizeof val, "ENDED");
-            rcol = 0xFF4466FF;
+            rcol = UI_DANGER;
          } else {
             /* Past the nominal end: count the grace down -- and past the
              * grace, KEEP counting into the negative (same rule as the main
@@ -623,7 +657,7 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
             fmt_dur((gl < 0) ? -gl : gl, rel, sizeof rel);
             (void)snprintf(val, sizeof val, "GRACE %s%s",
                            (gl <= -60) ? "-" : "", rel);
-            rcol = (gl < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+            rcol = (gl < 2L * 3600) ? UI_DANGER : UI_WARN;
          }
          menu_row(fb, h, y, g->sc, g->lh, "REMAINING", val, rcol, -1, 0);
          y += g->lh;
@@ -638,11 +672,11 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
          char pv[12];
          fmt_glu(s->predicted, m->prefs.units, pv, sizeof pv);
          (void)snprintf(b, sizeof b, "%s %s", pv, UI_LBL(m->prefs.units));
-         menu_row(fb, h, y, g->sc, g->lh, "PRED", b, 0xFFFFFFFF, -1, 0);
+         menu_row(fb, h, y, g->sc, g->lh, "PRED", b, UI_TEXT, -1, 0);
          y += g->lh;
       }
       (void)snprintf(b, sizeof b, "%d", s->sequence);
-      menu_row(fb, h, y, g->sc, g->lh, "SEQ", b, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "SEQ", b, UI_TEXT, -1, 0);
       y += g->lh;
    }
    return y;
@@ -658,25 +692,25 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
    (void)px;
    (void)m;
    y += g->lh; /* blank line between sections, matching the SETTINGS menu */
-   draw_str(px, fb, g->x, y, g->sc, "DEVICE INFO", 0xFF888888);
+   draw_str(px, fb, g->x, y, g->sc, "DEVICE INFO", UI_MUTED);
    y += g->lh;
    if (s->code[0]) {
-      menu_row(fb, h, y, g->sc, g->lh, "CODE", s->code, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "CODE", s->code, UI_TEXT, -1, 0);
       y += g->lh;
    }
-   menu_row(fb, h, y, g->sc, g->lh, "MAC", s->mac[0] ? s->mac : "--",
-            0xFFFFFFFF, -1, 0);
+   menu_row(fb, h, y, g->sc, g->lh, "MAC", s->mac[0] ? s->mac : "--", UI_TEXT,
+            -1, 0);
    y += g->lh;
    if (s->serial[0]) {
-      menu_row(fb, h, y, g->sc, g->lh, "SN", s->serial, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "SN", s->serial, UI_TEXT, -1, 0);
       y += g->lh;
    }
    if (s->model[0]) {
-      menu_row(fb, h, y, g->sc, g->lh, "SW", s->model, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "SW", s->model, UI_TEXT, -1, 0);
       y += g->lh;
    }
    if (s->fw[0]) {
-      menu_row(fb, h, y, g->sc, g->lh, "FW", s->fw, 0xFFFFFFFF, -1, 0);
+      menu_row(fb, h, y, g->sc, g->lh, "FW", s->fw, UI_TEXT, -1, 0);
       y += g->lh;
    }
    if (s->kind == KIND_CGM) {
@@ -685,20 +719,29 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
        * are indistinguishable on the air, so when the auto-resolution
        * guesses wrong this row is the correction.
        *
-       * AUTO IS NAMED, AND A PIN IS COLOURED. Both states used to print the
-       * same bare "10 DAYS", so a device whose model says 15 and whose
-       * override says 10 looked exactly like one correctly resolved to 10 --
-       * the countdown was five days short with nothing on screen to explain
-       * it. Green for a pin matches every other row here where green means
+       * AUTO IS NAMED, AND A PIN IS COLOURED. Printing the same bare
+       * "10 DAYS" for both makes a device whose model says 15 and whose
+       * override says 10 look exactly like one correctly resolved to 10 --
+       * a countdown five days short with nothing on screen to explain it.
+       * Green for a pin matches every other row here where green means
        * "the user changed this from the default". */
+      /* AND AN UNREAD MODEL IS BLANK, not a number. A G7 that has not yet
+       * reported its DIS model could be either version, and the type default
+       * standing in for it is a guess -- so this row says "--", the same
+       * thing every other unknown field on this screen says, rather than
+       * naming a length the sensor has never claimed. It fills in the moment
+       * the model arrives. The row stays tappable throughout: pinning 10 or
+       * 15 is how the user answers the question ahead of the sensor. */
       char wd[24];
       int wdays = (int)(s->wear_len / 86400);
-      if (s->wear_auto)
+      if (s->wear_prov)
+         (void)snprintf(wd, sizeof wd, "--");
+      else if (s->wear_auto)
          (void)snprintf(wd, sizeof wd, "AUTO %d D", wdays);
       else
          (void)snprintf(wd, sizeof wd, "%d DAYS", wdays);
       menu_row(fb, h, y, g->sc, g->lh, "WEAR", wd,
-               s->wear_auto ? 0xFFFFFFFF : 0xFF33FF88, MA_WEAR, 0);
+               s->wear_auto ? UI_TEXT : UI_OK, MA_WEAR, 0);
       y += g->lh;
    }
    /* RESCALE: the active multiplicative correction as a signed percentage, or
@@ -706,25 +749,25 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
     * CHANGE / STOP screen. Sits just above LAST CAL. */
    if (s->kind == KIND_CGM) {
       char rv[32]; /* "PENDING " + value(<=11) + ' ' + unit(<=6) + NUL */
-      uint32_t rcol = 0xFFFFFFFF;
+      uint32_t rcol = UI_TEXT;
       if (s->rescale_pending > 0) {
          char gv[12];
          fmt_glu(s->rescale_pending, m->prefs.units, gv, sizeof gv);
          (void)snprintf(rv, sizeof rv, "PENDING %s %s", gv,
                         UI_LBL(m->prefs.units));
-         rcol = 0xFF44CCFF;
+         rcol = UI_BUSY;
       } else if (s->rescale_rejected) {
          (void)snprintf(rv, sizeof rv, "REJECTED >25%%");
-         rcol = 0xFF4466FF; /* red */
+         rcol = UI_DANGER; /* red */
       } else if (s->rescale_expired) {
          (void)snprintf(rv, sizeof rv, "EXPIRED - RE-ENTER");
-         rcol = 0xFF4466FF; /* red */
+         rcol = UI_DANGER; /* red */
       } else if (s->rescale_pm != 1000) {
          int d = s->rescale_pm - 1000; /* tenths of a percent */
          int a = (d < 0) ? -d : d;
          (void)snprintf(rv, sizeof rv, "%c%d.%d%%", (d < 0) ? '-' : '+', a / 10,
                         a % 10);
-         rcol = 0xFF44CCFF; /* amber: active */
+         rcol = UI_BUSY; /* amber: active */
       } else {
          (void)snprintf(rv, sizeof rv, "(NONE)");
       }
@@ -748,7 +791,7 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
           (s->rescale_pending > 0 || s->rescale_rejected ||
            s->rescale_expired || s->rescale_pm != 1000)) {
          (void)snprintf(rv, sizeof rv, "NOT SAVED - RETRYING");
-         rcol = 0xFF4466FF; /* red */
+         rcol = UI_DANGER; /* red */
       }
       menu_row(fb, h, y, g->sc, g->lh, "RESCALE", rv, rcol, MA_RESCALE_OPEN, 0);
       y += g->lh;
@@ -760,12 +803,12 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
    if (s->kind == KIND_CGM) {
       char cv[40];
       char gv[12];
-      uint32_t ccol = 0xFFFFFFFF;
+      uint32_t ccol = UI_TEXT;
       if (s->cal_pending > 0) {
          fmt_glu(s->cal_pending, m->prefs.units, gv, sizeof gv);
          (void)snprintf(cv, sizeof cv, "PENDING %s %s", gv,
                         UI_LBL(m->prefs.units));
-         ccol = 0xFF44CCFF; /* amber: in progress */
+         ccol = UI_BUSY; /* amber: in progress */
       } else if (s->cal_t > 0) {
          char cd[20];
          fmt_date(s->cal_t, m->tz_off, cd, sizeof cd);
@@ -783,7 +826,7 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
             else if (s->cal_state == CAL_ST_NOTSUP)
                w = "NOT SUPPORTED";
             (void)snprintf(cv, sizeof cv, "%s %s", cd, w);
-            ccol = 0xFF4466FF; /* red */
+            ccol = UI_DANGER; /* red */
          }
       } else {
          (void)snprintf(cv, sizeof cv, "(NONE)");
@@ -795,7 +838,7 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
        * the first place. */
       if (s->cal_unsaved && (s->cal_pending > 0 || s->cal_t > 0)) {
          (void)snprintf(cv, sizeof cv, "NOT SAVED - RETRYING");
-         ccol = 0xFF4466FF; /* red */
+         ccol = UI_DANGER; /* red */
       }
       /* While a calibration is queued, the row itself is a shortcut into the
        * CAL PENDING menu (REPLACE / DELETE); otherwise it is display-only. */
@@ -825,21 +868,20 @@ static int sensor_action_buttons(struct ANativeWindow_Buffer *fb,
        * (still within its wear window). The handler shows a confirmation first
        * when the sensor is already expired, since reconnecting a dead sensor
        * rarely makes sense. */
-      menu_button(fb, h, g->x, y, bw, g->sc, "RECONNECT", 0xFF00FF00,
-                  MA_RECONNECT, 0);
+      menu_button(fb, h, g->x, y, bw, g->sc, "RECONNECT", UI_GO, MA_RECONNECT,
+                  0);
       return y;
    }
    if (s->kind == KIND_CGM)
-      y = menu_button(fb, h, g->x, y, bw, g->sc, "CALIBRATION", 0xFFFFFFFF,
+      y = menu_button(fb, h, g->x, y, bw, g->sc, "CALIBRATION", UI_TEXT,
                       MA_CAL_OPEN, 0);
    else
-      y = menu_button(fb, h, g->x, y, bw, g->sc, "SYNC NOW", 0xFFFFFFFF,
-                      MA_SYNC, 0);
+      y = menu_button(fb, h, g->x, y, bw, g->sc, "SYNC NOW", UI_TEXT, MA_SYNC,
+                      0);
    /* DISCONNECT is destructive: red, and well clear of the action above it
     * rather than one fat finger below. It only opens a confirmation. */
    y += 2 * g->lh;
-   menu_button(fb, h, g->x, y, bw, g->sc, "DISCONNECT", 0xFF0000FF, MA_FORGET,
-               0);
+   menu_button(fb, h, g->x, y, bw, g->sc, "DISCONNECT", UI_ALERT, MA_FORGET, 0);
    return y;
 }
 
@@ -885,18 +927,27 @@ void render_sensor(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * open. A stale selection (MA_SENSOR_BACK sets sel = -1, and several paths
     * then re-open a menu without setting it) therefore produced a blank screen
     * that ignored all input: force-stop required. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_SENSOR_BACK, 0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_SENSOR_BACK,
+              0);
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* SAY SO RATHER THAN DRAWING NOTHING. The escape above keeps this from
+       * being a lockout, but an all-black screen with one invisible tap
+       * target reads as a crashed app -- and this screen is the last thing
+       * on the path when a device stops existing under it. A line of text
+       * and a named way out is the difference between "it died" and "there
+       * is nothing here". */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
 
-   draw_str(px, fb, x, y, tsc, s->label, 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   /* No second registration here: the one above the range guard covers
-    * the identical rect with the identical action, so this was a leftover
-    * from before that fix -- a duplicate target that burns a slot of the
-    * UI_MAX_HITS budget and shows up in any reachability audit as a
-    * shadowed control, masking a real one. */
+   draw_str(px, fb, x, y, tsc, s->label, UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   /* No second registration here: the one above the range guard covers the
+    * identical rect with the identical action, and a duplicate target burns a
+    * slot of the UI_MAX_HITS budget and shows up in any reachability audit as
+    * a shadowed control, masking a real one. */
    y += 2 * lh;
 
    struct sensor_geo geo = {sc, lh, x, rx, tsc};
@@ -930,38 +981,37 @@ void render_cal(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * open. A stale selection (MA_SENSOR_BACK sets sel = -1, and several paths
     * then re-open a menu without setting it) therefore produced a blank screen
     * that ignored all input: force-stop required. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_CAL_BACK, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_CAL_BACK, 0);
    if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
       return;
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
 
    /* Confirmation for the value just typed on the keypad. The write is the most
     * consequential in the app, so it happens ONLY on CONFIRM below. */
-   draw_str(px, fb, x, y, tsc, "CONFIRM", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   /* No second registration here: the one above the range guard covers
-    * the identical rect with the identical action, so this was a leftover
-    * from before that fix -- a duplicate target that burns a slot of the
-    * UI_MAX_HITS budget and shows up in any reachability audit as a
-    * shadowed control, masking a real one. */
+   draw_str(px, fb, x, y, tsc, "CONFIRM", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   /* No second registration here: the one above the range guard covers the
+    * identical rect with the identical action, and a duplicate target burns a
+    * slot of the UI_MAX_HITS budget and shows up in any reachability audit as
+    * a shadowed control, masking a real one. */
    y += 2 * lh;
 
-   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1, 0);
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, UI_TEXT, -1, 0);
    y += lh;
    {
       char b[16];
       char v[24];
       fmt_glu(m->cal.cal_pending, m->prefs.units, b, sizeof b);
       (void)snprintf(v, sizeof v, "%s %s", b, UI_LBL(m->prefs.units));
-      menu_row(fb, h, y, sc, lh, "CALIBRATE TO", v, 0xFF33FF88, -1, 0);
+      menu_row(fb, h, y, sc, lh, "CALIBRATE TO", v, UI_OK, -1, 0);
       y += lh;
    }
    y += 2 * lh;
 
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_CAL_BACK, 0);
+   y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_CAL_BACK, 0);
    y += 3 * lh; /* wide gap so CONFIRM is deliberate */
-   menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88, MA_CAL_ENTER, 0);
+   menu_button(fb, h, x, y, bw, sc, "CONFIRM", UI_OK, MA_CAL_ENTER, 0);
 }
 
 /* Confirm a rescale: shows the target value and the clamped percentage, applied
@@ -976,48 +1026,48 @@ void render_rescale(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_RESCALE_BACK, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_RESCALE_BACK,
+              0);
    if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
       return;
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
-   draw_str(px, fb, x, y, tsc, "RESCALE", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "RESCALE", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* Title gap and row spacing follow the DISPLAY menu, like every other
     * settings screen: these three rows were packed at the bare line height
     * and read as one paragraph rather than three separate facts. */
    y += 3 * lh;
-   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1, 0);
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, UI_TEXT, -1, 0);
    y += 2 * lh;
    {
       char b[16];
       char v[24];
       fmt_glu(m->cal.rescale_entry, m->prefs.units, b, sizeof b);
       (void)snprintf(v, sizeof v, "%s %s", b, UI_LBL(m->prefs.units));
-      menu_row(fb, h, y, sc, lh, "TARGET", v, 0xFF33FF88, -1, 0);
+      menu_row(fb, h, y, sc, lh, "TARGET", v, UI_OK, -1, 0);
       y += 2 * lh;
    }
    {
       char v[20];
-      uint32_t vc = 0xFF44CCFF;
+      uint32_t vc = UI_BUSY;
       if (m->cal.rescale_pm == 0) {
          /* No reading yet to compute against -- do not show a bogus 0%. */
          (void)snprintf(v, sizeof v, "ON NEXT READING");
-         vc = 0xFFAAAAAA;
+         vc = UI_FAINT;
       } else {
          fmt_rescale_pct(m->cal.rescale_pm, v, sizeof v);
          /* Beyond +-25% will be REJECTED on CONFIRM -- flag it red. */
          if (m->cal.rescale_pm < 750 || m->cal.rescale_pm > 1250)
-            vc = 0xFF4466FF;
+            vc = UI_DANGER;
       }
       menu_row(fb, h, y, sc, lh, "RESCALE BY", v, vc, -1, 0);
       y += 2 * lh;
    }
    y += lh;
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_RESCALE_BACK,
-                   0);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_RESCALE_BACK, 0);
    y += 3 * lh;
-   menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88, MA_RESCALE_ENTER, 0);
+   menu_button(fb, h, x, y, bw, sc, "CONFIRM", UI_OK, MA_RESCALE_ENTER, 0);
 }
 
 /* ---- ADD menu: the main-screen '+' lands here ---- */
@@ -1048,21 +1098,23 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "OLD DEVICES", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_OLDDEV_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "OLD DEVICES", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_OLDDEV_BACK,
+              0);
    y += 3 * lh;
 
-   /* Collect the old slots' indices (into m->dev.sensors) in list order. */
+   /* Collect the retired slots' indices (into m->dev.sensors) in list
+    * order. */
    int idxs[UI_MAX_SLOTS];
    int nold = 0;
    for (int i = 0; i < m->dev.nsensors && nold < UI_MAX_SLOTS; i++)
       if (m->dev.sensors[i].old)
          idxs[nold++] = i;
    if (nold <= 0) {
-      draw_str(px, fb, x, y, sc, "None yet. Disconnected", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "None yet. Disconnected", UI_MUTED);
       y += lh;
-      draw_str(px, fb, x, y, sc, "devices appear here.", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "devices appear here.", UI_MUTED);
       return;
    }
 
@@ -1102,7 +1154,7 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
          (void)snprintf(val, sizeof val, "--");
       char name[3 + sizeof s->label];
       (void)snprintf(name, sizeof name, "  %s", s->label);
-      menu_row(fb, h, y, sc, lh, name, val, 0xFFAAAAAA, MA_SENSOR, idxs[r]);
+      menu_row(fb, h, y, sc, lh, name, val, UI_FAINT, MA_SENSOR, idxs[r]);
       if (s->marker != MARK_HIDE) {
          int gr = (2 * sc * s->size) / MARK_SIZE_DEF;
          if (gr < sc)
@@ -1123,18 +1175,21 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (npages > 1) {
       int navy = fb->height - lh - (4 * sc);
       if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc),
+         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
                     MA_OLDPAGE_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, (2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
-                    lh + (7 * sc), MA_OLDPAGE_NEXT, 0);
+         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect((2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
+                            lh + (7 * sc)),
+                    MA_OLDPAGE_NEXT, 0);
       }
    }
 }
@@ -1164,17 +1219,18 @@ void render_devlist(struct ANativeWindow_Buffer *fb, const struct screen *m,
    else
       (void)snprintf(sel_title, sizeof sel_title, "SELECT %s",
                      m->dev.add_type ? m->dev.add_type : "SENSOR");
-   (void)draw_title_fit(px, fb, x, y, tsc, sel_title, 0xFFFFFFFF,
+   (void)draw_title_fit(px, fb, x, y, tsc, sel_title, UI_TEXT,
                         rx - x - (7 * tsc));
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 8 * tsc, MA_DEV_CANCEL, 0);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 8 * tsc), MA_DEV_CANCEL,
+              0);
    y += 2 * lh;
 
    if (m->dev.ndev <= 0) {
-      draw_str(px, fb, x, y, sc, "Searching for sensors...", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "Searching for sensors...", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "Nearest first -- tap yours:", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "Nearest first -- tap yours:", UI_MUTED);
    y += 2 * lh;
 
    /* selection sort by RSSI, strongest first (the model owns index -> device)
@@ -1199,8 +1255,8 @@ void render_devlist(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int i = order[kk];
       char rs[12];
       (void)snprintf(rs, sizeof rs, "%d dBm", m->dev.devs[i].rssi);
-      menu_row(fb, h, y, sc, lh, m->dev.devs[i].name, rs, 0xFFFFFFFF,
-               MA_DEV_PICK, i);
+      menu_row(fb, h, y, sc, lh, m->dev.devs[i].name, rs, UI_TEXT, MA_DEV_PICK,
+               i);
       y += lh;
    }
 }
@@ -1221,10 +1277,10 @@ void render_meterhelp(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
    int y   = (fb->height / 20) + (8 * sc);
-   draw_str(px, fb, x, y, tsc, "ADD ONETOUCH", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "ADD ONETOUCH", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* X returns to the ADD DEVICE type picker. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_ADDSENSOR, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_ADDSENSOR, 0);
    y += 3 * lh;
 
    static const char *const steps[] = {
@@ -1238,12 +1294,12 @@ void render_meterhelp(struct ANativeWindow_Buffer *fb, const struct screen *m,
        "3. THEN TAP SCAN BELOW.",
    };
    for (int i = 0; i < (int)(sizeof steps / sizeof steps[0]); i++) {
-      draw_str(px, fb, x, y, sc, steps[i], 0xFFCCCCCC);
+      draw_str(px, fb, x, y, sc, steps[i], UI_TEXT_DIM);
       y += lh;
    }
    y += 2 * lh;
    int bw = fb->width - (2 * x);
-   menu_button(fb, h, x, y, bw, sc, "SCAN", 0xFF33FF88, MA_METERSCAN, 0);
+   menu_button(fb, h, x, y, bw, sc, "SCAN", UI_OK, MA_METERSCAN, 0);
 }
 
 /* ---- sensor-type picker (first step of adding a sensor) ---- */
@@ -1264,19 +1320,20 @@ void render_senstype(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y   = (fb->height / 20) + (8 * sc);
    (void)m;
 
-   draw_str(px, fb, x, y, tsc, "ADD DEVICE", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_SENSOR_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "ADD DEVICE", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_SENSOR_BACK,
+              0);
    y += 4 * lh; /* generous gap below the title */
 
    /* Each type is a standard menu_button -- the SAME control every other
     * screen uses, at the same height, so buttons look and feel identical
-    * across the app (this screen used to grow bespoke, much taller
-    * buttons). The OneTouch shows its full name (the stored type name
+    * across the app -- bespoke, taller buttons here would not. The OneTouch
+    * shows its full name (the stored type name
     * stays "ONETOUCH" so the 16-char device label does not truncate). */
    int bw = fb->width - (2 * x);
    for (int t = SENSOR_STELO; t < SENSOR_NTYPES; t++) {
-      y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), 0xFFFFFFFF,
+      y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), UI_TEXT,
                       MA_TYPE, t);
       y += lh;
    }

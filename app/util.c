@@ -4,21 +4,89 @@
 
 #include "util.h"
 #include "dexlibc.h"
-#include "thread.h"    /* mutex: one append at a time, see append_lk */
-#include <stdatomic.h> /* the mutation counter is written by two threads */
+#include "loadresult.h" /* the four answers a stored file can give */
+#include "log.h"        /* LOGW: a cleanup that failed says so, once */
+#include "thread.h"     /* mutex: one append at a time, see append_lk */
+#include <stdatomic.h>  /* the mutation counter is written by two threads */
 #include <stdio.h>
 
 /* snprintf returns the would-be length, which can exceed the buffer on
  * truncation; clamp so write() emits only bytes actually in the buffer. */
+/* CLAMP `n` INTO A BUFFER OF `cap` BYTES: 0..cap-1, and never below zero.
+ *
+ * `cap - 1` IS THE TRAP. With cap == 0 this returned -1 -- a negative index
+ * handed back by a function whose entire job is to produce a safe one, and
+ * every caller uses it to index or to length a write. Callers pass a snprintf
+ * return and a sizeof today, so none of them can reach it; the next one is a
+ * coin flip, and the failure is a write before the start of the buffer. A
+ * capacity of zero has no valid index at all, and 0 is the only answer that
+ * cannot corrupt anything. */
 int clampn(int n, int cap)
 {
+   if (cap <= 0)
+      return 0;
    if (n < 0)
       return 0;
    return n >= cap ? cap - 1 : n;
 }
 
+/* ---- THE BOUNDED BUILDER. See util.h for what it is for. ---- */
+void tout_init(struct textout *t, char *buf, int cap)
+{
+   t->buf = buf;
+   t->cap = (cap > 0) ? cap : 0;
+   t->len = 0;
+   t->bad = (buf && cap > 0) ? 0 : 1;
+   if (!t->bad)
+      buf[0] = 0;
+}
+
+char *tout_room(struct textout *t, int *room)
+{
+   if (!t || t->bad || !t->buf || t->len >= t->cap - 1) {
+      if (room)
+         *room = 0;
+      /* A FULL BUFFER IS NOT A ROW THAT FITS. The caller stops here, and
+       * tout_ok still answers 1 -- there was nothing left to take. Taking a
+       * row is what can fail; running out before one is offered is the
+       * caller's own loop ending. */
+      return 0;
+   }
+   if (room)
+      *room = t->cap - t->len;
+   return t->buf + t->len;
+}
+
+void tout_took(struct textout *t, int n)
+{
+   if (!t || t->bad)
+      return;
+   int room = t->cap - t->len;
+   /* n >= room is snprintf saying it TRUNCATED, which is the case the old
+    * hand-rolled loops treated as "stop here and write what we have". */
+   if (n <= 0 || n >= room) {
+      t->bad = 1;
+      return;
+   }
+   t->len += n;
+}
+
+int tout_ok(const struct textout *t)
+{
+   return t && !t->bad;
+}
+
 void str_snapshot(char *dst, int cap, const char *src)
 {
+   /* A NULL source is an empty string -- the callers copy fields that may be
+    * absent -- and a NULL destination is nowhere to put one. */
+   if (!dst)
+      return;
+   if (!src) {
+      if (cap > 0)
+         dst[0] = 0;
+      return;
+   }
    /* cap <= 0 skipped the copy loop and then wrote dst[0] anyway -- a
     * one-byte overflow into a zero-length buffer. No caller passes 0 today
     * (every one passes a sizeof), but this is the project's single string
@@ -64,13 +132,20 @@ static int fault_on(const char *var)
  * writer to fail while another succeeds. See util.h. */
 _Thread_local int app_fault_fsync_here;
 
-/* AND A WAY TO HOLD THE WINDOW OPEN. The bug this guards is a race whose
- * window is two syscalls wide; a test that merely runs both writers hard
+/* AND A WAY TO HOLD THE WINDOW OPEN. What this guards is a race whose window
+ * is two syscalls wide; a test that merely runs both writers hard
  * relies on luck to hit it, and a test that passes by luck is not a test.
  * When set, this runs at the exact instant the window opens -- after the
  * flush has failed and before the row is taken back -- so the other writer
  * lands in it every round. Test builds only. */
 _Thread_local void (*app_fault_gap_here)(void);
+
+/* THE SAME DEVICE FOR THE PUBLISH WINDOW. Runs inside
+ * log_replace_with_tail with the append lock HELD -- after the tail is
+ * captured, before the rename -- so a test can start an appender that is
+ * guaranteed to be inside that window, and then assert what it observes:
+ * nothing landing in the file about to be discarded. Test builds only. */
+_Thread_local void (*app_fault_publish_gap)(void);
 
 #define FAULT_FSYNC    (fault_on("APP_FAIL_FSYNC") || app_fault_fsync_here)
 #define FAULT_CLOSE    fault_on("APP_FAIL_CLOSE")
@@ -197,15 +272,15 @@ int fsync_dir_of(const char *path)
    return ok ? 0 : -1;
 }
 
-/* FINISH A REWRITE: sync the new contents, close, rename over the old file,
- * and sync the directory -- checking every one of those. `fd` is consumed
- * either way; on any failure the temporary is removed and the original is
- * left exactly as it was.
+/* FINISH A REWRITE: sync the new contents, close, rename it over the live
+ * file, and sync the directory -- checking every one of those. `fd` is
+ * consumed either way; on any failure the temporary is removed and the
+ * original is left untouched.
  *
- * Extracted from atomic_replace because the streamed rewrites (the weight and
- * dose logs, which are too big to build in memory) were doing the same job by
- * hand and skipping most of it: no fsync, an unchecked close, and no
- * directory sync. A rewrite that loses power between rename and sync leaves
+ * ONE FUNCTION, because the streamed rewrites (the weight and dose logs,
+ * which are too big to build in memory) otherwise do the same job by hand and
+ * skip most of it: no fsync, an unchecked close, and no directory sync. A
+ * rewrite that loses power between rename and sync leaves
  * the log EMPTY -- the temp file's data was never on disk. */
 enum replace_result replace_finish(int fd, const char *tmp, const char *path)
 {
@@ -235,9 +310,9 @@ enum replace_result replace_finish(int fd, const char *tmp, const char *path)
  * reading at a fabricated time, indistinguishable from a real one for ever
  * after. Truncating back is the only way to keep the log parseable.
  *
- * The result was previously discarded at every call site: `(void)ftruncate`.
+ * The result is NOT discarded at the call sites: `(void)ftruncate`.
  * A truncate that fails is exactly the case that matters -- the half row is
- * still there, and the caller was about to be told the append merely failed,
+ * still there, and the caller is about to be told the append merely failed,
  * which reads as "nothing happened". It did not; the file is damaged, and the
  * caller must say so. `by` is what THIS writer wrote, measured from the end as
  * it stands now rather than from an offset sampled before the write: with
@@ -300,14 +375,14 @@ int append_finish(int fd, const char *path, int created)
  *   told the same thing as "nothing happened". They are different facts and
  *   they need different answers -- see the return codes.
  *
- * Returns LOG_OK, LOG_FAIL (nothing was written; the file is as it was) or
+ * Returns LOG_OK, LOG_FAIL (nothing was written; the file is untouched) or
  * LOG_DAMAGED (a partial row is still in the file). */
 /* ONE APPEND AT A TIME, ACROSS ALL FOUR LOGS.
  *
  * The recovery is the reason. When the flush fails, the row is already in the
  * file and has to be taken back -- by truncating what THIS writer wrote,
  * measured from the end as it stands now, because O_APPEND means a remembered
- * offset may no longer be ours. But "the end as it stands now" is only our
+ * offset may not be ours any more. But "the end as it stands now" is only our
  * row if nobody appended in the gap between the failed flush and the reopen,
  * and something can: store_record releases the history lock before
  * store_append, so two threads reach here for readings.csv concurrently. The
@@ -323,6 +398,84 @@ static struct mutex append_lk = MUTEX_INIT;
 
 static int log_append_locked(const char *path, const void *hdr, int hdrlen,
                              const void *row, int rowlen);
+
+/* ---- PUBLISHING A REBUILT LOG WITHOUT LOSING AN APPEND ------
+ *
+ * THE WINDOW THIS CLOSES. A restore rebuilds a log into a staging file and
+ * renames it over the original. Between the last byte it copied and the
+ * rename, an append can land -- a CGM reading arrives every five minutes and
+ * the rebuild takes one GET per missing bucket -- and the rename then deletes
+ * a row the app had already acknowledged and drawn.
+ *
+ * app/syncrestore.c narrowed that to "two syscalls wide" by re-reading the
+ * original's tail just before the rename, and said in its own comment that
+ * the residual could only be closed by holding this file's append lock across
+ * the publish. That is what this is: the tail capture, the fsync, the close
+ * and the rename all happen with `append_lk` held, so no log_append can
+ * interleave with any of them.
+ *
+ * WHY IT BELONGS HERE. The lock is this file's and stays this file's -- the
+ * alternative is exporting it, which makes "who may hold it, and across
+ * what" a question every caller answers for itself. One operation with the
+ * rule inside it cannot be got wrong from outside.
+ *
+ * WHAT IT COSTS: an append made while a restore is publishing waits for a
+ * flush and a rename rather than for a flush. Restores are operator-initiated
+ * and rare, the wait is milliseconds, and the alternative is losing the row
+ * that would have waited.
+ *
+ * `fd` is the staging file, positioned at its end; `copied` is how many bytes
+ * of `path` are already in it. On any failure the staging file is unlinked
+ * and `fd` is closed, exactly as replace_finish does -- a caller that gets
+ * REPLACE_FAILED has nothing left to clean up. */
+enum replace_result log_replace_with_tail(const char *path, int fd,
+                                          const char *tmp, long copied)
+{
+   mutex_lock(&append_lk);
+   int ok = 1;
+   int in = open(path, O_RDONLY);
+   if (in >= 0) {
+      if (lseek(in, copied, SEEK_SET) != copied) {
+         ok = 0;
+      } else {
+         char tb[4096];
+         for (;;) {
+            long n = read(in, tb, sizeof tb);
+            if (n < 0) {
+               if (errno == EINTR)
+                  continue;
+               ok = 0;
+               break;
+            }
+            if (n == 0)
+               break;
+            if (write_all(fd, tb, (int)n) != 0) {
+               ok = 0;
+               break;
+            }
+         }
+      }
+      close(in);
+   } else if (errno != ENOENT) {
+      /* The original is there and could not be read: publishing now would
+       * rename a file that is missing whatever it has grown. */
+      ok = 0;
+   }
+   if (!ok) {
+      close(fd);
+      (void)unlink(tmp);
+      mutex_unlock(&append_lk);
+      return REPLACE_FAILED;
+   }
+#ifdef APP_FAULTS
+   /* Still holding append_lk: see app_fault_publish_gap. */
+   if (app_fault_publish_gap)
+      app_fault_publish_gap();
+#endif
+   enum replace_result rr = replace_finish(fd, tmp, path);
+   mutex_unlock(&append_lk);
+   return rr;
+}
 
 int log_append(const char *path, const void *hdr, int hdrlen, const void *row,
                int rowlen)
@@ -353,8 +506,8 @@ static int log_append_locked(const char *path, const void *hdr, int hdrlen,
        * The row is in the file by now -- write(2) returned -- so a failed
        * fsync or close cannot be reported as "nothing happened": the caller
        * retries, and the retry writes the row a SECOND time into a log that
-       * already holds it. Take it back instead, and flush THAT, so the file
-       * is left as long as it was.
+       * already holds it. Take it back, and flush THAT, so the file is left
+       * at the length it started.
        *
        * If the take-back cannot itself be made durable, the file's state is
        * genuinely unknown -- the row may be there, or not -- and the caller
@@ -401,8 +554,9 @@ static int log_append_locked(const char *path, const void *hdr, int hdrlen,
    /* fsync, close, rename and the directory sync, each checked -- spelled out
     * here rather than through replace_finish because the LAST step needs a
     * different answer. replace_finish is for REPLACING a file: if its
-    * directory sync fails the old file is gone and the new one is the best
-    * state available. This is a CREATION, so the honest recovery is to leave
+    * directory sync fails the previous file is gone and the new one is the
+    * best state available. This is a CREATION, so the honest recovery is to
+    * leave
     * nothing: the caller is being told the record was not saved, and if the
     * file survives holding that record, the caller's retry writes it twice. */
    int ok = fsync(t) == 0 && !FAULT_FSYNC;
@@ -450,9 +604,9 @@ enum replace_result atomic_replace(const char *path, const void *data, int len)
 
 /* EVERY COMMITTED CHANGE TO A SYNCED RECORD, counted.
  *
- * The sync scheduler used to decide "is there anything new?" by adding up the
- * SIZES of the five synced files. Almost every change moves one of them, so it
- * worked almost always -- and the exceptions are the ones that matter:
+ * A SCHEDULER CANNOT ANSWER "is there anything new?" FROM FILE SIZES. Almost
+ * every change moves one of the five synced files, so sizes work almost
+ * always -- and the exceptions are the ones that matter:
  *
  *   - an EQUAL-LENGTH edit. A dose corrected from 12 to 13 units, a weight
  *     from 70.4 to 70.5, a sensor renamed to a name of the same length: the
@@ -500,9 +654,9 @@ long record_generation(void)
 
 /* Build "<dir><name>", or REFUSE.
  *
- * This used to stop copying the directory at `cap - 32`, append the filename
- * on top of the truncated prefix, and return nothing. Two ways that is worse
- * than failing:
+ * Stopping the copy of the directory at `cap - 32`, appending the filename on
+ * top of the truncated prefix and returning nothing is worse than failing, two
+ * ways:
  *
  *   - the result is a DIFFERENT, WELL-FORMED PATH. A directory whose name is
  *     one byte too long silently becomes its own truncation, so the app
@@ -521,7 +675,8 @@ int data_path(char *dst, int cap, const char *dir, const char *name)
    dst[0] = 0;
    if (!dir || !name)
       return 0;
-   size_t dn = 0, nn = 0;
+   size_t dn = 0;
+   size_t nn = 0;
    while (dir[dn])
       dn++;
    while (name[nn])
@@ -638,7 +793,15 @@ long log_clear_generation(const char *path)
    }
    /* The line ends, and the FILE ends with it: trailing bytes mean this is
     * not the file this format describes, whatever its first line says. */
-   if (nd == 0 || gen <= 0 || *p++ != '\n' || (p - b) != n)
+   /* THE INCREMENT IS OUT OF THE CONDITION. `*p++ != '\n'` inside a chain of
+    * || is a side effect whose timing depends on which earlier test
+    * short-circuits -- so whether p moved at all is decided by nd and gen.
+    * Nothing downstream reads p, which is why it worked; a reader still has
+    * to prove that, and the next edit could make it false. */
+   if (nd == 0 || gen <= 0 || *p != '\n')
+      return 0;
+   p++;
+   if ((p - b) != n)
       return 0;
    return gen;
 }
@@ -682,13 +845,288 @@ int log_clear_forget(const char *path)
     * check anyway, because by then the log has rows in it again. */
    if (unlink(cp) == 0)
       return 0;
-   /* Asked of the TOMBSTONE, not of log_clear_generation: that answers 0 for
+   /* THE UNLINK FAILED, AND WHY DECIDES THE ANSWER.
+    *
+    * ENOENT means there was nothing to forget, which is the caller's claim
+    * already satisfied. EVERYTHING ELSE -- EACCES on a directory whose
+    * permissions changed, EROFS on a filesystem that went read-only, EIO on
+    * a card that is failing -- means the tombstone is STILL THERE, and this
+    * is the function whose whole job is to say it is gone.
+    *
+    * It answered 0 for all of them. The check below re-opened the file and
+    * read a failed open as absence, so the two cases that matter most (the
+    * file exists and cannot be removed; the file exists and cannot even be
+    * opened) both reported success. What follows from that is a sync client
+    * refusing to replicate a deliberate emptying for ever, on the strength
+    * of stale evidence this function has already told its caller it
+    * removed -- and the caller, having been told, has nothing to log.
+    *
+    * Asked of the TOMBSTONE, not of log_clear_generation: that answers 0 for
     * a non-empty log whatever the tombstone says, and this is called exactly
     * when the log is non-empty -- so trusting it here would report "no
     * evidence remains" over a file still sitting on disk. */
-   int fd = open(cp, O_RDONLY, 0);
-   if (fd < 0)
-      return 0; /* there was none to forget */
-   close(fd);
+   if (errno == ENOENT)
+      return 0;
+   int err = errno;
+   int fd  = open(cp, O_RDONLY, 0);
+   if (fd >= 0) {
+      close(fd);
+      LOGW("log_clear_forget: %s could NOT be removed (errno %d); the clear "
+           "evidence is still there",
+           cp, err);
+      return -1;
+   }
+   if (errno == ENOENT)
+      return 0; /* it went away between the unlink and the look */
+   /* Cannot remove it and cannot look at it: the honest answer is that this
+    * does not know whether the evidence remains, and "success" is the one
+    * thing it must not say. */
+   LOGW("log_clear_forget: %s: unlink failed (errno %d) and it cannot be "
+        "opened either (errno %d)",
+        cp, err, errno);
    return -1;
+}
+
+/* ---- ONE EDITABLE-LOG REWRITE, FOR THE THREE LOGS THAT HAVE ONE -------
+ *
+ * Weight, food and exercise each had their own copy of this, and each copy
+ * carried its own comment saying it was a copy of one of the others. That is
+ * the shape of a defect that gets fixed once: the version in weight.c learned
+ * that a read failure mid-copy must not be published (the rename would swap
+ * in whatever prefix had been copied and lose the rest of the log), that an
+ * over-long row must refuse the rewrite rather than be written back
+ * truncated, and that a delete which empties the file has to leave a
+ * tombstone or the sync client refuses to replicate the emptiness for ever.
+ * Three copies means three places for the next such lesson to reach, and the
+ * two that do not get it fail in a user's data.
+ *
+ * WHAT IS SHARED IS THE ALGORITHM AND EVERY DURABILITY RULE. What the caller
+ * supplies is the only part that is genuinely its own: which line is the row,
+ * and what the replacement row says.
+ *
+ * TWO PASSES, because the row to edit is the LAST one that matches. The first
+ * pass counts; the second copies, altering match number `nmatch` and nothing
+ * else. A single pass would have to buffer the file to know which match was
+ * the last one, and the file is the thing that must not be held whole. */
+
+/* One line of `path`, without its newline, offered to the caller's matcher. */
+static int edit_hit(const struct log_edit *ed, const char *line, int llen)
+{
+   return ed->matches && ed->matches(line, line + llen, ed->ctx);
+}
+
+/* See util.h. app/meterstore.c had this shape and the others did not; this is
+ * that reader, moved here so there is one of it. */
+enum load_result read_file_exact(const char *path, char *buf, int cap, int *len)
+{
+   if (len)
+      *len = 0;
+   if (!path || !*path || !buf || cap < 2)
+      return LOAD_ERROR;
+   int fd = open(path, O_RDONLY, 0);
+   if (fd < 0)
+      return errno == ENOENT ? LOAD_ABSENT : LOAD_ERROR;
+   /* INTO A LOCAL, so that a refusal leaves the caller's buffer alone: a
+    * loader that is told CORRUPT must not find half a record in the buffer it
+    * was going to parse. */
+   char tmp[MAX_EXACT_READ];
+   int room = cap - 1 < (int)sizeof tmp ? cap - 1 : (int)sizeof tmp;
+   int used = 0;
+   for (;;) {
+      long rn = read(fd, tmp + used, (size_t)(room - used));
+      if (rn < 0) {
+         if (errno == EINTR)
+            continue; /* a signal is not the end of the file */
+         close(fd);
+         return LOAD_ERROR;
+      }
+      if (rn == 0)
+         break; /* EOF, and this time it really is one */
+      used += (int)rn;
+      if (used == room)
+         break;
+   }
+   /* THE EOF PROBE. Filling the buffer proves nothing about the file's
+    * length, and one byte more is the only way to tell "exactly full" from
+    * "longer than anything this build can hold". */
+   int extra = 0;
+   if (used == room) {
+      char one  = 0;
+      long more = read(fd, &one, 1);
+      while (more < 0 && errno == EINTR)
+         more = read(fd, &one, 1);
+      extra = more > 0;
+   }
+   close(fd);
+   if (extra)
+      return LOAD_CORRUPT;
+   if (used == 0)
+      return LOAD_CORRUPT; /* created and not written: a torn save */
+   for (int i = 0; i < used; i++)
+      buf[i] = tmp[i];
+   buf[used] = '\0';
+   if (len)
+      *len = used;
+   return LOAD_OK;
+}
+
+int log_edit_last(const char *path, const struct log_edit *ed)
+{
+   if (!path || !*path || !ed || !ed->matches)
+      return -1;
+
+   /* pass 1: how many rows match? (the LAST one is the one edited) */
+   int fd = open(path, O_RDONLY, 0);
+   if (fd < 0)
+      return -1;
+   char buf[1024];
+   char line[LOG_EDIT_ROW_MAX];
+   int llen   = 0;
+   int nmatch = 0;
+   long n     = 0;
+   while ((n = read(fd, buf, sizeof buf)) > 0)
+      for (long i = 0; i < n; i++) {
+         if (buf[i] == '\n') {
+            if (llen < (int)sizeof line && edit_hit(ed, line, llen))
+               nmatch++;
+            llen = 0;
+         } else if (llen < (int)sizeof line) {
+            line[llen++] = buf[i];
+         } else {
+            llen = (int)sizeof line; /* over-long: cannot match */
+         }
+      }
+   int read_failed = n < 0;
+   close(fd);
+   /* A COUNT TAKEN FROM A FAILED READ IS NOT A COUNT. Reported as zero
+    * matches it reads as "no such row", which is a different answer from "the
+    * log could not be read" and sends the caller to the wrong conclusion. */
+   if (read_failed || nmatch == 0)
+      return -1;
+
+   /* pass 2: copy, altering only match #nmatch */
+   char tmp[LOG_EDIT_PATH_MAX];
+   int tn = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+   if (tn <= 0 || tn >= (int)sizeof tmp)
+      return -1;
+   fd = open(path, O_RDONLY, 0);
+   if (fd < 0)
+      return -1;
+   int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (out < 0) {
+      close(fd);
+      return -1;
+   }
+   int seen = 0;
+   int ok   = 1;
+   /* HOW MANY BYTES THE REWRITE KEPT. Zero means this delete removed the last
+    * line in the file -- see the tombstone at the bottom. */
+   long kept = 0;
+   llen      = 0;
+   /* `ok` IS CLEARED BY A READ FAILURE TOO, not only by a write one. A read
+    * error returns -1, which fails this loop's `> 0` test while leaving ok
+    * == 1 -- so the rename below would swap in whatever prefix was copied and
+    * the rest of the log would be gone. The rewrite-and-rename is what makes
+    * these files crash-safe; it must not also be what truncates them. */
+   while (ok && (n = read(fd, buf, sizeof buf)) > 0)
+      for (long i = 0; ok && i < n; i++) {
+         if (buf[i] != '\n') {
+            /* -1: the newline below is appended UNCONDITIONALLY, so the last
+             * byte of `line` belongs to it. */
+            if (llen < (int)sizeof line - 1)
+               line[llen++] = buf[i];
+            else
+               ok = 0; /* over-long row: refuse to rewrite blind */
+            continue;
+         }
+         int hit = edit_hit(ed, line, llen) && ++seen == nmatch;
+         if (hit && !ed->format) {
+            llen = 0;
+            continue; /* a delete: the row is simply not copied */
+         }
+         if (hit) {
+            int w = ed->format(line, (int)sizeof line - 1, ed->ctx);
+            if (w < 0 || w >= (int)sizeof line) {
+               ok = 0;
+               continue;
+            }
+            llen = w;
+         }
+         line[llen++] = '\n';
+         if (write(out, line, (size_t)llen) != llen)
+            ok = 0;
+         else
+            kept += llen;
+         llen = 0;
+      }
+   if (n < 0)
+      ok = 0; /* the read failed mid-file: see the loop above */
+   /* A FINAL LINE WITH NO TRAILING NEWLINE gets the same treatment. The
+    * appender always terminates rows; the file is user-copyable. */
+   if (ok && llen > 0 && llen < (int)sizeof line) {
+      int hit = edit_hit(ed, line, llen) && ++seen == nmatch;
+      if (!(hit && !ed->format)) {
+         if (hit) {
+            int w = ed->format(line, (int)sizeof line - 1, ed->ctx);
+            if (w < 0 || w >= (int)sizeof line)
+               ok = 0;
+            else
+               llen = w;
+         }
+         if (ok) {
+            line[llen++] = '\n';
+            if (write(out, line, (size_t)llen) != llen)
+               ok = 0;
+            else
+               kept += llen;
+         }
+      }
+   }
+   close(fd);
+   /* DURABLY, OR NOT AT ALL.
+    *
+    * A close(out) that goes unchecked before the rename -- no fsync of the
+    * new contents, no check that close flushed them, no sync of the directory
+    * the rename lands in -- leaves the log EMPTY after a power loss: the
+    * rename is visible while the bytes it points at never reached the disk,
+    * and the user's whole history is a file of nothing. */
+   if (!ok) {
+      close(out);
+      (void)unlink(tmp);
+      return -1;
+   }
+   /* Only a rename that never happened is a failure here: past it the log
+    * file already holds the rewritten rows, and reporting failure would leave
+    * the caller's in-memory tail disagreeing with the file it just wrote. */
+   if (replace_finish(out, tmp, path) == REPLACE_FAILED)
+      return -1;
+   /* THE OTHER HALF OF A DELETE THAT REMOVED THE LAST LINE.
+    *
+    * These logs are synced, and the phone is authoritative over the server's
+    * copy -- so an empty log is an instruction to delete the replica. The
+    * sync client refuses that instruction unless it can tell a deliberate
+    * emptying from a phone that lost its storage, and it cannot tell by
+    * looking: both are a log with no rows. It would therefore refuse for
+    * ever, with the user's deletion never reaching the server and every other
+    * log's sync stopped behind it.
+    *
+    * Only the code that did the emptying knows it was meant, so it is this
+    * code that says so. `kept == 0` is exactly that case and nothing else. In
+    * practice a '#' header keeps these files non-empty, so the tombstone is
+    * minted for a header-less log (an older build's, or one copied in by
+    * hand) -- which is precisely the log whose last delete would otherwise
+    * wedge the sync silently.
+    *
+    * The reverse is stated too, because a rewrite that still keeps lines is
+    * proof the log is NOT empty, and evidence of emptiness must not outlive
+    * the emptiness it describes. */
+   if (kept == 0)
+      (void)log_note_cleared(path);
+   else
+      (void)log_clear_forget(path);
+   /* AN EDIT OR A DELETE IS EXACTLY THE MUTATION FILE SIZES CAN MISS: a
+    * corrected value of the same length leaves the log byte-for-byte the
+    * same length, so the sync watcher sees nothing to send. */
+   record_mutated();
+   return 0;
 }

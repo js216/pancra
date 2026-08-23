@@ -57,13 +57,64 @@ void fmt_dur(long seconds, char *out, int n);
  * CSV_FIELD_OK == 0 -- would collide with a legitimate index and invert every
  * `if (slot)` written against it. The failure gets the out-of-range value and
  * the success stays an index, which is the only thing a decorator can use. */
+/* A FRAME WITH NOWHERE TO PUT THE PIXELS.
+ *
+ * Every primitive here answers a NULL `bits` (or a NULL pixel pointer) by
+ * doing everything EXCEPT the stores: the geometry is computed, the clip
+ * counter is bumped exactly as it would have been, and hit boxes are recorded
+ * by the callers as usual. What is skipped is the writing.
+ *
+ * Two callers want that. The offline harness sweeps every screen at fourteen
+ * real device geometries to prove that nothing lands off-screen and no touch
+ * target is dropped -- assertions about WHERE things are, which do not need a
+ * single pixel, and which cost sixteen seconds of memory traffic when they
+ * are drawn anyway. And on the phone, ANativeWindow_lock can hand back a
+ * buffer it failed to map, which a primitive that does not check writes
+ * through.
+ *
+ * THE CLIP COUNT is what the tests read to say a glyph
+ * was cut off, so it is computed before the pixels are skipped, not after. */
 enum { UI_HIT_DROPPED = -1 };
 
-void add_glow(struct hits *h, int slot, int x, int y, int w, int hgt);
+/* ---- A RECTANGLE IS ONE VALUE ----------------------------------------
+ *
+ * These four numbers travelled as four positional arguments through every
+ * touch target in the app -- `add_hit(h, x, y, w, hgt, kind, arg)`, seven
+ * arguments, four of which are one thing. Two of them are coordinates and two
+ * are extents, they are all `int`, and every call site writes them in the
+ * same order out of habit rather than because anything checks: a transposed
+ * pair compiles, draws nothing wrong (the drawing is separate code), and
+ * leaves a control whose tappable area is somewhere the control is not. The
+ * only symptom is a button that does not respond, or one that responds when
+ * the user meant its neighbour.
+ *
+ * As one value it can be BUILT ONCE and used twice, which is the other half
+ * of this: the glow rect a pressed control lights is the hit rect in all but
+ * a handful of cases, and those cases now narrow a copy of a named rectangle
+ * rather than repeating four expressions.
+ *
+ * A CONSTRUCTOR RATHER THAN A COMPOUND LITERAL AT EVERY CALL SITE, because a
+ * literal is four positional numbers again -- this at least has a name, one
+ * place to read the order from, and one place a bound could ever go. */
+struct ui_rect {
+   int x, y, w, h;
+};
 
-int add_hit(struct hits *h, int x, int y, int w, int hgt, int kind, int arg);
+static inline struct ui_rect ui_rect(int x, int y, int w, int h)
+{
+   struct ui_rect r;
+   r.x = x;
+   r.y = y;
+   r.w = w;
+   r.h = h;
+   return r;
+}
 
-int add_hit_ix(struct hits *h, int x, int y, int w, int hgt, int code, int ix);
+void add_glow(struct hits *h, int slot, struct ui_rect r);
+
+int add_hit(struct hits *h, struct ui_rect r, int kind, int arg);
+
+int add_hit_ix(struct hits *h, struct ui_rect r, int code, int ix);
 
 void chk_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
              int lh, const char *name, int on, int code);
@@ -87,11 +138,17 @@ int draw_title_fit(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
 /* `rest_col` is what the button is drawn in at level 0 -- pass whatever the
  * neighbouring buttons use, so an inactive EXERCISE is indistinguishable from
  * any other control. Only levels 1..3 take the blue. */
+/* The colour a level is drawn in, everywhere it is drawn. Levels outside
+ * EX_MIN_LEVEL..EX_MAX_LEVEL -- including the resting 0 -- take `rest_col`,
+ * the caller's ordinary text colour. See the definition. */
+uint32_t ui_text_on(uint32_t bg);
+uint32_t ui_ex_color(int level, uint32_t rest_col);
+
+
 int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
                        int y, int w, int sc, int level, int remaining,
                        int settle_s, const char *name, uint32_t rest_col);
 
-uint32_t glu_color(int g);
 /* The same, with the user's configured alarm and nudge bands applied on top --
  * only ever in the direction of MORE alarm, and inclusive at every limit so
  * the number, the banner and the alarm agree. See uidraw.c. */
@@ -127,14 +184,14 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
                      int ishigh, int code);
 
 uint32_t white_color(int g);
-/* THE THRESHOLD ROW, in both of its forms: the tappable +/- row the main
- * screen and the alarm menu share, and the plain menu row that only displays
- * one. Together because a threshold reads the same everywhere -- "OFF" with
- * no unit when it is off, the value with its unit when it is not. */
-int thresh_off(int mgdl, int ishigh);
+/* The big number's colour for `g`, by the fixed medical range. */
+uint32_t glu_color(int g);
 int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h, int lx0, int rx1, int y, int sc, int pad,
                int isalarm);
+/* Is this threshold at the end of its range, where it switches the alarm
+ * off? `ishigh` picks which end. */
+int thresh_off(int mgdl, int ishigh);
 const char *ui_bucket_label(int b);
 int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
               const char *name, const char *val, uint32_t vcol, int code,

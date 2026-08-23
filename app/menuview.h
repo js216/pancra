@@ -58,6 +58,13 @@ struct menu_view {
    /* EXPORT DATA's checkboxes (session-only; the defaults -- everything, all
     * time -- are the whole point). Range 0 = 30 D, 1 = 1 Y, 2 = ALL. */
    int exp_range, exp_glu, exp_dev, exp_ins, exp_wt;
+   /* THE LAST EXPORT DID NOT REACH JAVA. Discarding jb_export_data's answer
+    * makes an activity that has gone away, or a bridge method that cannot be
+    * resolved, look exactly like a successful export: no share sheet, and
+    * nothing said. The screen says it
+    * now, and the state is retryable -- a later accepted attempt or leaving
+    * the screen clears it. */
+   int exp_failed;
 };
 
 /* One consistent copy. Main thread, like every other part of a frame. */

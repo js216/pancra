@@ -11,12 +11,11 @@
  * an elapsed duration is never rewritten and never corrected. Several of those
  * mistakes have actually shipped (each is spelled out at its rule below).
  *
- * The answers used to be `if` conditions threaded between the driver's lock
- * and the registry's, interleaved with GATT reads and file I/O, so no test
- * could
- * reach them without a live sensor. They are pure decisions and they belong
- * here, in the shape the other workflows already use (alarmlogic, scanlogic,
- * meterlogic): main.c observes, this module decides, main.c acts.
+ * As `if` conditions threaded between the driver's lock and the registry's,
+ * interleaved with GATT reads and file I/O, no test can reach these answers
+ * without a live sensor. They are pure decisions and they belong here, in the
+ * shape the other workflows use (alarmlogic, scanlogic, meterlogic): main.c
+ * observes, this module decides, main.c acts.
  *
  * Pure: no globals, no clock, no JNI, no locks. test/senstest.c pins it.
  */
@@ -75,11 +74,14 @@
  * not started projects to nothing, not to the elapsed time since boot. */
 uint32_t sens_project_clock(uint32_t last_clock, long recv_mono, long now_mono);
 
-/* Seconds between session-cache writes. sessc_put marks the cache dirty from
- * the DRAW path, which runs far more often than the 5-minute cadence that
- * actually changes anything; without this a redraw storm becomes a write
- * storm. Losing up to a minute costs nothing -- the stored clock is projected
- * forward from whatever instant it holds. */
+/* Seconds between session-cache writes. The cache is marked dirty by the
+ * reconcile tick, which runs at 1 Hz against a session clock that reads a
+ * different value every second -- so without this every tick is a write, on
+ * a file whose only job is to survive the next launch. (Marking it dirty
+ * from the DRAW path is worse in both directions: several times a second with
+ * the screen up, and never at all with only the service running.) Losing up
+ * to a minute costs nothing -- the
+ * stored clock is projected forward from whatever instant it holds. */
 #define SENS_FLUSH_MIN_S 60
 
 /* The session cache's whole state: has it changed, and when was it written. */

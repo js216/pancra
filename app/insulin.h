@@ -2,18 +2,36 @@
 // insulin.h --- Insulin dose log: append-only CSV + in-memory tail
 // Copyright 2026 Jakob Kastelic
 
+#include "insrow.h" /* the log's own domain and decoder */
+
 #ifndef PANCRA_INSULIN_H
 #define PANCRA_INSULIN_H
+
+/* ---- WHICH KIND OF LOG THIS IS: AN ASSERTION LOG ---------------------
+ *
+ * THE APP HAS TWO TIERS and this is the strict one. A row here records
+ * something that happened to a BODY and cannot be taken back, so the file
+ * keeps what was asserted and when it was corrected rather than only what is
+ * currently believed: "14 units at 08:00" and "14 units at 08:00, corrected
+ * an hour later to 12" are different facts about a drug that is already in
+ * someone, and the second is the one a person or a doctor needs.
+ *
+ * So it is never rewritten. An edit appends a new assertion carrying the same
+ * id; a delete appends one with del=1; readers replay. No bug in a rewrite
+ * can lose a dose, because there is no rewrite.
+ *
+ * Every other hand-edited log -- weight, food, exercise -- is the other tier
+ * and is rewritten in place. */
 
 /* A dose is what the user TYPED, not something a sensor measured, so this log
  * is deliberately minimal: when, which kind, how much. The file is the
  * lifetime record and the in-memory tail exists for the UI -- pre-populating
  * the entry form with the last dose of a type, and any future plotting.
  *
- * THE FILE IS APPEND-ONLY, INCLUDING EDITS AND DELETES (schema v2). It used
- * to be rewritten in place by the edit form, which made it the one log that
- * could lose history to a bug, and left it unable to say what a dose used to
- * be. Now every row is an ASSERTION about a dose identified by an id:
+ * THE FILE IS APPEND-ONLY, INCLUDING EDITS AND DELETES (schema v2).
+ * Rewritten in place by the edit form, it would be the one log that can lose
+ * history to a bug, and it could not say what a dose said yesterday. Every
+ * row is an ASSERTION about a dose identified by an id:
  *
  *     written,id,del,unix_time,type,units,tz_offset_s
  *
@@ -22,20 +40,19 @@
  * and a past day's rows never change -- which is also what lets the sync
  * protocol treat old buckets as frozen.
  *
- * Rows in the OLD four-field form (unix_time,type,units,tz_offset_s) still
- * load, and are given negative ids by file order so they can never collide
- * with a minted one. Nothing rewrites them. */
+ * Rows in the original four-field form (unix_time,type,units,tz_offset_s)
+ * load too, and are given negative ids by file order so they can never
+ * collide with a minted one. Nothing rewrites them. */
 
-#define INS_SLOW 0 /* basal / long-acting */
-#define INS_FAST 1 /* bolus / rapid-acting */
-
-#define INS_UNITS_MIN 1
-#define INS_UNITS_MAX 99
+/* (INS_SLOW / INS_FAST / INS_UNITS_* / INS_T_MAX are lib/insrow.h's: they
+ * are the LOG's domain, and the server replays the same log. Declared here
+ * with the server repeating them as literals, the two are kept in step by a
+ * comment saying they must be -- which is a rule, not a
+ * mechanism.) */
 
 /* Epoch bound on a dose instant: any positive time up to year ~3000. Wide on
  * purpose (backdating and small future-dating are legitimate user entries);
  * it exists so a corrupt digit run can never parse as a plausible dose. */
-#define INS_T_MAX 32503680000L
 
 /* In-memory tail only -- the file keeps everything. 256 rows is over two
  * months of a heavy 4-dose day. */
@@ -48,8 +65,8 @@ struct ins_rec {
 };
 
 /* THE TAIL IS PRIVATE, for the same reasons as the weight log's (weight.h):
- * every reader used to depend on the representation, the ordering invariant
- * and the lifetime -- and could write to it. These hand out COPIES.
+ * exported, every reader depends on the representation, the ordering
+ * invariant and the lifetime -- and can write to it. These hand out COPIES.
  *
  * ORDER IS PART OF THE CONTRACT: oldest first, newest last, which is what the
  * dose table and the plot both draw. */

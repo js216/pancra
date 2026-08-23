@@ -7,8 +7,7 @@
  * libc/libandroid/liblog (stub_*.c) -- the phone binds the real bionic ones.
  * jni.h comes from the host JDK (same ABI as Android's).
  *
- * WHAT IS STILL HERE, after the split. This file used to own the UI, the
- * settings, the alarm and the history; it now owns the WIRING between them:
+ * WHAT IS HERE, and what is not. This file owns the WIRING:
  * the looper and its 1 Hz tick, the JNI entry points, the menu action table,
  * the alarm ACTUATION (the decisions are alarmlogic.c), and the model funnel
  * that turns all of that global state into the immutable struct the renderer
@@ -21,21 +20,23 @@
  * binder-thread updates just mark the screen dirty for the next 1 Hz repaint.
  */
 #include "alarm.h"
+#include "alarmcfg.h"
 #include "blejni.h"
 #include "bletrans.h"
 #include "calib.h"
 #include "clock.h"
 #include "crashlog.h"
+#include "devinfo.h"
+#include "devtag.h" /* a log may not carry an address; see there */
 #include "dexdriver.h"
 #include "dexlibc.h"
 #include "exercise.h"
 #include "food.h"
-#include "forms.h" /* the drafts a recreation must not silently discard */
 #include "input.h"
 #include "insulin.h"
 #include "jbridge.h"
-#include "keypad.h"     /* enum keypad_mode: which drafts may be restored */
-#include "loadresult.h" /* the four answers a persisted blob can give */
+#include "linkhealth.h" /* pancra_link_watchdog: the shell's tick drives it */
+#include "loadresult.h" /* LOAD_*: init_data combines the load verdicts */
 #include "log.h"
 #include "menu.h"
 #include "menuview.h"
@@ -45,20 +46,25 @@
 #include "ndk.h"
 #include "notify.h"
 #include "otble.h"
+#include "paircode.h"
 #include "pairing.h"
-#include "reading.h"   /* pancra_link_watchdog: the shell's tick drives it */
-#include "reconcile.h" /* long-span plot data, bucketed from the log */
-#include "remote.h"    /* pancra_remote_sync: ...and so does the service's */
+#include "readingrec.h" /* struct reading: one stored sample */
+#include "reconcile.h"  /* long-span plot data, bucketed from the log */
+#include "remote.h"     /* pancra_remote_sync: ...and so does the service's */
+#include "remotecfg.h"
 #include "scan.h"
 #include "scanlogic.h"
 #include "sensors.h"
 #include "sesscache.h"
 #include "settings.h"
 #include "shell.h"
+#include "shellstate.h" /* the saved-state workflow, split out of this file */
+#include "stategen.h"   /* state.gen: one generation, for a backup */
 #include "stats.h"
 #include "status.h"
 #include "store.h"
 #include "sync.h"
+#include "sysabi.h" /* the kernel clock and timer ABI, declared once */
 #include "thread.h" /* the ONLY cross-thread primitives; read its header */
 #include "tzoff.h"
 #include "ui.h"
@@ -83,25 +89,10 @@
  * main thread is never the reason the app is slow to close. */
 #define TEARDOWN_DRAIN_MS 50
 
-/* POSIX file I/O + kernel-timer calls. This is a FREESTANDING build with a
- * minimal stub libc (no NDK sysroot on the include path), so the system headers
- * that would declare these do not exist here -- they are hand-declared and libc
- * binds them at runtime. CLOCK_MONOTONIC is for the repaint timerfd below.
- *
- * (An editor configured with the normal Android sysroot sees BOTH this and the
- * system <time.h> and reports a redefinition of itimerspec; that is a tooling
- * mismatch, not a build defect -- the compiler here has no system header.) */
-#ifndef CLOCK_MONOTONIC
-#define CLOCK_MONOTONIC 1
-
-struct itimerspec {
-   struct timespec it_interval, it_value;
-};
-#endif
-
-int timerfd_create(int clockid, int flags);
-int timerfd_settime(int fd, int flags, const struct itimerspec *nv,
-                    struct itimerspec *ov);
+/* The kernel timer this file drives is declared in app/sysabi.h, with the
+ * clock ids and the timerfd flags -- one declaration of that ABI for the
+ * whole app, and one list of assertions checked against the pinned NDK's own
+ * headers. */
 
 /* --- screen model: a handful of text lines, redrawn on change --- */
 
@@ -168,16 +159,15 @@ static struct ANativeWindow *live_window(void)
    return atomic_load_explicit(&g_win, memory_order_acquire);
 }
 
-/* THE HISTORY LOCK now lives with the history it protects (store.c). These
- * two are the old names, kept because fifty call sites read better as
- * hist_lock() than as store_lock() -- and because "the history lock" is what
- * every comment in this file calls it.
+/* THE HISTORY LOCK lives with the history it protects (store.c). These two
+ * spellings are kept because fifty call sites read better as hist_lock() than
+ * as store_lock() -- and because "the history lock" is what every comment in
+ * this file calls it.
  *
- * It used to be a flag HERE called g_draw_busy, doing three unrelated jobs at
- * once: guarding the reading history, serialising draws, and a surface-
- * lifetime handshake at teardown. See on_window_destroyed for why the third
- * was not a job at all, and draw() for why the first two are no longer one
- * critical section. */
+ * It is NOT a flag here doing three unrelated jobs at once -- guarding the
+ * reading history, serialising draws, and a surface-lifetime handshake at
+ * teardown. See on_window_destroyed for why the third is not a job at all,
+ * and draw() for why the first two are not one critical section. */
 static void hist_lock(void)
 {
    store_lock();
@@ -244,32 +234,31 @@ long shell_launch_mono(void)
  * from dexdriver.h */
 
 /* reading history + current-reading snapshot live in store.c (see store.h) */
-static long g_tz_checked; /* when g_tz_off was last refreshed */
+static long g_tz_checked; /* when tz_off_now() was last refreshed */
 
 /* alarm thresholds (mg/dL, adjustable in the UI) + their button hit boxes */
 
 /* alarm kind passed to dexble_alarm() / Alarm.trigger() (keep in sync with
  * Alarm.java) */
-/* The old ALARM_LOW/HIGH/STALE enum lived here. It is DELETED, not kept for
- * reference: ALARM_LOW was 0, which collided with the "nothing should sound"
- * sentinel and made the low-glucose alarm impossible to fire. Levels now come
- * from alarmlogic.h (AL_*), and Java's kind only ever via alarm_java_kind. */
+/* THE LEVELS ARE alarmlogic.h's (AL_*), and Java's kind is reached only
+ * through alarm_java_kind. A second enumeration here is what put a zero-valued
+ * level beside the "nothing should sound" sentinel, which is a low-glucose
+ * alarm that cannot fire. */
 
-/* ONE SCREEN IDENTITY. There used to be two.
+/* ONE SCREEN IDENTITY, and only one.
  *
- * A second enumeration lived here with thirty-odd MENU_* names, `enum
- * ui_screen` lived in what was then ui.h with the SAME thirty-odd screens
- * named SCR_*, and a hand-written switch translated one into the other -- a
- * table whose only job was to say that the weight-log entry of one enumeration
- * and the weight-log entry of the other are the same screen.
+ * A second enumeration here with thirty-odd MENU_* names, alongside `enum
+ * ui_screen` with the SAME thirty-odd screens named SCR_*, needs a
+ * hand-written switch to translate one into the other -- a table whose only
+ * job is to say that the weight-log entry of one enumeration and the
+ * weight-log entry of the other are the same screen.
  *
- * That is not a mapping, it is a duplicate, and it had the failure duplicates
- * always have: a screen added on one side and forgotten on the other. The
- * comment that stood here described exactly that happening -- three WEIGHT
- * screens missing from a hand-written map for as long as they had existed, so
- * the back key was dead on all three and only the X got out.
+ * That is not a mapping, it is a duplicate, and it has the failure duplicates
+ * always have: a screen added on one side and forgotten on the other. What
+ * that costs, concretely: a WEIGHT screen missing from a hand-written map has
+ * a dead back key, and only the X gets out.
  *
- * There is now one enum (uimodel.h), and adding a screen is one edit. What made
+ * So there is one enum (uimodel.h), and adding a screen is one edit. What made
  * the duplicate survivable -- naming the type so -Wswitch-enum can see every
  * map over it -- is kept: the maps that remain are still exhaustive switches
  * with no `default:`, so a screen without a back code is still a build
@@ -284,9 +273,9 @@ static long g_tz_checked; /* when g_tz_off was last refreshed */
  * menu-navigation bug this app keeps re-growing. */
 /* WHERE THE FOUR LOGGING SCREENS WERE OPENED FROM.
  *
- * They used to hardcode SCR_ADDMENU, which was true while the ADD menu was
- * their only door. The main screen's PIN buttons are a second door, so a
- * hardcoded return drops the user into a menu they never opened -- the exact
+ * Hardcoding SCR_ADDMENU is true only while the ADD menu is their only door.
+ * The main screen's PIN buttons are a second door, so a hardcoded return
+ * drops the user into a menu they never opened -- the exact
  * failure the record-the-origin rule exists to prevent, and one this codebase
  * has now hit on the devices screen, the sensor screen and the pairing flow.
  * Captured at open, never inferred at close. */
@@ -367,11 +356,9 @@ static void draw_impl(struct ANativeWindow *win, const struct screen *sm);
  * that was ALREADY under way on this thread from painting into a surface the
  * framework has since replaced.
  *
- * (There used to be a second claim here -- that a BLE thread could be inside
- * draw_impl -- and a spin in on_window_destroyed to cover it. That stopped
- * being true when rendering moved to the main thread; the spin outlived the
- * hazard by enough that it had become a plain main-thread stall. See
- * on_window_destroyed.)
+ * (No second claim is needed -- a BLE thread cannot be inside draw_impl, and
+ * the spin in on_window_destroyed that would cover it is a plain main-thread
+ * stall now that rendering is on the main thread. See on_window_destroyed.)
  */
 static void draw(struct ANativeWindow *win)
 {
@@ -385,8 +372,6 @@ static void draw(struct ANativeWindow *win)
       flag_raise(&g_ui_dirty);
       return;
    }
-   /* Before the history lock, never inside it -- see model_snapshot(). */
-   model_snapshot();
    if (win != live_window())
       return; /* not the live surface any more */
 
@@ -401,19 +386,17 @@ static void draw(struct ANativeWindow *win)
     * milliseconds, and for every one of them a GATT binder thread with a
     * reading to deliver was spinning on this lock waiting for the compositor.
     *
-    * `struct screen` is already the immutable frame model, so the fix is to
-    * stop treating "the model is consistent" and "the surface is mine" as one
-    * question. The lock now covers only the model build -- microseconds of
-    * array copying, no syscall, no JNI -- and the render works from the copy.
+    * `struct screen` is an immutable frame, which is what lets "the model is
+    * consistent" and "the surface is mine" be two questions. The lock covers
+    * only the model build -- microseconds of array copying, no syscall, no
+    * JNI -- and the render works from the copy.
     *
     * trylock, not lock: a frame is disposable and the 1 Hz timer repaints
     * immediately after, so waiting here would queue the main thread behind a
     * binder thread for a frame nobody would miss. */
    struct screen sm;
-   if (!store_trylock())
-      return;
-   build_model(&sm);
-   store_unlock();
+   if (!model_frame(&sm))
+      return; /* somebody else has the history; the timer will come round */
    draw_impl(win, &sm);
 }
 
@@ -451,12 +434,12 @@ static void draw_impl(struct ANativeWindow *win, const struct screen *sm)
  * framework's class loader, which can't see app classes; go through the
  * activity's own loader instead. Takes a dotted name ("com.jk.pancra.Ble").
  *
- * THE SIX JNI CALLS THIS USED TO MAKE NOW LIVE IN jb_app_class, with the rest
- * of this app's JNI marshalling. They were written here as one unbroken chain
- * whose only check was at the end, which meant a null loader or a pending
- * exception from step two was fed to steps three through six -- an abort
- * under CheckJNI -- and the four intermediate local refs were never released
- * even when it worked. Both are properties of a JNI sequence, not of the
+ * THE SIX JNI CALLS IT TAKES LIVE IN jb_app_class, with the rest of this
+ * app's JNI marshalling. Written here as one unbroken chain checked only at
+ * the end, a null loader or a pending exception from step two feeds steps
+ * three through six -- an abort under CheckJNI -- and the four intermediate
+ * local refs leak even when it works. Both are properties of a JNI sequence,
+ * not of the
  * shell, and jbridgetest can drive them with a fake JNIEnv; nothing could
  * reach them while they were a static function in here. */
 static jclass find_app_class(struct ANativeActivity *a, const char *name)
@@ -473,6 +456,11 @@ static jclass find_app_class(struct ANativeActivity *a, const char *name)
 int shell_on_main(void)
 {
    return on_main();
+}
+
+void shell_gate_arm(void)
+{
+   g_gate = 1;
 }
 
 int shell_gate(void)
@@ -519,9 +507,14 @@ void shell_service_tick(void)
    meter_sync_watchdog();
    /* Register a sensor that bonded while the UI was gone. */
    pancra_reconcile_tick();
+   /* THE GENERATION STAMP a backup reads before and after it pulls (item
+    * 247). Here rather than only on the activity's timer for the usual
+    * reason: the writes it is stamping arrive on a binder thread with no
+    * activity alive, which is exactly when a backup is likely to be taken. */
+   stategen_tick();
    /* The settled exercise level, for the case the activity is gone -- which
     * is the case this control is designed around. See on_timer. */
-   (void)exercise_button_tick(realtime_s(), mono_s(), g_tz_off);
+   (void)exercise_button_tick(realtime_s(), mono_s(), tz_off_now());
    /* Expire a stale calibration or rescale target, and RETRY any automatic
     * transition that could not be written. on_timer does this too, on the
     * activity's looper -- and that is exactly the looper that dies. A
@@ -530,6 +523,17 @@ void shell_service_tick(void)
     * the retry on the activity's timer left it dead in the one case it
     * exists for. */
    calib_tick();
+   /* WRITE OUT WHAT THE MODEL HAS LEARNED, once an hour.
+    *
+    * Not on every sample: it is 3200 numbers, and what a crash between two
+    * saves costs is up to an hour of learning on a model that takes weeks to
+    * converge -- which is nothing beside writing 80 KB every five minutes for
+    * the life of the phone.
+    *
+    * ON THE SERVICE TICK, deliberately, because the service is the half that
+    * outlives the activity: the process most likely to be killed without
+    * warning is one whose UI has been gone for hours, and that is exactly
+    * when the activity's timer is not running. */
 }
 
 void shell_ui_dirty(void)
@@ -606,13 +610,13 @@ void shell_orient_apply(void)
 
 /* The app's own log is the outbox now.
  *
- * There used to be one here: a byte offset into readings.csv that the
- * server had confirmed, a second one for the live tail, an in-flight
- * marker for each, and the same again for doses -- all of it bookkeeping
- * about what the server already had. The replica protocol asks the server
- * that question directly and gets an exact answer, so the only thing still
- * worth knowing locally is whether the log has GROWN since the last look,
- * which is one number. */
+ * A local outbox is a byte offset into readings.csv that the server has
+ * confirmed, a second one for the live tail, an in-flight marker for each,
+ * and the same again for doses -- all of it bookkeeping about what the
+ * server already has. The replica protocol asks the server that question
+ * directly and gets an exact answer, so the only thing worth knowing
+ * locally is whether the log has GROWN since the last look, which is one
+ * number. */
 /* (ob_log_size is gone: syncjni_state_stamp covers every synced file, not
  * just the readings log, and that is what decides whether to sync.) */
 
@@ -679,20 +683,13 @@ struct ANativeActivity *shell_activity(void)
 /* --- input: drain the queue so the ANR watchdog stays fed --- */
 
 /* reprogram the shared timer: first tick after `first_ms`, then every
- * `repeat_ms`. Used to switch between the 1 Hz repaint cadence and the
- * hold-to- repeat cadence -- which waits before repeating so a quick tap
- * doesn't repeat.
+ * `repeat_ms`. Switches between the 1 Hz repaint cadence and the hold-to-
+ * repeat cadence -- which waits before repeating so a quick tap does not
+ * repeat.
  */
 static void timer_set(long first_ms, long repeat_ms)
 {
-   if (g_timerfd < 0)
-      return;
-   struct itimerspec its;
-   its.it_value.tv_sec     = first_ms / 1000;
-   its.it_value.tv_nsec    = (first_ms % 1000) * 1000000L;
-   its.it_interval.tv_sec  = repeat_ms / 1000;
-   its.it_interval.tv_nsec = (repeat_ms % 1000) * 1000000L;
-   timerfd_settime(g_timerfd, 0, &its, 0);
+   (void)sys_timer_arm_ms(g_timerfd, first_ms, repeat_ms);
 }
 
 /* THE NOTIFICATION lives in notify.c: it is a second, independent RENDERER
@@ -722,7 +719,7 @@ static int on_timer(int fd, int events, void *data)
    /* One REMOTE step per tick: read the server's cursor, or send the next
     * chronological batch of points newer than it. Self-throttling (Java
     * reports busy while a request is in flight or a backoff is running),
-    * so a backlog drains at the server's own pace instead of being lost. */
+    * so a backlog drains at the server's own pace rather than being lost. */
    pancra_remote_sync();
    calib_tick(); /* retry / expire the calibration queue and any pending
                   * rescale target */
@@ -731,18 +728,19 @@ static int on_timer(int fd, int events, void *data)
     * from the service tick below, because the minute can expire with the
     * activity gone: the whole point of the delay is that the user presses the
     * button and puts the phone away. */
-   if (exercise_button_tick(realtime_s(), mono_s(), g_tz_off))
+   if (exercise_button_tick(realtime_s(), mono_s(), tz_off_now()))
       shell_ui_dirty();
-   /* Refresh the UTC offset periodically. It used to be read once in
-    * onCreate, but the foreground service is designed to outlive the
-    * activity for days -- so across a DST transition every displayed
-    * timestamp, and every subsequent meter import, stayed an hour off until
-    * a cold start. */
+   /* Refresh the UTC offset periodically, rather than reading it once in
+    * onCreate: the foreground service is designed to outlive the activity
+    * for days, so across a DST transition every displayed timestamp, and
+    * every subsequent meter import, would stay an hour off until a cold
+    * start. */
    if (g_act && g_act->env && realtime_s() - g_tz_checked > 300) {
       g_tz_checked = realtime_s();
       tz_refresh(g_act->env);
    }
    sensor_reconcile(); /* keep the registry in step with the live session */
+   stategen_tick();    /* the backup's generation stamp: see stategen.h */
 
    /* SELF-HEAL THE SCAN.
     *
@@ -757,8 +755,8 @@ static int on_timer(int fd, int events, void *data)
     *
     * MA_SYNC's comment already asserts the intended invariant -- "one is
     * already running whenever the UI is up (start_scan is idempotent via
-    * scan_running())". This is what makes that assertion true instead of
-    * aspirational, and it self-heals any future path that forgets.
+    * scan_running())". This is what makes that assertion true rather than
+    * aspirational, and it self-heals any path that forgets.
     *
     * THROTTLED to once every 30 s, not every tick. start_scan() sets
     * scan_running() only on success, so a persistent failure (Bluetooth off,
@@ -918,27 +916,22 @@ static void on_window_destroyed(struct ANativeActivity *a,
 {
    (void)a;
    (void)win;
-   /* THE SPIN THAT USED TO BE HERE WAS WAITING FOR THE WRONG THING.
+   /* WHAT THIS PUBLISHES, AND WHAT IT DELIBERATELY DOES NOT WAIT FOR.
     *
-    * Its stated job was to keep this callback from returning -- and letting
-    * the framework free the surface -- while a draw_impl was still holding it,
-    * "possibly on a BLE thread". That was true once. It has not been true
-    * since rendering moved to the main looper: draw() returns early for any
-    * thread that is not the looper, and THIS callback is on the looper, so a
+    * Rendering happens on the main looper: draw() returns early for any thread
+    * that is not the looper, and THIS callback is on the looper, so a
     * draw_impl in flight here would mean the main thread were in two places at
-    * once. There is nothing to wait for.
-    *
-    * What the spin actually waited on was g_draw_busy -- which is also the
-    * history lock, held by binder threads appending readings. So the main
-    * thread sat in a tight loop with no yield, burning a core, waiting for a
-    * hist_insert it had no reason to care about, at the exact moment the
+    * once. There is nothing to wait for, and a spin here would in fact be
+    * waiting on the HISTORY lock -- held by binder threads appending readings
+    * -- which is the main thread in a tight loop, burning a core for a
+    * hist_insert it has no reason to care about, at the exact moment the
     * system wants the app to get out of the way. On a slow core that is an
     * ANR, and the user sees the app hang as they close it.
     *
-    * What remains is what was always load-bearing: publish that this surface
-    * is gone, so the next frame on this thread does not paint into it. The
-    * drain is a bounded courtesy, not a correctness requirement -- it lets an
-    * in-flight history append finish before teardown continues, and gives up
+    * What is load-bearing is publishing that this surface is gone, so the next
+    * frame on this thread does not paint into it. The drain is a bounded
+    * courtesy, not a correctness requirement -- it lets an in-flight history
+    * append finish before teardown continues, and gives up
     * rather than holding the main thread hostage. */
    atomic_store_explicit(&g_win, NULL, memory_order_release);
    (void)store_drain(TEARDOWN_DRAIN_MS);
@@ -973,7 +966,7 @@ static int init_java(struct ANativeActivity *activity, JNIEnv *env)
       set_status("NO BLE CLASS!");
       return 0;
    }
-   if (!jb_bind(env, ble)) {
+   if (!jb_bind(env, activity->clazz, ble)) {
       LOGI("Ble bind failed");
       set_status("JNI BIND FAILED!");
       return 0;
@@ -1045,25 +1038,24 @@ static void recover_bonded_mac(struct ANativeActivity *activity, JNIEnv *env)
    /* Bonded-MAC recovery runs HERE, after sensors_load().
     *
     * It asks the OS bond list for a device whose name matches the
-    * primary sensor's family prefix -- but it used to run before the
-    * registry was read, so slot_count() was always 0, the primary always
-    * resolved to -1, and the prefix was always "DX01". A G7-only
-    * user's bonded device was therefore never found and could never
-    * reconnect; a user with both got LINK_CGM locked onto the Stelo's
-    * address while the Stelo already owned its own link, leaving two
-    * links reporting the same MAC and collapsing the address-based
+    * primary sensor's family prefix -- so running it before the registry
+    * is read leaves slot_count() at 0, the primary resolving to -1, and the
+    * prefix always "DX01". A G7-only user's bonded device would then never
+    * be found and could never reconnect; a user with both would get
+    * LINK_CGM locked onto the Stelo's address while the Stelo already owned
+    * its own link, leaving two links reporting the same MAC and collapsing
+    * the address-based
     * routing. */
    {
       struct dex_session s;
       /* The CGM link BY NAME, not whichever link a callback last selected:
        * getting this wrong would let a second sensor's session suppress the
        * primary's MAC recovery entirely. driver_session_of takes the lock
-       * itself, so the hand-taken one that used to wrap this was redundant --
-       * and a redundant lock is exactly what once held the driver's own for
-       * the life of the process -- which is why it is private to
-       * dexdriver.c now. */
-      driver_session_of(LINK_CGM, &s);
-      if (!s.mac[0] && s.paired) {
+       * itself, so wrapping this call in a hand-taken one is redundant --
+       * and a redundant lock is exactly what can hold the driver's own for
+       * the life of the process, which is why it is private to
+       * dexlink.c. */
+      if (driver_session_of(LINK_CGM, &s) && !s.mac[0] && s.paired) {
          /* The name prefix comes from the REGISTRY, i.e. from the
           * family the user actually paired, so this can never latch
           * onto a bonded sensor they did not choose. */
@@ -1076,12 +1068,23 @@ static void recover_bonded_mac(struct ANativeActivity *activity, JNIEnv *env)
             want = "DXCM";
          char bm[24] = {0};
          if (jb_bonded_sensor(env, activity->clazz, want, bm, sizeof bm)) {
-            LOGI("locked to bonded sensor %s (%s)", bm, want);
+            char dt[DEVTAG_LEN];
+            LOGI("locked to bonded sensor dev %s (%s)", devtag(bm, dt), want);
             /* dexble_register() has already run, so GATT callbacks can be
              * firing. ONE operation, because the file and the reconnect
-             * target must change together: a callback between them saw the
-             * new address with the old target still set. */
-            driver_bind_mac(LINK_CGM, bm);
+             * target must change together: a callback between them would see
+             * the new address with the previous target still set.
+             *
+             * AND THE FILE GOES FIRST. This walk is the only thing that finds
+             * a bonded sensor whose files/<link>.mac went missing, and it runs
+             * once per launch -- so an address published to the live target
+             * but not written is a sensor that works this session and is
+             * gone the next, with nothing to notice. The refusal is said
+             * out loud here and retried by the link watchdog; the target
+             * keeps whatever it had until the write actually lands. */
+            if (driver_bind_mac(LINK_CGM, bm) != BIND_PUBLISHED)
+               LOGW("recovered sensor address NOT SAVED -- retrying; "
+                    "the previous reconnect target still stands");
          }
       }
    }
@@ -1112,32 +1115,43 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       const char *dir = activity->internalDataPath ? activity->internalDataPath
                                                    : "/data/local/tmp";
       /* EVERY MODULE OWNS ITS OWN FILENAME. The shell hands over the
-       * directory and nothing else -- it used to name all thirteen files
-       * itself, so renaming one meant editing the activity's startup, and
-       * a module could not be moved without taking a line of main.c with
-       * it. */
+       * directory and nothing else: with all thirteen files named here,
+       * renaming one means editing the activity's startup, and a module
+       * cannot be moved without taking a line of main.c with it. */
       /* AND EVERY ONE OF THEM MUST FIT.
        *
        * data_path refuses a path it cannot represent rather than truncating
        * it, because a truncated path is not an error anyone notices -- it is
        * a well-formed path to somewhere ELSE, which reads as empty and looks
        * exactly like a first run. If any canonical path cannot be built,
-       * persistence is not initialised: the app says so instead of running
+       * persistence is not initialised: the app says so rather than running
        * on a data directory it only half addresses, appending readings to
        * one file and settings to another. */
       int pathsok = 1;
-      pathsok &= store_paths(dir);
-      pathsok &= settings_paths(dir);
-      pathsok &= sensors_paths(dir);
-      pathsok &= insulin_paths(dir);
-      pathsok &= weight_paths(dir);
-      pathsok &= food_paths(dir); /* food.csv AND foodtypes.csv */
-      pathsok &= exercise_paths(dir);
+      if (!(store_paths(dir)))
+         pathsok = 0;
+      if (!(settings_paths(dir)))
+         pathsok = 0;
+      if (!(sensors_paths(dir)))
+         pathsok = 0;
+      if (!(insulin_paths(dir)))
+         pathsok = 0;
+      if (!(weight_paths(dir)))
+         pathsok = 0;
+      if (!(food_paths(dir))) /* food.csv AND foodtypes.csv */
+         pathsok = 0;
+      if (!(exercise_paths(dir)))
+         pathsok = 0;
       meter_register_ops(); /* the driver routes callbacks to it: see meter.h */
-      pathsok &= meter_paths(dir);
-      pathsok &= sess_paths(dir);
+      if (!(meter_paths(dir)))
+         pathsok = 0;
+      if (!(sess_paths(dir)))
+         pathsok = 0;
       calib_register_ops(); /* the driver serialises the queue: see calib.h */
-      pathsok &= calib_paths(dir); /* cal.q and rescale.cfg */
+      if (!(calib_paths(dir))) /* cal.q and rescale.cfg */
+         pathsok = 0;
+      if (!(stategen_paths(dir))) /* state.gen: what a backup pulls first */
+         pathsok = 0;
       if (!pathsok) {
          LOGW("startup: the data directory is too long to build every file "
               "path from (%s)",
@@ -1145,16 +1159,21 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
          set_status("DATA PATH TOO LONG");
       }
 
-      /* Load order is NOT free: the registry resolves the readings, so it
-       * has to be read before them (see store_load below). */
-      meter_state_load(); /* per-meter last-sync times and record indices */
       /* WHAT THE STORAGE ACTUALLY GAVE BACK. Each loader answers absent /
-       * ok / corrupt / unreadable now; the worst of them is what startup
-       * reports, because a phone that lost one file has lost data whichever
-       * file it was. See app/loadresult.h. */
+       * ok / corrupt / unreadable, and the worst of them is what startup
+       * reports: a phone that lost one file has lost data whichever file that
+       * is. See app/loadresult.h. */
       enum load_result lr = LOAD_ABSENT;
-      lr                  = load_worse(lr, sess_load()); /* the session clock */
-      lr = load_worse(lr, remote_load()); /* remote-push server config */
+      /* Load order is NOT free: the registry resolves the readings, so it
+       * has to be read before them (see store_load below).
+       *
+       * AND THE METER'S ANSWER IS ONE OF THESE, rather than being discarded
+       * by a void wrapper: a meter.sync that cannot be read must not look
+       * like a first run -- LAST SEEN blank, the re-arm cooldown gone, and
+       * nothing to say why. */
+      lr = load_worse(lr, meter_state_load()); /* per-meter sync state */
+      lr = load_worse(lr, sess_load());        /* the session clock */
+      lr = load_worse(lr, remote_load());      /* remote-push server config */
       /* EVERY LOADER IS ASKED, AND EVERY ANSWER IS KEPT. Each returns 0 for
        * "read whole" -- including a first run with no file -- and -1 for a
        * read that stopped partway, having kept what it managed to parse. One
@@ -1181,8 +1200,8 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
        * runs AFTER dexble_register, whose own comment notes GATT
        * callbacks can already be firing. Today the first reading cannot
        * realistically land inside the load window (scan, timer and
-       * service tick all start later), so this was latent rather than
-       * live -- but store.h states the contract and relying on startup
+       * service tick all start later), so the exposure is latent rather
+       * than live -- but store.h states the contract, and relying on startup
        * ordering to satisfy it is exactly the kind of reasoning that goes
        * stale when the ordering changes. */
       /* The primary BEFORE the history lock: registry -> history. */
@@ -1207,11 +1226,16 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
        * and consistent styling like everything else. Bounded by the
        * readings window and MAX_SLOTS. */
       {
-         hist_lock();
+         /* ONE SNAPSHOT. Startup, single-threaded, and still
+          * worth asking properly: the walk below is over a table the ingest
+          * path appends to, and "we are early enough that nobody else is
+          * running yet" is an argument that stops being true silently. */
+         static struct reading snap[NHIST];
+         int nsnap = hist_copy(snap, NHIST);
          int orphans[NHIST];
          int no = 0;
-         for (int i = 0; i < hist_count(); i++) {
-            int src = hist_at(i).src;
+         for (int i = 0; i < nsnap; i++) {
+            int src = snap[i].src;
             if (src <= 0)
                continue;
             int seen = 0;
@@ -1223,7 +1247,6 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
             if (!seen && no < NHIST)
                orphans[no++] = src;
          }
-         hist_unlock();
          for (int j = 0; j < no; j++) {
             int id = orphans[j];
             /* Is it already one of the user's devices, and if not, what was
@@ -1273,7 +1296,13 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
             }
          }
       }
-      stat_load(store_path());
+      /* THE STATISTICS ARE PART OF THE LOAD VERDICT. A log that exists and
+       * cannot be read is not a first run: the figures beside the plot would
+       * otherwise be computed from whatever prefix came back, and look
+       * exactly like a phone with less history rather than one whose record
+       * is unreadable. stat_load keeps what it read and refuses to publish a
+       * window; this is what makes the app SAY so. */
+      lr = load_worse(lr, stat_load(store_path()));
       lr = load_worse(lr, info_load());
       lr = load_worse(lr, alarm_load());
       /* The paired identity survives a restart; without this the first sync
@@ -1284,7 +1313,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
        * and sync_set_key(0, ...) is exactly the unsigned state this line
        * exists to prevent. */
       struct sync_creds sc;
-      sync_creds_get(&sc);
+      remote_creds_get(&sc);
       sync_set_key(sc.uid, sc.key);
       lr = load_worse(lr, settings_load());
       /* A calibration or a live rescale factor that EXISTS on disk and could
@@ -1304,20 +1333,24 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       /* DEGRADED STORAGE IS NOT A FIRST RUN, and this is where the two stop
        * looking alike.
        *
-       * Every one of these loaders used to return void, so a settings file
-       * that could not be read, or one truncated by a power loss mid-write,
-       * left the app running on compiled defaults -- indistinguishable from a
-       * fresh install, and silently overwriting the user's choices with
-       * defaults at the next save. LOAD_ABSENT really is a first run and says
-       * nothing; the other two are reported. */
+       * A loader returning void leaves a settings file that could not be
+       * read, or one truncated by a power loss mid-write, running the app on
+       * compiled defaults -- indistinguishable from a fresh install, and
+       * silently overwriting the user's choices with defaults at the next
+       * save. LOAD_ABSENT really is a first run and says nothing; the other
+       * two are reported. */
+      /* SAVED DATA, not "settings": this verdict is the worst of every load
+       * above -- the session clock, the remote config, the READINGS LOG
+       * behind the statistics, the alarm thresholds, the settings and the
+       * pairing code. Naming one of them sends the user to the wrong screen
+       * to look for the damage. */
       if (lr == LOAD_ERROR) {
-         LOGW("startup: stored settings could NOT BE READ (%s)",
+         LOGW("startup: saved data could NOT BE READ (%s)",
               load_result_name(lr));
-         set_status("SETTINGS NOT READ");
+         set_status("SAVED DATA NOT READ");
       } else if (lr == LOAD_CORRUPT) {
-         LOGW("startup: stored settings were INCOMPLETE (%s)",
-              load_result_name(lr));
-         set_status("SETTINGS INCOMPLETE");
+         LOGW("startup: saved data was INCOMPLETE (%s)", load_result_name(lr));
+         set_status("SAVED DATA INCOMPLETE");
       }
       /* ...and the orientation AFTER settings_load(), for the same reason:
        * a copy from before it is the default, so the phone would ignore the
@@ -1326,7 +1359,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       settings_get(&sp);
       jb_set_orientation(g_act, sp.orient); /* restore the last choice */
       LOGI("reading log: %s (%d in memory, %d stored)", store_path(),
-           hist_count(), store_appended());
+           hist_in_memory(), store_appended());
       /* store_load restored g_cur_glu/g_cur_time -- the big number shows
        * it immediately, so the ongoing notification must too. It is
        * dirty-driven off new readings, which have not arrived yet at cold
@@ -1336,624 +1369,6 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       if (store_now(realtime_s()).glu >= 0)
          notify_mark();
    }
-}
-
-/* ==== WHAT SURVIVES AN ACTIVITY OR PROCESS RECREATION ==================
- *
- * WHAT THE USER SAW. Android hands a native activity a saved-state buffer at
- * onCreate and asks for one back through onSaveInstanceState. This file took
- * neither: the two parameters were `(void)saved; (void)saved_size;` and no
- * onSaveInstanceState callback was ever installed, so the framework had
- * nothing to keep and nothing to give back. The whole of the shell's screen
- * state -- which screen is open, the route taken to reach it, and the digits
- * half typed into a form -- lived only in this process's memory.
- *
- * That memory goes away more often than it sounds. The activity declares
- * configChanges for orientation, so a rotation does NOT destroy it; what does
- * is the phone reclaiming the app under memory pressure, which is routine on
- * a device with a camera app and a browser open, and which Android hides
- * completely: the task stays in the recents list and reopening it looks like
- * resuming. A person who had typed 14 units of insulin, been interrupted by a
- * call, and come back, found the LOG INSULIN form gone and the main screen in
- * its place -- with no message, because nothing knew anything had been lost.
- * The next thing they do is retype it or, worse, assume they already logged
- * it.
- *
- * SO: A SNAPSHOT. Three properties, and none of them is decoration.
- *
- * BOUNDED. The blob travels in the activity's saved-state Bundle, which
- * crosses a Binder transaction shared with everything else the framework is
- * saving at that moment -- and a transaction over the (roughly 1 MB, shared,
- * undocumented) limit does not degrade, it throws TransactionTooLargeException
- * and takes the app with it. This state is a handful of small integers and
- * one 63-character field: the largest snapshot this build can produce is a
- * twelve-deep route (12 * 3 bytes), two instants (2 * 12), six small numbers,
- * the marker, and a 63-byte entry -- a little over 150 bytes. STATE_MAX is
- * 256, comfortably above that and far enough below the transaction limit that
- * this state can never be the reason a save fails. It is also the size of the
- * stack buffer the decoder copies into, which is the other half of "bounded":
- * the length comes from the framework, so a decoder that trusted it would be
- * taking a memcpy size from outside this process.
- *
- * VERSIONED, in the vocabulary settings.c already uses: a `v<N> ` marker at
- * the head. An older build's blob and a newer build's blob are both REFUSED
- * WHOLE rather than read as far as they parse. Reading a v2 blob with a v1
- * parser is not a partial restore, it is a field-order mismatch -- the route
- * read as a keypad mode, the keypad mode read as an instant -- and the
- * failure arrives as the app opening on the wrong screen with somebody's dose
- * in the weight field. There is no upgrade path here and there should not be:
- * the cost of refusing is one lost draft on the launch after an update.
- *
- * VALIDATED AFTER THE DURABLE DATA LOADS, which is why state_restore is
- * called below init_data rather than from ANativeActivity_onCreate's first
- * lines. Two of the checks cannot be made any earlier:
- *
- *   - the DISPLAY UNITS. The weight draft is held in tenths of the display
- *     unit (see forms.c), so the digits "1624" mean 162.4 lb or 162.4 kg
- *     depending on a preference that lives in settings.cfg. Restore them
- *     under the other unit and the user confirms a weight wrong by a factor
- *     of 2.2 -- silently, because the number on screen is the one they typed.
- *     The glucose unit governs every threshold keypad the same way. So the
- *     snapshot records both units and the whole blob is refused if either has
- *     changed, which needs settings_load() to have run;
- *   - the ROUTE. A screen is restorable only if it does not stand for a
- *     THING: SCR_SENSOR, SCR_CAL, SCR_FORGET and their neighbours are all
- *     about whichever device sel_device() points at, and that selection is a
- *     tap, not a stored fact. Restoring one of those puts the user in front
- *     of a confirmation dialog about a sensor the app can no longer identify
- *     -- which is worse, not better, than opening on the main screen. The
- *     list below is the whitelist, and its default is REFUSE.
- *
- * The vocabulary is app/loadresult.h's, so a refused blob reads the same way
- * as a refused settings file: ABSENT is a normal cold start and says nothing;
- * CORRUPT is a blob that exists and cannot be trusted.
- */
-#define STATE_VERSION 1
-#define STATE_MAX     256
-
-struct saved_state {
-   enum ui_screen path[NAV_MAX];
-   int n;
-   enum keypad_mode kp_mode;
-   enum ui_screen kp_ret;
-   long wt_t;
-   int wt_tenths;
-   long ins_t;
-   int ins_type, ins_units;
-   char entry[64];
-};
-
-/* WHICH SCREENS MAY BE RESTORED AT ALL.
- *
- * The rule is one question: does this screen stand for a THING the app would
- * have to identify again? Every screen below is either a view of durable data
- * (the logs, the device list, the export panel) or a settings page, so it
- * means the same thing on a fresh process as it did on the old one.
- *
- * Everything else is refused, and the asymmetry is why: the cost of refusing
- * a route is landing on the main screen; the cost of restoring a bad one is a
- * CONFIRM button about a device that is not there.
- *
- * SCR_GATE is excluded deliberately and not by oversight. It is not a place
- * the user navigated to -- it is computed at every onCreate from whether the
- * BLE permissions are actually held -- so a stored one would either duplicate
- * that answer or contradict it.
- *
- * EVERY SCREEN IS NAMED, including the ones that answer no, and the compiler
- * insists: the app is built with -Wswitch-enum, so a screen added to the enum
- * and not to this list is a build failure rather than a screen that quietly
- * became restorable, or quietly did not. The `default` underneath is still
- * load-bearing -- state_decode casts a number that arrived from outside this
- * process into this enum, and that number need not be one of the names
- * above. */
-static int scr_restorable(enum ui_screen s)
-{
-   switch (s) {
-      /* Views of durable data, and settings pages. Each means the same thing
-       * on a fresh process as it did on the one that was killed. */
-      case SCR_MAIN:
-      case SCR_SETTINGS:
-      case SCR_DISPLAY:
-      case SCR_ALARM:
-      case SCR_REMOTE:
-      case SCR_PERMS:
-      case SCR_DEVICES:
-      case SCR_ADDMENU:
-      case SCR_INSLOG:
-      case SCR_WTLOG:
-      /* A view of durable data, like the other two logs. */
-      case SCR_FOODLOG:
-      case SCR_EXPORT:
-      case SCR_INSULIN:
-      case SCR_WEIGHT:
-      case SCR_FOOD:
-      case SCR_KEYPAD: return 1;
-      /* SCREENS ABOUT A DEVICE. Every one of these reads sel_device(), which
-       * is a tap and not a stored fact, so restored they are panels and
-       * confirmations about a sensor this process cannot name. */
-      case SCR_DEVLIST:
-      case SCR_SENSOR:
-      case SCR_CAL:
-      case SCR_CALPEND:
-      case SCR_RESCALE:
-      case SCR_RESCALEACT:
-      case SCR_SENSTYPE:
-      case SCR_FORGET:
-      case SCR_LABEL:
-      case SCR_MARKPICK:
-      case SCR_COLORPICK:
-      case SCR_METERHELP:
-      case SCR_PAIRCONF:
-      case SCR_OLDDEV:
-      case SCR_RECONF:
-      /* THE FOOD PICKER, for the same reason as the confirmations below: what
-       * it does on the way out is return to a RECORDED origin and, from the
-       * entry form's side, hand back a chosen type. Neither the origin nor the
-       * draft survives the process, so a restored picker is a list whose exit
-       * leads nowhere in particular and whose choice lands in a form that was
-       * never opened. The entry form itself (SCR_FOOD) is restorable in the
-       * same sense SCR_INSULIN and SCR_WEIGHT are -- an empty form is a
-       * coherent thing to come back to. */
-      case SCR_FOODTYPE:
-      /* CONFIRMATIONS about a row of a log, held in a draft that is not
-       * restored (see forms.h) -- a YES with nothing behind it. */
-      case SCR_WTDEL:
-      case SCR_INSDEL:
-      case SCR_SYNCRESTORE:
-      /* Computed from the permissions actually held, at every onCreate. */
-      case SCR_GATE:
-      /* Not a screen. */
-      case SCR_N: return 0;
-      default: return 0;
-   }
-}
-
-/* WHICH KEYPAD FIELDS MAY BE RESTORED.
- *
- * THE TWO REFUSALS ARE THE POINT. KP_PAIR_CODE is the code printed on a
- * sensor's applicator and KP_SYNC_CODE is the one the server shows for
- * claiming an account; both are shared secrets, and this snapshot is written
- * into a Bundle that leaves this process, is held by system_server, and on
- * some configurations is written to disk as part of the task's saved state. A
- * half-typed pairing code has no business being there, and the convenience of
- * not retyping four digits does not begin to pay for it.
- *
- * KP_CALIB and KP_RESCALE are on the list and are unreachable in practice for
- * a different reason, which costs nothing to allow: they are only ever opened
- * from SCR_CAL / SCR_RESCALE, which are not restorable screens, so any route
- * holding one is truncated before the keypad. This list says what the FIELD
- * is, not what the route allows; both have to agree.
- *
- * KP_NONE is refused here on purpose: "no field" is not something to restore
- * a keypad onto, and the encoder never puts SCR_KEYPAD in a saved route
- * without a real mode beside it.
- *
- * EVERY MODE IS NAMED, for the reason scr_restorable gives: -Wswitch-enum
- * turns a mode added to keypad.h and forgotten here into a compile error
- * rather than into a field that silently started, or stopped, being carried
- * across a process death. */
-static int kp_restorable(enum keypad_mode m)
-{
-   switch (m) {
-      case KP_PLOT_MAX:
-      case KP_CALIB:
-      case KP_RESCALE:
-      case KP_PORT:
-      case KP_INS_UNITS:
-      case KP_DATE:
-      case KP_TIME:
-      case KP_YEAR:
-      case KP_ALARM_LOW:
-      case KP_ALARM_HIGH:
-      case KP_NUDGE_LOW:
-      case KP_NUDGE_HIGH:
-      case KP_WEIGHT:
-      case KP_WT_DATE:
-      case KP_WT_TIME:
-      case KP_WT_YEAR:
-      /* The LOG FOOD form's fields, on the same footing as the weight form's:
-       * a portion and a civil instant, neither of them a secret. */
-      case KP_FOOD_G:
-      case KP_FOOD_DATE:
-      case KP_FOOD_TIME:
-      case KP_FOOD_YEAR: return 1;
-      /* SECRETS. Never written into somebody else's process. */
-      case KP_PAIR_CODE:
-      case KP_SYNC_CODE:
-      /* Not a field: see above. */
-      case KP_NONE:
-      /* Retired (the server is a name now, not a quad) and not a count. */
-      case KP_SERVER:
-      case KP_NMODES: return 0;
-      default: return 0;
-   }
-}
-
-/* MAY THIS SCREEN GO INTO THE SNAPSHOT, GIVEN WHAT IS OPEN ON IT.
- *
- * scr_restorable asks a question about the screen alone. This asks it about
- * the screen AND the draft sitting on it, which is where the two
- * edit-in-progress cases live: a LOG WEIGHT or LOG INSULIN form that is
- * amending an existing row carries a copy of that row as its match key, and
- * the row may be gone by the time this comes back (see forms.h). Rather than
- * restore the form without the thing it is editing -- a screen that says EDIT
- * and would silently create a new entry -- the route is truncated before it,
- * so the user lands on whatever they had open underneath.
- *
- * The keypad is the same shape: a route may keep SCR_KEYPAD only if the field
- * it is collecting is one this build is willing to store. */
-static int scr_saveable(enum ui_screen s, const struct forms_view *fv)
-{
-   if (!scr_restorable(s))
-      return 0;
-   if (s == SCR_WEIGHT && fv->wt_edit >= 0)
-      return 0;
-   if (s == SCR_INSULIN && fv->ins_edit >= 0)
-      return 0;
-   if (s == SCR_KEYPAD && !kp_restorable(fv->kp_mode))
-      return 0;
-   return 1;
-}
-
-/* Is `s` on the saved route? */
-static int state_path_has(const struct saved_state *st, enum ui_screen s)
-{
-   for (int i = 0; i < st->n; i++)
-      if (st->path[i] == s)
-         return 1;
-   return 0;
-}
-
-/* ---- THE PARSER -------------------------------------------------------
- *
- * Hand-written, in settings.c's idiom and for its reason: this reads a buffer
- * produced outside this process, so every step either consumes exactly what
- * it expects or refuses. A digit run longer than any legal value is REFUSED
- * rather than folded, because a folded number is a plausible-looking wrong
- * one. */
-static int st_num(char **q, long *out)
-{
-   char *p = *q;
-   while (*p == ' ')
-      p++;
-   int neg = 0;
-   if (*p == '-') {
-      neg = 1;
-      p++;
-   }
-   if (*p < '0' || *p > '9')
-      return 0;
-   long x = 0;
-   int nd = 0;
-   while (*p >= '0' && *p <= '9') {
-      if (nd >= 18)
-         return 0; /* longer than any value this format holds */
-      x = (x * 10) + (*p - '0');
-      nd++;
-      p++;
-   }
-   *out = neg ? -x : x;
-   *q   = p;
-   return 1;
-}
-
-/* The `v<N> ` marker settings.c uses, with one difference that matters here:
- * there is no version 0. A settings file with no marker is a real file
- * written by a deployed build, so its absence had to mean something; a saved
- * state with no marker was written by nothing this project ever shipped, so
- * it is simply refused. -1 for anything that is not a marker. */
-static int st_version(char **q)
-{
-   char *p = *q;
-   if (*p != 'v')
-      return -1;
-   p++;
-   long v;
-   if (!st_num(&p, &v))
-      return -1;
-   if (*p != ' ')
-      return -1;
-   *q = p;
-   return (int)v;
-}
-
-/* WHAT THE SHELL WOULD LIKE BACK, encoded into `out`.
- *
- * Returns the byte count, or 0 when there is nothing worth saving -- which
- * includes every ordinary case: a user sitting on the main screen with no
- * form open has a one-entry route and no draft on show, and storing that
- * would mean handing the framework a blob on every single pause.
- *
- * The route is TRUNCATED at the first screen that may not be saved, rather
- * than the whole snapshot being dropped. A user three screens deep into the
- * device registry with a sensor's calibration panel on top still gets back
- * the part of their route that means the same thing on a new process. */
-static int state_encode(char *out, int cap)
-{
-   struct forms_view fv;
-   forms_view_get(&fv);
-   enum ui_screen path[NAV_MAX];
-   int n    = nav_path(path, NAV_MAX);
-   int keep = 0;
-   while (keep < n && scr_saveable(path[keep], &fv))
-      keep++;
-   /* keep <= 1 is the main screen with nothing open. There is no draft to
-    * carry because no form is showing one, and a blob that restores the main
-    * screen onto the main screen is a blob for nothing. */
-   if (keep <= 1)
-      return 0;
-   int haskp  = 0;
-   int haswt  = 0;
-   int hasins = 0;
-   for (int i = 0; i < keep; i++) {
-      if (path[i] == SCR_KEYPAD)
-         haskp = 1;
-      if (path[i] == SCR_WEIGHT)
-         haswt = 1;
-      if (path[i] == SCR_INSULIN)
-         hasins = 1;
-   }
-   /* CANONICAL, so the decoder can check the blob against itself. Fields
-    * belonging to a screen that is not on the saved route are written as
-    * zeroes rather than as whatever the process happened to be holding: a
-    * keypad return screen left over from a route that was truncated away is
-    * not information, it is a leftover, and one that would have to be
-    * validated for no benefit. */
-   enum keypad_mode mode = haskp ? fv.kp_mode : KP_NONE;
-   enum ui_screen ret    = haskp ? forms_kp_return() : SCR_MAIN;
-   struct prefs sp;
-   settings_get(&sp);
-   int len = snprintf(out, (size_t)cap, "v%d %d %d %d", STATE_VERSION, sp.units,
-                      sp.wunits, keep);
-   if (len < 0 || len >= cap)
-      return 0;
-   for (int i = 0; i < keep; i++) {
-      int k = snprintf(out + len, (size_t)(cap - len), " %d", (int)path[i]);
-      if (k < 0 || k >= cap - len)
-         return 0;
-      len += k;
-   }
-   int k = snprintf(out + len, (size_t)(cap - len), " %d %d %ld %d %ld %d %d",
-                    (int)mode, (int)ret, haswt ? fv.wt_t : 0L,
-                    haswt ? fv.wt_tenths : 0, hasins ? fv.ins_t : 0L,
-                    hasins ? fv.ins_type : 0, hasins ? fv.ins_units : 0);
-   if (k < 0 || k >= cap - len)
-      return 0;
-   len += k;
-   /* THE TYPED DIGITS, LAST, so the rest of the line is fixed-shape and this
-    * one variable field cannot shift anything. '-' for an empty entry, which
-    * keeps the field mandatory: a missing field and an empty one would
-    * otherwise be the same bytes, and a truncated blob would then parse.
-    *
-    * `entrylen`, NOT strlen. The keypad's buffer is only valid up to its
-    * recorded length -- clearing it resets the length and leaves the previous
-    * characters in place -- so reading to the NUL would append somebody's
-    * earlier typing to this entry. */
-   int el = fv.entrylen;
-   if (el < 0 || el > (int)sizeof fv.entry - 1)
-      el = 0;
-   if (!haskp)
-      el = 0;
-   if (len + 2 + el >= cap)
-      return 0;
-   out[len++] = ' ';
-   if (el == 0) {
-      out[len++] = '-';
-      return len;
-   }
-   for (int i = 0; i < el; i++) {
-      char c = fv.entry[i];
-      /* The digit keypads collect [0-9.] and nothing else. A character
-       * outside that set is not something to store and repost through the
-       * framework: the entry is dropped and the route kept. */
-      if (!((c >= '0' && c <= '9') || c == '.')) {
-         out[len++] = '-';
-         return len;
-      }
-      out[len++] = c;
-   }
-   return len;
-}
-
-/* THE OTHER HALF: a blob from the framework, checked against everything this
- * build knows and against everything the durable data now says. Fills `*st`
- * only on LOAD_OK. */
-static enum load_result state_decode(const void *blob, size_t nb,
-                                     struct saved_state *st)
-{
-   if (!blob || nb == 0)
-      return LOAD_ABSENT; /* a normal cold start: nothing was saved */
-   if (nb > STATE_MAX)
-      return LOAD_CORRUPT; /* bigger than anything this build writes */
-   char b[STATE_MAX + 1];
-   memcpy(b, blob, nb);
-   b[nb] = 0;
-   /* PRINTABLE ASCII, checked over the WHOLE length rather than left to the
-    * parser. An embedded NUL would otherwise end the parse early and a
-    * truncated blob would read as a complete one. */
-   for (size_t i = 0; i < nb; i++)
-      if (b[i] < 0x20 || b[i] > 0x7e)
-         return LOAD_CORRUPT;
-   char *q = b;
-   if (st_version(&q) != STATE_VERSION)
-      return LOAD_CORRUPT;
-   long units, wunits, n;
-   if (!st_num(&q, &units) || !st_num(&q, &wunits) || !st_num(&q, &n))
-      return LOAD_CORRUPT;
-   /* THE UNITS THE DRAFT WAS TYPED IN, and the reason this runs after
-    * settings_load(). "1624" in the weight field is 162.4 of whichever unit
-    * was showing; restore it under the other one and the user confirms a
-    * weight wrong by a factor of 2.2, with the digits they typed still on
-    * screen. The glucose unit governs every threshold keypad the same way. */
-   struct prefs sp;
-   settings_get(&sp);
-   if (units != sp.units || wunits != sp.wunits)
-      return LOAD_CORRUPT;
-   if (n < 1 || n > NAV_MAX)
-      return LOAD_CORRUPT;
-   for (long i = 0; i < n; i++) {
-      long v;
-      if (!st_num(&q, &v))
-         return LOAD_CORRUPT;
-      if (v < 0 || v >= SCR_N)
-         return LOAD_CORRUPT;
-      if (!scr_restorable((enum ui_screen)v))
-         return LOAD_CORRUPT;
-      st->path[i] = (enum ui_screen)v;
-   }
-   st->n = (int)n;
-   /* THE ROOT IS THE MAIN SCREEN. Every route home ends there and nav_back
-    * stops at index 0, so a route rooted anywhere else is a user who cannot
-    * leave the screen they were restored onto. */
-   if (st->path[0] != SCR_MAIN)
-      return LOAD_CORRUPT;
-   long mode, ret, wt_t, tenths, ins_t, ins_type, ins_units;
-   if (!st_num(&q, &mode) || !st_num(&q, &ret) || !st_num(&q, &wt_t) ||
-       !st_num(&q, &tenths) || !st_num(&q, &ins_t) || !st_num(&q, &ins_type) ||
-       !st_num(&q, &ins_units))
-      return LOAD_CORRUPT;
-   int haskp = 0;
-   for (int i = 0; i < st->n; i++)
-      if (st->path[i] == SCR_KEYPAD)
-         haskp = 1;
-   if (haskp) {
-      if (!kp_restorable((enum keypad_mode)mode))
-         return LOAD_CORRUPT;
-      /* Where the keypad closes to has to be somewhere this build is willing
-       * to be, or its X button lands on a screen the route was truncated to
-       * avoid -- and it may not be the keypad itself, which would be a screen
-       * that cannot be closed. */
-      if (ret < 0 || ret >= SCR_N || ret == SCR_KEYPAD ||
-          !scr_restorable((enum ui_screen)ret))
-         return LOAD_CORRUPT;
-   } else if (mode != KP_NONE || ret != SCR_MAIN) {
-      /* The encoder writes exactly these when no keypad is on the route.
-       * Anything else is a blob that does not agree with itself. */
-      return LOAD_CORRUPT;
-   }
-   st->kp_mode = (enum keypad_mode)mode;
-   st->kp_ret  = (enum ui_screen)ret;
-   /* THE DRAFT NUMBERS, against the same bounds their own modules enforce. A
-    * value outside them cannot have been typed here, so it came from
-    * somewhere else and the blob is not ours. Deliberately NOT the full
-    * domain rule (a weight of 1.6 lb is out of range, and is also what a
-    * half-typed 162.4 looks like): these are the format's bounds, and the
-    * commit path still applies the real ones. */
-   if (wt_t < 0 || wt_t > WT_T_MAX)
-      return LOAD_CORRUPT;
-   if (tenths < 0 || tenths > 99999)
-      return LOAD_CORRUPT;
-   if (ins_t < 0 || ins_t > INS_T_MAX)
-      return LOAD_CORRUPT;
-   if (ins_type != INS_SLOW && ins_type != INS_FAST)
-      return LOAD_CORRUPT;
-   if (ins_units < 0 || ins_units > INS_UNITS_MAX)
-      return LOAD_CORRUPT;
-   st->wt_t      = wt_t;
-   st->wt_tenths = (int)tenths;
-   st->ins_t     = ins_t;
-   st->ins_type  = (int)ins_type;
-   st->ins_units = (int)ins_units;
-   /* THE TYPED DIGITS. '-' is an empty entry; anything else must be the
-    * character set the digit keypads collect, no longer than the field this
-    * mode actually draws (kp_slots), and there must be a keypad on the route
-    * to hold it. */
-   while (*q == ' ')
-      q++;
-   if (*q == 0)
-      return LOAD_CORRUPT; /* the field is mandatory, so a truncation shows */
-   st->entry[0] = 0;
-   if (!(q[0] == '-' && q[1] == 0)) {
-      if (!haskp)
-         return LOAD_CORRUPT;
-      int el = 0;
-      while (q[el]) {
-         char c = q[el];
-         if (!((c >= '0' && c <= '9') || c == '.'))
-            return LOAD_CORRUPT;
-         el++;
-         if (el > (int)sizeof st->entry - 1)
-            return LOAD_CORRUPT;
-      }
-      /* '.' costs a cell like every other character does on screen, so this
-       * is the same ceiling the input path applies. */
-      if (el > kp_slots((enum keypad_mode)mode))
-         return LOAD_CORRUPT;
-      memcpy(st->entry, q, (size_t)el);
-      st->entry[el] = 0;
-   }
-   return LOAD_OK;
-}
-
-/* Put a validated snapshot back. Nothing here can fail: everything it writes
- * was checked by state_decode against this build's rules and this phone's
- * loaded settings. */
-static void state_apply(const struct saved_state *st)
-{
-   /* THE DRAFTS FIRST, then the route, then the keypad -- so the screen the
-    * user lands on is already showing the values it is about. Only the drafts
-    * whose form is actually on the route: the others were written as zeroes,
-    * and restoring those would overwrite a form the user has not opened yet
-    * with a 1970 timestamp. */
-   if (state_path_has(st, SCR_WEIGHT))
-      forms_wt_restore(st->wt_t, st->wt_tenths);
-   if (state_path_has(st, SCR_INSULIN))
-      forms_ins_restore(st->ins_t, st->ins_type, st->ins_units);
-   nav_set_path(st->path, st->n);
-   if (st->kp_mode != KP_NONE) {
-      forms_kp_mode_set(st->kp_mode);
-      forms_kp_return_set(st->kp_ret);
-      forms_kp_seed(st->entry);
-   }
-}
-
-/* THE FRAMEWORK IS ASKING FOR THE STATE. The buffer must be malloc'd: the
- * NativeActivity contract is that the framework free()s it, so a pointer to
- * anything else here is a free() of a static or a stack address.
- *
- * Answering NULL with *outsz = 0 is the ordinary case, not a failure -- see
- * state_encode: most pauses happen with nothing worth carrying. */
-static void *on_save_state(struct ANativeActivity *a, size_t *outsz)
-{
-   (void)a;
-   if (!outsz)
-      return 0;
-   *outsz = 0;
-   char buf[STATE_MAX];
-   int n = state_encode(buf, (int)sizeof buf);
-   if (n <= 0)
-      return 0;
-   char *heap = malloc((size_t)n);
-   if (!heap)
-      return 0;
-   memcpy(heap, buf, (size_t)n);
-   *outsz = (size_t)n;
-   return heap;
-}
-
-/* THE FRAMEWORK IS HANDING THE STATE BACK. Called from onCreate AFTER
- * init_data, because two of the checks inside are against data that has to be
- * on disk and in memory first (see the header comment above). */
-static void state_restore(const void *saved, size_t nb)
-{
-   struct saved_state st;
-   enum load_result r = state_decode(saved, nb, &st);
-   if (r == LOAD_OK) {
-      state_apply(&st);
-      LOGI("startup: restored screen state (%d deep, screen %d)", st.n,
-           (int)st.path[st.n - 1]);
-      return;
-   }
-   if (r == LOAD_ABSENT)
-      return; /* nothing was saved: an ordinary cold start */
-   /* REFUSED, and the user is on the main screen. Logged rather than put on
-    * the status line: nothing durable was lost -- the readings, the doses and
-    * the settings are all on disk -- and the one thing that is gone, a draft
-    * the user had not confirmed, is not something to raise an alarm about on
-    * a launch that is otherwise healthy. The most common cause is the launch
-    * straight after an update, where the version marker moved. */
-   LOGW("startup: the saved screen state was REFUSED (%s, %d bytes)",
-        load_result_name(r), (int)nb);
 }
 
 /* NDK entry point: resolved by name by the Android runtime when the .so
@@ -1973,10 +1388,10 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    g_act = activity;
    /* Stale-alarm grace starts at PROCESS start, not at every onCreate.
     *
-    * Re-arming it on each activity launch meant that opening the app to see
-    * why the alarm was sounding silenced it: the next heartbeat recomputed
-    * grace = 1, dropped g_disc_alarmed, and alarm_apply issued a silence --
-    * then refused to re-raise for the whole threshold (up to 60 min) with
+    * Re-arming it on each activity launch means opening the app to see why
+    * the alarm is sounding silences it: the next heartbeat recomputes
+    * grace = 1, drops g_disc_alarmed, and alarm_apply issues a silence --
+    * then refuses to re-raise for the whole threshold (up to 60 min) with
     * the sensor still dead. The service keeps running across activity
     * destruction, so the grace period must not restart with the UI. */
    if (!g_launch_mono)
@@ -1994,9 +1409,31 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    cctx.glu    = store_glu_ptr();
    cctx.menu   = &g_screen_now;
    cctx.nhist  = hist_count_ptr();
-   crash_install(activity->internalDataPath ? activity->internalDataPath
-                                            : "/data/local/tmp",
-                 &cctx);
+   /* ---- AND WHETHER THE HANDLER IS ACTUALLY THERE ----------
+    *
+    * This call was void and every signal() result inside it was dropped, so
+    * this line "installed crash reporting" whether or not any of it took.
+    * The failure that produces is invisible by construction: the app dies,
+    * there is no crash.log, and nothing anywhere says the handler was never
+    * installed -- which is the one fact that would explain the missing file.
+    *
+    * PARTIAL COVERAGE IS KEPT AND NAMED. A handler that IS in place still
+    * writes a report for its own signal; what the log says is which signals
+    * are uncovered, by number, so a crash with no report can be matched
+    * against them. */
+   struct crash_install_result ci =
+       crash_install(activity->internalDataPath ? activity->internalDataPath
+                                                : "/data/local/tmp",
+                     &cctx);
+   if (ci.failed) {
+      for (unsigned b = 0; b < 32; b++)
+         if (ci.failed & (1U << b))
+            LOGW("startup: no crash handler for signal %d -- a crash on it "
+                 "will leave no crash.log",
+                 crash_sig_of(b));
+      if (!ci.installed)
+         set_status("NO CRASH REPORTING");
+   }
 
    /* local timezone offset (seconds), for on-screen timestamps */
    tz_refresh(env);
@@ -2014,7 +1451,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * nothing to hand back at the next onCreate, so `saved` below was always
     * NULL and the two parameters were cast to void -- which is exactly what
     * they were. See the state_* family above. */
-   activity->callbacks->onSaveInstanceState = on_save_state;
+   activity->callbacks->onSaveInstanceState = shellstate_save;
 
    /* Process-wide, one-time setup: JNI globals, the BLE driver, and the
     * loaded history/settings. The foreground service can outlive the
@@ -2042,7 +1479,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * question `g_inited` already answers for the JNI globals and the loaded
     * history, asked one line earlier. */
    if (cold)
-      state_restore(saved, saved_size);
+      shellstate_restore(saved, saved_size);
 
    /* Window flags are per-window, so this must run on every onCreate -- not
     * just the first -- and only once settings_load() has supplied the user's
@@ -2061,15 +1498,10 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       g_timerfd = -1;
    }
    {
-      int tfd = timerfd_create(CLOCK_MONOTONIC, 04000 /* TFD_NONBLOCK */);
+      int tfd = sys_timer_open();
       if (tfd >= 0) {
          g_timerfd = tfd;
-         struct itimerspec its;
-         its.it_value.tv_sec     = 1;
-         its.it_value.tv_nsec    = 0;
-         its.it_interval.tv_sec  = 1;
-         its.it_interval.tv_nsec = 0;
-         timerfd_settime(tfd, 0, &its, 0);
+         (void)sys_timer_arm_ms(tfd, 1000, 1000); /* 1 Hz repaint */
          ALooper_addFd(g_looper, tfd, 3, ALOOPER_EVENT_INPUT, on_timer, 0);
       }
    }
@@ -2078,7 +1510,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * rationale screen first; CONTINUE (in on_input) issues the actual
     * request. */
    if (!has_ble_permissions(activity)) {
-      g_gate = 1;
+      shell_gate_arm();
       /* Force portrait, exactly as opening any other modal screen does. The
        * gate's fixed 15-line body is laid out at a width-derived scale, so
        * in landscape its CONTINUE button falls below the buffer -- and that

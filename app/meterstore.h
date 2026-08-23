@@ -22,6 +22,7 @@
  */
 #ifndef METERSTORE_H
 #define METERSTORE_H
+#include "compiler.h"   /* PANCRA_MUST_USE: an answer no caller may drop */
 #include "loadresult.h" /* what a load actually found */
 
 /* One meter's runtime record. In memory except sync_t, which is persisted. */
@@ -52,7 +53,7 @@ struct meter_rt {
     * still stored -- refusing it would lose a fingerstick outright -- but the
     * fact that it was a GUESS is kept here rather than thrown away, together
     * with the instant that was not chosen, so the stamp can be repaired
-    * instead of merely doubted.
+    * rather than merely doubted.
     *
     * Per meter and per import: cleared when a walk begins, so the count
     * describes the last import rather than accumulating for the life of the
@@ -63,12 +64,12 @@ struct meter_rt {
 
 /* ---- THE RUNTIME TABLE IS THIS FILE'S, AND SO IS ITS LOCK ---------------
  *
- * It used to hand out `struct meter_rt *` into a file-scope array. Binder
+ * It does NOT hand out `struct meter_rt *` into a file-scope array. Binder
  * callbacks write a meter's RSSI, its phase text and its timestamps while the
  * watchdog reads them to decide whether to re-arm and the renderer reads them
- * to draw a row -- through pointers, so the reads were neither locked nor
- * even copies. `stat` is a 24-byte string: a device row could be drawn from
- * one half of a phase text and the other half of the next.
+ * to draw a row -- through pointers, such reads are neither locked nor even
+ * copies. `stat` is a 24-byte string: a device row would be drawn from one
+ * half of a phase text and the other half of the next.
  *
  * So the pointer does not leave: every read takes a COPY and every write is a
  * named operation. Each locks for itself.
@@ -84,16 +85,16 @@ struct meter_rt {
  *            rename so that two saves cannot interleave -- and, far more
  *            importantly, so that a save cannot render the table, wait, and
  *            then write a state that is older than the one a concurrent
- *            caller has already put in the table. It used to be a single
- *            flight entered AFTER the render, and a caller that lost it was
- *            told its meter's last-sync time had been persisted when no
- *            buffer anywhere contained it. Taken OUTSIDE mrt_lk, like
+ *            caller has already put in the table. As a single flight entered
+ *            AFTER the render, a caller that loses it is told its meter's
+ *            last-sync time was persisted when no buffer anywhere contained
+ *            it. Taken OUTSIDE mrt_lk, like
  *            calfile_lk around cal_lk; no reader ever takes it.
  *   idx_lk   the record-index file, which is a read-modify-write and was
  *            serialised only by the accident that its one writer runs under
  *            the driver's lock.
  * No path takes idx_lk with either of the other two held. `make lockcheck`
- * runs app/test/lockorder.py, which knows all three -- a leaf claim no tool
+ * runs test/app/lockorder.py, which knows all three -- a leaf claim no tool
  * checks is a comment.
  *
  * NOT a claim that this file calls nothing: meter_index_save asks the
@@ -127,7 +128,8 @@ int meter_rt_advert(int id, long sync_t, long advert_mono, int rssi,
  * One operation because the caller's version was a check and an act with a
  * gap: read the last advert time, decide, then record. Two scan callbacks for
  * one meter -- which is what a meter waking up produces -- could both read
- * the old stamp and both decide to wake it, issuing two connects during the
+ * the same stamp and both decide to wake it, issuing two connects during
+ * the
  * one second it is listening. */
 int meter_rt_advert_turn(int id, long sync_t, long advert_mono, int rssi,
                          int rssi_ok, long rssi_t, long window);
@@ -147,16 +149,73 @@ int meter_rt_amb_clear(int id);
 /* Where the two files live. Call once, at startup, before loading. */
 void meter_store_paths(const char *index_path, const char *sync_path);
 
-/* The last-sync times: persist all of them, or restore them. */
-int meter_sync_save(void);
+/* The last-sync times: persist all of them, or restore them.
+ *
+ * meter_sync_save() answers about THE FILE and nothing else: 0 means these
+ * bytes are on disk. It is not the same question as whether the live
+ * observation was accepted -- that is what meter_rt_rssi and its siblings
+ * answer -- and a caller that treats one as the other is claiming a restart
+ * will remember something it will not. */
+PANCRA_MUST_USE int meter_sync_save(void);
+
+/* ---- THE WRITE THAT DID NOT LAND ----------------------------
+ *
+ * Every meter observation the file carries -- when it was last seen, and the
+ * signal at that instant -- is written by a BLE callback that has no way to
+ * try again: a scan result is delivered once, and the meter it came from may
+ * not advertise again for hours. So a refused write would be the end of that
+ * observation, silently, with the screen still showing it.
+ *
+ * The table therefore tracks a generation: it knows which of its own state
+ * the file is known to hold, and a tick retries until the two agree.
+ *
+ *   SYNC_CLEAN        the file holds everything the table has.
+ *   SYNC_DEFERRED     something is owed and this call did not attempt it --
+ *                     throttled, or another writer holds the file (whose
+ *                     write covers the same rows).
+ *   SYNC_STILL_DIRTY  it was attempted and the file system refused again.
+ *
+ * `now` is a MONOTONIC second (the throttle measures an interval; a wall
+ * clock correction must not postpone a retry by an hour). */
+enum sync_retry { SYNC_CLEAN, SYNC_DEFERRED, SYNC_STILL_DIRTY };
+PANCRA_MUST_USE enum sync_retry meter_sync_retry(long now);
+
+/* Does the table hold anything the file is not known to? For the retry, for
+ * the tests, and for anything that wants to say so on the screen. */
+PANCRA_MUST_USE int meter_sync_dirty(void);
 enum load_result meter_sync_load(void);
 
-/* The record index for one meter. meter_index_load returns 0 when nothing is
- * stored -- which correctly means "walk from the beginning". */
 int meter_index_save(int id, int idx);
-int meter_index_load(int id);
-/* Every stored (id, index) pair, for a rewrite. Returns how many were read. */
-int meter_index_all(int *ids, int *vals, int cap);
+
+/* ---- THIS METER'S STORED INDEX, AND WHY THE ANSWER IS TYPED --
+ *
+ * The index is how far through a meter's records the app has already walked.
+ * Getting it wrong in the "I know nothing" direction is not free: the walk
+ * starts from the beginning, re-reads a window of records that were imported
+ * weeks ago, and re-offers every one of them. They dedup on an exact
+ * timestamp, so the history survives -- but the sync is long, it holds the
+ * meter awake, and any record whose timestamp shifted (a meter whose clock
+ * was set) lands twice.
+ *
+ * As one int, -1 means BOTH "this meter has no stored index" and "the file
+ * could not be read". Those want opposite actions: the
+ * first is a first sync and walking from the beginning is exactly right; the
+ * second is a file that exists and did not answer, where walking from the
+ * beginning is a guess with a cost.
+ *
+ *   LOAD_ABSENT   no index file at all -- a first run. *out is -1.
+ *   LOAD_OK       the file was read. *out is this meter's index, or -1 if
+ *                 the file does not mention it (which for a file that IS
+ *                 there is still "walk from the beginning", but knowingly).
+ *   LOAD_CORRUPT  the file was read and some of it is not this format. Rows
+ *                 that DID parse are still answered from -- losing every
+ *                 meter's progress over one bad row is the harm, not the
+ *                 fix -- and the caller is told the file is incomplete.
+ *   LOAD_ERROR    it could not be read. *out is -1 and the caller must NOT
+ *                 treat that as "nothing stored".
+ */
+enum load_result meter_index_load(int id, int *out);
+
 
 #ifdef APP_FAULTS
 /* HELD OPEN ON DEMAND, twice inside meter_sync_save: once between the two

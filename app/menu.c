@@ -7,6 +7,7 @@
 #include "calib.h"
 #include "clock.h"
 #include "device.h"
+#include "devtag.h" /* a log may not carry an address; see there */
 #include "dexdriver.h"
 #include "food.h"
 #include "forms.h"
@@ -20,6 +21,7 @@
 #include "pairing.h"
 #include "reconcile.h"
 #include "remote.h" /* remote_retry_now: a fixed setting is tried NOW */
+#include "remotecfg.h"
 #include "scan.h"
 #include "selection.h"
 #include "sensors.h"
@@ -81,7 +83,25 @@ static int g_pair_mark = 1;
  *
  * The JNI is in jbridge.c; what is left here is the app's own policy: which
  * cutoff EXPORT DATA uses, and which of the g_exp_* checkboxes it passes. */
-static void sys_export_data(void)
+/* ---- WHETHER THE LAST EXPORT REACHED JAVA AT ALL ----------------------
+ *
+ * WHY THE ANSWER IS KEPT. Discard jb_export_data's answer and an activity
+ * that has gone away, a method the bridge cannot resolve, and a Java
+ * exception on the way in all look exactly like a successful export: the menu
+ * stays, nothing is said, and no share sheet appears. The user's only
+ * evidence is a sheet that did not open, and the
+ * natural conclusion is that the app is slow -- so they tap again, and again.
+ *
+ * 0 = nothing attempted yet or the last attempt was accepted; 1 = the last
+ * attempt did NOT reach Java. RETRYABLE and deliberately sticky: it is
+ * cleared when a later attempt is accepted, and by leaving the screen (the
+ * export menu's X), so the notice cannot outlive the workflow it describes.
+ * Main-thread state, like everything else here. */
+static int g_exp_failed;
+
+/* 1 if Java accepted the request. THE CALLER MUST NOT claim the export
+ * happened on any other answer. */
+static int sys_export_data(void)
 {
    /* Cutoff epoch: rows OLDER than this are left out (0 = keep all). Java
     * filters by each row's leading epoch field and keeps header lines. */
@@ -90,8 +110,8 @@ static void sys_export_data(void)
       cutoff = realtime_s() - (30L * 86400);
    else if (g_exp_range == 1)
       cutoff = realtime_s() - (365L * 86400);
-   jb_export_data(shell_activity(), cutoff, g_exp_glu, g_exp_dev, g_exp_ins,
-                  g_exp_wt);
+   return jb_export_data(shell_activity(), cutoff, g_exp_glu, g_exp_dev,
+                         g_exp_ins, g_exp_wt);
 }
 
 /* ONE CONSISTENT COPY for the frame (see menuview.h). Everything here is
@@ -116,6 +136,7 @@ void menu_view_get(struct menu_view *out)
    out->exp_dev        = g_exp_dev;
    out->exp_ins        = g_exp_ins;
    out->exp_wt         = g_exp_wt;
+   out->exp_failed     = g_exp_failed;
 }
 
 /* Sample the system states the settings screen shows into the g_sys_* cache.
@@ -125,11 +146,11 @@ void sys_refresh(void)
 {
    /* A CACHE KEEPS ITS LAST GOOD VALUE when Java could not answer.
     *
-    * Each of these used to take the Java call's return value straight into
-    * the cache, and a call that THREW returns a zeroed one -- so a revoked
-    * permission that makes checkSelfPermission throw showed as "not
-    * granted" (the same as a real denial), and a throwing getAppStandbyBucket
-    * showed as bucket 0, ACTIVE: the most reassuring answer there is,
+    * Taking a Java call's return value straight into the cache stores a
+    * zeroed one whenever the call THREW -- so a revoked permission that makes
+    * checkSelfPermission throw shows as "not granted" (the same as a real
+    * denial), and a throwing getAppStandbyBucket shows as bucket 0, ACTIVE:
+    * the most reassuring answer there is,
     * displayed as a fact on the screen a user opens precisely when something
     * is wrong. Leaving the previous reading in place is not perfect either,
     * but it is the difference between stale and fabricated. */
@@ -142,17 +163,17 @@ void sys_refresh(void)
 
 /* THE SUBMENU DISPATCHERS, one per screen family.
  *
- * This was ONE chain of thirty-four `else if`s covering the alarm, the export
- * sheet, the sync server, the device lists and four separate back buttons --
- * "split out of menu_action so it stays under the size gate", which moved the
- * heterogeneity rather than removing it. Each family is now its own function
- * returning 1 when the action was its own, the way menu.c already dispatches
+ * ONE FUNCTION PER FAMILY, each returning 1 when the action was its own. A
+ * single chain of thirty-four `else if`s covering the alarm, the export
+ * sheet, the sync server, the device lists and four separate back buttons is
+ * a size-gate problem answered by moving heterogeneity around rather than by
+ * removing it. This is the way menu.c dispatches
  * per screen family, and what is left here is the navigation between them.
  */
 /* THE ALARM AND NUDGE SUBMENU: the two thresholds, the two nudge bands, and
- * the outputs. Each threshold row opens the keypad and RECORDS where it was
- * tapped, because this screen is reachable from the main screen as well as
- * from settings. */
+ * the outputs. Each threshold row opens the keypad and RECORDS the screen it
+ * is tapped on, because this screen is reachable from the main screen as well
+ * as from settings. */
 static int alarm_menu_action(int action)
 {
    struct prefs sp;
@@ -161,7 +182,7 @@ static int alarm_menu_action(int action)
        action == MA_NUDGE_LOW || action == MA_NUDGE_HIGH) {
       /* "LOW <value>" / "HIGH <value>" (main-screen rows or ALARM submenu):
        * type the threshold on the keypad (display units). The keypad
-       * returns to WHERE this was tapped -- the origin rule. */
+       * returns to the screen the row is tapped on -- the origin rule. */
       int mode = KP_NUDGE_HIGH;
       if (action == MA_ALARM_LOW)
          mode = KP_ALARM_LOW;
@@ -206,10 +227,14 @@ static int export_menu_action(int action)
       g_exp_wt = !g_exp_wt;
    } else if (action == MA_EXP_GO) {
       if (cur_screen() == SCR_EXPORT &&
-          (g_exp_glu || g_exp_dev || g_exp_ins || g_exp_wt))
-         sys_export_data(); /* Java builds the CSV per the checkboxes/range
-                             * and opens the share sheet; the menu stays,
-                             * its X returns to settings */
+          (g_exp_glu || g_exp_dev || g_exp_ins || g_exp_wt)) {
+         /* Java builds the CSV per the checkboxes/range and opens the share
+          * sheet; the menu stays, its X returns to settings. The ANSWER is
+          * read: only Java accepting the call means the export was
+          * dispatched, and a refusal is shown on the screen the user is
+          * looking at rather than swallowed. */
+         g_exp_failed = !sys_export_data();
+      }
    } else {
       return 0; /* not ours */
    }
@@ -223,7 +248,7 @@ static int export_menu_action(int action)
 static int remote_menu_action(int action)
 {
    struct sync_creds sc;
-   sync_creds_get(&sc);
+   remote_creds_get(&sc);
    struct prefs sp;
    settings_get(&sp);
    if (action == MA_REMOTE_OPEN || action == MA_SYNCREST_NO) {
@@ -236,7 +261,7 @@ static int remote_menu_action(int action)
        * state before the toggle -- and the retry below would then fire on
        * the way OFF and not on the way on. */
       int want = !sp.remote_on;
-      if (settings_set_remote_on(want) != SETTINGS_OK)
+      if (remote_set_on(want) != SETTINGS_OK)
          set_status("SYNC SETTING NOT SAVED");
       /* TURNING IT BACK ON IS A REQUEST TO SYNC. Whatever schedule the last
        * failure earned belongs to the settings that failed; the user has
@@ -287,7 +312,7 @@ static int remote_menu_action(int action)
        * identity is rolled back whole -- so dropping the key anyway leaves a
        * phone that has stopped syncing while the screen still says PAIRED,
        * and the next launch loads the identity straight back. */
-      if (settings_forget_identity() != SETTINGS_OK)
+      if (remote_forget_identity() != SETTINGS_OK)
          set_status("UNPAIR NOT SAVED");
       else
          sync_set_key(0, sc.key);
@@ -397,7 +422,7 @@ static int submenu_action(int action, int ix)
 }
 
 /* Per-device STYLING: marker shape, size, colour, and the rename keypad.
- * Split out of menu_action for the same reason ins_action and wt_action were
+ * Split out of menu_action for the same reason the typed-entry families were
  * -- that function is the app's single largest, and the size gate is what
  * stops it growing without bound. Returns 1 when `action` was one of ours.
  */
@@ -459,7 +484,7 @@ static int style_action(int action, int ix)
        * this list does not fail loudly -- it silently gets the sensor label's
        * capacity. For a food name that is 20 characters too many: the keypad
        * would accept them and food_type_add would then refuse the name, so
-       * the refusal arrives after the typing rather than instead of it. */
+       * the refusal arrives after the typing rather than in place of it. */
       int cap = (int)sizeof(((struct sensor_slot *)0)->label) - 1;
       if (fv.label_field == LABEL_SERVER)
          cap = (int)sizeof(((struct prefs *)0)->remote_server) - 1;
@@ -515,9 +540,9 @@ static int settings_action(int action, int ix)
          set_status("UNITS NOT SAVED");
       /* The notification renders the value in DISPLAY units (title AND the
        * status-bar icon) but is only rebuilt on a new datapoint -- without
-       * an explicit refresh the bar keeps showing the OLD units' rendering
-       * (e.g. "9.4" beside a big number reading 169) for up to a full CGM
-       * cadence after the toggle. */
+       * an explicit refresh the bar keeps showing the previous units'
+       * rendering (e.g. "9.4" beside a big number reading 169) for up to a
+       * full CGM cadence after the toggle. */
       notify_mark();
       notify_tick();
    } else if (action == MA_DISC) {
@@ -540,11 +565,10 @@ static int settings_action(int action, int ix)
 
 /* THE DEVICE REGISTRY, one dispatcher per stage of a device's life.
  *
- * This was one 196-line chain covering discovery, pairing, the primary
- * choice, the wear budget, retirement, revival and the meter's on-demand
- * sync -- fourteen actions with nothing in common but the word "device".
- * Each stage is its own function now; registry_action is the order they are
- * tried in.
+ * Discovery, pairing, the primary choice, the wear budget, retirement,
+ * revival and the meter's on-demand sync are fourteen actions with nothing in
+ * common but the word "device", so each stage is its own function and
+ * registry_action is the order they are tried in.
  */
 /* OPENING one device's own screen, and leaving it. The origin is RECORDED on
  * a genuine external entry and never inferred -- the rule this file's header
@@ -553,15 +577,15 @@ static int device_open_action(int action, int ix)
 {
    if (action == MA_SENSOR) {
       /* Remember the origin so MA_SENSOR_BACK returns there -- but ONLY on a
-       * genuine EXTERNAL entry (the DEVICES list, the OLD DEVICES list, or
+       * genuine EXTERNAL entry (the DEVICES list, the retired-devices list, or
        * the main screen's info-block shortcut). The marker/colour/label/cal
-       * sub-screens also re-enter SCR_SENSOR via MA_SENSOR. The condition
-       * that used to guard the origin capture here -- "capture only when the
-       * current screen is one of these three, because any other is an
-       * internal round-trip" -- is gone: nav_go treats a screen already on
-       * the path as a RETURN, so re-entering SCR_SENSOR from its own
-       * sub-screen pops back to it and cannot record the sub-screen as its
-       * origin. The rule is derived from the route now, not listed. */
+       * sub-screens also re-enter SCR_SENSOR via MA_SENSOR. No listed
+       * condition guards the capture -- "capture only when the current screen
+       * is one of these three, because any other is an internal round-trip"
+       * -- because nav_go treats a screen already on the path as a RETURN, so
+       * re-entering SCR_SENSOR from its own sub-screen pops back to it and
+       * cannot record the sub-screen as its origin. The rule is derived from
+       * the route, not listed. */
       /* `ix` IS THE DEVICE ID. The row the finger landed on became one at
        * touch-down, in input.c, against the frame that drew it -- a redraw
        * between down and up renumbers rows, and this dispatch happens on the
@@ -673,6 +697,7 @@ static int device_primary_action(int action, int ix)
  * retiring it, and syncing a meter on demand. */
 static int device_life_action(int action)
 {
+   char dt[DEVTAG_LEN];
    if (action == MA_RECONNECT) {
       /* Direct revive if the sensor was pulled BEFORE expiry; otherwise a
        * confirmation, since reconnecting a dead sensor just waits forever.
@@ -690,19 +715,34 @@ static int device_life_action(int action)
    } else if (action == MA_RECON_YES) {
       do_reconnect(sel_device());
    } else if (action == MA_PEND_CANCEL) {
+      /* CONFIRM FIRST; this action changes nothing.
+       *
+       * The armed-pairing row sits in the device list wearing a device's
+       * clothes -- a name on the left, a state on the right -- and every
+       * other row there opens that device's own screen. A finger reaching
+       * for the new sensor lands on the one row that instead threw the
+       * pairing away, and threw it away in silence: the status line is drawn
+       * on the main screen, so from the device list the row simply vanished
+       * with nothing said. */
+      if (pairing_pending())
+         nav_go(SCR_PENDCANCEL);
+   } else if (action == MA_PEND_KEEP) {
+      nav_go(SCR_DEVICES); /* leave it armed, exactly as it was */
+   } else if (action == MA_PEND_STOP) {
       if (pairing_pending()) {
          LOGI("pending pairing cancelled by user");
          pairing_arm(0);
          set_status("PAIRING CANCELLED");
       }
+      nav_go(SCR_DEVICES);
    } else if (action == MA_WEAR) {
       /* Cycle this device's wear budget: AUTO -> 10 D -> 15 D -> AUTO.
        *
-       * THREE STATES, NOT TWO, AND AUTO MUST BE REACHABLE. This was a
-       * 10 <-> 15 toggle, so the first tap wrote an explicit override and
-       * NOTHING could ever remove it again: sensor_wear_seconds gives a pin
-       * absolute priority, which permanently disabled the model resolution
-       * for that device. A G7 paired on 2026-07-23 -- one day before the
+       * THREE STATES, NOT TWO, AND AUTO MUST BE REACHABLE. A 10 <-> 15
+       * toggle would mean the first tap writes an explicit override that
+       * nothing can remove: sensor_wear_seconds gives a pin absolute
+       * priority, which permanently disables the model resolution for that
+       * device. A G7 paired on 2026-07-23 -- one day before the
        * SW14758 (G7 15 Day) model rule existed -- carried a pin of 10 from
        * that era, so once the rule landed the app went on counting a 10-day
        * budget for a sensor it could now positively identify as 15-day,
@@ -719,24 +759,17 @@ static int device_life_action(int action)
    } else if (action == MA_FORGET_YES) {
       device_retire(sel_device());
    } else if (action == MA_SYNC) {
-      /* SYNC NOW CONNECTS. It used to do nothing whatsoever.
+      /* SYNC NOW CONNECTS, and that is the whole of what this control is.
        *
-       * All three of its old statements were no-ops by the time they ran:
-       *
-       *   - it cleared g_meter_last_sync "so the next advertisement syncs
-       *     immediately", but the per-meter throttle refactor moved the gate
-       *     to meter_rt.sync_t and left that global read by NOTHING. Grep
-       * it: one declaration, one write here, one write on completion, zero
-       *     reads. The throttle it claimed to clear was untouched.
-       *   - it called start_scan, which early-returns whenever scan_running()
-       * is set -- always, while the UI is up. See scan_restart.
-       *   - and it never attempted a connection at all. The whole design
-       * waits passively for an advertisement, so with the meter switched on
-       * but between advertising bursts, the one control the user has to
-       * force a sync did literally nothing, silently, however many times it
-       * was pressed. Confirmed from an HCI capture on 2026-08-03: 26 minutes
-       *     of taps with no radio traffic to the meter at all, then a sync
-       *     1.3 s after the first advertisement finally arrived.
+       * Clearing a throttle and restarting the scan is NOT a sync: start_scan
+       * early-returns whenever scan_running() is set -- always, while the UI
+       * is up (see scan_restart) -- and the rest of the design waits
+       * passively for an advertisement. With the meter switched on but
+       * between advertising bursts, that leaves the one control the user has
+       * to force a sync doing nothing at all, silently, however many times it
+       * is pressed. Measured from an HCI capture: twenty-six minutes of taps
+       * with no radio traffic to the meter at all, then a sync 1.3 s after
+       * the first advertisement arrived on its own.
        *
        * A registered meter is BONDED and its address is known, and
        * dexble_meter_connect uses autoConnect=true -- so there is no reason
@@ -762,7 +795,8 @@ static int device_life_action(int action)
             LOGI("manual sync refused: a meter sync is already in flight");
             set_status("METER BUSY, RETRY");
          } else {
-            LOGI("manual sync: connecting to meter %s (id %d)", mmac, mid);
+            LOGI("manual sync: connecting to meter id %d (dev %s)", mid,
+                 devtag(mmac, dt));
             set_status("METER: SYNCING");
             meter_sync_start(mid, mmac);
          }
@@ -771,8 +805,8 @@ static int device_life_action(int action)
        * Android has quietly demoted (scan_restart). Deliberately NOT
        * pair_scan_start(): that sets g_smart_pairing, which suppresses every
        * CGM's advert-driven reconnect and is never cleared from this screen,
-       * so a single SYNC NOW tap used to kill CGM reconnection for the life
-       * of the process. */
+       * so a single SYNC NOW tap through it kills CGM reconnection for the
+       * life of the process. */
       pairing_forget_candidates(); /* atomic vs the binder-thread writer */
       scan_restart(shell_activity());
    } else {
@@ -809,7 +843,7 @@ static int calib_action(int action, int ix)
          nav_go(SCR_CALPEND);
       } else {
          /* Straight to the value keypad (like PLOT MAX); cancel returns to
-          * the device menu. The old read-only bounds panel is gone. */
+          * the device menu. */
          nav_go(SCR_KEYPAD);
          forms_kp_open(KP_CALIB, SCR_SENSOR);
          forms_set_cal_pending(0);
@@ -849,8 +883,8 @@ static int calib_action(int action, int ix)
        * puts every part of the transition back when its one-line file cannot
        * be replaced (CALIB_UNSAVED means nothing changed, in memory or on
        * disk), so the only thing standing between the user and a retry is
-       * this screen -- and it used to clear the value and leave anyway,
-       * making a one-press retry a re-entry on a keypad three screens away.
+       * this screen: clearing the value and leaving anyway turns a one-press
+       * retry into a re-entry on a keypad three screens away.
        *
        * A value of 0, or no selected sensor, is not a failed write: there is
        * nothing to hold on to and nothing to retry, so those leave as
@@ -878,9 +912,9 @@ static int calib_action(int action, int ix)
        * now. It is NOT dropped if the sensor is not streaming this instant
        * -- it stays queued and every subsequent reading retries it (see
        * calib_try in pancra_glucose) until the sensor accepts or the
-       * freshness window lapses, and the outcome is always shown. This is
-       * the fix for a confirmed calibration being silently lost to a
-       * reconnect gap.
+       * freshness window lapses, and the outcome is always shown -- which is
+       * what keeps a confirmed calibration from being lost to a reconnect
+       * gap.
        */
       /* ...AND THE VALUE IS KEPT WHEN THE QUEUE COULD NOT BE WRITTEN. It is a
        * fingerstick: a number that was true a minute ago and cannot be
@@ -983,10 +1017,10 @@ static int keypad_action(int action, int ix)
        * numeric entry.
        *
        * ONE PREDICATE, shared with the renderer that draws the key
-       * (kp_has_dot). This branch used to spell the range out as 10..11
-       * while the renderer drew the key for 10..13, so the NUDGE keypads had
-       * a visible, tappable, DEAD '.' -- and with it no way to enter a nudge
-       * threshold at all in mmol/L. */
+       * (kp_has_dot). Spelled out here as a range, it drifts from the one
+       * the renderer draws the key for -- 10..11 against 10..13 leaves the
+       * NUDGE keypads a visible, tappable, DEAD '.', and with it no way to
+       * enter a nudge threshold at all in mmol/L. */
       if (cur_screen() == SCR_KEYPAD && kp_has_dot(forms_kp_mode(), sp.units) &&
           forms_kp_len() < kp_slots(forms_kp_mode())) {
          if (!forms_kp_has('.')) /* one decimal point per number */
@@ -998,7 +1032,7 @@ static int keypad_action(int action, int ix)
       /* ONLY the pairing keypad backs out to the ADD DEVICE type picker. The
        * label editor and the plot-max / calibration keypads share this close
        * code -- gate on the actual menu, or renaming a device (SCR_LABEL)
-       * and cal/plot-max entry wrongly landed on ADD DEVICE instead of their
+       * and cal/plot-max entry would land on ADD DEVICE rather than on their
        * own return target. */
       int was_pairing =
           (cur_screen() == SCR_KEYPAD && forms_kp_mode() == KP_PAIR_CODE);
@@ -1076,10 +1110,10 @@ static int shortcut_action(int action, int ix)
       /* Every X that simply pops to wherever its screen was opened FROM. One
        * branch because it is one rule: nav_back() reads the recorded origin,
        * so there is nothing per-screen left to say -- and four identical
-       * bodies scattered down the chain is exactly how the old hardcoded exit
-       * targets drifted apart. Each log is reachable from the ADD menu OR
-       * from a main-screen shortcut; the comments here used to claim "where
-       * it opened" while the code named one fixed menu. */
+       * bodies scattered down the chain is exactly how hardcoded exit
+       * targets drift apart -- each log is reachable from the ADD menu OR
+       * from a main-screen shortcut, so a comment claiming "where it opened"
+       * over code naming one fixed menu is the failure mode. */
       nav_back();
    } else if (action == MA_STATBAR || action == MA_LOCKSCR ||
               action == MA_NOTIF_REOPEN) {
@@ -1128,6 +1162,10 @@ int menu_back_code(int *ix)
       case SCR_FOOD: return MA_FOOD_DISCARD;
       case SCR_FOODTYPE: return MA_FOODTYPE_BACK;
       case SCR_FOODLOG: return MA_FOODLOG_BACK;
+      case SCR_FOODDEL: return MA_FOODDEL_NO;
+      case SCR_EXLOG: return MA_EXLOG_BACK;
+      case SCR_EXEDIT: return MA_EX_DISCARD;
+      case SCR_EXDEL: return MA_EXDEL_NO;
       case SCR_MARKPICK:
       case SCR_COLORPICK:
          /* the combined picker's X: DISPLAY for an insulin type's styling,
@@ -1139,6 +1177,7 @@ int menu_back_code(int *ix)
       case SCR_METERHELP: return MA_ADDSENSOR;
       case SCR_SYNCRESTORE: return MA_SYNCREST_NO;
       case SCR_PAIRCONF: return MA_PAIR_NO;
+      case SCR_PENDCANCEL: return MA_PEND_KEEP;
       case SCR_INSULIN: return MA_INS_DISCARD;
       case SCR_INSDEL: return MA_INSDEL_NO;
       /* The three WEIGHT screens, missing since they were added: default
@@ -1158,9 +1197,9 @@ int menu_back_code(int *ix)
       case SCR_RECONF: return MA_RECON_NO;
       case SCR_REMOTE: return MA_REMOTE_BACK;
       /* NO `default:`. Every screen is listed, so -Wswitch-enum turns adding
-       * one and forgetting its back code into a build error instead of a key
-       * that silently does nothing -- which is exactly how the three WEIGHT
-       * screens above shipped without a back key. SCR_MAIN is "no modal is
+       * one and forgetting its back code into a build error rather than a
+       * key that silently does nothing -- which is exactly how a screen ships
+       * without a back key. SCR_MAIN is "no modal is
        * open", which has no back code by definition.
        *
        * SCR_GATE and SCR_N appeared here the moment the two screen enums
@@ -1186,16 +1225,25 @@ void menu_action(int action, int ix)
    if (settings_action(action, ix) || registry_action(action, ix) ||
        calib_action(action, ix) || system_action(action, ix) ||
        keypad_action(action, ix) || pair_action(action, ix) ||
-       shortcut_action(action, ix) || ins_action(action, ix) ||
-       wt_action(action, ix) || food_action(action, ix) ||
-       style_action(action, ix) ||
-       submenu_action(action, ix)) {
-      /* HANDLED BY A NAMED FAMILY. Every one of them is defined immediately
-       * above this function, each states in a sentence what it is a family OF,
-       * and the order here is the order the branches had inside the single
-       * chain this replaced -- which matters, because a few of them overlap on
-       * purpose (a keypad digit and a device pick are both "a number the user
-       * touched") and the first match has always won. */
+       shortcut_action(action, ix) || forms_action(action, ix) ||
+       style_action(action, ix) || submenu_action(action, ix)) {
+      /* HANDLED BY A NAMED FAMILY, and EXACTLY ONE of them.
+       *
+       * Every family is defined immediately above this function or in
+       * app/form*.c, and each states in a sentence what it is a family OF.
+       * THE ORDER IS NOT LOAD-BEARING, and that is a property worth having:
+       * with first-match-wins, two families claiming one action produce a
+       * control whose behaviour depends on how this file happens to be
+       * written, and an action claimed by NONE of them produces a button that
+       * draws perfectly and does nothing.
+       *
+       * `make -f test/Makefile actioncheck` now proves neither can happen: it
+       * attributes every MA_* to the function that tests it, across all six
+       * dispatch files, and refuses a duplicate or an orphan. With ownership
+       * unique the chain answers the same whatever order it is written in --
+       * so the order below is a reading convenience rather than a rule, and
+       * adding a family cannot change what an existing control does. (It
+       * found six actions nothing dispatched, on its first run.) */
    } else if (action == MA_OK) {
       /* OK MEANS "I HAVE FINISHED TYPING", and nothing more. The keypad and
        * the label editor are one widget each, shared by every field that needs

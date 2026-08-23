@@ -105,9 +105,9 @@ int gif_dims_ok(int w, int h, size_t *npx)
       return 0;
    /* CHECKED MULTIPLICATION, even though the _Static_assert in gif.h proves it
     * cannot fail at the current GIF_DIM_MAX. It costs one divide once per
-    * image, and it is the line that stays correct if the limit ever moves --
-    * the old code multiplied through a signed `long`, which on a 32-bit `long`
-    * is undefined behaviour rather than a wrong answer. */
+    * image, and it is the line that stays correct if the limit ever moves.
+    * An earlier version multiplied through a signed long, which on a 32-bit
+    * target is undefined behaviour rather than a wrong answer. */
    if ((size_t)w > SIZE_MAX / (size_t)h)
       return 0;
    *npx = (size_t)w * (size_t)h;
@@ -124,19 +124,17 @@ size_t gif_encode(struct gif_ws *ws, uint8_t *out, size_t cap,
     * That ordering is the whole point: a refusal that has already written a
     * header is indistinguishable, to the buffer's owner, from a success.
     *
-    * The NULL tests are new and were reachable. `px` was dereferenced
-    * unconditionally at the head of the pixel loop (`int prefix = px[0]`), so
-    * gif_encode(ws, out, cap, NULL, 8, 8, pal, 16) segfaulted -- measured, not
-    * inferred. `pal` was read while emitting the global colour table, and
-    * `out` was written through by put() whenever cap was nonzero. Only `ws`
-    * was ever checked. */
+    * All four pointers, not just `ws`: each of the other three was
+    * dereferenced on some path before this test existed -- `px` at the head
+    * of the pixel loop, `pal` while emitting the colour table, and `out`
+    * through put() whenever `cap` was nonzero. */
    if (!ws || !out || !px || !pal)
       return 0;
    if (ncolors < 2 || ncolors > 256)
       return 0;
-   /* THE DIMENSIONS, AND THE PIXEL COUNT, IN ONE PLACE. See gif.h for what a
-    * width above 65535 used to put on the wire; the short version is a header
-    * claiming four pixels above a stream carrying 262148 of them. */
+   /* THE DIMENSIONS, AND THE PIXEL COUNT, IN ONE PLACE -- because a header
+    * field and a pixel stream that disagree about the size is a file every
+    * decoder reads differently. See gif.h for the bound. */
    size_t npx;
    if (!gif_dims_ok(w, h, &npx))
       return 0;

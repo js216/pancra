@@ -7,15 +7,17 @@
 #include "alarmlogic.h" /* the entry bounds these commits enforce */
 #include "blejni.h"     /* dexble_env: a JNIEnv for THIS thread */
 #include "civil.h"
-#include "clock.h"
-#include "exercise.h"
+#include "exercise.h" /* EX_DUR_MAX: the ceiling a typed duration meets */
 #include "food.h"
+#include "formsint.h" /* what the four workflow controllers owe this file */
+#include "insrow.h"   /* INS_*: what a dose row can say */
 #include "insulin.h"
 #include "keypad.h" /* enum keypad_mode: these numbers have names */
 #include "log.h"
 #include "nav.h"
 #include "notify.h"
 #include "remote.h"
+#include "remotecfg.h"
 #include "selection.h"
 #include "sensors.h"
 #include "settings.h"
@@ -23,10 +25,10 @@
 #include "status.h"
 #include "syncjni.h"
 #include "tzoff.h"
-#include "uiact.h"
 #include "uimodel.h"
 #include "util.h"
 #include "weight.h"
+#include <jni.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -49,95 +51,32 @@
  * through one helper that sets EVERY field, so a workflow starts from a state
  * it stated in full rather than from whatever the last one left behind. */
 
-/* Which page each LOG is showing, and how the WEIGHT LOG's plot is being
- * read. Paging and scrubbing are typed-entry state in the same sense the
- * forms are: the user is navigating within a screen, not between screens. */
-struct log_view {
-   int ins_page;
-   int wt_page;
-   int wt_tab;
-   int wt_scrub; /* -1 = not scrubbing */
-   int foodtype_page; /* which page of the FOOD TYPE picker is showing */
-   int foodlog_page;  /* ...and of the FOOD LOG table */
-};
-static struct log_view g_view = {0, 0, 0, -1, 0, 0};
-
-/* LOG/EDIT WEIGHT.
- *
- * `f` IS THE MODEL'S OWN STRUCT, not a copy of its fields. weight.h has
- * defined `struct wt_form` and `wt_form_open` all along -- typed, tested by
- * weighttest, and holding the rule that a fresh form opens on the last logged
- * weight -- while this file kept its own three loose globals for the same
- * three values beside it. Two representations of one form is how the shell
- * and the model come to disagree about what is being edited.
- *
- * `orig` is the part the model has no opinion about: a COPY of the entry as
- * it was, which is the match key for the rewrite. An index into the tail
- * would go stale the moment the log reloads, and rewriting by position is how
- * an edit lands on the wrong row. */
-struct wt_draft {
-   struct wt_form f;
-   struct wt_rec orig;
-};
-static struct wt_draft g_wt = {
-    {0, 0, -1},
-    {0, 0}
-};
-
-/* LOG/EDIT FOOD. The third of these, and the same shape for the same reasons:
- * the values being typed, plus the entry as it was on disk for an edit.
- *
- * WHICH FOOD IS AN ID, not a position in the vocabulary. The picker can ADD a
- * food -- that is the point of its NEW FOOD row -- which grows the table on
- * the very tap that returns here, so an index would name a different food
- * afterwards and nothing on the screen would say so. */
-struct food_draft {
-   long t;
-   int type; /* a food_type id; FOOD_TYPE_NONE = nothing chosen yet */
-   int g;
-   int edit; /* index being edited, < 0 for a new entry */
-};
-static struct food_draft g_food = {0, FOOD_TYPE_NONE, 0, -1};
-
-/* LOG/EDIT INSULIN. Same shape and same reason as the weight draft above:
- * insulin.h's `struct ins_form` is the model (the instant is edited as a
- * whole; units re-populate from the last dose of the selected type when the
- * form opens or the type toggles), and `orig` is the rewrite's match key. */
-struct ins_draft {
-   struct ins_form f; /* insulin.h's own, with ins_form_open/toggle_type */
-   struct ins_rec orig;
-};
-static struct ins_draft g_ins = {
-    {0, 0, 0, -1},
-    {0, 0, 0}
-};
-
 /* WHICH FORM'S INSTANT THIS MODE EDITS, as a pointer or NULL.
  *
- * This was `kp_edits_weight(m) ? &g_wt.f.t : &g_ins.f.t` at both call sites --
- * a two-way choice that was right while there were two forms and silently
- * wrong the moment there was a third: every food date would have moved the
- * INSULIN form's instant, because "not weight" meant insulin by default.
+ * A `weight ? weight's instant : insulin's` test at each call site is a
+ * two-way choice that is right for two forms and silently wrong for a third:
+ * every food date would move the INSULIN form's instant, because "not weight"
+ * means insulin by default.
  * keypad.h carries the full argument; what matters here is that the mapping is
  * now total, and a mode that is not a form field at all gets NULL rather than
  * somebody else's timestamp. */
 static long *form_instant_of(enum keypad_mode m)
 {
    switch (kp_form_of(m)) {
-      case KP_FORM_WEIGHT: return &g_wt.f.t;
-      case KP_FORM_INSULIN: return &g_ins.f.t;
-      case KP_FORM_FOOD: return &g_food.t;
+      case KP_FORM_WEIGHT: return form_wt_instant();
+      case KP_FORM_INSULIN: return form_ins_instant();
+      case KP_FORM_FOOD: return form_food_instant();
+      case KP_FORM_EXERCISE: return form_ex_instant();
       case KP_FORM_NONE: break;
    }
    return 0;
 }
 
-
 /* ---- OPENING A DRAFT SETS ALL OF IT --------------------------------------
  *
  * EVERY FIELD, INCLUDING THE ONES THE PATH HAS NO USE FOR. Opening the weight
- * form for a new entry used to set `t`, `tenths` and `edit` and say nothing
- * about `orig`, which then still held the row of whatever was edited last.
+ * form for a new entry by setting `t`, `tenths` and `edit` alone leaves `orig`
+ * holding the row of whatever was edited last.
  * That is safe only for exactly as long as every reader of `orig` remembers
  * to test `edit` first -- an invariant spread across a dozen branches, none of
  * which the compiler checks, guarding a rewrite that lands on a row the user
@@ -145,59 +84,6 @@ static long *form_instant_of(enum keypad_mode m)
  *
  * These take the whole draft, so a workflow starts from a state it stated in
  * full rather than from whatever the last one left behind. */
-
-static void wt_draft_new(struct wt_draft *d, const struct prefs *sp)
-{
-   struct wt_rec none = {0, 0};
-   d->orig            = none;
-   /* wt_form_open is weight.h's, and holds the rule this file must not
-    * restate: a fresh form opens on the LAST logged weight, because a
-    * weigh-in moves by ounces and starting from zero would make every entry a
-    * full retype. weighttest pins it. */
-   wt_form_open(&d->f, wt_newest().g, sp->wunits, realtime_s());
-}
-
-static void wt_draft_edit(struct wt_draft *d, int i, const struct prefs *sp)
-{
-   struct wt_rec row = wt_at(i);
-   d->orig           = row; /* the rewrite's match key, not an index */
-   d->f.edit         = i;
-   d->f.t            = row.t;
-   d->f.tenths       = wt_to_tenths(row.g, sp->wunits);
-}
-
-/* No longer editing anything. The draft's values stay readable for the render
- * that follows the tap; what changes is that they no longer name a row. */
-static void wt_draft_done(struct wt_draft *d)
-{
-   struct wt_rec none = {0, 0};
-   d->f.edit          = -1;
-   d->orig            = none;
-}
-
-static void ins_draft_new(struct ins_draft *d, int type)
-{
-   struct ins_rec none = {0, 0, 0};
-   d->orig             = none;
-   ins_form_open(&d->f, type, realtime_s());
-}
-
-static void ins_draft_edit(struct ins_draft *d, int i)
-{
-   struct ins_rec row = ins_at(i);
-   d->orig            = row;
-   d->f.edit          = i;
-   d->f.t             = row.t;
-   d->f.type          = row.type;
-   d->f.units         = row.units;
-}
-
-static void ins_draft_done(struct ins_draft *d)
-{
-   struct ins_rec none = {0, 0, 0};
-   d->f.edit           = -1;
-   d->orig             = none;
-}
 
 /* THE KEYPAD AND WHAT THE DIGITS ARE FOR.
  *
@@ -250,450 +136,25 @@ void keypad_close(void)
 
 /* THE ZONE THE FORMS EDIT IN. Every date/time entry below splits an instant
  * into a civil date and recombines it, and both halves of that need the
- * offset in force AT THE INSTANT BEING EDITED -- not g_tz_off, which is the
+ * offset in force AT THE INSTANT BEING EDITED -- not tz_off_now(), which is the
  * offset TODAY.
  *
- * That is TODO 131 exactly: the keypad split and recombined with g_tz_off, so
- * moving a dose to a date on the far side of a DST boundary persisted it an
+ * That is TODO 131 exactly: the keypad split and recombined with tz_off_now(),
+ * so moving a dose to a date on the far side of a DST boundary persisted it an
  * hour wrong, and wrote today's offset into its tz column so nothing
  * downstream could tell it had happened. What each entry does about the
  * repeated and the skipped hour is stated once, in civil.h, and applied by
  * civil_reaim.
  *
  * dexble_env(), not g_act->env: it returns a JNIEnv valid on the CALLING
- * thread, and these run on the UI thread. g_tz_off is the fallback when there
- * is no VM at all -- a stale offset, but never a wild one, which is tzoff.h's
- * standing rule. */
-static long form_zone(void *ctx, long t)
+ * thread, and these run on the UI thread. tz_off_now() is the fallback when
+ * there is no VM at all -- a stale offset, but never a wild one, which is
+ * tzoff.h's standing rule. */
+long form_zone(void *ctx, long t)
 {
    (void)ctx;
    JNIEnv *env = dexble_env();
-   return env ? tz_offset_at(env, t) : g_tz_off;
-}
-
-/* FOOD actions, split out like wt_action so menu_action stays small.
- * Returns 1 when `action` was one of ours.
- *
- * THE FLOW, AND WHY IT IS SHAPED LIKE THIS.
- *
- * Logging food is two decisions -- which food, then how much -- and the FOOD
- * button opens the PICKER, not the form, because the food is the one that can
- * fail: the vocabulary may not have it yet. So the picker is the first
- * question, and the form is what the picker returns to.
- *
- * The form is pushed onto the path UNDER the picker, unrendered, for exactly
- * the reason wt_action pushes SCR_WEIGHT under the keypad: nav_go RETURNS to a
- * screen already on the path rather than pushing a second copy, so picking a
- * food pops back to the form and the form's own exit goes to whatever opened
- * the flow -- the ADD menu or the main screen -- without either of them being
- * named here. Skipping the push instead leaves the form off the path, and then
- * the two exits chase each other and nothing reaches the main screen. That
- * failure has happened in this file before; the comment in wt_action is the
- * record of it. */
-int food_action(int action, int ix)
-{
-   if (action == MA_FOOD_OPEN) {
-      forms_food_open(realtime_s());
-      /* Both, in this order. See above: the form has to be BELOW the picker
-       * on the path or there is nothing for the picker to return to. */
-      nav_go(SCR_FOOD);
-      nav_go(SCR_FOODTYPE);
-   } else if (action == MA_FOODTYPE_PICK) {
-      /* THE ROW GAVE AN INDEX; WHAT IS STORED IS AN ID. The vocabulary can
-       * grow between the frame that drew the row and the tap that lands on it
-       * -- NEW FOOD does exactly that -- so an index kept past this moment
-       * would name a different food. Resolve it here, immediately, and store
-       * the id. An index that no longer exists resolves to nothing and the
-       * form is left alone rather than being pointed at a neighbour. */
-      struct food_type ft = food_type_at(ix);
-      if (ft.id != FOOD_TYPE_NONE) {
-         forms_food_type_set(ft.id);
-         nav_back(); /* to the form: whatever opened the picker */
-      }
-   } else if (action == MA_FOODTYPE_NEW) {
-      /* The letter keypad, seeded empty. A new food is a word nobody has
-       * typed here before, so there is nothing useful to pre-fill. */
-      g_kp.len = 0;
-      g_kp.entry[0] = 0;
-      nav_go(SCR_LABEL);
-      forms_set_label_field(LABEL_FOOD);
-      forms_kp_return_set(SCR_FOODTYPE);
-   } else if (action == MA_FOODLOG_OPEN) {
-      nav_go(SCR_FOODLOG);
-   } else if (action == MA_FOODLOG_BACK) {
-      nav_back();
-   } else if (action == MA_FOODLOG_PREV) {
-      if (g_view.foodlog_page > 0)
-         g_view.foodlog_page--;
-   } else if (action == MA_FOODLOG_NEXT) {
-      /* The renderer clamps an over-large page to the last one, so walking
-       * past the end shows the end rather than an empty table -- how many
-       * rows fit is a property of the window, which nothing here can see. */
-      g_view.foodlog_page++;
-   } else if (action == MA_FOODTYPE_BACK) {
-      nav_back();
-   } else if (action == MA_FOOD_EDIT) {
-      /* ROW 0 IS THE TYPE, and it is the one field that is not a number:
-       * it reopens the PICKER rather than a keypad, so there is one way to
-       * choose a food rather than two that could disagree. Every other row
-       * maps through kp_food_field, which owns the row-to-mode table -- the
-       * arithmetic version of that (`KP_FOOD_G + ix`) is what keypad.h
-       * records going wrong for the insulin form. */
-      if (ix == 0) {
-         nav_go(SCR_FOODTYPE);
-      } else {
-         enum keypad_mode mode = kp_food_field(ix - 1);
-         if (mode != KP_NONE) {
-            nav_go(SCR_KEYPAD);
-            g_kp.mode = mode;
-            g_kp.ret  = SCR_FOOD;
-            g_kp.len  = 0;
-         }
-      }
-   } else if (action == MA_FOOD_CONFIRM) {
-      /* BOTH REFUSALS ARE VISIBLE, and neither leaves the form.
-       *
-       * A portion with no food is not an entry, and a food with no portion is
-       * not one either -- food_append refuses both, but by then the user is
-       * off the screen that could fix it. So the form checks what it can say
-       * something useful about and stays put; food_append remains the
-       * authority on the bounds, and its refusal is reported the same way. */
-      if (g_food.type == FOOD_TYPE_NONE) {
-         set_status("CHOOSE A FOOD FIRST");
-      } else if (g_food.g < FOOD_MIN_G) {
-         set_status("ENTER HOW MANY GRAMS");
-      } else if (food_append(g_food.t, g_food.type, g_food.g,
-                             form_zone(0, g_food.t)) != 0) {
-         /* PERSISTENCE FAILED, SO THE FORM STAYS. Navigating away here would
-          * discard a draft whose write did not happen -- the failure items
-          * 136-138 are about, in a form written after them. */
-         set_status("FOOD NOT SAVED");
-      } else {
-         nav_back();
-      }
-   } else if (action == MA_EXERCISE) {
-      /* ONE PRESS, NO SCREEN. The button cycles and nothing else happens
-       * here: what makes the value a record is a minute of not being pressed
-       * again, and that is decided by the tick, not by this tap. */
-      exercise_button_press(mono_s());
-   } else if (action == MA_FOOD_DISCARD) {
-      /* Leave the entry form without logging. The draft is left alone
-       * deliberately: nothing has been written, and the next MA_FOOD_OPEN
-       * calls forms_food_open, which is the one place that decides what a
-       * fresh form starts from. Clearing it here as well would be a second
-       * opinion about that, in the function that knows least about it. */
-      nav_back();
-   } else if (action == MA_FOODPAGE_PREV) {
-      if (g_view.foodtype_page > 0)
-         g_view.foodtype_page--;
-   } else if (action == MA_FOODPAGE_NEXT) {
-      /* THE UPPER BOUND IS THE RENDERER'S, not this function's: how many
-       * types fit on a page depends on the window, which nothing here can
-       * see. The renderer clamps the page it is given, so an over-large value
-       * shows the last page rather than an empty one -- and the next tap on
-       * '<' walks back from where the user actually is. */
-      g_view.foodtype_page++;
-   } else {
-      return 0;
-   }
-   return 1;
-}
-
-/* WEIGHT actions, split out like ins_action so menu_action stays small.
- * Returns 1 when `action` was one of ours. */
-int wt_action(int action, int ix)
-{
-   struct prefs sp;
-   settings_get(&sp);
-   if (action == MA_WT_OPEN) {
-      /* Pre-populate: now, and the LAST logged weight -- a weigh-in moves by
-       * ounces, so the previous value is nearly always one or two keypresses
-       * from the new one, and starting from zero would make every entry a
-       * full retype. */
-      wt_draft_new(&g_wt, &sp);
-      /* STRAIGHT TO THE KEYPAD, not to the form. Logging a weight is one
-       * number, and every door into this action -- the ADD menu button, the
-       * pinned main-screen button -- already says which number. The form in
-       * between existed only to be tapped once, on the row this opens.
-       *
-       * BUT THE FORM STILL GOES ON THE PATH, because that is what makes the
-       * way out work. OK and X both land on it (g_kp.ret), and nav_go
-       * RETURNS to a screen already on the path instead of pushing a second
-       * copy -- so the keypad pops and the form's own CANCEL goes back to
-       * whatever opened the flow. Skipping the push instead put a screen
-       * BELOW the keypad that was not on the path, and the two exits chased
-       * each other: LOG WEIGHT returned to WEIGHT, WEIGHT returned to LOG
-       * WEIGHT, and nothing reached the main screen. The user has to be able
-       * to leave. It is not rendered on the way in -- the keypad opens on
-       * top of it in the same tap. */
-      nav_go(SCR_WEIGHT);
-      nav_go(SCR_KEYPAD);
-      g_kp.mode = KP_WEIGHT;
-      g_kp.ret  = SCR_WEIGHT;
-      g_kp.len  = 0;
-   } else if (action == MA_WTLOG_EDIT) {
-      /* A row in the table opens that entry in the EDIT WEIGHT form. Keep a
-       * COPY as the rewrite's match key -- see g_wt.orig. */
-      int i = ix;
-      if (i >= 0 && i < wt_count()) {
-         wt_draft_edit(&g_wt, i, &sp);
-         nav_go(SCR_WEIGHT);
-      }
-   } else if (action == MA_WTTAB) {
-      g_view.wt_tab   = ix;
-      g_view.wt_scrub = -1; /* the picked point may not be in the new span */
-   } else if (action == MA_WT_DELETE) {
-      if (g_wt.f.edit >= 0)
-         nav_go(SCR_WTDEL); /* confirm first; this tap deletes nothing */
-   } else if (action == MA_WTDEL_NO) {
-      nav_go(SCR_WEIGHT);
-   } else if (action == MA_WTDEL_YES) {
-      /* THE TARGET SURVIVES A FAILED DELETE. g_wt.orig is the exact entry
-       * weight_delete matches on, and it is the only thing a second YES can
-       * aim at; this reported the failure and then cleared it anyway, so the
-       * retry had no row to delete and the user was back on the log with
-       * nothing to say which weigh-in they had meant. Stay on the
-       * confirmation instead -- the retry is then one press, on the screen
-       * already in front of them. */
-      enum draft_fate fate = DRAFT_RETRY;
-      if (g_wt.f.edit < 0) {
-         /* Not editing anything, so there is no target to keep and no retry
-          * to offer. Leave as before. */
-         fate = DRAFT_DONE;
-      } else if (weight_delete(&g_wt.orig) == 0) {
-         LOGI("weight entry deleted: %ld g at %ld", g_wt.orig.g, g_wt.orig.t);
-         set_status("WEIGHT DELETED");
-         fate = DRAFT_DONE;
-      } else {
-         set_status("WEIGHT: DELETE FAILED");
-      }
-      if (fate == DRAFT_DONE) {
-         wt_draft_done(&g_wt);
-         nav_go(SCR_WTLOG);
-      }
-      shell_ui_dirty();
-   } else if (action == MA_WTLOG_OPEN) {
-      g_view.wt_page = 0;
-      nav_go(SCR_WTLOG);
-   } else if (action == MA_WTLOG_PREV) {
-      if (g_view.wt_page > 0)
-         g_view.wt_page--;
-   } else if (action == MA_WTLOG_NEXT) {
-      g_view.wt_page++; /* the renderer clamps to the last page */
-   } else if (action == MA_WT_EDIT) {
-      /* Tapping a form value opens the keypad for EXACT entry. Which field
-       * row `ix` is belongs to the keypad's own table (kp_weight_field): the
-       * weight has its own mode, and date/time/year are shared with the
-       * insulin form because they are a calendar instant and carry no
-       * insulin meaning -- the keypad returns here, so nothing crosses
-       * over. */
-      /* AN INDEX THAT NAMES NO FIELD OPENS NOTHING. kp_weight_field answers
-       * KP_NONE for one, and storing that would put the keypad on screen
-       * with the renderer's red "BAD KP MODE" -- visible, which is right,
-       * but it is a tap that should simply do nothing. */
-      enum keypad_mode wm = kp_weight_field(ix);
-      if (wm == KP_NONE)
-         return 0;
-      nav_go(SCR_KEYPAD);
-      g_kp.mode = wm;
-      g_kp.ret  = SCR_WEIGHT;
-      g_kp.len  = 0;
-   } else if (action == MA_WT_CONFIRM) {
-      /* The one write, on the explicit CONFIRM only (the calibration rule).
-       */
-      if (cur_screen() == SCR_WEIGHT) {
-         long g = wt_from_tenths(g_wt.f.tenths, sp.wunits);
-         int rc = -1;
-         int ed = (g_wt.f.edit >= 0);
-         /* THE OFFSET AT THE INSTANT BEING WRITTEN, not the offset now. A
-          * weigh-in backdated across a DST boundary used to carry today's
-          * offset in its tz column, which is the one field that could have
-          * revealed the hour error the recombination above used to make. */
-         long wtz = form_zone(0, g_wt.f.t);
-         if (g > 0)
-            rc = ed ? weight_update(&g_wt.orig, g_wt.f.t, g, wtz)
-                    : weight_append(g_wt.f.t, g, wtz);
-         if (rc == 0) {
-            LOGI("weight %s: %ld g at %ld", ed ? "edited" : "logged", g,
-                 g_wt.f.t);
-            set_status(ed ? "WEIGHT EDITED" : "WEIGHT LOGGED");
-            /* An EDIT returns to the log it was opened from; a NEW entry is
-             * a completed task and lands on the main screen (the insulin
-             * rule).
-             */
-            nav_go(ed ? SCR_WTLOG : SCR_MAIN);
-            wt_draft_done(&g_wt);
-         } else {
-            /* Refuse VISIBLY. A weight the user believes recorded but is not
-             * is a silent hole in the only copy of that number. */
-            set_status("WEIGHT: WRITE FAILED");
-         }
-         shell_ui_dirty();
-      }
-   } else if (action == MA_WT_DISCARD) {
-      /* Back where it came from: the log for an edit, otherwise the screen
-       * the form was opened from (the record-the-origin rule -- which this
-       * line only claimed to follow while it named a fixed menu). */
-      if (g_wt.f.edit >= 0)
-         nav_go(SCR_WTLOG);
-      else
-         nav_back();
-      wt_draft_done(&g_wt);
-   } else if (action == MA_WUNITS) {
-      /* Display only: the file is grams, so this re-renders history rather
-       * than converting it. */
-      if (settings_set_wunits((sp.wunits == WT_LB) ? WT_KG : WT_LB) !=
-          SETTINGS_OK)
-         set_status("UNITS NOT SAVED");
-   } else {
-      return 0; /* not ours */
-   }
-   return 1;
-}
-
-int ins_action(int action, int ix)
-{
-   if (action == MA_INS_OPEN || action == MA_INS_FAST ||
-       action == MA_INS_SLOW) {
-      /* The ADD menu picks the type up front (FAST / SLOW buttons); the
-       * legacy MA_INS_OPEN keeps the last-used type. Pre-populate: now
-       * (whole minute) and the type's last entered amount (1 U when none
-       * is known). */
-      /* The form's own rules live in insulin.c, where a test can reach them:
-       * which amount a fresh form offers, and why the instant is a whole
-       * minute. */
-      int itype = -1; /* -1 = "keep whatever the form had" */
-      if (action == MA_INS_FAST)
-         itype = INS_FAST;
-      else if (action == MA_INS_SLOW)
-         itype = INS_SLOW;
-      ins_draft_new(&g_ins, itype);
-      /* The screen the tap came from: the ADD menu, or the main screen when
-       * this action is one of its shortcut buttons. */
-      nav_go(SCR_INSULIN);
-   } else if (action == MA_INS_TYPE) {
-      ins_form_toggle_type(&g_ins.f);
-   } else if (action == MA_INSLOG_OPEN) {
-      g_view.ins_page = 0;
-      nav_go(SCR_INSLOG);
-   } else if (action == MA_INSLOG_PREV) {
-      if (g_view.ins_page > 0)
-         g_view.ins_page--;
-   } else if (action == MA_INSLOG_NEXT) {
-      g_view.ins_page++; /* render clamps to the last page */
-   } else if (action == MA_INS_EDIT) {
-      /* Tapping a form value opens the keypad for EXACT entry: units (2
-       * digits), date (MMDD), time (HHMM) or year (YYYY). The keypad's OK
-       * validates and writes back; X returns unchanged. */
-      enum keypad_mode im = kp_ins_field(ix); /* KP_NONE opens nothing */
-      if (im == KP_NONE)
-         return 0;
-      nav_go(SCR_KEYPAD);
-      g_kp.mode = im;
-      g_kp.ret  = SCR_INSULIN;
-      g_kp.len  = 0;
-   } else if (action == MA_INS_CONFIRM) {
-      /* The one write, on the explicit CONFIRM only (the calibration rule).
-       * Editing rewrites the matched original row; logging appends. */
-      if (cur_screen() == SCR_INSULIN) {
-         int rc = -1;
-         /* The dose's OWN offset, resolved at the dose's instant. See the
-          * weight CONFIRM above and TODO 131: a dose moved to a date in the
-          * other half of the year was persisted with today's offset. */
-         long itz = form_zone(0, g_ins.f.t);
-         if (g_ins.f.edit >= 0)
-            rc = insulin_update(&g_ins.orig, g_ins.f.t, g_ins.f.type,
-                                g_ins.f.units, itz);
-         else
-            rc = insulin_append(g_ins.f.t, g_ins.f.type, g_ins.f.units, itz);
-         enum draft_fate fate = rc == 0 ? DRAFT_DONE : DRAFT_RETRY;
-         if (fate == DRAFT_DONE) {
-            LOGI("insulin %s: %d U %s at %ld",
-                 g_ins.f.edit >= 0 ? "edited" : "logged", g_ins.f.units,
-                 insulin_type_name(g_ins.f.type), g_ins.f.t);
-            set_status(g_ins.f.edit >= 0 ? "INSULIN EDITED" : "INSULIN LOGGED");
-         } else {
-            /* Refuse VISIBLY -- a dose the user believes recorded but is not
-             * would corrupt every judgement made on top of the log. */
-            set_status("INSULIN: WRITE FAILED");
-         }
-         /* ...AND STAY ON THE FORM WHEN IT FAILED. The draft is the only
-          * copy of what was typed and g_ins.f.edit is the only thing saying
-          * WHICH dose is being rewritten; tearing both down after a write
-          * that did not happen made the retry a full retype at best, and at
-          * worst -- see MA_INSDEL_YES -- a second copy of the dose. */
-         if (fate == DRAFT_DONE) {
-            /* CONFIRM on a NEW dose lands on the MAIN screen -- logging a
-             * dose is a completed task, not a detour to return from, and the
-             * status banner + plot marker there ARE the confirmation. An
-             * EDIT still returns to the log it was opened from -- which the
-             * path knows. */
-            if (g_ins.f.edit >= 0)
-               nav_back();
-            else
-               nav_home();
-            ins_draft_done(&g_ins);
-         }
-         shell_ui_dirty();
-      }
-   } else if (action == MA_INS_DELETE) {
-      /* Confirm first; this action deletes nothing (the SCR_FORGET rule --
-       * DELETE sat right between CANCEL and CONFIRM, one mis-tap from
-       * silently losing a logged dose). */
-      if (cur_screen() == SCR_INSULIN && g_ins.f.edit >= 0)
-         nav_go(SCR_INSDEL);
-   } else if (action == MA_INSDEL_YES) {
-      /* The one deleting control, on the confirmation screen only. */
-      if (cur_screen() == SCR_INSDEL && g_ins.f.edit >= 0) {
-         /* A FAILED DELETE IS THE ONE THAT DUPLICATES THE DOSE. This used to
-          * report the failure, drop back to the still-populated EDIT form
-          * and clear g_ins.f.edit on the way -- so the form no longer knew
-          * it was amending a row, and the next CONFIRM (the obvious thing to
-          * try) APPENDED a second copy of a dose that had never been
-          * deleted. Two identical entries in the record of what was
-          * injected is worse than either the failed delete or the failed
-          * edit. So the confirmation stays up, holding g_ins.orig, and YES
-          * retries the same delete. */
-         enum draft_fate fate = DRAFT_RETRY;
-         if (insulin_delete(&g_ins.orig) == 0) {
-            set_status("INSULIN DELETED");
-            fate = DRAFT_DONE;
-         } else {
-            set_status("INSULIN: DELETE FAILED");
-         }
-         if (fate == DRAFT_DONE) {
-            nav_back();
-            ins_draft_done(&g_ins);
-         }
-         shell_ui_dirty();
-      }
-   } else if (action == MA_INSDEL_NO) {
-      if (cur_screen() == SCR_INSDEL)
-         nav_go(SCR_INSULIN); /* back to the EDIT form, state intact */
-   } else if (action == MA_INSLOG_EDIT) {
-      /* Open this dose in the EDIT form, pre-filled; remember the ORIGINAL
-       * row so the eventual rewrite matches content, not a tail index that
-       * may have shifted meanwhile. */
-      int i = ix;
-      if (cur_screen() == SCR_INSLOG && i >= 0 && i < ins_count()) {
-         ins_draft_edit(&g_ins, i);
-         nav_go(SCR_INSULIN);
-      }
-   } else if (action == MA_INS_DISCARD) {
-      if (cur_screen() == SCR_INSULIN) {
-         nav_back();
-         ins_draft_done(&g_ins);
-      }
-   } else if (action == MA_INSMARK_OPEN) {
-      g_kp.markpick_ins = ix; /* INS_SLOW / INS_FAST */
-      nav_go(SCR_MARKPICK);
-   } else if (action == MA_INSMARK_BACK) {
-      g_kp.markpick_ins = -1;
-      nav_go(SCR_DISPLAY); /* the row lives on the DISPLAY menu */
-   } else {
-      return 0; /* not an insulin action */
-   }
-   return 1;
+   return env ? tz_offset_at(env, t) : tz_off_now();
 }
 
 /* Render a mg/dL bound in the units the screen is showing.
@@ -754,7 +215,7 @@ int label_commit(void)
        * on screen is the one that was already stored, so retrying the sync
        * against it -- and telling the user it was saved by moving on -- would
        * both be false. Stay on the editor with the failure showing. */
-      if (settings_set_email(em) != SETTINGS_OK) {
+      if (remote_set_email(em) != SETTINGS_OK) {
          set_status("EMAIL NOT SAVED");
          return COMMIT_STAY;
       }
@@ -762,7 +223,7 @@ int label_commit(void)
        * address typed wrong is refused by the server, and the correction
        * must be tried NOW rather than after the schedule the wrong one
        * earned. The server and port paths get this through
-       * remote_forget_cursor; the address does not change the server, so it
+       * remote_drop_identity; the address does not change the server, so it
        * asks directly. */
       remote_retry_now();
       g_kp.len = 0;
@@ -790,13 +251,19 @@ int label_commit(void)
        * -- it drops the paired key -- and doing it for a server change that
        * did not persist would unpair the phone from the server it is still
        * configured for. */
-      if (settings_set_server(host) != SETTINGS_OK) {
+      if (remote_set_server(host) != SETTINGS_OK) {
          set_status("SERVER NOT SAVED");
          return COMMIT_STAY;
       }
-      /* A DIFFERENT server holds a different record: whatever we knew about
-       * what it already had is meaningless now. */
-      remote_forget_cursor();
+      /* A DIFFERENT SERVER MEANS A DIFFERENT ACCOUNT, so the paired identity
+       * goes with the server it belonged to -- and if the settings file
+       * refuses the write,
+       * it does NOT go and the user has to be told: the phone is configured
+       * for one server and still paired to another, and only they can
+       * re-pair. Saying nothing would leave a sync failing for a reason the
+       * screen never mentioned. */
+      if (remote_drop_identity() != IDENTITY_DROPPED)
+         set_status("SERVER SAVED, STILL PAIRED: RE-PAIR");
       g_kp.len = 0;
       nav_go(SCR_REMOTE);
    } else if (cur_screen() == SCR_LABEL && g_kp.label_field == LABEL_FOOD) {
@@ -806,8 +273,8 @@ int label_commit(void)
        * PORRIDGE in order to then go and find PORRIDGE in a list -- so the
        * commit sets the form's type and returns to the form rather than to
        * the picker it was opened from. nav_go RETURNS to SCR_FOOD because it
-       * is already on the path (food_action pushed it under the picker), so
-       * the keypad and the picker are both discarded in one step and the
+       * is already on the path (form_food_action pushed it under the picker),
+       * so the keypad and the picker are both discarded in one step and the
        * form's own exit still goes wherever the flow began.
        *
        * food_type_add OWNS the rules -- what a name may contain, what happens
@@ -858,10 +325,10 @@ int kp_commit_correction(void)
          int mgdl = cal_entry_mgdl(g_kp.entry, g_kp.len, sp.units);
          /* Out of range: refuse VISIBLY. Do NOT clamp -- silently
           * altering a calibration value the user typed is worse than not
-          * accepting it. Previously the driver refused with only a log
-          * line while the keypad closed and SCR_CAL still showed the
-          * PREVIOUS result, so a rejected entry looked exactly like a
-          * successful one. Staying on the keypad with the entry cleared
+          * accepting it. A driver-side refusal with only a log line, while
+          * the keypad closes and SCR_CAL still shows the PREVIOUS result,
+          * makes a rejected entry look exactly like a successful one.
+          * Staying on the keypad with the entry cleared
           * is the feedback: nothing was submitted, retype it. Easy to hit
           * in mmol/L (2.2 -> 39 mg/dL). */
          if (mgdl < 0) {
@@ -979,8 +446,8 @@ int kp_commit_thresholds(void)
           * only to say WHY when it refuses. */
          int why = bad ? -1 : alarm_set_threshold(isnudge, islow, mgdl);
          /* STORED BUT NOT WRITTEN is not a refusal: the value is live now,
-          * and it is the OLD one again after the next launch. Say so and
-          * close, rather than clearing the entry as though it had been
+          * and it is the stored one again after the next launch. Say so and
+          * close, rather than clearing the entry as though it were
           * rejected -- retyping it would not help. */
          if (why == TH_NOT_SAVED) {
             set_status("THRESHOLD NOT SAVED");
@@ -992,12 +459,12 @@ int kp_commit_thresholds(void)
             LOGI("%s %s %d mg/dL refused (0..%d, low<=high)",
                  isnudge ? "nudge" : "alarm", islow ? "low" : "high", mgdl,
                  AL_ENTRY_MAX);
-            /* THREE different refusals used to share one sentence.
+            /* THREE different refusals, THREE sentences.
              *
-             * Typing 1500 was answered with "HIGH MUST BE >= LOW", which is
-             * not why it was refused and sends the user to change the other
-             * number. Say which rule was broken, and say it in the units the
-             * keypad is accepting. */
+             * Answering 1500 with "HIGH MUST BE >= LOW" names the wrong
+             * rule and sends the user to change the other number. Say
+             * which rule was broken, and say it in the units the keypad is
+             * accepting. */
             char bnd[8];
             fmt_bound(bnd, sizeof bnd, AL_ENTRY_MAX);
             if (bad)
@@ -1052,7 +519,7 @@ int kp_commit_number(void)
             set_status("PLOT SCALE NOT SAVED");
          keypad_close();
          /* the notification plot shares this vertical scale; without a
-          * refresh it keeps the old one until the next datapoint */
+          * refresh it keeps the previous scale until the next datapoint */
          notify_mark();
          notify_tick();
       }
@@ -1093,12 +560,15 @@ int kp_commit_number(void)
          /* range checked just above, so a refusal here is the file */
          /* Same rule as the server name: the identity is dropped below, and
           * a port that did not persist must not cost the pairing. */
-         if (settings_set_remote_port(v) != SETTINGS_OK) {
+         if (remote_set_port(v) != SETTINGS_OK) {
             set_status("PORT NOT SAVED");
             g_kp.len = 0;
             return COMMIT_STAY;
          }
-         remote_forget_cursor(); /* possibly a different server */
+         /* Possibly a different server, so the identity goes -- and a
+          * refusal is said out loud, for the reason the server case gives. */
+         if (remote_drop_identity() != IDENTITY_DROPPED)
+            set_status("PORT SAVED, STILL PAIRED: RE-PAIR");
          g_kp.len = 0;
          keypad_close();
       }
@@ -1122,7 +592,36 @@ int kp_commit_number(void)
             shell_ui_dirty();
             return COMMIT_STAY;
          }
-         g_food.g = (int)v;
+         form_food_set_grams((int)v);
+         g_kp.len = 0;
+         keypad_close();
+      }
+   } else if (g_kp.mode == KP_EX_DUR) { /* whole minutes, no decimal point */
+      if (g_kp.len > 0) {
+         long v = 0;
+         for (int i = 0; i < g_kp.len; i++)
+            v = (v * 10) + (g_kp.entry[i] - '0');
+         /* MINUTES IN, SECONDS STORED: the column is seconds (exercise.h), and
+          * this is the one place the two units meet. Refused rather than
+          * clamped, for the reason the grams branch above gives.
+          *
+          * ZERO IS ACCEPTED, and it is not "no exercise": it is the log's own
+          * "how long is not known", which is what an open session reads as and
+          * what a user who mistyped a duration needs a way back to. */
+         long *dur = form_ex_duration();
+         if (!dur) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "NO ENTRY OPEN");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         if (v < 0 || v > EX_DUR_MAX / 60) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "MINUTES OUT OF RANGE");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         *dur     = v * 60;
          g_kp.len = 0;
          keypad_close();
       }
@@ -1131,10 +630,10 @@ int kp_commit_number(void)
          /* THE DIGITS ARE THE WHOLE NUMBER, with an optional '.' and one
           * decimal -- exactly the alarm-threshold entry's shape.
           *
-          * They used to be TENTHS, so "162" meant 16.2 lb: below the
-          * minimum, refused, entry cleared, and the only way to enter 162
-          * was to type "1620". Nobody would. An entry form has to accept
-          * the number as it is spoken and as the row displays it. */
+          * NOT tenths, under which "162" means 16.2 lb: below the
+          * minimum, refused, entry cleared, and the only way to enter 162 is
+          * to type "1620". Nobody would. An entry form has to accept the
+          * number as it is spoken and as the row displays it. */
          int ip  = 0;
          int fd  = 0;
          int dot = 0; /* 0 none, 1 seen, 2 decimal digit consumed */
@@ -1167,8 +666,8 @@ int kp_commit_number(void)
             shell_ui_dirty();
             return COMMIT_STAY; /* stay: the cleared entry is the feedback */
          }
-         g_wt.f.tenths = tenths;
-         g_kp.len      = 0;
+         form_wt_set_tenths(tenths);
+         g_kp.len = 0;
          keypad_close();
       }
    } else if (g_kp.mode == KP_INS_UNITS) { /* 1..99 */
@@ -1184,8 +683,8 @@ int kp_commit_number(void)
             shell_ui_dirty();
             return COMMIT_STAY; /* stay: cleared entry is the refusal */
          }
-         g_ins.f.units = v;
-         g_kp.len      = 0;
+         form_ins_set_units(v);
+         g_kp.len = 0;
          keypad_close();
       }
    } else if (kp_is_year(g_kp.mode)) {
@@ -1237,7 +736,7 @@ int kp_commit_datetime(void)
          /* whichever form's field this MODE is -- see the year entry above */
          long *tp = form_instant_of(g_kp.mode);
          if (!tp)
-            return COMMIT_PASS; /* not a form field: nothing to move */
+            return COMMIT_PASS;       /* not a form field: nothing to move */
          if (kp_is_date(g_kp.mode)) { /* MMDD, within the current year */
             /* THE YEAR THE INSTANT IS IN, read in the offset in force at that
              * instant, because February's length depends on it. Reading it in
@@ -1374,30 +873,6 @@ int forms_markpick(void)
    return g_kp.markpick_ins;
 }
 
-/* Put a saved WEIGHT draft back, as a NEW entry. See forms.h: `edit` is
- * forced to -1 and `orig` cleared, so a restored draft can never rewrite a
- * row -- the log behind it was reloaded from disk while the process was
- * gone, and the row this draft named may not be there any more. */
-void forms_wt_restore(long t, int tenths)
-{
-   struct wt_rec none = {0, 0};
-   g_wt.orig          = none;
-   g_wt.f.edit        = -1;
-   g_wt.f.t           = t;
-   g_wt.f.tenths      = tenths;
-}
-
-/* The same for a saved INSULIN draft, and for the same reason. */
-void forms_ins_restore(long t, int type, int units)
-{
-   struct ins_rec none = {0, 0, 0};
-   g_ins.orig          = none;
-   g_ins.f.edit        = -1;
-   g_ins.f.t           = t;
-   g_ins.f.type        = type;
-   g_ins.f.units       = units;
-}
-
 void forms_kp_mode_set(enum keypad_mode mode)
 {
    g_kp.mode = mode;
@@ -1423,11 +898,6 @@ int forms_cal_pending(void)
    return g_kp.cal_pending;
 }
 
-void forms_set_wt_scrub(int idx)
-{
-   g_view.wt_scrub = idx;
-}
-
 static int g_scrub = -1;
 
 void forms_set_scrub(int idx)
@@ -1440,47 +910,18 @@ int forms_scrub(void)
    return g_scrub;
 }
 
-/* THE WHOLE FORM STATE, IN ONE COPY.
+/* ---- ONE TAP, TRIED AGAINST EACH WORKFLOW IN TURN ---------------------
  *
- * This was a stub -- `(void)out;` -- so every frame read an UNINITIALISED
- * stack struct: kp_mode was whatever was on the stack, and the keypad
- * rendered "BAD KP MODE 875648851" over a field of garbage characters. The
- * red title is what caught it, which is exactly why the unknown-mode branch
- * refuses to draw a plausible screen (see uikeypad.c).
- *
- * Fill EVERY member. A field left out here is the same bug in slower motion:
- * it reads as zero on one frame and as the caller's leftover stack on the
- * next, and zero is a real mode, a real screen and a real insulin type. */
-/* Open a fresh LOG FOOD form.
- *
- * NO TYPE IS CHOSEN, deliberately, and it is why the FOOD button opens the
- * PICKER rather than this form: an entry needs a food before it needs a
- * portion, and a form that opened on the last food used would log the wrong
- * one for anybody who forgot to look. The picker is the first question.
- *
- * The instant defaults to now, like the other two forms, because the common
- * case is logging something as it happens. */
-void forms_food_open(long now)
+ * The order is the order these were `||`-ed together in menu_action, and it
+ * is preserved rather than rearranged: a few actions overlap on purpose (a
+ * keypad digit and a device pick are both "a number the user touched") and
+ * the first match has always won. What changes is WHERE the order lives --
+ * beside the workflows it orders, in the file that owns the keypad they
+ * share, rather than in the menu that merely forwards a tap. */
+int forms_action(int action, int ix)
 {
-   g_food.t    = now;
-   g_food.type = FOOD_TYPE_NONE;
-   g_food.g    = 0;
-   g_food.edit = -1;
-}
-
-void forms_food_type_set(int type_id)
-{
-   g_food.type = type_id;
-}
-
-void forms_foodtype_page_set(int page)
-{
-   g_view.foodtype_page = page < 0 ? 0 : page;
-}
-
-int forms_foodtype_page(void)
-{
-   return g_view.foodtype_page;
+   return form_ins_action(action, ix) || form_wt_action(action, ix) ||
+          form_food_action(action, ix) || form_ex_action(action, ix);
 }
 
 void forms_view_get(struct forms_view *out)
@@ -1492,29 +933,15 @@ void forms_view_get(struct forms_view *out)
    out->entrylen = g_kp.len;
    str_snapshot(out->entry, sizeof out->entry, g_kp.entry);
    str_snapshot(out->kp_err, sizeof out->kp_err, g_kp.err);
-   /* the insulin form and its log */
-   out->ins_t        = g_ins.f.t;
-   out->ins_type     = g_ins.f.type;
-   out->ins_units    = g_ins.f.units;
-   out->ins_edit     = g_ins.f.edit;
-   out->inslog_page  = g_view.ins_page;
    out->markpick_ins = g_kp.markpick_ins;
-   /* the weight form, its log and its plot */
-   out->wt_t       = g_wt.f.t;
-   out->wt_tenths  = g_wt.f.tenths;
-   out->wt_edit    = g_wt.f.edit;
-   out->wt_orig    = g_wt.orig;
-   out->wtlog_page = g_view.wt_page;
-   out->wt_tab     = g_view.wt_tab;
-   out->wt_scrub   = g_view.wt_scrub;
-   /* the food form and the picker's page */
-   out->food_t        = g_food.t;
-   out->food_type     = g_food.type;
-   out->food_g        = g_food.g;
-   out->food_edit     = g_food.edit;
-   out->foodtype_page = g_view.foodtype_page;
-   out->foodlog_page  = g_view.foodlog_page;
-   out->scrub      = g_scrub;
+   /* EACH WORKFLOW FILLS ITS OWN FIELDS, from its own file. That is what
+    * makes a field in this struct traceable to one writer -- and it is the
+    * whole reason the drafts are not in scope of each other any more. */
+   form_ins_view(out);
+   form_wt_view(out);
+   form_food_view(out);
+   form_ex_view(out);
+   out->scrub = g_scrub;
    /* the odds and ends */
    out->label_field   = g_kp.label_field;
    out->rescale_entry = g_kp.rescale;

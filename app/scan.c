@@ -63,15 +63,15 @@ static atomic_int g_scan_gen;
 static _Atomic long g_scan_retry_after;
 
 /* The ScanCallback error code of that failure, so a user who taps something
- * expecting the scan back gets told WHY it is still down instead of nothing
+ * expecting the scan back gets told WHY it is still down rather than nothing
  * happening. */
 static atomic_int g_scan_last_err;
 
 /* Hold the scan down until this time, so a pairing/bonding connect gets a quiet
  * radio. Zero means "no hold". See the self-heal in on_timer. */
 /* MONOTONIC. This is "keep the radio quiet for the next 20 seconds", an
- * interval, and a wall-clock correction used to either lift it instantly or
- * hold the scan down for an hour. */
+ * interval; on the wall clock a correction either lifts it instantly or holds
+ * the scan down for an hour. */
 static long g_scan_hold_until;
 
 /* A stop_scan that Java could not confirm; the 1 Hz timer retries it. Without
@@ -290,8 +290,8 @@ void start_scan(struct ANativeActivity *a)
     *
     * The heal's own throttle (scan_should_start) is stamped by main.c when it
     * DECIDES to heal, and its "never tried" sentinel deliberately does not
-    * throttle the first attempt -- so a scan that fails asynchronously would
-    * get one immediate un-throttled restart, and every explicit restart path
+    * throttle a first try -- so a scan that fails asynchronously gets
+    * one immediate un-throttled restart, and every explicit restart path
     * (on_resume, the DEVICES refresh) another. Refusing the start itself keeps
     * a persistently failing scan to one startScan per SCAN_RETRY_S from every
     * caller at once, which is what keeps Android's 5-in-30-seconds block from
@@ -342,8 +342,9 @@ void start_scan(struct ANativeActivity *a)
     * never restore), so reading without selecting reports whichever link a
     * binder thread happened to touch -- "the lock is held" is not the same as
     * "the right context is chosen". driver_enter is both. */
-   driver_session_of(LINK_CGM, &s);
-   if (!s.paired && !s.have_reading)
+   /* LINK_CGM always exists; a refusal zeroes s, which reads as "nothing
+    * paired" -- the same branch this takes anyway. */
+   if (!driver_session_of(LINK_CGM, &s) || (!s.paired && !s.have_reading))
       set_status("SCANNING");
 }
 
@@ -386,12 +387,12 @@ void stop_scan(struct ANativeActivity *a)
 
 /* Tear the scan down and bring it back up.
  *
- * WHY THIS EXISTS, and it is the bug that made SYNC NOW useless: start_scan
+ * WHY THIS EXISTS, and it is what makes SYNC NOW mean anything: start_scan
  * is idempotent on g_scanning, so calling it while a scan is already
  * registered does NOTHING. That is right for the self-heal -- stacking a
- * second scan client is how the app used to hit Android's scan-throttle
- * block -- but it meant the app had no way at all to REFRESH a scan that was
- * still registered yet no longer delivering.
+ * second scan client is how an app hits Android's scan-throttle block -- but
+ * on its own it leaves no way at all to REFRESH a scan that is still
+ * registered yet no longer delivering.
  *
  * And Android degrades scans behind our back with no callback: send the
  * activity to the background and the stack quietly demotes SCAN_MODE_LOW_

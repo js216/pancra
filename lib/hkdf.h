@@ -4,6 +4,8 @@
  */
 #ifndef HKDF_H
 #define HKDF_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -21,10 +23,10 @@
  * N = ceil(L/HashLen), so there is no 256th block for the construction to
  * name. Past 255 blocks the function is simply not HKDF any more.
  *
- * WHAT THE OLD CODE DID, for whoever ends up debugging a key that does not
- * match: the counter was a `uint8_t` that ran 1, 2, ... 255, 0, 1, 2 and kept
- * going, and nothing compared n against anything. An ask for 8161 bytes
- * returned 8161 bytes and reported nothing, with block 256 computed as
+ * WHAT A WRAPPING COUNTER DOES, for whoever ends up debugging a key that
+ * does not match: as a `uint8_t` it runs 1, 2, ... 255, 0, 1, 2 and keeps
+ * going, and with nothing comparing n against anything an ask for 8161 bytes
+ * returns 8161 bytes and reports nothing, with block 256 computed as
  * HMAC(PRK, T(255) || info || 0x00) -- a value no other HKDF on earth
  * produces from those inputs. A peer that had it right would have agreed
  * about the first 8160 bytes and disagreed about every byte after, and there
@@ -37,7 +39,7 @@
  * assembles T(i-1) || info || i into one stack block and hands the whole
  * thing to the one-shot hmac_sha256(). Streaming `info` through an
  * incremental HMAC would remove the bound outright, but lib/hmac.c exposes
- * only the one-shot form, so the bound stays and is enforced instead of
+ * only the one-shot form, so the bound stays and is enforced rather than
  * assumed.
  *
  * The number is sized by the largest `info` anything in this repo builds: the
@@ -46,10 +48,10 @@
  * srv/tls.c static-asserts its own worst case against this constant, so the
  * two cannot drift apart silently.
  *
- * WHAT THE OLD CODE DID: the block was `uint8_t in[32 + 256 + 1]`, nothing
- * looked at infon, and the header simply asked callers to stay under 256
+ * WHY infon IS CHECKED: with a `uint8_t in[32 + 256 + 1]` block, nothing
+ * looking at infon, and a header that merely asks callers to stay under 256
  * ("Every caller here passes an HkdfLabel, which cannot" -- while the
- * HkdfLabel encoder bounded neither its label nor its context). infon == 257
+ * HkdfLabel encoder bounds neither its label nor its context), infon == 257
  * therefore wrote one byte past a stack array. */
 #define HKDF_INFO_MAX 514
 
@@ -77,7 +79,7 @@ enum hkdf_status {
 void hkdf_extract(const uint8_t *salt, size_t saltn, const uint8_t *ikm,
                   size_t ikmn, uint8_t out[HKDF_HASH_LEN]);
 
-/* HKDF-Expand. HKDF_OK, or a status with `out` LEFT EXACTLY AS IT WAS.
+/* HKDF-Expand. HKDF_OK, or a status with `out` LEFT UNTOUCHED.
  *
  * REFUSES, NEVER CLAMPS. A caller asking for more than the construction can
  * produce has a bug; handing it the first HKDF_L_MAX bytes instead would turn
@@ -88,8 +90,8 @@ void hkdf_extract(const uint8_t *salt, size_t saltn, const uint8_t *ikm,
  *
  * warn_unused_result is not decoration: a status nobody reads is worse than
  * the clamp it replaced, because the clamp at least produced bytes. */
-enum hkdf_status hkdf_expand(const uint8_t prk[HKDF_HASH_LEN],
-                             const uint8_t *info, size_t infon, uint8_t *out,
-                             size_t n) __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum hkdf_status hkdf_expand(const uint8_t prk[HKDF_HASH_LEN],
+                                             const uint8_t *info, size_t infon,
+                                             uint8_t *out, size_t n);
 
 #endif

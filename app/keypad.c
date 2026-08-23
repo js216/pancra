@@ -4,10 +4,9 @@
 
 #include "keypad.h"
 
-/* ONE ROW PER MODE. The two tables this replaced -- titles in the renderer,
- * slot counts beside them -- were indexed by the same integer and maintained
- * separately, which is how the weight mode came to be missing from one of
- * them.
+/* ONE ROW PER MODE. Two tables -- titles in the renderer, slot counts beside
+ * them -- indexed by the same integer and maintained separately is how a mode
+ * comes to be missing from one of them.
  *
  * The slot counts, and why each is what it is:
  *   4  a sensor pairing code
@@ -23,36 +22,42 @@
  *      merely awkward
  */
 static const struct kp_info g_modes[KP_NMODES] = {
-    [KP_PAIR_CODE]  = {0,              4,  0, 0, 0, 0, 0},
-    [KP_PLOT_MAX]   = {"PLOT MAX",     3,  0, 1, 0, 0, 0},
-    [KP_CALIB]      = {"CALIBRATION",  3,  0, 1, 0, 0, 0},
-    [KP_RESCALE]    = {"RESCALE",      3,  0, 1, 0, 0, 0},
-    [KP_SERVER]     = {"SERVER",       15, 0, 0, 0, 0, 0},
-    [KP_PORT]       = {"REMOTE PORT",  5,  0, 0, 0, 0, 0},
-    [KP_INS_UNITS]  = {"UNITS",        2,  0, 0, 0, 0, 0},
-    [KP_DATE]       = {"DATE (MMDD)",  4,  0, 0, 0, 0, 0},
-    [KP_TIME]       = {"TIME (HHMM)",  4,  0, 0, 0, 0, 0},
-    [KP_YEAR]       = {"YEAR",         4,  0, 0, 0, 0, 0},
-    [KP_ALARM_LOW]  = {"ALARM LOW",    4,  1, 1, 0, 1, 0},
-    [KP_ALARM_HIGH] = {"ALARM HIGH",   4,  1, 1, 0, 0, 0},
-    [KP_NUDGE_LOW]  = {"NUDGE LOW",    4,  1, 1, 0, 1, 1},
-    [KP_NUDGE_HIGH] = {"NUDGE HIGH",   4,  1, 1, 0, 0, 1},
-    [KP_WEIGHT]     = {"WEIGHT",       5,  0, 1, 1, 0, 0},
-    [KP_SYNC_CODE]  = {"PAIRING CODE", 6,  0, 0, 0, 0, 0},
+    [KP_PAIR_CODE]  = {0,              4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_PLOT_MAX]   = {"PLOT MAX",     3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_CALIB]      = {"CALIBRATION",  3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_RESCALE]    = {"RESCALE",      3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_PORT]       = {"REMOTE PORT",  5, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_INS_UNITS]  = {"UNITS",        2, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_DATE]       = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_TIME]       = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_YEAR]       = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_ALARM_LOW]  = {"ALARM LOW",    4, 1, KP_UNIT_GLU,  0, 1, 0},
+    [KP_ALARM_HIGH] = {"ALARM HIGH",   4, 1, KP_UNIT_GLU,  0, 0, 0},
+    [KP_NUDGE_LOW]  = {"NUDGE LOW",    4, 1, KP_UNIT_GLU,  0, 1, 1},
+    [KP_NUDGE_HIGH] = {"NUDGE HIGH",   4, 1, KP_UNIT_GLU,  0, 0, 1},
+    [KP_WEIGHT]     = {"WEIGHT",       5, 0, KP_UNIT_WT,   1, 0, 0},
+    [KP_SYNC_CODE]  = {"PAIRING CODE", 6, 0, KP_UNIT_NONE, 0, 0, 0},
     /* The weight form's calendar fields: the same entry as the insulin
      * form's, and their own modes so the commit knows whose instant it is
      * editing. */
-    [KP_WT_DATE] = {"DATE (MMDD)",  4,  0, 0, 0, 0, 0},
-    [KP_WT_TIME] = {"TIME (HHMM)",  4,  0, 0, 0, 0, 0},
-    [KP_WT_YEAR] = {"YEAR",         4,  0, 0, 0, 0, 0},
+    [KP_WT_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_WT_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_WT_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* The LOG FOOD form. GRAMS is a whole number with a unit suffix and no
      * decimal point: portions are recorded to the gram, and a '.' key would
      * invite tenths the format does not store. Five digits covers
      * FOOD_MAX_G. */
-    [KP_FOOD_G]    = {"GRAMS",        5,  0, 1, 0, 0, 0},
-    [KP_FOOD_DATE] = {"DATE (MMDD)",  4,  0, 0, 0, 0, 0},
-    [KP_FOOD_TIME] = {"TIME (HHMM)",  4,  0, 0, 0, 0, 0},
-    [KP_FOOD_YEAR] = {"YEAR",         4,  0, 0, 0, 0, 0},
+    [KP_FOOD_G]    = {"GRAMS",        5, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_FOOD_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_FOOD_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_DATE]   = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_TIME]   = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_YEAR]   = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    /* MINUTES, five slots: EX_DUR_MAX is seven days, which is 10080 of them.
+     * Whole minutes and no decimal point -- the column is seconds, but a
+     * session nobody timed to the second is not one anybody types that way. */
+    [KP_EX_DUR]    = {"MINUTES",      5, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_FOOD_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
 };
 
 /* A mode this build does not define draws nothing and takes nothing. NOT the
@@ -120,6 +125,10 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_FOOD_DATE:
       case KP_FOOD_TIME:
       case KP_FOOD_YEAR: return KP_FORM_FOOD;
+      case KP_EX_DATE:
+      case KP_EX_TIME:
+      case KP_EX_YEAR:
+      case KP_EX_DUR: return KP_FORM_EXERCISE;
       /* Every other mode is not a form field, and says so rather than
        * defaulting into somebody's timestamp. */
       case KP_NONE:
@@ -127,7 +136,6 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_PLOT_MAX:
       case KP_CALIB:
       case KP_RESCALE:
-      case KP_SERVER:
       case KP_PORT:
       case KP_ALARM_LOW:
       case KP_ALARM_HIGH:
@@ -143,17 +151,20 @@ enum kp_form kp_form_of(enum keypad_mode mode)
  * arithmetic on the enum's order, which keypad.h records going wrong. */
 int kp_is_date(enum keypad_mode mode)
 {
-   return mode == KP_DATE || mode == KP_WT_DATE || mode == KP_FOOD_DATE;
+   return mode == KP_DATE || mode == KP_WT_DATE || mode == KP_FOOD_DATE ||
+          mode == KP_EX_DATE;
 }
 
 int kp_is_time(enum keypad_mode mode)
 {
-   return mode == KP_TIME || mode == KP_WT_TIME || mode == KP_FOOD_TIME;
+   return mode == KP_TIME || mode == KP_WT_TIME || mode == KP_FOOD_TIME ||
+          mode == KP_EX_TIME;
 }
 
 int kp_is_year(enum keypad_mode mode)
 {
-   return mode == KP_YEAR || mode == KP_WT_YEAR || mode == KP_FOOD_YEAR;
+   return mode == KP_YEAR || mode == KP_WT_YEAR || mode == KP_FOOD_YEAR ||
+          mode == KP_EX_YEAR;
 }
 
 enum keypad_mode kp_food_field(int ix)
@@ -161,6 +172,19 @@ enum keypad_mode kp_food_field(int ix)
    /* ITS OWN calendar fields, like the weight form's: see keypad.h. */
    static const enum keypad_mode f[] = {KP_FOOD_G, KP_FOOD_TIME, KP_FOOD_DATE,
                                         KP_FOOD_YEAR};
+
+   if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
+      return KP_NONE;
+   return f[ix];
+}
+
+enum keypad_mode kp_ex_field(int ix)
+{
+   /* ITS OWN calendar fields, like every other form's: see keypad.h. The
+    * level is cycled rather than typed, so it is not in this list; the
+    * duration is typed, and it is. */
+   static const enum keypad_mode f[] = {KP_EX_TIME, KP_EX_DATE, KP_EX_YEAR,
+                                        KP_EX_DUR};
 
    if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
       return KP_NONE;
@@ -182,7 +206,7 @@ int kp_has_dot(enum keypad_mode mode, int mmol_units)
 {
    const struct kp_info *k = kp_info(mode);
    /* A threshold takes a decimal point only where the unit has one: mg/dL is
-    * whole numbers, mmol/L is "5.5". A weight always does. This was two
-    * expressions in two files, and they disagreed. */
+    * whole numbers, mmol/L is "5.5". A weight always does. As two
+    * expressions in two files, the two disagree. */
    return k->dot_always || (k->thresh && mmol_units);
 }

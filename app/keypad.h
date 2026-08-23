@@ -6,13 +6,13 @@
  *
  * There is a single digit keypad. Which value it is collecting -- a pairing
  * code, a calibration, an alarm threshold, a dose, a weight -- was a bare int
- * passed around as 0..15, compared as `mode == 14` in the shell, `mode >= 10
- * && mode <= 13` in the renderer, and `6 + ix` at the two forms that open it.
+ * passed around as bare integers, compared against literals in the shell and
+ * the renderer, and opened as `<base> + ix` at the two forms that use one.
  * Every fact about a mode was restated wherever it was needed:
  *
  *   - how many digits it takes (a table in the renderer),
  *   - what it is called (another table, beside it),
- *   - whether it shows a unit suffix (an expression at the draw site),
+ *   - which unit suffix it shows, if any (see enum kp_unit),
  *   - whether it offers a '.' key (a different expression, at a different
  *     draw site, and a THIRD one in the input dispatcher),
  *   - whether it is one of the four thresholds (a predicate in the renderer,
@@ -47,28 +47,27 @@ enum keypad_mode {
    KP_PLOT_MAX  = 1,
    KP_CALIB     = 2,
    KP_RESCALE   = 3,
-   KP_SERVER    = 4, /* unused since the server became a name, not a quad */
-   KP_PORT      = 5,
+   KP_PORT      = 4,
    /* The insulin form's four fields; the weight form reuses the last three,
     * which are a calendar instant and carry no insulin meaning. The forms
     * open one by ROW INDEX, and that translation is kp_ins_field() below --
     * not `KP_INS_UNITS + ix` at the call site, which is a second, silent
     * statement about this enum's order. */
-   KP_INS_UNITS = 6,
-   KP_DATE      = 7, /* MMDD */
-   KP_TIME      = 8, /* HHMM */
-   KP_YEAR      = 9,
+   KP_INS_UNITS = 5,
+   KP_DATE      = 6, /* MMDD */
+   KP_TIME      = 7, /* HHMM */
+   KP_YEAR      = 8,
    /* The four thresholds, in the order the ALARM screen lists them. Which
     * PAIR one belongs to and which END it is are facts about the mode, and
-    * they are in the table below -- the shell used to derive them with
-    * `>= KP_NUDGE_LOW` and `% 2`, which made this order a load-bearing
-    * secret shared by two files. */
-   KP_ALARM_LOW  = 10,
-   KP_ALARM_HIGH = 11,
-   KP_NUDGE_LOW  = 12,
-   KP_NUDGE_HIGH = 13,
-   KP_WEIGHT     = 14,
-   KP_SYNC_CODE  = 15, /* the SERVER's 6-digit pairing code, not the sensor's */
+    * they are in the table below. Derived by the shell with `>= KP_NUDGE_LOW`
+    * and `% 2`, this order would be a load-bearing secret shared by two
+    * files. */
+   KP_ALARM_LOW  = 9,
+   KP_ALARM_HIGH = 10,
+   KP_NUDGE_LOW  = 11,
+   KP_NUDGE_HIGH = 12,
+   KP_WEIGHT     = 13,
+   KP_SYNC_CODE  = 14, /* the SERVER's 6-digit pairing code, not the sensor's */
    /* THE WEIGHT FORM'S OWN calendar fields. They collect exactly what
     * KP_DATE / KP_TIME / KP_YEAR collect and they are separate modes anyway,
     * because WHICH INSTANT is being edited is a fact about the field -- and
@@ -77,20 +76,50 @@ enum keypad_mode {
     * insulin form's by asking where the keypad would return to. That
     * is the numeric protocol this enum exists to remove, wearing a different
     * hat: a keypad re-aimed with forms_kp_return_set would edit the wrong
-    * form's instant. Ask kp_edits_weight() instead. */
-   KP_WT_DATE = 16,
-   KP_WT_TIME = 17,
-   KP_WT_YEAR = 18,
+    * form's instant. Ask the retired weight-or-not boolean() instead. */
+   KP_WT_DATE = 15,
+   KP_WT_TIME = 16,
+   KP_WT_YEAR = 17,
    /* The LOG FOOD form's own fields, and its own calendar modes for the same
     * reason the weight form has its own: which form an instant belongs to is
     * a property of the MODE. Sharing the insulin form's KP_DATE here would
     * make the answer depend on which screen the keypad happened to return
     * to, which is a different fact and one a user can change. */
-   KP_FOOD_G    = 19,
-   KP_FOOD_DATE = 20,
-   KP_FOOD_TIME = 21,
-   KP_FOOD_YEAR = 22,
-   KP_NMODES    = 23
+   KP_FOOD_G    = 18,
+   KP_FOOD_DATE = 19,
+   KP_FOOD_TIME = 20,
+   KP_FOOD_YEAR = 21,
+   /* The EDIT EXERCISE form's own fields. The LEVEL is not among them: it
+    * cycles 1-2-3 on the form itself, because those are the only three values
+    * there are and the ADD button already says them that way. The DURATION is
+    * a number, and one the button cannot know -- a row is written when the
+    * level settles, which is the start -- so it is typed. */
+   KP_EX_DATE = 22,
+   KP_EX_TIME = 23,
+   KP_EX_YEAR = 24,
+   KP_EX_DUR  = 25,
+   KP_NMODES  = 26
+};
+
+/* WHICH UNIT THE ENTRY CARRIES -- a name, not a yes/no.
+ *
+ * As `int unit` -- a flag meaning "print the glucose unit here" -- the
+ * renderer needs one hardcoded exception for the WEIGHT keypad, on the
+ * premise that weight is "the one entry that is not a glucose value". The
+ * food form makes that premise false without saying so: GRAMS inherits the
+ * flag and labels a portion of beans MG/DL. A boolean cannot be wrong about
+ * which unit it means, so the compiler has nothing to
+ * check.
+ *
+ * Naming the unit puts the answer in the same table as the title and the slot
+ * count, and -Wswitch-enum then makes the draw site fail to build until a new
+ * unit is handled. NONE is a real answer -- a date, a port, a pairing code --
+ * and not a default. */
+enum kp_unit {
+   KP_UNIT_NONE = 0, /* bare digits: dates, times, codes, ports, insulin */
+   KP_UNIT_GLU,      /* mg/dL or mmol/L, whichever the user displays in */
+   KP_UNIT_WT,       /* kg or lb, per the weight preference */
+   KP_UNIT_G         /* grams -- a food portion, and not a preference */
 };
 
 /* Everything the two sides need to know about one mode. */
@@ -100,7 +129,7 @@ struct kp_info {
    int slots;         /* digit cells: the renderer draws exactly this many and
                        * the input path accepts exactly this many */
    int thresh;        /* one of the four alarm/nudge thresholds */
-   int unit;          /* the entry carries a unit suffix (mg/dL, mmol/L, kg) */
+   enum kp_unit unit; /* which unit suffix the entry carries, if any */
    int dot_always;    /* a '.' key regardless of the display units (weight) */
    /* WHICH THRESHOLD, for the four that are one. `low` is the lower end of
     * its pair, `nudge` says which pair. Meaningless (0) for every other
@@ -146,14 +175,15 @@ enum keypad_mode kp_weight_field(int ix);
  * re-aiming the keypad's return screen cannot move the wrong form's
  * timestamp.
  *
- * THIS USED TO BE A BOOLEAN, kp_edits_weight, and it was correct for exactly
- * as long as there were two forms. A third (LOG FOOD) makes "not the weight
- * form" mean two different things, and the callers were written as
- * `kp_edits_weight(m) ? &g_wt.f.t : &g_ins.f.t` -- so a food date would have
- * silently moved the INSULIN form's instant, with nothing on either screen to
- * say so. That is the same shape as the two-outcome database lookup NOTES.md
- * records: two answers for three situations, where the third quietly borrows
- * one of the others.
+ * A WEIGHT-OR-NOT BOOLEAN is correct for exactly as long as there are two
+ * forms. A third (LOG FOOD) makes "not the weight form" mean two different
+ * things, and a caller that asks "is this the weight form" and picks
+ * &g_wt.f.t or &g_ins.f.t from the answer silently moves the INSULIN form's
+ * instant for a food date, with nothing on
+ * either screen to say so. That is the same shape as the two-outcome
+ * two-answer database lookup this codebase has been bitten by before: two
+ * answers for three situations, where the third quietly borrows one of the
+ * others.
  *
  * KP_FORM_NONE is the honest answer for every mode that is not a form field
  * at all, rather than defaulting to somebody's timestamp. */
@@ -161,17 +191,18 @@ enum kp_form {
    KP_FORM_NONE = 0,
    KP_FORM_INSULIN,
    KP_FORM_WEIGHT,
-   KP_FORM_FOOD
+   KP_FORM_FOOD,
+   KP_FORM_EXERCISE
 };
 enum kp_form kp_form_of(enum keypad_mode mode);
 
 /* WHAT KIND OF FIELD a mode is, across every form.
  *
- * The commits used to ask by NAME -- `mode == KP_DATE || mode == KP_WT_DATE`
- * -- which is a list that has to be extended in four places every time a form
- * is added, and which fails SILENTLY when it is not: the field simply stops
- * committing, or commits down a branch meant for something else. Adding the
- * LOG FOOD form did exactly that, and the date it typed went nowhere.
+ * A COMMIT THAT ASKS BY NAME -- `mode == KP_DATE || mode == KP_WT_DATE` --
+ * is a list that has to be extended in four places every time a form is
+ * added, and which fails SILENTLY when it is not: the field simply stops
+ * committing, or commits down a branch meant for something else. That is how
+ * a form ships with a date that goes nowhere.
  *
  * A mode has a kind the way it has a form (kp_form_of); asking for it is how a
  * call site stays correct when a form is added. */
@@ -183,5 +214,8 @@ int kp_is_year(enum keypad_mode mode);
  * (Row 0 of the form is TYPE, which opens the picker rather than a keypad, so
  * the dispatcher maps it before reaching here.) */
 enum keypad_mode kp_food_field(int ix);
+/* The EDIT EXERCISE form's rows, minus the LEVEL row the caller handles
+ * itself: 0 time, 1 date, 2 year. KP_NONE for anything else. */
+enum keypad_mode kp_ex_field(int ix);
 
 #endif

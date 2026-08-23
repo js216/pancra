@@ -17,10 +17,10 @@
  *
  * 1. LEVEL-based, not edge-triggered. Every entry point recomputes what
  *    should be sounding and reconciles, so a missed transition self-corrects
- *    on the next tick. The original edge-triggered version lost a disconnect
- *    alarm permanently when a reading silenced it a microsecond after it was
- *    raised: the latch stayed at 1, so the !alarmed -> alarmed edge never
- *    happened again.
+ *    on the next tick. An edge-triggered version loses a disconnect alarm
+ *    permanently when a reading silences it a microsecond after it is raised:
+ *    the latch stays at 1, so the !alarmed -> alarmed edge never happens
+ *    again.
  * 2. Raise and silence are mutually exclusive END TO END, JNI call included.
  *    Splitting the decision from the call lets two threads decide in one
  *    order and call Java in the other; Alarm.trigger/silence being

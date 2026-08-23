@@ -4,9 +4,11 @@
 #ifndef PANCRA_BONDTABLE_H
 #define PANCRA_BONDTABLE_H
 
-/* What the OS last said about this address's bond, or 0 if it has never said
- * anything about it. Safe from any thread: the value is COPIED out under the
- * table's own lock, so the caller never holds a pointer into it. */
+/* What the OS last said about this address's bond, using the framework's own
+ * constants: 0 = never heard, 10 = NONE, 11 = BONDING, 12 = BONDED. Fed by
+ * Ble's ACTION_BOND_STATE_CHANGED receiver. Safe from any thread: the value is
+ * COPIED out under the table's own lock, so the caller never holds a pointer
+ * into it. */
 int dexble_bond_state(const char *mac);
 
 /* Record a transition. Called from the binder thread that receives the OS's

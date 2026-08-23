@@ -3,9 +3,11 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "alarmlogic.h" /* AL_ENTRY_MAX: the alarm keypads' ceiling */
-#include "exercise.h" /* EX_SETTLE_S: the pinned button draws its countdown */
+#include "exercise.h"   /* EX_SETTLE_S: the pinned button draws its countdown */
 #include "font.h"
-#include "insulin.h" /* struct ins_rec + INS_* for the INSULIN LOG table */
+#include "food.h"
+#include "insrow.h"  /* INS_SLOW / INS_FAST: which kind a dose row names */
+#include "insulin.h" /* struct ins_rec: the doses the INSULIN LOG table draws */
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h"  /* sensor types, kinds, marker enum */
@@ -22,6 +24,21 @@
 #include <stdint.h>
 #include <stdio.h> /* snprintf */
 
+/* HOW LONG THE AGE BAR UNDER THE BIG NUMBER TAKES TO FILL.
+ *
+ * One CGM cadence is 300 s and the reading has to travel -- sensor to phone
+ * over BLE, then decoded and stored -- so the bar is the cadence plus the
+ * slack that arrival takes. Full means "the next one is due about now";
+ * PAST full it stops being a bar at all and becomes a dashed line, because a
+ * bar that keeps growing reads as more data rather than late data.
+ *
+ * 345 s: a histogram of arrivals puts the great majority in the 3..45 s
+ * window after the reading's own timestamp, so the bar fills right as the
+ * late end of that window passes. At 305 it dashed while readings that were
+ * merely at the far end of normal were still on their way, and a display
+ * that cries late four times an hour is one nobody reads. */
+#define AGE_BAR_S 345
+
 /* One threshold row on the main screen: "<NAME>  LOW <v>  HIGH <v>", the full
  * column width, returning the y below it.
  *
@@ -31,6 +48,30 @@
  * are five characters and both rows reserve the SAME fixed icon cell -- the
  * nudge simply leaves it empty -- so identical arithmetic here puts every
  * column in the same place on both rows. */
+
+/* A RUN OF TIME IN THE COARSEST UNIT THAT STILL SAYS SOMETHING.
+ *
+ * Days from two days up, hours from one hour up, minutes below that. One
+ * function because the streak and the record it is measured against are
+ * rendered side by side, and two copies of this arithmetic would eventually
+ * disagree about where an hour becomes a day -- which would read as the two
+ * numbers being on different scales.
+ *
+ * `cap` is at least 7: the widest answers are "59 MIN" and "365 D" plus their
+ * terminator, and a truncated one would silently change the number rather than
+ * the unit. The callers pass 8, which is what lets the compiler prove the line
+ * they build out of two of these fits its own buffer. */
+static void streak_len(long s, char *out, size_t cap)
+{
+   if (s < 0)
+      s = 0;
+   if (s >= 2L * 86400)
+      (void)snprintf(out, cap, "%ld D", s / 86400);
+   else if (s >= 3600)
+      (void)snprintf(out, cap, "%ld H", s / 3600);
+   else
+      (void)snprintf(out, cap, "%ld MIN", s / 60);
+}
 
 /* The CGM that owns the big number, or NULL. Four places open-coded this same
  * scan; the big number, its session line and the plot all have to agree on
@@ -48,14 +89,13 @@ static const struct ui_sensor *primary_cgm(const struct screen *m)
  * "--". Imminence is in the colour -- yellow inside the last day, red inside
  * the final two hours -- because the number alone does not shout.
  *
- * This rule used to be inlined in the main screen's SESSION row, one of four
- * rows in a table that has since collapsed into a single line under the
- * progress bar. Keeping it in a function is what let that move be a layout
- * change rather than a rewrite of the semantics. */
+ * A FUNCTION RATHER THAN A LINE IN THE ROW THAT DRAWS IT: the rule is about
+ * what the session means, and the row it appears in has moved twice. Keeping
+ * the two apart is what makes a layout change a layout change. */
 static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
                              char *out, int n)
 {
-   const uint32_t plain = 0xFFCCCCCC;
+   const uint32_t plain = UI_TEXT_DIM;
    if (!m->reading.has_cgm) {
       (void)snprintf(out, n, "--");
       return plain;
@@ -68,22 +108,38 @@ static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
     * even though the session was running and its clock was known (it is cached
     * across restarts now -- see sessc_restore). A session duration should
     * disappear only when there is genuinely no session to describe. */
-   if (m->reading.session_seconds <= 0) {
-      /* No clock yet: if the primary is inside its warmup window, SAY so
-       * with the minutes left -- an unexplained "--" for the first half hour
-       * of a new sensor reads as broken, and warmup is the one wait that is
-       * by design. Off the pairing instant it is an estimate; the '~' says
-       * so. */
+   long ss = m->reading.session_seconds;
+   /* NO LIVE CLOCK: FALL BACK TO WHEN THE SESSION WAS RECORDED AS STARTING.
+    *
+    * The live clock is the sensor's own, exact to the second, and it is
+    * preferred whenever there is one -- but there is none until this link's
+    * first 0x4e of the process, and a reconnect takes it away again. The
+    * instant the session started does not have to be re-learned across
+    * either: it is minted once and kept in the provenance row, which is what
+    * the per-device screen's STARTED and ELAPSED are built from.
+    *
+    * Without this the headline row read "--" for a sensor delivering
+    * readings on screen: the warmup estimate below it is disqualified the
+    * moment a sensor HAS produced a reading (ps->last != 0), so a sensor
+    * past its first sample but before this process's first 0x4e fell
+    * between the two and described its session as nothing at all. */
+   if (ss <= 0 && ps && ps->activation > 0 && m->now > ps->activation)
+      ss = m->now - ps->activation;
+   if (ss <= 0) {
+      /* Nothing recorded yet either: if the primary is inside its warmup
+       * window, SAY so with the minutes left -- an unexplained "--" for the
+       * first half hour of a new sensor reads as broken, and warmup is the
+       * one wait that is by design. Off the pairing instant it is an
+       * estimate; the '~' says so. */
       long wp = (ps && ps->last == 0) ? ps->paired : 0;
       if (wp > 0 && m->now - wp < SENSOR_WARMUP_S) {
          (void)snprintf(out, n, "WARMUP ~%ldM",
                         (wp + SENSOR_WARMUP_S - m->now) / 60);
-         return 0xFF00CCFF;
+         return UI_WARN;
       }
       (void)snprintf(out, n, "--");
       return plain;
    }
-   long ss = m->reading.session_seconds;
    if (m->reading.sess_state == SENSOR_STATE_WARMUP ||
        (m->reading.sess_state == 0 && ss > 0 && ss < SENSOR_WARMUP_S)) {
       /* The sensor's OWN state byte, or the clock heuristic before any 4e has
@@ -93,13 +149,13 @@ static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
       if (r < 0)
          r = 0;
       (void)snprintf(out, n, "WARMUP %ld:%02ld", r / 60, r % 60);
-      return 0xFF00CCFF;
+      return UI_WARN;
    }
    if (m->reading.sess_state == SENSOR_STATE_ENDED) {
       /* The sensor SAID the session is over -- its own verdict, not
        * arithmetic on a wear budget. The one allowed ENDED. */
       (void)snprintf(out, n, "ENDED");
-      return 0xFF4466FF;
+      return UI_DANGER;
    }
    /* The primary's own wear budget (per-device: user override, DIS model, or
     * type default -- see sensor_wear_seconds). */
@@ -121,13 +177,13 @@ static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
                         (ag % 3600) / 60);
       else
          (void)snprintf(out, n, "GRACE %s%ldM", sg, ag / 60);
-      return (grace < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+      return (grace < 2L * 3600) ? UI_DANGER : UI_WARN;
    }
    if (left < 86400) {
       /* The last day counts in hours and minutes: a bare "0D" reads as
        * already over. */
       (void)snprintf(out, n, "LEFT %ldH %ldM", left / 3600, (left % 3600) / 60);
-      return (left < 2L * 3600) ? 0xFF4466FF : 0xFF00CCFF;
+      return (left < 2L * 3600) ? UI_DANGER : UI_WARN;
    }
    (void)snprintf(out, n, "LEFT %ldD %ldH", left / 86400,
                   (left % 86400) / 3600);
@@ -143,12 +199,11 @@ static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
  * number.
  *
  * It was 51 -- a (7+9) advance plus a 5*sc-scaled glyph, 7*5 tall -- charged
- * to whichever block sat at the BOTTOM of the column, and the reason every
- * such block had to know about a banner it did not draw. The cost is now paid
- * once, above the number, out of padding that was already there: in portrait
- * the gap is 12 and this fits inside it, so the number does not move at all.
- * The blocks below no longer reserve anything, which is what leaves room for
- * the second shortcut row. */
+ * PAID ONCE, ABOVE THE NUMBER, out of padding that is already there: in
+ * portrait the gap is 12 and this fits inside it, so the number does not
+ * move. No block below reserves anything for it, which is what leaves room
+ * for the second shortcut row -- and it is why a block at the BOTTOM of the
+ * column does not have to know about a banner it does not draw. */
 #define UI_BANNER_H (9)
 
 /* Defined below; the number block draws it, both orientations. */
@@ -156,17 +211,16 @@ static const char *banner_of(const struct screen *m, uint32_t *col);
 
 /* THE TOP BLOCK AND THE PLOT BLOCK ARE SEPARATE RENDERERS.
  *
- * They used to be one function, which was fine while they were always stacked
- * in one column. In LANDSCAPE they are not: the big number keeps the left
- * column with the stats table under it, while the plot and the threshold rows
- * move to the right column where the plot can have real height. Two callers
- * placing two blocks independently is exactly what one function could not do.
+ * IN LANDSCAPE THEY ARE NOT STACKED: the big number keeps the left column
+ * with the stats table under it, while the plot and the threshold rows move to
+ * the right column where the plot can have real height. Two callers placing
+ * two blocks independently is what one function cannot do.
  *
  * What the plot block needs from the number block travels in this struct
- * rather than being recomputed -- the tab row's tap band is defined by the
+ * rather than being recomputed. The tab row's tap band is defined by the
  * number's lowest pixel and by the rows beside it, so a second copy of that
- * arithmetic would be a silent mis-actuation waiting to happen (it has been
- * one before: a tap on the AGE used to switch the plot span). */
+ * arithmetic is a silent mis-actuation waiting to happen -- a tap landing on
+ * one control and firing another. */
 struct bignum_geo {
    int y; /* y below the block, before the tab-row gap */
    int bigsc3, bigsc, gh, pad;
@@ -192,7 +246,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
     * placeholder as stale. */
    if (m->reading.stale || m->reading.glu < 0 || !m->reading.has_cgm) {
       (void)snprintf(big, sizeof big, "---");
-      bigcol = 0xFF888888;
+      bigcol = UI_MUTED;
    } else {
       fmt_glu(m->reading.glu, m->prefs.units, big, sizeof big);
       bigcol = glu_color_band(m->reading.glu, m->prefs.alarm_low,
@@ -205,8 +259,8 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
     * more than the 9*sc a normal-size row costs -- so the banner fits inside
     * padding that already existed and the number does not move. Landscape's
     * gap is only 4*sc, so there the band grows to UI_BANNER_H; that column
-    * gains far more than it spends, because the plot no longer reserves the
-    * old 51*sc banner under its threshold rows.
+    * gains far more than it spends, because the plot reserves nothing under
+    * its threshold rows.
     *
     * DRAWN FROM `y` DOWNWARD, never from the number upward. `y` on entry is
     * already clear of the Android status bar (the caller starts the screen at
@@ -260,10 +314,12 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    char pred[14];
    /* SHOWN IFF THE TREND IS -- both come out of the same 4e response, so a
     * prediction without a trend (or a trend without a prediction) means one of
-    * the two sentinels fired, not that the app has just started. The
-    * have_reading gate that used to be here made the row disappear for a
-    * cadence after every launch while the trend beside it came straight back
-    * from the log; the sentinel bounds below are the real test. */
+    * the two sentinels fired, not that the app has just started.
+    *
+    * NOT GATED ON have_reading: the trend beside it comes straight back from
+    * the log at launch, so gating this on a live reading makes the row vanish
+    * for a cadence after every start while its neighbour is already there.
+    * The sentinel bounds below are the real test. */
    if (m->reading.has_cgm && m->reading.predicted > 0 &&
        m->reading.predicted <= 400) {
       char pv[12];
@@ -338,8 +394,8 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
     * Drawn here rather than where the row was reserved, because bx is a
     * result of the layout immediately above. */
    {
-      uint32_t bcol     = 0;
-      const char *bmsg  = banner_of(m, &bcol);
+      uint32_t bcol    = 0;
+      const char *bmsg = banner_of(m, &bcol);
       if (bmsg)
          draw_str(px, fb, bx, bany, sc, bmsg, bcol);
    }
@@ -347,16 +403,16 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    /* The NUMBER ITSELF opens the DEVICES screen -- the registry of everything
     * feeding it, where the primary is chosen (per device) and a new one is
     * added. The glyphs only, not the band: the hamburger (settings) and the
-    * tab row keep their own pixels, which is why the old whole-band settings
-    * target was removed. */
-   add_hit_ix(h, bx, y, ink_w, 7 * bigsc, MA_DEVICES_OPEN, 0);
+    * tab row keep their own pixels, and the band between them belongs to
+    * neither. */
+   add_hit_ix(h, ui_rect(bx, y, ink_w, 7 * bigsc), MA_DEVICES_OPEN, 0);
    /* Age bar: a thin bar under the number, exactly the footprint's ink
     * width (three digits: 5+1+5+1+5 cells) whatever the current digit
     * count. The full-length TRACK is always drawn in dark gray, so the
     * bar visibly ENDS -- the fill is readable as a fraction of the whole.
     * The live part draws on top in the number's own (dynamically
     * recolored) colour, filling left-to-right over one CGM cadence plus
-    * sync slack (305 s); once overdue it becomes a full-length DASHED
+    * sync slack (AGE_BAR_S); once overdue it becomes a full-length DASHED
     * line -- a different pattern, not a fuller bar, so "late" can never
     * be misread as "fresh". Blank exactly when the age is blank. */
    /* Bar geometry lives OUTSIDE the draw condition: the AGE value in the
@@ -372,7 +428,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int bar_y = y + (7 * bigsc3) + bgap;
    if (m->reading.t > 0 && m->reading.has_cgm) {
       fill_rect(px, fb, bx3, bar_y, bar_w, bar_h, 0xFF444444);
-      if (a >= 305) {
+      if (a >= AGE_BAR_S) {
          int dash = 3 * sc; /* dash == gap */
          for (int dx = 0; dx < bar_w; dx += 2 * dash) {
             int seg = dash;
@@ -381,7 +437,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
             fill_rect(px, fb, bx3 + dx, bar_y, seg, bar_h, bigcol);
          }
       } else {
-         int fw = (int)(((long)bar_w * a) / 305);
+         int fw = (int)(((long)bar_w * a) / AGE_BAR_S);
          if (fw > 0)
             fill_rect(px, fb, bx3, bar_y, fw, bar_h, bigcol);
       }
@@ -401,10 +457,10 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int vspan   = agev_y - units_y;
    int tr_y    = units_y + (vspan / 3);
    int pred_y  = units_y + ((2 * vspan) / 3);
-   draw_str(px, fb, colx, units_y, sc, UI_LBL(m->prefs.units), 0xFFCCCCCC);
-   draw_str(px, fb, colx, tr_y, sc, tr, 0xFFCCCCCC);
-   draw_str(px, fb, colx, pred_y, sc, pred, 0xFFCCCCCC);
-   draw_str(px, fb, colx, agev_y, sc, agestr, 0xFFCCCCCC);
+   draw_str(px, fb, colx, units_y, sc, UI_LBL(m->prefs.units), UI_TEXT_DIM);
+   draw_str(px, fb, colx, tr_y, sc, tr, UI_TEXT_DIM);
+   draw_str(px, fb, colx, pred_y, sc, pred, UI_TEXT_DIM);
+   draw_str(px, fb, colx, agev_y, sc, agestr, UI_TEXT_DIM);
    /* Settings hamburger: a modest 3-bar icon CENTERED (both axes) in the empty
     * space above the three values. Its hit box is the ONLY way to open settings
     * now (the whole-top-band target is gone), so pad it out well past the glyph
@@ -421,35 +477,37 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int ham_x = colx + ((col_w - ham_w) / 2); /* h-centre in the column */
    for (int b = 0; b < 3; b++)
       fill_rect(px, fb, ham_x, ham_y + (b * (ham_bh + ham_gp)), ham_w, ham_bh,
-                0xFFCCCCCC);
+                UI_TEXT_DIM);
    /* The settings hit zone is the WHOLE band right of the number -- from
     * the number's ink edge to the screen edge, from the band top down
     * through the entire units row -- so it cannot be missed. The number
     * keeps its own pixels (they open the DEVICES screen). */
    int hx0 = bx3 + (foot_ink * bigsc3) + sc;
    /* Bounded by THIS COLUMN, not by the whole screen. In landscape the number
-    * owns the left column only, and a band running to fb->width reached across
-    * into the plot column -- where the tab row, added later, took the pixels
-    * back. The band still existed but its own centre no longer resolved to it,
-    * which is the shape of a control that looks present and is not. Identical
-    * in portrait, where the column IS the screen. */
-   int hamslot = add_hit(h, hx0, y, (cx + cw) - hx0, (units_y + (7 * sc)) - y,
-                         ACT_OPEN_SETTINGS, 0);
+    * owns the left column only; a band running to fb->width would reach into
+    * the plot column, where the tab row owns those pixels, and its centre
+    * would resolve to a control the eye cannot hit -- the shape of a thing
+    * that looks present and is not. Identical in portrait, where the column IS
+    * the screen. */
+   int hamslot =
+       add_hit(h, ui_rect(hx0, y, (cx + cw) - hx0, (units_y + (7 * sc)) - y),
+               ACT_OPEN_SETTINGS, 0);
    /* ...but the pressed highlight lights the hamburger GLYPH alone (plus a
     * little breathing room) -- the zone also contains the units label, and
     * a lit MG/DL would read as if the units were about to change. Through the
     * slot the band actually got: if it was dropped there is no band to narrow,
     * and the last box on the list is a different control entirely. */
-   add_glow(h, hamslot, ham_x - (2 * sc), ham_y - (2 * sc), ham_w + (4 * sc),
-            ham_h + (4 * sc));
+   add_glow(h, hamslot,
+            ui_rect(ham_x - (2 * sc), ham_y - (2 * sc), ham_w + (4 * sc),
+                    ham_h + (4 * sc)));
 
    /* ONE LINE under the progress bar: which sensor owns the big number, its
     * plot marker, and how much of its session is left --
-    * "G7-91-D1  X  GRACE 8H 35M". This is the whole of what the old
-    * four-row PRIMARY / STATE / SESSION / PRED table under the alarm rows
-    * said that was worth saying, put on the number it describes instead of in
-    * a table the eye had to travel to. Left-aligned on the bar, so the three
-    * -- number, bar, line -- read as one block. */
+    * "G7-91-D1  X  GRACE 8H 35M". Everything worth saying about the primary
+    * sensor -- which one it is, its state, its session and its prediction --
+    * sits ON the number it describes, rather than in a table the eye has to
+    * travel to. Left-aligned on the bar, so the three -- number, bar, line --
+    * read as one block. */
    const struct ui_sensor *ps = primary_cgm(m);
    /* EQUAL AIR ABOVE AND BELOW THE BAR. The gap over the bar is bgap (the
     * number's glyph bottom to the bar's top); this one was a flat 5*sc, so the
@@ -463,10 +521,10 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
        *
        * bx3 + bar_w is the same pixel the big number's rightmost ink lands on
        * (bx is derived from it), so number, bar and countdown share one right
-       * margin and the block has a true edge on both sides instead of a ragged
-       * one. draw_str lays out len cells of 6 units with no trailing gap after
-       * the last, so the ink is (len*6 - 1)*sc wide -- subtracting the CELL
-       * width instead would leave a one-unit sliver past the bar. */
+       * margin, which is what gives the block a true edge on both sides.
+       * draw_str lays out len cells of 6 units with no trailing gap after the
+       * last, so the ink is (len*6 - 1)*sc wide; subtracting the CELL width
+       * would leave a one-unit sliver past the bar. */
       int slw = ((str_len(sleft) * 6) - 1) * sc;
       int sx  = bx3 + bar_w - slw;
       /* TRUNCATE the name to what is left after the countdown, never the
@@ -482,13 +540,13 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
          nbud = 0;
       if (str_len(pname) > nbud)
          pname[nbud] = '\0';
-      draw_str(px, fb, bx3, pl_y, sc, pname, 0xFFCCCCCC);
+      draw_str(px, fb, bx3, pl_y, sc, pname, UI_TEXT_DIM);
       draw_str(px, fb, sx, pl_y, sc, sleft, scol);
       /* The marker sits at the exact MIDPOINT of the space between the two --
-       * from the name's last ink column to the countdown's first. It used to
-       * be pinned two cells after the name, which put it hard against the
-       * label and left a ragged void before the countdown; centring makes the
-       * gap read as deliberate whatever the name's length. */
+       * from the name's last ink column to the countdown's first. Centring
+       * rather than a fixed offset from the name, so the gap reads as
+       * deliberate whatever the name's length: a pinned marker sits hard
+       * against a long name and leaves a ragged void before the countdown. */
       if (ps && ps->marker != MARK_HIDE) {
          int gr = (2 * sc * ps->size) / MARK_SIZE_DEF;
          if (gr < sc)
@@ -501,12 +559,11 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
              (struct plot_fb){px, fb->stride, fb->width, fb->height}, mx,
              pl_y + (3 * sc), gr, ps->marker, ui_sensor_color(ps->color));
       }
-      /* The line names a device, so tapping it opens that device's menu --
-       * the shortcut the old info table carried, kept on the content that
-       * replaced it. */
+      /* The line names a device, so tapping it opens that device's menu. */
       if (ps)
-         add_hit_ix(h, bx3, pl_y - (2 * sc), (cx + cw) - bx3, gh + (4 * sc),
-                    MA_SENSOR, (int)(ps - m->dev.sensors));
+         add_hit_ix(
+             h, ui_rect(bx3, pl_y - (2 * sc), (cx + cw) - bx3, gh + (4 * sc)),
+             MA_SENSOR, (int)(ps - m->dev.sensors));
    }
 
    {
@@ -589,22 +646,30 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int tab_h = tab_bot - tab_y;
    if (tab_h < rowh)
       tab_h = rowh; /* never shrink below the tab glyphs themselves */
-   /* Settings now opens ONLY from the hamburger (added above), not from the
-    * whole top band -- the band target that used to sit here is gone, so a tap
-    * on the number or trend no longer navigates away by accident. */
+   /* SETTINGS OPENS FROM THE HAMBURGER ONLY (added above), never from the
+    * whole top band: a band-wide target means a tap on the number or the
+    * trend navigates away by accident. */
    if (scrub) {
       char ts[16];
-      char line[48];
+      /* 72, and the size is load-bearing. The scrub line carries a FOOD NAME
+       * as its unit field (up to eight characters) alongside the value, the
+       * date and the time; at 48 the compiler cannot prove the format fits,
+       * which this build treats as an error rather than letting the time be
+       * cut off the end. The alternative is shortening the name until it
+       * stops meaning anything. */
+      char line[72];
       char gv[12];
       int ins = (m->plot.hist[m->plot.scrub].kind == KIND_INS);
       int wt  = (m->plot.hist[m->plot.scrub].kind == KIND_WT);
+      int fd  = (m->plot.hist[m->plot.scrub].kind == KIND_FOOD);
+      int exr = (m->plot.hist[m->plot.scrub].kind == KIND_EX);
       fmt_hms(m->plot.hist[m->plot.scrub].t, m->tz_off, ts, sizeof ts);
       ts[5] = '\0';
       /* An insulin dose scrubs like glucose, shown as "2 U FAST" /
        * "10 U SLOW" (src carries the dose TYPE for insulin points). A weight
        * scrubs the same way -- identical code path, identical readout shape --
        * converted from the stored GRAMS into whichever display unit is set,
-       * so switching KG/LB re-renders history instead of relabelling it. */
+       * so switching KG/LB re-renders history rather than relabelling it. */
       if (ins) {
          (void)snprintf(gv, sizeof gv, "%d U", m->plot.hist[m->plot.scrub].glu);
       } else if (wt) {
@@ -619,6 +684,24 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          if (t10 > 99999)
             t10 = 99999;
          (void)snprintf(gv, sizeof gv, "%d.%d", t10 / 10, t10 % 10);
+      } else if (fd) {
+         /* Grams, as stored. FOOD_MAX_G is 20000, so five digits and the
+          * unit fit `gv` with room to spare. */
+         (void)snprintf(gv, sizeof gv, "%d G", m->plot.hist[m->plot.scrub].glu);
+      } else if (exr) {
+         /* HOW LONG IT LASTED, which is the thing about a session that a
+          * glance at the plot cannot give you: the rule shows roughly, this
+          * says exactly. Minutes, because seconds are noise at this scale and
+          * hours would round a 40-minute walk to nothing. A session with no
+          * recorded end -- the app was killed, or it is still running -- has
+          * no length to show, so the intensity carries the line alone. */
+         long mins = m->plot.hist[m->plot.scrub].src / 60;
+         if (mins <= 0)
+            (void)snprintf(gv, sizeof gv, "EX");
+         else if (mins > 9999)
+            (void)snprintf(gv, sizeof gv, "EX 9999M");
+         else
+            (void)snprintf(gv, sizeof gv, "EX %ldM", mins);
       } else {
          fmt_glu(m->plot.hist[m->plot.scrub].glu, m->prefs.units, gv,
                  sizeof gv);
@@ -628,10 +711,40 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
        * Thursday but not WHICH one, which is useless once the span passes a
        * week -- and at 30D it is useless immediately. */
       const char *unit = UI_LBL(m->prefs.units);
-      if (ins)
+      if (ins) {
          unit = (m->plot.hist[m->plot.scrub].src == INS_FAST) ? "FAST" : "SLOW";
-      else if (wt)
+      } else if (wt) {
          unit = wt_unit_name(m->prefs.wunits);
+      } else if (exr) {
+         /* The user's own words for the three levels, the same ones the
+          * button shows -- a scrub that said "2" would be asking the reader
+          * to remember a scale nothing on screen defines. */
+         static const char *const exl[EX_MAX_LEVEL + 1] = {"", "LIGHT", "MOD",
+                                                           "HARD"};
+         int lv = m->plot.hist[m->plot.scrub].glu;
+         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv] : "";
+      } else if (fd) {
+         /* THE FOOD'S NAME, TRUNCATED TO WHAT THE LINE HOLDS.
+          *
+          * A name is up to FOOD_NAME_MAX (20) characters and this readout
+          * also carries a value, a date and a time inside a 48-byte line --
+          * so a long name would push the time off the end, and the time is
+          * the part that says WHICH entry is being scrubbed. Cut to eight,
+          * which leaves every other field intact at the narrowest span.
+          *
+          * A copy, not a borrowed pointer: `unit` is used further down and
+          * food_type_name's answer is only valid while the vocabulary is
+          * unchanged. An id the vocabulary does not hold answers "", which
+          * renders as a blank name rather than a number -- the honest look of
+          * an entry nothing can name. */
+         static char fname[9];
+         const char *nm = food_type_name(m->plot.hist[m->plot.scrub].src);
+         int fi         = 0;
+         for (; nm[fi] && fi < (int)sizeof fname - 1; fi++)
+            fname[fi] = nm[fi];
+         fname[fi] = 0;
+         unit      = fname;
+      }
       if (m->plot.plot_hours >= 720) {
          /* A MONTH-long span: a weekday name is ambiguous four times over,
           * so name the actual date. */
@@ -669,7 +782,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       int lx = cx + ((cw - lw) / 2);
       if (lx < cx + (2 * sc))
          lx = cx + (2 * sc);
-      draw_str(px, fb, lx, y, tsc2, line, 0xFFFFFFFF);
+      draw_str(px, fb, lx, y, tsc2, line, UI_TEXT);
    } else {
       int laby = y + ((rowh - (7 * sc)) / 2);
       for (int i = 0; i < UI_TABS; i++) {
@@ -688,11 +801,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          int lw   = str_len(lab) * 6 * sc;
          int tabx = cx + (i * colw);
          draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, lab,
-                  ui_tab_hours[i] == m->plot.plot_hours ? 0xFFFFFFFF
-                                                        : 0xFF888888);
+                  ui_tab_hours[i] == m->plot.plot_hours ? UI_TEXT : UI_MUTED);
          /* arg carries the plot span in hours, so the shell needn't know the
           * tab list -- it just assigns it. */
-         add_hit(h, tabx, tab_y, colw, tab_h, ACT_PLOT_TAB, ui_tab_hours[i]);
+         add_hit(h, ui_rect(tabx, tab_y, colw, tab_h), ACT_PLOT_TAB,
+                 ui_tab_hours[i]);
       }
    }
    y += rowh;
@@ -712,10 +825,9 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * screen bottom AT FULL FONT:
     *   59 = what render_glucose itself adds after the plot: a 9 gap, then the
     *        ALARM and NUDGE threshold rows at 7 row + 18 portrait pad EACH.
-    *        This was 34 while there was one row; a second row that the
-    *        reserve does not count is a second row the plot grows over, and
-    *        the overlap lands on the thresholds -- the numbers whose whole
-    *        purpose is to be readable at a glance.
+    *        BOTH rows are counted: a row the reserve leaves out is a row the
+    *        plot grows over, and the overlap lands on the thresholds -- the
+    *        numbers whose whole purpose is to be readable at a glance.
     *  186 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
     *        the banner's advance and glyph),
     *   16 = one blank line BELOW the alarm's large letters.
@@ -726,21 +838,20 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
    int ph   = 0;
    if (landscape)
-   /* 39, not 26: in landscape the plot is sized by SUBTRACTING what comes
-    * after it, and what comes after it is now TWO threshold rows -- a 9 gap
-    * then 7 glyph + 6 landscape pad EACH, i.e. 35, leaving the same 4 sc of
-    * slack the old 26 left over one row. Left at 26 the NUDGE row and all
-    * three of its tap targets landed below the buffer on every wide-short
-    * geometry (measured at 1440x1300 and 1600x720), which is the whole
-    * no-scrolling failure: drawn nowhere, tappable nowhere. */
+   /* 39, BECAUSE TWO THRESHOLD ROWS COME AFTER THE PLOT. In landscape the
+    * plot is sized by subtracting what follows it: a 9 gap, then 7 glyph +
+    * 6 landscape pad EACH, i.e. 35, plus 4 sc of slack.
+    *
+    * A NUMBER TOO SMALL HERE DOES NOT CROP THE PLOT -- it puts the NUDGE row
+    * and all three of its tap targets below the buffer, on every wide-short
+    * geometry. This app does not scroll, so that is drawn nowhere and
+    * tappable nowhere. uitest sweeps the geometries. */
    /* THREE QUARTERS of what is left, not all of it. The rest is the two
     * threshold rows (39*sc).
     *
-    * It used to reserve the banner under them as well, this column being the
-    * only one with room beneath the plot in landscape. The banner is above
-    * the big number now, in the other column, so that reservation is gone and
-    * the plot keeps the height -- but the three-quarter cap stays, because
-    * what it protects is the threshold rows' own room on a short window, not
+    * The banner needs no reservation here: it is above the big number, in the
+    * other column. The three-quarter cap stays anyway, because what it
+    * protects is the threshold rows' own room on a short window, not
     * the banner's. */
    {
       ph      = bottom - y - (39 * sc);
@@ -748,9 +859,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       if (ph > cap)
          ph = cap;
    } else {
-      /* Never below the old fixed height (short screens keep exactly the
-       * previous layout, so nothing that used to fit now clips); grow only
-       * into genuine excess on taller screens. */
+      /* A FLOOR OF 12*bigsc, and growth only into genuine excess above it. A
+       * plot that shrinks on a short screen takes the space from itself
+       * rather than from the rows below, which is the wrong way round: those
+       * rows have tap targets and this does not. */
       ph = (grow > 12 * g.bigsc) ? grow : 12 * g.bigsc;
    }
    if (ph < 20 * sc)
@@ -775,9 +887,9 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * ones still showed. NINS comes from insulin.h (already included by
     * ui.h); only the glucose half is a literal, so the Makefile's
     * crosscheck can keep it in step with store.h's NHIST. */
-/* A LONG span returns up to PLOT_LONG_MAX points (plotdata.h), which is
- * far more than the live window holds -- size for the larger of the two or
- * the old half of a 30-day plot is silently cut off. */
+/* A LONG span returns up to PLOT_LONG_MAX points (plotdata.h), which is far
+ * more than the live window holds. Sized for the LARGER of the two: too
+ * small and the older half of a 30-day plot is silently cut off. */
 #define UI_PLOT_MAX (PLOT_LONG_MAX + NINS + NWT)
    static struct plot_pt pts[UI_PLOT_MAX];
    int np = m->plot.nhist < UI_PLOT_MAX ? m->plot.nhist : UI_PLOT_MAX;
@@ -795,6 +907,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       pts[i].col    = 0;
       pts[i].hidden = 0;
       pts[i].size   = MARK_SIZE_DEF;
+      /* EVERY POINT IS AN INSTANT UNLESS IT SAYS OTHERWISE. Set here, before
+       * the kinds below, because `pts` is a static that outlives the frame:
+       * a span left over from the last frame's exercise entry would draw a
+       * rule from an unrelated point. */
+      pts[i].span = 0;
       /* An insulin dose: drawn in the user's INSULIN MARKER styling
        * (marker/colour/size, both types alike). Its y IGNORES the units
        * value entirely -- units are not glucose -- and sits at 60, the
@@ -817,6 +934,17 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
        * value back out of m->plot.hist, exactly as it does for a dose. A fixed
        * shape and colour, not a configurable marker: there is one weight
        * series, so there is nothing to tell apart. */
+      /* A logged FOOD entry: the same bottom line, drawn as a small F. Fixed
+       * shape and colour like the weight's W -- there is one food series on
+       * this axis, however many food TYPES exist, so there is nothing to tell
+       * apart by styling; the scrub names the food. */
+      if (m->plot.hist[i].kind == KIND_FOOD) {
+         pts[i].glu    = 60;
+         pts[i].marker = PLOT_MARK_F;
+         pts[i].col    = 0xFF66DDFF;
+         pts[i].size   = MARK_SIZE_DEF;
+         continue;
+      }
       if (m->plot.hist[i].kind == KIND_WT) {
          pts[i].glu    = 60;
          pts[i].marker = PLOT_MARK_W;
@@ -824,14 +952,29 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          pts[i].size   = MARK_SIZE_DEF;
          continue;
       }
+      /* A logged EXERCISE session: the same bottom line as the doses, drawn
+       * as a small E in the button's own blue so the plot and the control
+       * agree about what exercise looks like. `src` carries the LENGTH in
+       * seconds (model.c), which becomes the rule drawn beside the letter --
+       * the one point on this plot that is a stretch of time rather than an
+       * instant. */
+      if (m->plot.hist[i].kind == KIND_EX) {
+         pts[i].glu    = 60;
+         pts[i].marker = PLOT_MARK_E;
+         pts[i].col    = ui_ex_color(m->plot.hist[i].glu, 0xFFFF9955);
+         pts[i].size   = MARK_SIZE_DEF;
+         pts[i].span   = m->plot.hist[i].src;
+         continue;
+      }
       int matched = 0;
       for (int k = 0; k < m->dev.nsensors; k++) {
          /* Pre-registry legacy readings (src 0) match NO sensor and keep the
-          * default value-based styling below. They used to be attributed to
-          * the PRIMARY sensor at display time ("one CGM behind all of it"),
-          * but the primary flag is mutable: the moment the user made a
-          * freshly paired G7 primary, days of another sensor's legacy data
-          * flipped to the G7's colour and marker on the plot -- a provenance
+          * default value-based styling below.
+          *
+          * NOT ATTRIBUTED TO THE PRIMARY, however tempting: the primary flag
+          * is mutable, so the moment a freshly paired G7 is made primary,
+          * days of another sensor's legacy data would flip to the G7's colour
+          * and marker on the plot -- a provenance
           * lie the append-only log exists to prevent. Unknown provenance is
           * rendered as the neutral main trace, never as a live device. */
          if (m->dev.sensors[k].id == m->plot.hist[i].src &&
@@ -849,7 +992,8 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       }
       /* A DISCONNECTED (old) device keeps its slot, so it is matched by the
        * loop above and its historical trace stays in the device's own marker
-       * and colour -- consistent with what the OLD DEVICES menu shows. Only a
+       * and colour -- consistent with what the DEVICES menu draws for a
+       * retired slot. Only a
        * source with NO slot at all (re-minted under a new id, e.g. a firmware
        * bump) is a true orphan: draw it muted and crossed so it reads as
        * "historical, not from a sensor you still have". src 0 is pre-registry
@@ -862,7 +1006,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    }
    /* The longer the span, the denser the points and the less a fat marker
     * says: at 30D thousands of readings share the width, so half the 7D
-    * radius keeps the shape of the trace readable instead of smearing it
+    * radius keeps the shape of the trace readable rather than smearing it
     * into a band. */
    int prad = 3 * sc / 2;
    if (m->plot.plot_hours >= 720)
@@ -873,17 +1017,115 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       prad = prad * 3 / 4;
    if (prad < 1)
       prad = 1;
-   /* ONE configuration, used to draw and then recorded for the touch path:
-    * two compound literals are two things to keep in step, which is the drift
-    * this whole change exists to remove. */
+   /* ONE configuration, drawn with and then recorded for the touch path.
+    * Two compound literals would be two things to keep in step, and the touch
+    * path cannot see the scale and span the renderer derived. */
    struct plot_cfg pcfg = {m->plot.plot_max, prad};
    plot_render((struct plot_fb){px, fb->stride, fb->width, fb->height},
                (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, np, m->now,
                m->plot.plot_hours, pcfg, white_color,
                scrub ? m->plot.scrub : -1, UI_HILITE, m->tz_off);
+   /* THE IN-RANGE STREAK, upper right, inside the plot.
+    *
+    * Drawn only while the streak is running -- 0 means the newest reading is
+    * out of range, and a "STREAK 0 MIN" would be a consolation prize for the
+    * one state it is not meant to celebrate. Grey and normal-sized: it is a
+    * fact about the trace, not a control and not a headline.
+    *
+    * RIGHT-ALIGNED, so the number grows leftward and the label never moves as
+    * the units change from minutes to hours to days.
+    *
+    * AFTER plot_render, so it sits on top of the trace rather than under it,
+    * and inside the plot rect rather than above it, where the tab row lives
+    * and the scrub readout replaces it. */
+   if (m->plot.streak_s > 0) {
+      /* 40, and clamped below. A long is up to 19 digits and the compiler
+       * cannot see that a streak is bounded by the history's own span, so at
+       * 24 it treats the format as possibly truncating -- which this build
+       * makes an error rather than letting the label be cut in half. The
+       * clamp is the honest half of it: a streak of more than a year is not
+       * a number this screen should be trying to render. */
+      char st[40];
+      long ss = m->plot.streak_s;
+      if (ss > 365L * 86400)
+         ss = 365L * 86400;
+      long bb = m->plot.best_streak_s;
+      if (bb > 365L * 86400)
+         bb = 365L * 86400;
+      /* IS THIS THE BEST ONE YET? Then it says so and nothing else: a record
+       * being broken is the whole news, and a bar showing 100% of a target
+       * already passed would be reporting the smaller fact. `>=` because
+       * equalling the record is reaching it, and because the record is raised
+       * on the reading path -- a streak that has just passed it reads its own
+       * value back here one reading later. */
+      const int is_best = (bb <= 0) || (ss >= bb);
+      /* 8 IS THE PROVABLE BOUND, and the compiler is the reason it is not 16:
+       * streak_len's widest answer is "59 MIN" or "365 D", but with a 16-byte
+       * destination gcc must assume 15 characters twice and cannot show the
+       * combined line fits -- which this build treats as an error rather than
+       * letting a number be cut in half. */
+      char cur[8];
+      char bst[8];
+      streak_len(ss, cur, sizeof cur);
+      streak_len(bb, bst, sizeof bst);
+      if (is_best)
+         (void)snprintf(st, sizeof st, "BEST STREAK %s", cur);
+      else
+         (void)snprintf(st, sizeof st, "STREAK %s (BEST %s)", cur, bst);
+      /* INSET BY HALF A CHARACTER HEIGHT, down and left.
+       *
+       * A glyph is 7*sc tall at this scale, so the inset is (7*sc)/2 on both
+       * axes. Hard against the plot's corner the text read as part of the
+       * frame rather than as something written inside it; half a character is
+       * enough air to separate them and small enough that the label still
+       * belongs to the plot rather than floating above it. */
+      int inset = (7 * sc) / 2;
+      int sw    = ((str_len(st) * 6) - 1) * sc;
+      int sx    = plot_x + plot_w - sw - (2 * sc) - inset;
+      if (sx < plot_x)
+         sx = plot_x;
+      int sy = plot_y + (2 * sc) + inset;
+      draw_str(px, fb, sx, sy, sc, st, UI_MUTED);
+      /* HOW FAR ALONG THE RUN IS, as a rule under the whole line.
+       *
+       * Only while the record still stands: once it is beaten the text says
+       * so and a bar has nothing left to measure. Two rows of pixels, the
+       * width of the text: a dark track with the earned part lit over it. It
+       * is a progress bar for something nobody is racing, so it reads as an
+       * underline that happens to be partly lit rather than as a control.
+       *
+       * THE LIT SHADE IS ITS OWN, one step off the label's grey and drawn
+       * nowhere else in the app. Not for looks -- at these two rows nobody
+       * could tell them apart -- but so a test can say "no bar was drawn"
+       * and mean it. With the lit part in the label's own colour, a bar
+       * drawn at FULL width covers its dark track completely and is then
+       * indistinguishable, in pixels, from no bar at all: a mutant that drew
+       * the bar after the record was beaten survived exactly that way.
+       *
+       * The fraction is computed in LONG and clamped to the bar: ss and bb are
+       * both bounded to a year above, so ss * sw cannot overflow, and the
+       * clamp covers the frame between passing the record and the reading
+       * that raises it. */
+      if (!is_best && bb > 0) {
+         long fill = (ss * (long)sw) / bb;
+         if (fill < 0)
+            fill = 0;
+         if (fill > sw)
+            fill = sw;
+         int bh = sc < 2 ? 1 : 2;
+         /* ONE BAR HEIGHT OF AIR BELOW THE TEXT, on top of the half-glyph
+          * gap: at two rows of pixels the rule sat close enough to the
+          * letters' baseline to read as an underline of the words rather
+          * than a measure of the run. */
+         int by = sy + (7 * sc) + (sc < 2 ? 1 : sc / 2) + bh;
+         fill_rect(px, fb, sx, by, sw, bh, 0xFF333333);
+         if (fill > 0)
+            fill_rect(px, fb, sx, by, (int)fill, bh, 0xFF9A9A9A);
+      }
+   }
    /* the whole plot rect scrubs; the shell resolves the datapoint via plot_hit
     */
-   add_hit(h, plot_x, plot_y, plot_w, ph, ACT_SCRUB, 0);
+   add_hit(h, ui_rect(plot_x, plot_y, plot_w, ph), ACT_SCRUB, 0);
    /* ...WITH THE CONFIGURATION IT WAS DRAWN WITH. plot_hit must reproduce
     * this mapping exactly, and the radius above is derived from the screen
     * scale and the span -- neither of which the touch path can see. It used
@@ -902,28 +1144,24 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * copies of the same arithmetic that could drift apart. */
    y = thresh_row(fb, m, h, g.x0, g.x1, y, sc, pad, 1);
    y = thresh_row(fb, m, h, g.x0, g.x1, y, sc, pad, 0);
-   /* The banner used to be drawn here in landscape, this column being the
-    * only one with room under it, and in the info block in portrait. It now
-    * rides above the big number in both orientations, so neither column
-    * places it and neither has to know it exists. */
+   /* NO BANNER HERE. It rides above the big number in both orientations, so
+    * neither column places it and neither has to know it exists. */
    return y;
 }
 
 /* Right/bottom column: the rolling-stats table, the ADD '+' and the alarm
- * banner. The PRIMARY / STATE / SESSION / PRED table that used to head this
- * block is gone -- what it said now rides on the big number itself (the
- * prediction in the label column, the sensor and its countdown on one line
- * under the progress bar), which is where the eye already is. */
+ * banner. What a PRIMARY / STATE / SESSION / PRED table would say rides on the
+ * big number itself instead -- the prediction in the label column, the sensor
+ * and its countdown on one line under the progress bar -- because that is
+ * where the eye already is. */
 /* THE OUT-OF-RANGE BANNER -- STALE / LOW / HIGH.
  *
  * ONLY THE WORDING AND THE COLOUR are decided here; the caller places it.
  *
- * It used to draw itself as well, in 5*sc letters, and it needed a function of
- * its own because the two layouts put it in different columns: under the stats
- * table in portrait, under the plot's threshold rows in landscape, the stats
- * column having nothing left beneath it there. Both callers therefore had to
- * reserve UI_BANNER_H before deciding their own heights, and the block that
- * forgot did not fail -- it drew the banner off the bottom of the buffer,
+ * A DECIDER, NOT A DRAWER, and that split is what keeps the height budget in
+ * one place. When this drew itself, both column layouts had to reserve
+ * UI_BANNER_H before deciding their own heights, and the block that forgot did
+ * not fail -- it drew the banner off the bottom of the buffer,
  * which is unreachable because nothing on this screen scrolls.
  *
  * It is now one normal-size row in the band ABOVE the big number: empty space
@@ -996,14 +1234,12 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * version reserved 53 columns for a worst-case status line, which shrank
     * the whole block a step below the rest of the UI on a normal phone to
     * reserve room no real row used. */
-   /* NO BANNER TERM, in either orientation.
+   /* NO BANNER TERM, in either orientation -- the banner is not in this
+    * column any more, so this block must not charge itself for it.
     *
-    * This used to read `+ (landscape ? 0 : UI_BANNER_H)`, and the asymmetry
-    * was the point: in portrait this block drew the banner beneath its own
-    * stats table, in landscape the plot column drew it instead. Charging for
-    * it in landscape too is what once floored this block's vsc a whole step
-    * and rendered the stats table in a tiny font -- the row count never
-    * changed, the space it was given did. Any block that derives its scale
+    * Charging for a row that is not drawn floors this block's vsc a whole
+    * step and renders the stats table in a tiny font: the row count never
+    * changes, the space it is given does. Any block that derives its scale
     * from the space it receives can shrink that way, which is why the term is
     * worth a paragraph even now that it is zero.
     *
@@ -1031,9 +1267,9 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (m->prefs.shortcut[i] > 0)
          npin++;
    int needv  = 7 + (4 * 16) + 24 + 3 + (npin > 3 ? 28 : 0);
-   int availv    = fb->height - y;
-   int vsc       = availv > 0 ? availv / needv : 1;
-   int hsc       = cw / (2 + (35 * 6)); /* 35 = the stats table's fixed width */
+   int availv = fb->height - y;
+   int vsc    = availv > 0 ? availv / needv : 1;
+   int hsc    = cw / (2 + (35 * 6)); /* 35 = the stats table's fixed width */
    if (vsc < sc)
       sc = vsc;
    if (hsc < sc)
@@ -1044,7 +1280,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * '+' is pinned to the right edge, so nothing on this block hangs off a
     * left margin. */
    int lh             = 16 * sc; /* row pitch: matches the settings leading */
-   const uint32_t col = 0xFFCCCCCC;
+   const uint32_t col = UI_TEXT_DIM;
 
    /* Widest row is a stats row: 4 + 5*6 + a 6-char unit, with each cell up to
     * 15 now that hc[] is wider. 96 covers it with room to spare. */
@@ -1088,7 +1324,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += 7 * sc;
    (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "", "1D", "3D",
                   "7D", "30D", "90D", "");
-   draw_str(px, fb, tx, y, sc, row, 0xFF888888);
+   draw_str(px, fb, tx, y, sc, row, UI_MUTED);
    y += lh;
    (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "TIR", tc[0],
                   tc[1], tc[2], tc[3], tc[4], "%");
@@ -1105,10 +1341,9 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
    /* A big '+' just under the stats table and hard right: the ADD entry point
     * (new device / log insulin / log weight) reachable without a trip through
-    * SETTINGS. It used to sit beside the info table above; that table is gone,
-    * so it follows the last thing still drawn here. Its hit zone is the whole
-    * band right of the table's ink, so the surrounding space is pressable too
-    * -- a bare glyph is a poor target one-handed. */
+    * SETTINGS. It follows the last thing still drawn in this column. Its hit
+    * zone is the whole band right of the table's ink, so the surrounding
+    * space is pressable too -- a bare glyph is a poor target one-handed. */
    {
       int psc = 3 * sc;
       int pw  = 6 * psc;
@@ -1116,7 +1351,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int pxx = cx + cw - pw - (2 * sc);
       /* COUNTED AS RENDERABLE, not as stored.
        *
-       * A slot can hold a pin this build no longer offers -- that is the whole
+       * A slot can hold a pin this build does not offer -- that is the whole
        * reason pins are stored by identity and ui_shortcut_slot_by_id can
        * answer -1 -- and the layout loop below skips those. Counting them here
        * would shape the rows around buttons that are never drawn: four stored
@@ -1136,7 +1371,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * ceil(nsc/2) is that balance, and it is capped implicitly by SC_MAX: at
        * six it gives exactly three, which is the per-row ceiling. The two
        * numbers are the same fact, stated in settings.h where SC_MAX lives. */
-      int nrows = nsc > 3 ? 2 : 1;
+      int nrows  = nsc > 3 ? 2 : 1;
       int percol = nrows == 2 ? ((nsc + 1) / 2) : nsc;
       /* Pitch between the two rows: the button (25*sc, see menu_button) and
        * 3*sc of air. Named because the '+' is placed from it too. */
@@ -1147,10 +1382,9 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * Taken only out of SLACK: try a full line, then half, then none, and
        * take the first that still leaves the row itself on the screen.
        *
-       * The 51*sc this used to hold back for the banner drawn beneath it is
-       * gone -- the banner is above the big number now -- so on a short window
-       * the air survives where it used to be spent, and the bottom of the
-       * column is free for the second shortcut row.
+       * NOTHING IS HELD BACK FOR THE BANNER, which is above the big number
+       * and not beneath this column: on a short window the air survives here
+       * and the bottom of the column is free for the second shortcut row.
        *
        * MEASURED AGAINST THE HIT BOX, which reaches 3*sc below the glyph. The
        * old test used the glyph alone and was wrong by exactly that much; the
@@ -1165,16 +1399,16 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int pyy = y + (2 * sc) + air;
       /* THE '+' SITS ON THE FIRST ROW, always.
        *
-       * It used to sit on the LAST one, so with two rows of shortcuts it
-       * dropped to the second and its position depended on how many things
-       * happened to be pinned -- the one control here that opens a whole menu
-       * moved whenever an unrelated button was pinned or unpinned. Anchored
-       * to the first row it is in the same place whatever the row count, and
+       * ANCHORED TO THE FIRST ROW, not the last: on the last one its position
+       * depends on how many things happen to be pinned, so the one control
+       * here that opens a whole menu moves whenever an unrelated button is
+       * pinned or unpinned. On the first it is in the same place whatever the
+       * row count, and
        * the empty space falls BELOW it beside the second row, which reads as
        * the group of actions having grown rather than the '+' having
        * wandered. */
       int plusy = pyy;
-      draw_str(px, fb, pxx, plusy, psc, "+", 0xFFCCCCCC);
+      draw_str(px, fb, pxx, plusy, psc, "+", UI_TEXT_DIM);
       /* PINNED BUTTONS share the row(s) to the LEFT of the '+'. They divide
        * whatever the row has left after the plus, so one button is wide and
        * three are narrow -- the row's edges never move as shortcuts are added
@@ -1209,21 +1443,20 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
          int availw = rowr - rowl;
          int bwid   = (availw - ((percol - 1) * sgap)) / percol;
          if (bwid > 6 * sc) { /* narrower than this and nothing can be read */
-            int bx   = rowl;
-            int slotn = 0; /* how many pins have been PLACED, not scanned */
+            int slotn = 0;    /* how many pins have been PLACED, not scanned */
             for (int i = 0; i < SC_MAX; i++) {
                int slot = ui_shortcut_slot_by_id(m->prefs.shortcut[i]);
                if (slot < 0)
-                  continue; /* a pin this build no longer offers */
+                  continue; /* a pin this build does not offer */
                /* COUNTED ON PLACEMENT, never on the loop index. A pin this
-                * build no longer offers is skipped above, so `i` and the
+                * build does not offer is skipped above, so `i` and the
                 * button's position part company the moment one appears -- and
                 * the row would break where the gap was rather than after
                 * percol buttons. */
                int r = slotn / percol;
                int c = slotn % percol;
                slotn++;
-               bx = rowl + (c * (bwid + sgap));
+               int bx          = rowl + (c * (bwid + sgap));
                int code        = ui_shortcut_code(slot);
                const char *lbl = ui_shortcut_label(slot, nsc > 1);
                if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc))
@@ -1233,18 +1466,16 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                /* EXERCISE IS NOT A LABEL. Pinned here it must show the
                 * level it is on, in the colour that encodes it, with the
                 * settling bar -- otherwise the pinned copy and the one in the
-                * ADD menu would disagree about the same value, which is the
-                * objection that kept it off the pin list until now. One
-                * function draws both. */
+                * ADD menu would disagree about the same value. One function
+                * draws both. */
                if (code == MA_EXERCISE)
                   (void)ui_exercise_button(
                       fb, h, bx, pyy - (2 * sc) + (r * rowpitch), bwid, sc,
-                      m->food.ex_level, m->food.ex_remaining, EX_SETTLE_S,
-                      lbl, 0xFFCCCCCC);
+                      m->food.ex_level, m->food.ex_remaining, EX_SETTLE_S, lbl,
+                      UI_TEXT_DIM);
                else
-                  (void)menu_button(fb, h, bx,
-                                    pyy - (2 * sc) + (r * rowpitch), bwid, sc,
-                                    lbl, 0xFFCCCCCC, code, 0);
+                  (void)menu_button(fb, h, bx, pyy - (2 * sc) + (r * rowpitch),
+                                    bwid, sc, lbl, UI_TEXT_DIM, code, 0);
             }
             /* The '+' keeps only the space right of the last button. */
             hx0 = rowr;
@@ -1255,22 +1486,19 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * right that the target shrinks below the glyph's own padded square. */
       if (hx0 > pxx - (3 * sc))
          hx0 = pxx - (3 * sc);
-      add_hit_ix(h, hx0, plusy - (3 * sc), cx + cw - hx0, ph + (6 * sc),
+      add_hit_ix(h,
+                 ui_rect(hx0, plusy - (3 * sc), cx + cw - hx0, ph + (6 * sc)),
                  MA_ADD_OPEN, 0);
-      /* THE BLOCK ENDS BELOW THE LAST ROW, which is no longer where the '+'
-       * is. With two rows the buttons extend a full rowpitch past it, and
-       * `plusy + ph` would hand whatever follows a y that overlaps them. */
-      y = pyy + ((nrows - 1) * rowpitch) + ph;
+      /* THE BLOCK ENDS BELOW THE LAST ROW, which is not where the '+' is:
+       * with two rows the buttons extend a full rowpitch past it. Nothing
+       * below reads `y` -- this is the last thing the main screen draws -- so
+       * the running cursor is not advanced here: a number that looks
+       * load-bearing and is not is worse than no number. */
    }
 
-   /* The banner used to be drawn here, this block being the one with room
-    * under it in portrait. It is above the big number now, in both
-    * orientations, and the space it has given up at the bottom of the column
-    * is what the second row of pinned shortcuts is drawn in. */
-
-   /* No SENSOR EXPIRED prompt any more: it read as an error banner and
-    * confused more than it helped, and the main-screen '+' (ADD -> NEW
-    * DEVICE) is now a permanent, calmer route to pairing a replacement. The
+   /* THE ROUTE TO A REPLACEMENT SENSOR is the main screen's '+' (ADD -> NEW
+    * DEVICE): permanent, and calm. An expiry prompt on this screen would read
+    * as an error banner and confuse more than it helps. The
     * SESSION row's GRACE/ENDED countdown is what states expiry. */
 }
 
@@ -1286,30 +1514,33 @@ static void render_noreading(struct ANativeWindow_Buffer *fb,
     * until store_load finds a reading) settings, permissions and the whole
     * pairing flow were unreachable by touch. A sensor needing a 4-digit
     * applicator code could never be added. */
-   add_hit(h, 0, y - (2 * sc), fb->width, 14 * sc, ACT_OPEN_SETTINGS, 0);
+   add_hit(h, ui_rect(0, y - (2 * sc), fb->width, 14 * sc), ACT_OPEN_SETTINGS,
+           0);
    /* "PANCRA  " + a UI_COLS-long status needs more than UI_COLS+1. The
     * status is snapshotted at UI_COLS, so budget the prefix on top. */
    char line[UI_COLS + 12];
    char st[UI_COLS + 1];
-   str_snapshot(st, sizeof st, m->status ? m->status : "");
+   /* No null test: the frame CARRIES the text now rather than pointing at it
+    * (uimodel.h), so there is nothing that could be absent. */
+   str_snapshot(st, sizeof st, m->status);
    (void)snprintf(line, sizeof line, "PANCRA  %s", st);
-   draw_str(px, fb, 2 * sc, y, sc, line, 0xFFFFFFFF);
+   draw_str(px, fb, 2 * sc, y, sc, line, UI_TEXT);
    y += 9 * sc;
    /* total rounded to 10s so ambient chatter doesn't churn the line */
    (void)snprintf(line, sizeof line, "ADV %u  DX %d",
                   (m->dev.adv_total / 10) * 10, m->dev.ndev);
-   draw_str(px, fb, 2 * sc, y, sc, line, 0xFFFFFFFF);
+   draw_str(px, fb, 2 * sc, y, sc, line, UI_TEXT);
    y += 9 * sc;
 
    if (m->dev.ndev > 0) {
       y += 3 * sc;
-      draw_str(px, fb, 2 * sc, y, sc, "SENSORS", 0xFF888888);
+      draw_str(px, fb, 2 * sc, y, sc, "SENSORS", UI_MUTED);
       y += 10 * sc;
       for (int i = 0; i < m->dev.ndev; i++) {
          char dl[48];
          (void)snprintf(dl, sizeof dl, "%-8s %4d %s", m->dev.devs[i].name,
                         m->dev.devs[i].rssi, m->dev.devs[i].mac);
-         draw_str(px, fb, 2 * sc, y, sc, dl, 0xFFCCCCCC);
+         draw_str(px, fb, 2 * sc, y, sc, dl, UI_TEXT_DIM);
          y += 9 * sc;
       }
    }
@@ -1359,10 +1590,10 @@ void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
           * RIGHT: the plot and the threshold rows, with the whole column's
           * height to spend.
           *
-          * The plot used to share the left column with the number, which left
-          * it a sliver of height, while the right column held only the stats
-          * table and a lot of empty space. Landscape exists to give the plot
-          * room; this is the arrangement that actually does. */
+          * LANDSCAPE EXISTS TO GIVE THE PLOT ROOM, so the plot gets a column
+          * of its own. Sharing the left column with the number leaves it a
+          * sliver of height while the right column holds a stats table and a
+          * lot of empty space. */
          int gw   = 2 * 6 * sc;
          int cwid = (fb->width - gw) / 2;
          int rx0  = cwid + gw;

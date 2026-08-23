@@ -143,4 +143,10 @@ struct ANativeActivityCallbacks {
 void ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                               size_t saved_size);
 
+/* WHAT ALL OF THE ABOVE CLAIMS, stated as numbers a compiler can check -- and
+ * checked again against the official NDK headers by `make ndkcheck`. Last,
+ * because it asserts about the declarations above it. */
+#define NDKABI_DECLS 1
+#include "ndkabi.h"
+
 #endif

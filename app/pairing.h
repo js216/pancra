@@ -19,10 +19,10 @@
  *
  * PENDING, NOT PARKED. When the code is in but no candidate is on the air,
  * the intent is ARMED and every menu closes; the tick commits the moment an
- * unambiguous candidate appears. The old flow parked the user in the device
- * list until the sensor deigned to advertise -- and suppressed every OTHER
- * sensor's reconnect the whole time, so waiting for a new sensor cost the
- * readings of the ones already worn.
+ * unambiguous candidate appears. Parking the user in the device list until
+ * the sensor deigns to advertise suppresses every OTHER sensor's reconnect
+ * the whole time, so waiting for a new sensor costs the readings of the ones
+ * already worn.
  */
 #ifndef PAIRING_H
 #define PAIRING_H

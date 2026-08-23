@@ -1,20 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0
-// weight.h --- Body-weight log: append-only CSV + in-memory tail
+// weight.h --- Body-weight log: an editable CSV + in-memory tail
 // Copyright 2026 Jakob Kastelic
 
 /* A weight is what the user TYPED, so this log is the same shape as the
- * insulin one: when, and how much. The file is the lifetime record
- * (append-only, never rewritten, the readings.csv discipline); the in-memory
- * tail exists for the table the UI draws. */
+ * insulin one: when, and how much. The file is the lifetime record; the
+ * in-memory tail exists for the table the UI draws.
+ *
+ * TWO TIERS, AND THIS IS THE ORDINARY ONE (see the block below): capture
+ * APPENDS, and an edit or a delete atomically REPLACES the whole file. The
+ * immutable, never-rewritten discipline is insulin.h's alone.
+ *
+ * (A header that says "append-only, never rewritten, the readings.csv
+ * discipline" thirty lines above the block documenting this log's own edit
+ * and delete is saying two things that cannot both be true, and a reader has
+ * no way to tell which one the code follows.) */
 #ifndef PANCRA_WEIGHT_H
 #define PANCRA_WEIGHT_H
+
+/* ---- WHICH KIND OF LOG THIS IS: REWRITTEN IN PLACE -------------------
+ *
+ * THE APP HAS TWO TIERS and this is the ordinary one. A row here records what
+ * the USER BELIEVES -- what they ate, what they weighed, how hard they worked
+ * -- and a correction REPLACES that belief; the superseded value is of no
+ * interest to anybody afterwards. So an edit rewrites the row and a delete
+ * removes it, through a temporary file and a rename, which makes the commit
+ * atomic: there is no window in which the log is truncated.
+ *
+ * The other tier is insulin.h's, and it is the only one: a dose is not a
+ * preference, so that log is never rewritten and keeps its own history. */
 
 /* STORED IN GRAMS, ALWAYS, whatever the display unit is.
  *
  * The display unit is a preference the user can flip at any time, so it must
  * not be part of the record: a log half in pounds and half in kilograms, with
  * nothing on the row to say which, is unrecoverable. One canonical unit on
- * disk means flipping the setting re-renders history instead of corrupting
+ * disk means flipping the setting re-renders history rather than corrupting
  * it. Grams (not tenths of a kilo) so a pound entry survives the round trip
  * to storage and back without drifting -- see wt_from_tenths. */
 #define WT_MIN_G 20000L  /* 20 kg / 44 lb */
@@ -38,12 +58,11 @@ struct wt_rec {
    long g; /* grams */
 };
 
-/* THE TAIL IS PRIVATE. It used to be `extern struct wt_rec g_wt[NWT]` plus a
- * count, so every reader depended on the representation (an array, oldest
- * first, this long), on the invariant (sorted), and on the lifetime (valid
- * until the next load, which the weight screen triggers) -- and any of them
- * could write to it. The queries below hand out COPIES, bounded by what the
- * caller asked for.
+/* THE TAIL IS PRIVATE. As `extern struct wt_rec g_wt[NWT]` plus a count,
+ * every reader depends on the representation (an array, oldest first, this
+ * long), on the invariant (sorted), and on the lifetime (valid until the next
+ * load, which the weight screen triggers) -- and any of them can write to it.
+ * The queries below hand out COPIES, bounded by what the caller asked for.
  *
  * ORDER IS PART OF THE CONTRACT, not of the array: oldest first, newest last,
  * because that is what the log table and the trend plot both draw. */
@@ -71,6 +90,14 @@ int weight_paths(const char *dir);
  * parsed is kept, and the caller says the record is incomplete. */
 int weight_load(void);
 
+#ifdef APP_FAULTS
+/* CALLED BETWEEN A COMMITTED REWRITE AND ITS RE-READ, and nowhere else. The
+ * app never defines APP_FAULTS; this exists so weighttest can make the log
+ * unreadable at the one instant where "the file is right and memory is not"
+ * is reachable at all. See wt_rewrite. */
+extern void (*weight_fault_before_reload)(void);
+#endif
+
 /* Append one weight durably and mirror it into the tail. 0 on success, -1
  * when the write failed (the tail is then left untouched, so memory never
  * claims an entry the file does not have). Rejects out-of-range input. */
@@ -92,8 +119,9 @@ const char *wt_unit_name(int units); /* "KG" / "LB" */
 /* Rewrite the LAST file row matching `orig` (t and grams) to the new values,
  * or delete it. Rewrite-and-rename, so a crash never truncates the log; the
  * tail is reloaded afterwards. 0 on success, -1 on failure or when no row
- * matches. These exist for the EDIT WEIGHT form only -- everything else
- * treats the log as append-only. Matching is by CONTENT, not position, so a
+ * matches. These exist for the EDIT WEIGHT form only -- every other writer
+ * here APPENDS, and nothing but these two replaces the file. Matching is by
+ * CONTENT, not position, so a
  * stale tail index can never touch the wrong entry. */
 int weight_update(const struct wt_rec *orig, long t, long g, long tz);
 int weight_delete(const struct wt_rec *orig);

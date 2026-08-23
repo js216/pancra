@@ -2,9 +2,25 @@
 // sensors.h --- Permanent sensor registry: provenance + per-sensor preferences
 // Copyright 2026 Jakob Kastelic
 
-/* Every datapoint must name its origin exactly, forever -- decades after the
- * sensor itself is landfill. That splits into two very different kinds of
- * state, so they live in two different files:
+/* Every datapoint must name its origin exactly, decades after the sensor
+ * itself is landfill.
+ *
+ * "FOREVER" IS WHAT THIS SAID, and it is a promise with a number behind it
+ *: the provenance table holds MAX_SENSOR_RECS devices, and the
+ * block above that constant is the whole argument for where the bound is,
+ * why it is not reachable before the phone is landfill, and why the table
+ * REFUSES a new device rather than forgetting an old one when it is. A
+ * contract that says "forever" and means "2048 devices" is the kind that gets
+ * read once and relied on for years, so it says the number.
+ *
+ * WHAT A REFUSAL COSTS, PRECISELY: the new sensor shows as unregistered, and
+ * a reading arriving on its link is DEFERRED rather than attributed (see
+ * app/reading.c -- stamping it with an ambient id is how a retired sensor
+ * comes to own somebody else's data). Nothing
+ * already attributed is affected: every id the table holds still resolves,
+ * and it resolves to its own row.
+ *
+ * The state splits into two very different kinds, so they live in two files:
  *
  *   sensors.csv  IMMUTABLE provenance, append-only, never rewritten. One row
  *                per minted id: what the device was, which firmware, which
@@ -33,10 +49,9 @@
  * premise was false. readings.csv is append-only and EVERY row cites a
  * source_id, so a citation outlives the plot window by years -- the reason to
  * keep the log at all is that a reading taken in 2026 can still say which
- * physical sensor produced it in 2036. The old srec_push dropped "the oldest
- * record no LIVE SLOT references", which is exactly the set of ids that only
- * HISTORY cites: the row stayed on disk and the app simply stopped being able
- * to resolve it.
+ * physical sensor produced it in 2036. Dropping "the oldest record no LIVE
+ * SLOT references" evicts exactly the set of ids that only HISTORY cites: the
+ * row stays on disk and the app simply stops being able to resolve it.
  *
  * WHEN IT BIT, exactly. A CGM session mints one id (a new sensor advertises a
  * new address), so a Stelo (15 d) and a G7 (10 d) worn together plus a meter
@@ -55,14 +70,15 @@
  *     rewritten. Reachable by anyone, with one tap.
  *   - sensor_complete fills a bare row's model, firmware and session start
  *     when they arrive. A live sensor with no slot (slots fill at MAX_SLOTS)
- *     whose row had been dropped could never be completed, so it stayed bare
+ *     whose row was dropped could never be completed, so it would stay bare
  *     for ever. Reachable once the user owns ten devices.
  *   - sensor_in_warmup FAILS OPEN on an id it cannot resolve, and stats.c
  *     asks it for every historical row: an unresolvable sensor's uncalibrated
  *     first hour then COUNTS towards time-in-range and the daily average, at
  *     every launch. stats.c reaches back STAT_HOURS (~92 days) and g_hist
  *     ~9-17 days, both inside a one-year horizon -- so at a typical mint rate
- *     this was latent. At ~5x that rate (six concurrent CGMs, or sensors
+ *     the exposure is latent. At ~5x that rate (six concurrent CGMs, or
+ *     sensors
  *     failing early and being replaced) the horizon falls under 92 days and
  *     it starts moving the numbers on the front screen.
  *
@@ -126,10 +142,18 @@ enum sensor_kind {
    KIND_FOOD,    /* logged food: same bottom line as the doses and weights,
                   * drawn as a small F. Like them it never enters g_hist, so
                   * it cannot reach TIR, the average or the remote push. */
-   KIND_WT       /* logged body weights: same bottom line as the doses, drawn
+   KIND_WT,      /* logged body weights: same bottom line as the doses, drawn
                   * as a small W. Like KIND_INS these never enter g_hist, so
                   * they cannot reach TIR, the average or the remote push --
                   * they exist only in the plot model the UI is handed. */
+   KIND_EX       /* logged exercise: the same bottom line, drawn as a small E.
+                  * The ONE kind that is not an instant -- a session has a
+                  * length, and the point carries it so the plot can draw a
+                  * rule to where it ended. Its `glu` is the INTENSITY (1..3)
+                  * and its `src` the length in seconds; neither is a glucose
+                  * value, which is why these are pinned to the bottom line
+                  * and read back out of the model by the scrub, exactly as
+                  * the food and weight points are. */
 };
 
 /* Immutable provenance for one minted id. */
@@ -162,10 +186,10 @@ struct sensor_slot {
    char label[20];
 };
 
-/* THE REGISTRY IS PRIVATE. Both arrays and both counts used to be exported,
- * so every caller depended on the representation and could write to it -- and
- * a slot written by hand is a device the user sees whose change was never
- * saved, or a provenance row that contradicts the append-only file it came
+/* THE REGISTRY IS PRIVATE. Export the two arrays and their counts and every
+ * caller depends on the representation and can write to it -- and a slot
+ * written by hand is a device the user sees whose change was never saved, or
+ * a provenance row that contradicts the append-only file it came
  * from. An id names one physical device FOR EVER (readings cite it in a log
  * that is never rewritten), which is why this of all state is behind
  * accessors.
@@ -177,49 +201,12 @@ struct sensor_slot {
  * snapshot (sensors_view_get above) rather than calling them in a loop, so no
  * caller has to hold a lock -- or know which one. */
 
-/* THE SLOT AT AN INDEX, AND WHETHER THERE IS ONE, IN ONE STEP.
- *
- * This is what production code uses; slot_count/slot_at below are for the
- * registry's own tests. An index is a POSITION, and a mint or a forget on a
- * binder thread moves every position after it -- so "is idx in range?" and
- * "what is at idx?" answered by two calls can describe two different
- * devices, and the caller then renames, recolours, calibrates or disconnects
- * the wrong one. Asked as one locked question it cannot.
- *
- * Once the answer is in hand, the ID is the stable key: everything else
- * (sensor_rec_of, calib_queued_for, the sensor_set_* operations) is keyed by
- * id or re-validates the index itself. `out` may be NULL to ask only whether
- * the slot exists. Returns 1 when it does. */
-int sensor_slot_at(int idx, struct sensor_slot *out);
 
-/* ---- THE INDEXED READS, WHICH ARE THE TESTS' INTERFACE ----------------
+/* (THE INDEXED READS ARE NOT HERE. A count-then-index pair is two locked
+ * questions about a moving table, and no production caller may ask them --
+ * see app/sensorsint.h, which the registry's own tests include.)
  *
- * A position is not an identity. A mint or a forget on a binder thread moves
- * every slot after it, so "how many are there" and "what is at 3" answered by
- * two calls can describe two different devices -- and the caller then renames,
- * recolours, calibrates or disconnects one the user was not looking at. That
- * is why the app has none of these: it takes a SNAPSHOT (sensors_view_get) or
- * asks by ID (sensor_slot_of, sensor_rec_of, sensor_id_is_live).
- *
- * They remain because a test arranges states no public operation can reach --
- * a corrupt row, half an ordered pair -- and must then look at the table
- * directly. `make lockcheck` refuses them anywhere else, which is what keeps
- * this an interface for tests rather than a way back to the old model.
- *
- * Two went entirely: slots_copy (a whole-table copy nothing called, which
- * sensors_view_get supersedes) and sensor_slot_index (id -> position, whose
- * only possible use was to hand a position to something else).
- *
- * How many slots are configured, and the i-th of them; out of range yields a
- * zeroed slot. */
-int slot_count(void);
-struct sensor_slot slot_at(int i);
-
-/* The provenance cache: how many rows, and the i-th. Same rule -- a walk
- * takes the view. */
-int srec_count(void);
-struct sensor_rec srec_at(int i);
-/* The two files, for the sync client that must NAME them. Read-only: they are
+ * The two files, for the sync client that must NAME them. Read-only: they are
  * set once, by sensors_paths. */
 const char *sensors_path(void);
 const char *slots_path(void);
@@ -230,15 +217,14 @@ int sensors_paths(const char *dir);
 
 /* EVERY SLOT AND ITS PROVENANCE, AT ONE INSTANT.
  *
- * The lock used to be public and eleven files took it by hand around a
- * count/index walk. Three things were wrong with that, and the third is the
- * reason this exists:
+ * A PUBLIC lock, taken by hand around a count/index walk in a dozen files,
+ * is wrong three ways, and the third is the reason this exists:
  *
- *   - a walk without it -- and several were -- can see the array shift under
- *     it: srec_push memmoves the records when a binder thread mints a sensor,
- *     and sensor_forget shifts the slots;
- *   - "which lock, and for how long" became a question every caller had to
- *     answer correctly, forever;
+ *   - a walk without it can see the array shift under it: srec_push memmoves
+ *     the records when a binder thread mints a sensor, and sensor_forget
+ *     shifts the slots;
+ *   - "which lock, and for how long" becomes a question every caller has to
+ *     answer correctly, at every call site, for as long as the code lives;
  *   - the documented order is driver -> registry, and a caller holding the
  *     registry lock across link_for_slot (which takes the driver's) inverts
  *     it. A snapshot cannot: the lock is gone before anything else is called.
@@ -267,38 +253,61 @@ int sensor_id_is_live(int id);
 /* 0 when the registry was read whole (including a first run with no files),
  * -1 when a read failed partway. Whatever parsed is kept; the caller warns. */
 int sensors_load(void); /* both files; safe on a fresh install */
-int slots_save(void);   /* rewrite slots.csv from g_slot */
 
 /* Resolve a reading's source_id to its provenance. 0 only when NO ROW EXISTS
  * -- the id predates the registry (source 0), was never minted, or its row
  * was refused by the parser. A row that loaded once stays resolvable for the
  * life of the process: nothing ages out, because readings.csv keeps citing
  * these ids long after the sensor is gone. See MAX_SENSOR_RECS. */
-/* THE PROVENANCE FOR AN ID, AS A COPY. It used to be a pointer straight into
- * the record cache, which is the one thing that must not leave this module:
- * srec_push memmoves that array when a binder thread mints a sensor, so a
- * pointer held across any call is a row that has MOVED -- and the frame held
- * one across a run of field copies. Returns 1 when the id is known; `out` may
+/* THE PROVENANCE FOR AN ID, AS A COPY, never a pointer into the record cache
+ * -- that is the one thing that must not leave this module: srec_push memmoves
+ * that array when a binder thread mints a sensor, so a pointer held across any
+ * call is a row that has MOVED, and the frame builder holds one across a run
+ * of field copies. Returns 1 when the id is known; `out` may
  * be NULL to ask only whether it is. */
 int sensor_rec_of(int id, struct sensor_rec *out);
 /* The slot for an id, or 0 if the sensor has been forgotten. */
 /* THE SLOT FOR AN ID, AS A COPY -- and its index, for the operations that
- * take one. The writable pointer this replaces let any caller change a
- * device's name, marker, colour or primary flag with none of the validation
- * and none of the persistence: the change showed on screen and was gone at
- * the next launch. Every mutation goes through a sensor_* operation now.
+ * take one. A writable pointer here would let any caller change a device's
+ * name, marker, colour or primary flag with none of the validation and none
+ * of the persistence: the change shows on screen and is gone at the next
+ * launch. Every mutation goes through a sensor_* operation.
  * Returns 1 when the id has a slot. */
 int sensor_slot_of(int id, struct sensor_slot *out);
 /* Derived, never stored: the kind follows from the type. */
 int sensor_kind(int type);
 const char *sensor_type_name(int type);
-/* Nominal wear time in seconds, so the UI can show when a session ends.
- * 0 for a meter, which has no session at all. */
-long sensor_session_len(int type);
-/* The wear length that actually applies to ONE device: the user's per-slot
+
+/* THE WEAR LENGTH AND WHERE IT CAME FROM, as one answer.
+ *
+ * `seconds` is what actually applies to ONE device: the user's per-slot
  * override when set, else the model-derived length (Dexcom sells both 10-day
  * and 15-day G7s and the sensor never states which it is -- the G7 15 Day is
- * only recognisable by its DIS model string), else the type default. Pure. */
+ * only recognisable by its DIS model string), else the type default.
+ *
+ * `pinned` is whether that number came from the OVERRIDE, and it is part of
+ * this answer rather than something a caller re-derives. The WEAR row shows
+ * AUTO or a pinned value in a different colour, and the two behave
+ * differently over time: a resolved length improves when a new model is
+ * recognised, a pinned one never does. A caller that decides which it was by
+ * re-testing `wear_days` against the values this function happens to accept
+ * TODAY is a second copy of the rule -- and the day a third override becomes
+ * valid, that copy labels a correct duration as automatic.
+ *
+ * Pure: no locks, no clock, no registry lookup. */
+struct sensor_wear {
+   long seconds;
+   int pinned; /* 1 = the user's override, 0 = resolved from model or type */
+   /* 1 = the TYPE's default standing in for a model that has not been read.
+    * Dexcom sells the G7 in 10- and 15-day versions that are identical on the
+    * air apart from the DIS model string, so between pairing and the first
+    * DIS read there is no honest answer -- only a default. The row that shows
+    * the budget marks it, because a countdown judged against a guess and one
+    * judged against the sensor's own model look the same on screen. */
+   int provisional;
+};
+struct sensor_wear sensor_wear_of(int type, int wear_days, const char *model);
+/* The length alone, for callers that only do arithmetic with it. */
 long sensor_wear_seconds(int type, int wear_days, const char *model);
 /* The post-session grace period (Stelo and G7 both give 12 hours past the
  * nominal end before the sensor hard-stops). The UI counts this down as
@@ -350,6 +359,57 @@ long sensor_wear_seconds(int type, int wear_days, const char *model);
  * hist_lock(), alongside sensor_primary_id(), never inside it. */
 int sensor_in_warmup(int id, long t);
 
+/* ---- WHAT THE SENSOR SAID ABOUT ITS OWN WARM-UP ------------
+ *
+ * The rule above is an INFERENCE: it compares a reading's timestamp against a
+ * session start learned from the session clock. The sensor also answers the
+ * question directly -- every 0x4e response carries a state byte, and
+ * SENSOR_STATE_WARMUP is the sensor saying so itself -- and that answer was
+ * thrown away the moment the frame was decoded, so a replayed row could only
+ * ever be judged by the inference.
+ *
+ * The two differ where it matters. An activation of 0 (a session whose start
+ * was never learned -- a sensor paired mid-session, a registry row from
+ * before the field existed) makes the inference count an uncalibrated first
+ * hour into time-in-range and the average. That is a decision to include data
+ * on the strength of not knowing.
+ *
+ * So the measurement is stored with the row, and this enum is what a row can
+ * say. UNKNOWN is not a third kind of warm-up: it is the absence of a
+ * measurement, and it is what every row written before this column existed,
+ * and every reading that arrived before the sensor answered 0x4e, carries. */
+enum warm_state {
+   WARM_UNKNOWN = 0, /* nothing was measured; the inference is all there is */
+   WARM_NO,          /* the sensor answered, and it was not warming up */
+   WARM_YES          /* the sensor answered SENSOR_STATE_WARMUP */
+};
+
+/* What the statistics should do with a reading. */
+enum warm_verdict {
+   WARM_COUNT,        /* count it, and the answer is measured */
+   WARM_COUNT_UNSURE, /* count it, but nothing measured said it was not warmup
+                       */
+   WARM_SKIP          /* uncalibrated: it is shown, and it is not counted */
+};
+
+/* THE ONE RULE, and both paths must call it: the live reading as it arrives,
+ * and the same row when stat_reload_prepare replays it. Anything a row cannot
+ * express would make TIR and the average change across a restart of the same
+ * log -- the drift stats.c records having been fixed twice.
+ *
+ * A measured state is believed. Without one the inference decides, and a
+ * reading it lets through is COUNTED BUT UNSURE, so the coverage figures can
+ * say how much of a window rests on it rather than on a measurement.
+ *
+ * Takes the registry lock when it consults the inference, so the same
+ * lock-order rule as sensor_in_warmup applies: call it BEFORE hist_lock. */
+enum warm_verdict warm_decide(enum warm_state measured, int id, long t);
+
+/* The state byte a 0x4e response carried, as a stored measurement. An
+ * unrecognised byte is UNKNOWN: a firmware this build has never seen is not
+ * evidence about warm-up in either direction, and 0 is "no response yet". */
+enum warm_state warm_of_state(int state);
+
 /* How recently a CGM must have delivered to still count as an ACTIVE session
  * when it holds no live bond (right after an app restart no sensor does --
  * sessions re-establish one connect cycle at a time, but the reading history
@@ -389,9 +449,6 @@ int sensor_complete(int id, const char *serial, const char *model,
 
 /* Give a freshly minted sensor a slot (label defaults to type + MAC tail).
  * Returns the slot index, or -1 when all MAX_SLOTS are taken. */
-/* Repoint the slot showing `old_id` at `new_id`, keeping the user's label,
- * marker, colour and pin. 1 if a slot was repointed, 0 if none held old_id. */
-int sensor_rebind_slot(int old_id, int new_id);
 
 int sensor_claim_slot(int id, int type, const char *identity);
 
@@ -401,12 +458,11 @@ int sensor_claim_slot(int id, int type, const char *identity);
  * slots.csv, and if that rewrite fails it puts the table back exactly as it
  * was. So there are only two outcomes, and the caller can act on either.
  *
- * They used to be `void`. slots_save()'s result was discarded at seven of its
- * eight call sites, so a full disk or a dying card gave a device that was
- * retired on screen and live again after the next launch -- or, worse, a
- * sensor CLAIMED, bonded and streaming whose slot was never written, so the
- * pairing had to be done again with the key file already replaced. The screen
- * said it worked. Nothing said otherwise.
+ * NOT `void`. With the rewrite's result discarded, a full disk or a dying
+ * card gives a device that is retired on screen and live again after the next
+ * launch -- or, worse, a sensor CLAIMED, bonded and streaming whose slot was
+ * never written, so the pairing has to be done again with the key file
+ * already replaced. The screen says it worked. Nothing says otherwise.
  *
  * SENSOR_UNSAVED means NOTHING CHANGED: not in memory, not on disk. That is
  * what makes it safe to act on -- a caller that stops has lost nothing, and a
@@ -432,7 +488,7 @@ int sensor_claim_slot(int id, int type, const char *identity);
 
 /* Drop the slot (provenance is untouched, so old readings stay attributed). */
 int sensor_forget(int id);
-/* DISCONNECT: retire the slot to "old" instead of dropping it -- keeps its
+/* DISCONNECT: retire the slot to "old" rather than dropping it -- keeps its
  * marker/label/prefs and its place in the registry so the full per-device
  * menu and plot styling still work, but excludes it from every live path.
  * Reassigns the primary to the first live CGM left. */
@@ -448,14 +504,14 @@ int sensor_set_primary(int id);
  *
  * Each of these validates its argument, takes the registry lock, changes the
  * slot and PERSISTS the table -- and returns -1 if the save failed, so the
- * caller can say so instead of showing a change that will be gone after the
+ * caller can say so rather than showing a change that will be gone after the
  * next launch.
  *
- * They exist because every caller was doing that by hand: lock, assign,
- * slots_save(), unlock, discarding the result. Four copies of the same
- * sequence in one dispatcher, each free to forget a step -- and forgetting
- * the save is invisible until the app restarts and the user's marker, colour
- * or wear budget is back to what it was. */
+ * They exist so that no caller spells the transaction out by hand: lock,
+ * assign, rewrite, unlock, and act on the result. Four copies of that
+ * sequence in one dispatcher are four chances to forget a step -- and
+ * forgetting the rewrite is invisible until the app restarts and the user's
+ * marker, colour or wear budget is back to the stored value. */
 int sensor_set_marker(int id, int marker);
 int sensor_set_color(int id, int color);
 int sensor_set_size(int id, int size);
@@ -474,5 +530,26 @@ int sensor_primary_slot(void);
  * (not sensor_primary_slot) from any path that also takes hist_lock: resolve
  * BEFORE taking hist_lock, so the reg->hist order is preserved. */
 int sensor_primary_id(void);
+
+/* How long a session of this sensor type lasts, in seconds; 0 for a type
+ * with no fixed wear length. */
+long sensor_session_len(int type);
+
+#ifdef APP_FAULTS
+/* ---- A RENDER THAT CANNOT DESCRIBE THE TABLE ----------------
+ *
+ * When > 0, the registry's serializer pretends its buffer is this many bytes.
+ * It exists because the real one cannot overflow at MAX_SLOTS = 10 with a
+ * 19-byte label -- so the behaviour that matters (publish NOTHING, keep the
+ * file, report the failure) is unreachable without it -- and an unreachable
+ * path is one that stops working with nobody noticing. Never compiled into
+ * the app. */
+/* A SETTER, not the variable: app/sensors.h may not export a writable object
+ * (make settingscheck), and that rule is right even for a hook -- a header
+ * that hands out an int hands out the ability to write it from anywhere. 0
+ * puts the real buffer size back. */
+void sensors_fault_render_cap_set(int cap);
+
+#endif
 
 #endif

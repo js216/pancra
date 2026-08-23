@@ -32,6 +32,8 @@ void model_lines_reset(void);
 
 /* The status line itself, for the crash handler, which may only hold a
  * pointer -- it runs on a signal stack and cannot allocate or lock. */
-const char *model_status_buf(void);
+/* ATOMIC BYTES: the handler that reads this can interrupt the thread writing
+ * it (see crashlog.h and set_status in model.c). */
+const _Atomic char *model_status_buf(void);
 
 #endif

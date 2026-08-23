@@ -28,11 +28,6 @@
 #include "uimodel.h"
 
 /* Render model `m` into framebuffer `fb`, recording touch targets into `h`. */
-/* The epoch the current span starts at (0 = everything), and the index into
- * m->wt nearest an x pixel. Both PURE and both used by the renderer as well,
- * so the scrub cursor lands exactly on the point the finger picked instead of
- * near it. */
-long ui_wt_from(const struct screen *m);
 int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x);
 
 void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
@@ -54,5 +49,7 @@ void ui_press_overlay(struct ANativeWindow_Buffer *fb, int x, int y, int w,
  * and the green big number have no headroom at full intensity, so the
  * resting frame gives some up. */
 void ui_dim(struct ANativeWindow_Buffer *fb);
+
+long ui_wt_from(const struct screen *m);
 
 #endif

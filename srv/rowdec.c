@@ -30,7 +30,7 @@
  * and must not move when the compiler's long does. */
 #define ROW_DIGITS_MAX 18
 
-static int field(const char **p, const char *end, long *out)
+static int field(const char **p, const char *end, int64_t *out)
 {
    const char *q = *p;
    int neg       = 0;
@@ -38,8 +38,8 @@ static int field(const char **p, const char *end, long *out)
       neg = 1;
       q++;
    }
-   long v = 0;
-   int nd = 0;
+   int64_t v = 0;
+   int nd    = 0;
    while (q < end && *q >= '0' && *q <= '9') {
       if (nd < ROW_DIGITS_MAX)
          v = (v * 10) + (*q - '0');
@@ -62,10 +62,10 @@ static int field(const char **p, const char *end, long *out)
 /* A PARSED long BECOMING A STORED int, or the row is not a row.
  *
  * Three of this format's fields are `int` in struct row_reading and `long` on
- * the way in, and all three used to make the trip by cast alone: `(int)v`.
+ * the way in, and none of them makes the trip by cast alone: `(int)v`.
  * A cast from a long that an int cannot hold is implementation-defined -- on
  * every compiler this ships on it is the low 32 bits, which is the worst
- * possible answer because it is a PLAUSIBLE one. What that looked like to
+ * possible answer because it is a PLAUSIBLE one. What that looks like to
  * somebody reading the stored data:
  *
  *   - a row whose trend field said 4294967296 was stored, drawn and
@@ -92,7 +92,7 @@ static int field(const char **p, const char *end, long *out)
  * by the ranges at the bottom of row_decode for the offset, and by nothing at
  * all today for the trend and the source id. Folding a semantic bound in here
  * would put three different rules behind one name. */
-static int narrow(long v, int *out)
+static int narrow(int64_t v, int *out)
 {
    if (v < INT_MIN || v > INT_MAX)
       return 0;
@@ -121,7 +121,7 @@ int row_decode(const char *line, int len, struct row_reading *out)
       end--;
 
    struct row_reading r = {0};
-   long v;
+   int64_t v;
 
    if (!field(&p, end, &v) || !sep(&p, end))
       return 0;
@@ -152,9 +152,9 @@ int row_decode(const char *line, int len, struct row_reading *out)
       return 0;
    /* NARROWED HERE, RANGE-CHECKED BELOW, and both are needed. The range check
     * at the bottom (+/- a day) is far tighter than an int, so it looks like it
-    * subsumes this one -- it does not, because it used to run AFTER the cast
-    * and therefore judged the truncated value. This refuses the offset that an
-    * int cannot hold; the range below refuses the offset that a clock cannot
+    * subsumes this one -- it does not: run AFTER the cast it judges the
+    * truncated value. This refuses the offset that an int cannot hold; the
+    * range below refuses the offset that a clock cannot
     * have. Deleting either one puts a wrong wall clock on the page. */
    if (!narrow(v, &r.tz))
       return 0;

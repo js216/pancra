@@ -38,6 +38,8 @@
  * seizure of the exchange as two separate statements. Everything below that
  * reads it (meter_busy, meter_src, meter_ui_of) is a snapshot taken there.
  */
+#include "loadresult.h" /* what a load actually found */
+
 #ifndef METER_H
 #define METER_H
 
@@ -49,11 +51,8 @@
  * must skip meters; this is the fact they check. It mirrors what the
  * transport was told, and is written in one place, so the two cannot drift. */
 int meter_link_is(int link);
-/* Route (or stop routing) a link to the OneTouch parser. */
+/* Say whether `link` carries a meter (1) or a CGM (0). */
 void meter_link_set(int link, int on);
-/* Is a standing connect outstanding on this link, and to which address? */
-int meter_link_armed(int link);
-void meter_link_arm_mac(int link, char *out, int cap);
 /* Un-arm: this meter no longer has a connection outstanding, so the tick may
  * arm it again. The link KEEPS its meter routing bit. */
 void meter_unarm_link(int link);
@@ -94,11 +93,16 @@ void meter_register_ops(void);
  * not, and then NONE of them is usable -- see data_path in util.h. */
 int meter_paths(const char *dir);
 /* Load the persisted per-meter sync times and record indices. */
-void meter_state_load(void);
+/* THE PER-METER STATE FILES, read at startup: the last-sync times and the
+ * signal captured with them. Answers what the storage actually gave back --
+ * LOAD_ABSENT on a first run, LOAD_CORRUPT for a file this program did not
+ * write, LOAD_ERROR for one it could not read -- so startup can report it
+ * with every other loader's answer rather than presenting a lost file as an
+ * ordinary launch. */
+enum load_result meter_state_load(void);
 
 /* Registry id of the meter the app is bound to, and its address. */
 int meter_src(void);
-void meter_mac(char *out, int cap);
 /* Bind to a meter: the id whose fingersticks are being imported, and the
  * address the "is this OUR meter" guard compares against. Without the address
  * that guard accepted ANY OneTouch in range after a restart -- importing a
@@ -110,14 +114,11 @@ void meter_bind(int id, const char *mac);
  * process-global "last meter" state made one meter's sync throttle the other
  * and showed one meter's signal against both. */
 
-/* (This meter's own last signal used to be its own question,
- * meter_rssi_of. It is in struct meter_ui now: the device row asked for the
- * sync time and the signal separately, which is two reads of a record a
- * binder thread writes, and the row could show one instant's time beside
- * another instant's signal.) */
+/* (This meter's own last signal is NOT its own question: it is in struct
+ * meter_ui. Asked for separately from the sync time, that is two reads of a
+ * record a binder thread writes, and the row can show one instant's time
+ * beside another instant's signal.) */
 
-/* When this meter was last SEEN (an advert or a connection). */
-long meter_seen(int id);
 /* (The advert throttle's own stamp was readable as meter_advert_mono. It is
  * not any more: reading it, deciding, and recording were three steps a
  * second scan callback could interleave. meter_note_advert does all three,
@@ -127,17 +128,17 @@ long meter_seen(int id);
  *
  * THROTTLED, and the throttle is part of the same step: 1 when this advert
  * took the turn (none in the last `window` seconds), 0 when it was too soon.
- * The caller used to ask for the last advert time, decide, and then record --
- * and two scan callbacks for one meter, which is what a meter waking up
- * produces, could both pass. */
+ * A caller that asks for the last advert time, decides, and then records
+ * lets two scan callbacks for one meter -- which is what a meter waking up
+ * produces -- both pass. */
 int meter_note_advert(int id, int rssi, long now, long window);
 
 /* What the device row shows for this meter. */
 struct meter_ui {
    long sync_t; /* when the app last CONNECTED it (not its last reading) */
-   /* ...and its signal, from the SAME copy: the row used to take a second
-    * one through meter_rssi_of, so a binder write in between showed a time
-    * and a signal from two different instants. */
+   /* ...and its signal, from the SAME copy: take a second one through a
+    * separate query and a binder write in between shows a time and a signal
+    * from two different instants. */
    int rssi, rssi_ok;
    long rssi_t;
    char stat[24]; /* the driver's last phase text, or "" -- A COPY: this was

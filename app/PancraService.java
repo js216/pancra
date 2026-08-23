@@ -44,15 +44,15 @@ public final class PancraService extends Service {
 
     /* LAST glucose notification content, cached so EVERY (re)post of the
      * foreground notification -- including the wake-alarm restart every cycle --
-     * re-shows the value + plot instead of a placeholder. Without this, each
+     * re-shows the value + plot rather than a placeholder. Without this, each
      * onStartCommand stamped the plain "Reading glucose" over the live reading,
      * so the shade showed neither number nor plot until the next reading. */
     /* ONE OBJECT, PUBLISHED THROUGH ONE REFERENCE.
      *
-     * This was seven separate volatile fields, written one after another by
-     * showGlucose and read one after another by buildNotif. Each field was
-     * individually safe and the SET was not: a build running while a reading
-     * lands sees any mix of old and new, and two of those mixes are not merely
+     * As seven separate volatile fields, written one after another by
+     * showGlucose and read one after another by buildNotif, each field is
+     * individually safe and the SET is not: a build running while a reading
+     * lands sees any mix of the two, and two of those mixes are not merely
      * stale but wrong.
      *
      *   - `px` with the OLD `w`/`h`. The guard `px.length >= w * h` is what
@@ -73,17 +73,17 @@ public final class PancraService extends Service {
      * THE PIXELS ARE COPIED, not referenced. They arrive from native as a
      * jintArray this class does not own; keeping the caller's array would let
      * the plot change under a build that had already checked its length. */
-    /* THE CLASS ITSELF IS IN BoundaryLogic, where the host JVM can execute it.
+    /* THE CLASS ITSELF IS IN ServicePolicy, where the host JVM can execute it.
      * A copy here would be a second definition of the one rule that stands
      * between a mismatched plot and Bitmap.createBitmap reading past the end of
      * an array -- and the copy in this file is the one no test can reach,
      * because this class needs android.jar. */
 
     /* Never null, so no reader needs a null check: the initial value is the
-     * "before the first reading" state buildNotif used to spell out with a
-     * null test per field. */
-    private static volatile BoundaryLogic.Notif sNotif =
-        BoundaryLogic.nextNotif(null, null, null, null, true, null, 0, 0);
+     * "before the first reading" state, rather than a null test per field
+     * inside buildNotif. */
+    private static volatile NotifPolicy.Notif sNotif =
+        NotifPolicy.nextNotif(null, null, null, null, true, null, 0, 0);
 
     /* Hold a partial wakelock so the CPU keeps processing BLE while the screen is
      * off. The foreground service keeps the process alive, but without this the
@@ -100,8 +100,8 @@ public final class PancraService extends Service {
         } catch (Throwable t) { Log.i("pancra", "wakelock: " + t); }
     }
 
-    /* GIVE THE CPU BACK. Its own method because onDestroy is no longer the
-     * only caller: a start that cannot promote the service to the foreground
+    /* GIVE THE CPU BACK. Its own method because onDestroy is not the only
+     * caller: a start that cannot promote the service to the foreground
      * has to release the lock a PREVIOUS start took (the field is static and
      * outlives one onStartCommand), and it has to do it now rather than
      * whenever the looper gets round to destroying the service. A partial
@@ -169,7 +169,7 @@ public final class PancraService extends Service {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         /* CAPTURED ONCE. Every field below comes from this one object, so a
          * reading landing mid-build cannot contribute half of itself. */
-        BoundaryLogic.Notif n = sNotif;
+        NotifPolicy.Notif n = sNotif;
         String title = (n.title != null) ? n.title : "Pancra";
         String text  = (n.text  != null) ? n.text  : "Reading glucose";
         Notification.Builder b = new Notification.Builder(app, CH)
@@ -198,7 +198,7 @@ public final class PancraService extends Service {
         if (li != 0)
             b.setLargeIcon(android.graphics.drawable.Icon
                 .createWithResource(app, li));
-        /* No length test: BoundaryLogic.Notif refused any pixels that did not
+        /* No length test: NotifPolicy.Notif refused any pixels that did not
          * match their dimensions, so hasPlot() IS the guarantee. */
         if (n.hasPlot()) {
             Bitmap bmp = Bitmap.createBitmap(n.px, n.w, n.h,
@@ -264,7 +264,7 @@ public final class PancraService extends Service {
      * uncaught exception on the main thread, i.e. the process dies immediately.
      * That process holds the CGM connection and the alarm. Trading "the plot
      * could not be drawn, so the service was killed" for "the plot could not be
-     * drawn, so the app crashed" is not the fix this was.
+     * drawn, so the app crashed" is not a trade worth making.
      *
      * Returning null instead lets the REST of onStartCommand run, which is the
      * part that still has something useful to do: the recreation check, the
@@ -318,10 +318,10 @@ public final class PancraService extends Service {
              * before it is published. That is the property worth having, and a
              * compare-and-set would only buy back one cycle of one plot at the
              * cost of a loop in the reading path. */
-            sNotif = BoundaryLogic.nextNotif(sNotif, title, text, value,
+            sNotif = NotifPolicy.nextNotif(sNotif, title, text, value,
                                              lockscr != 0, px, w, h);
             NotificationManager nm = app.getSystemService(NotificationManager.class);
-            nm.notify(BoundaryLogic.NOTIF_SERVICE, buildNotif(app));
+            nm.notify(NotifPolicy.NOTIF_SERVICE, buildNotif(app));
         } catch (Throwable t) { Log.i("pancra", "showGlucose: " + t); }
     }
 
@@ -405,10 +405,10 @@ public final class PancraService extends Service {
          *
          * The notification is built OUTSIDE the try that guards
          * startForeground, through build(), which already falls back to the
-         * plain notification rather than propagating. Previously the whole
-         * thing sat in one try: a throw from buildNotif -- rendering the value
-         * icon, or a pixel array the plot guard let through -- was caught and
-         * logged, and startForeground was NEVER REACHED. Android then kills a
+         * plain notification rather than propagating. With the whole thing
+         * in one try, a throw from buildNotif -- rendering the value icon, or
+         * a pixel array the plot guard let through -- is caught and logged,
+         * and startForeground is NEVER REACHED. Android then kills a
          * foreground service that has not presented its notification within
          * seconds, so a failure to draw a plot took BLE down with it, and the
          * log line said "buildNotif" while the visible symptom was that the
@@ -425,31 +425,31 @@ public final class PancraService extends Service {
         Notification first = build();
         /* WHAT THE PROMOTION DID, KEPT rather than logged and dropped.
          *
-         * This catch used to be the end of the story: the throwable was
-         * written to the log and the method carried straight on to take a
-         * wakelock, start the heartbeat, re-arm the wake alarm and return
-         * START_STICKY -- the full set of gestures that mean "monitoring is
-         * protected" -- on a service the OS was about to stop for never
-         * having presented a notification. Nothing on the phone said so. The
-         * user had a warm battery and no readings.
+         * Ending the story in this catch -- write the throwable to the log
+         * and carry straight on to take a wakelock, start the heartbeat,
+         * re-arm the wake alarm and return START_STICKY -- performs the full
+         * set of gestures that mean "monitoring is protected" on a service
+         * the OS is about to stop for never having presented a notification.
+         * Nothing on the phone says so. The user gets a warm battery and no
+         * readings.
          *
          * The throwable is the evidence for WHICH failure this is (see
-         * BoundaryLogic.promotionOutcome), so it is kept. */
+         * ServicePolicy.promotionOutcome), so it is kept. */
         Throwable promoErr = null;
         try {
             if (first == null)
                 Log.i("pancra", "startForeground: nothing could be built");
             else if (Build.VERSION.SDK_INT >= 29)
-                startForeground(BoundaryLogic.NOTIF_SERVICE, first,
+                startForeground(NotifPolicy.NOTIF_SERVICE, first,
                                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             else
-                startForeground(BoundaryLogic.NOTIF_SERVICE, first);
+                startForeground(NotifPolicy.NOTIF_SERVICE, first);
         } catch (Throwable t) {
             promoErr = t;
             Log.i("pancra", "startForeground: " + t);
         }
-        int promo = BoundaryLogic.promotionOutcome(first != null, promoErr);
-        if (promo != BoundaryLogic.PROMO_OK)
+        int promo = ServicePolicy.promotionOutcome(first != null, promoErr);
+        if (promo != ServicePolicy.PROMO_OK)
             Log.i("pancra", "startForeground: REFUSED (kind " + promo
                             + ") -- releasing and stopping");
         /* i == null means the system restarted us on its own (START_STICKY)
@@ -457,29 +457,29 @@ public final class PancraService extends Service {
          * native lib, so this process cannot monitor anything. It must not
          * pretend to (a notification and a wakelock, reading nothing).
          *
-         * But it must not vanish either, which is what it used to do. The
-         * foreground notification goes with the service, and a phone with no
-         * pancra notification is exactly what a healthy phone looks like when
-         * the app is not in the shade -- so a user whose device reclaimed the
-         * app had their glucose stop being watched with nothing anywhere to
-         * say so. Alarms included.
+         * But it must not vanish either. The foreground notification goes
+         * with the service, and a phone with no pancra notification is exactly
+         * what a healthy phone looks like when the app is not in the shade --
+         * so a user whose device reclaimed the app would have their glucose
+         * stop being watched with nothing anywhere to say so. Alarms
+         * included.
          *
-         * The decision itself is in BoundaryLogic, where it is tested on the
+         * The decision itself is in ServicePolicy, where it is tested on the
          * host without a phone. */
-        int act = BoundaryLogic.serviceAction(i != null, sNativeReady, false);
+        int act = ServicePolicy.serviceAction(i != null, sNativeReady, false);
         /* WHICH SENTENCE THE NOTICE CARRIES. The two ways monitoring stops
          * are one fact to the user -- the app is not watching any more -- and
          * one notification (NOTIF_STOPPED), but they are not the same
          * sentence: "Android restarted pancra without the app" is a lie about
          * a phone that refused the foreground notification, and a user who is
          * told the wrong thing tries the wrong fix. */
-        final boolean promoFailed = promo != BoundaryLogic.PROMO_OK;
+        final boolean promoFailed = promo != ServicePolicy.PROMO_OK;
         /* EVERY EFFECT onStartCommand HAS, handed to the policy as calls it
          * can make. The sequence -- and above all the fact that the failing
          * paths release the wakelock and post the notice before stopping --
          * is asserted on the host by boundaryjavatest, which is the only
          * place a REFUSED promotion can be arranged at all. */
-        BoundaryLogic.ServiceOps ops = new BoundaryLogic.ServiceOps() {
+        ServicePolicy.ServiceOps ops = new ServicePolicy.ServiceOps() {
             @Override public void holdWakelock() { PancraService.this.holdWakelock(); }
             @Override public void releaseWakelock() { PancraService.this.releaseWakelock(); }
             @Override public void startTicking() { PancraService.this.startTicking(); }
@@ -498,7 +498,7 @@ public final class PancraService extends Service {
          * for a recoverable refusal and cancels it for a terminal one, so a
          * manifest fault cannot become a five-minute loop for the life of the
          * install. */
-        return BoundaryLogic.serviceStart(act, promo, ops)
+        return ServicePolicy.serviceStart(act, promo, ops)
             ? START_STICKY : START_NOT_STICKY;
     }
 
@@ -506,13 +506,13 @@ public final class PancraService extends Service {
      *
      * Its own notification id, because the foreground one (id 1) disappears
      * with the service. Ongoing and DEFAULT importance so it does not sit
-     * silently at the bottom of the shade: this says the app is no longer
+     * silently at the bottom of the shade: this says the app has stopped
      * watching, which is exactly the thing a person relies on it for. Tapping
      * it opens the app, which is also what fixes it. */
-    /* Its OWN id, from BoundaryLogic's list. This was 2 -- the same 2 Alarm.java
-     * used for a sounding glucose alarm, so each notice could replace the other
-     * and either cancel could take down the wrong one. */
-    private static final int WARN_ID = BoundaryLogic.NOTIF_STOPPED;
+    /* Its OWN id, from NotifPolicy's list. Sharing 2 with Alarm.java's
+     * sounding glucose alarm would let each notice replace the other, and
+     * either cancel take down the wrong one. */
+    private static final int WARN_ID = NotifPolicy.NOTIF_STOPPED;
 
     /* THE TWO WAYS MONITORING STOPS, in the words that lead to the right fix.
      * One notification and one id, because to the person holding the phone it
@@ -590,10 +590,10 @@ public final class PancraService extends Service {
 
     /* Service-owned heartbeat.
      *
-     * The alarm used to be evaluated only on the activity's 1 Hz looper timer,
-     * which onDestroy tears down -- so after a back-press or a task swipe, with
-     * this service still holding the BLE connection alive for days, a hypo was
-     * decoded and logged but never sounded, and an alarm already ringing could
+     * Evaluated only on the activity's 1 Hz looper timer, which onDestroy
+     * tears down, the alarm stops after a back-press or a task swipe -- with
+     * this service still holding the BLE connection alive for days, a hypo is
+     * decoded and logged but never sounded, and an alarm already ringing can
      * never be silenced. The heartbeat has to belong to whatever outlives the
      * activity, which is this service.
      *
@@ -605,19 +605,19 @@ public final class PancraService extends Service {
     private volatile android.os.Handler tick;
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
-            /* EVERYTHING inside the try. The reschedule used to sit outside it
-             * and read `tick` twice: onDestroy can null the field between the
-             * check and the postDelayed, and that NPE escapes run() inside a
+            /* EVERYTHING inside the try. A reschedule outside it, reading
+             * `tick` twice, lets onDestroy null the field between the check
+             * and the postDelayed, and that NPE escapes run() inside a
              * Looper dispatch -> uncaught handler -> the PROCESS IS KILLED.
              * That process holds the CGM connection and the alarm, so a service
-             * teardown could take the alarm down with it. */
+             * teardown would take the alarm down with it. */
             /* The reschedule is in a FINALLY, not merely inside the try.
              *
-             * Inside the try it was skipped whenever Ble.onTick() threw, and
-             * one throw was permanent: startTicking() returns early while
-             * `tick` is non-null, so nothing ever re-armed the heartbeat. The
-             * service then kept its notification and wakelock while no longer
-             * evaluating the alarm at all -- with the activity gone, that is
+             * Inside the try it is skipped whenever Ble.onTick() throws,
+             * and one throw is permanent: startTicking() returns early while
+             * `tick` is non-null, so nothing re-arms the heartbeat. The
+             * service then keeps its notification and wakelock while
+             * evaluating no alarm at all -- with the activity gone, that is
              * the exact hypo-decoded-but-never-sounded case this heartbeat
              * exists to prevent. UnsatisfiedLinkError from a native-less
              * process (see onStartCommand) is the realistic first throw.

@@ -9,7 +9,7 @@
  * branch or a length: gf_mul is written branchlessly (see below), and every
  * public entry point judges its lengths against SP 800-38D 5.2.1.1 before it
  * writes anything. gcm.h carries the derivation of both bounds and the
- * description of what the old silent counter wrap produced.
+ * description of what a silent counter wrap produces.
  */
 #include "gcm.h"
 #include "aes.h"
@@ -46,11 +46,11 @@ _Static_assert((uint32_t)(1ull + GCM_CTR_BLOCKS_MAX + 2) == 1u,
  * reduction polynomial appears as 0xe1 in the first byte.
  *
  * BRANCHLESS, AND THIS ONE IS A NETWORK-OBSERVABLE LEAK RATHER THAN A CACHE
- * ONE. Both of the `if`s this loop used to contain tested a secret:
+ * ONE. Written with `if`s, both of them test a secret:
  *
  *   - `if (x[i / 8] & bit) z ^= v;` -- x is the GHASH accumulator, a value
  *     derived from the key and the data, and the number of set bits in it
- *     decided how many 16-byte XORs ran.
+ *     decides how many 16-byte XORs run.
  *   - `if (lsb) v[0] ^= 0xe1;` -- lsb comes from v, which begins each call as
  *     H = AES(key, 0^128), the GCM authentication subkey. The sequence of 128
  *     lsb values is a function of H ALONE, so it is the same timing signature
@@ -144,13 +144,19 @@ static void gctr(const uint8_t key[16], const uint8_t iv[12], uint32_t ctr,
                  const uint8_t *in, uint8_t *out, size_t n)
 {
    uint8_t blk[16], ks[16];
+   /* THE SCHEDULE IS EXPANDED ONCE, not once per block. It always could have
+    * been; it matters now because lib/aes.c computes its S-box rather than
+    * reading a table, so the 40 evaluations a schedule costs are no longer
+    * lost in the noise of the 160 the rounds need. */
+   struct aes128 ctx;
+   aes128_init(&ctx, key);
    memcpy(blk, iv, 12);
    while (n) {
       blk[12] = (uint8_t)(ctr >> 24);
       blk[13] = (uint8_t)(ctr >> 16);
       blk[14] = (uint8_t)(ctr >> 8);
       blk[15] = (uint8_t)ctr;
-      aes128_encrypt(key, blk, ks);
+      aes128_encrypt_ctx(&ctx, blk, ks);
       size_t take = n < 16 ? n : 16;
       for (size_t i = 0; i < take; i++)
          out[i] = in[i] ^ ks[i];
@@ -170,31 +176,17 @@ static void gcm_tag(const uint8_t key[16], const uint8_t iv[12],
    aes128_encrypt(key, zero, h);
    ghash(y, h, aad, aadn);
    ghash(y, h, ct, ctn);
-   /* THE LENGTH BLOCK, and the multiply that used to be able to lie. Both
-    * products are exact now because both operands were bounded before this
+   /* THE LENGTH BLOCK, and a multiply that must not be able to lie. Both
+    * products are exact because both operands were bounded before this
     * function was reached: aadn <= 2^61 - 1 keeps aadn * 8 inside 2^64, and
     * ctn <= 2^36 - 32 is nowhere near it. Unbounded, `(uint64_t)aadn * 8`
-    * wrapped, and an AAD of 2^61 bytes encoded the same zero length block as
+    * wraps, and an AAD of 2^61 bytes encodes the same zero length block as
     * an empty one -- see gcm.h on why a non-injective length encoding stops
     * the tag from committing to anything. */
    be64(len, (uint64_t)aadn * 8);
    be64(len + 8, (uint64_t)ctn * 8);
    ghash(y, h, len, 16);
    gctr(key, iv, 1, y, tag, 16); /* counter 1 masks the tag */
-}
-
-enum gcm_status aes128_gcm_limits(uint64_t aadn, uint64_t n)
-{
-   /* Two comparisons and nothing else -- no key, no buffer, no allocation --
-    * which is the entire point of it being a separate function. It is what a
-    * test can call with 2^36 and 2^61 without owning that much memory. The
-    * order is documented in gcm.h and depended upon there, so it is not free
-    * to change: aadn is judged first. */
-   if (aadn > GCM_AAD_MAX)
-      return GCM_ERR_AAD_LEN;
-   if (n > GCM_PT_MAX)
-      return GCM_ERR_PT_LEN;
-   return GCM_OK;
 }
 
 enum gcm_status aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
@@ -257,4 +249,18 @@ int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
 {
    /* The polarity is the whole reason this wrapper exists; see gcm.h. */
    return aes128_gcm_unseal(key, iv, aad, aadn, ct, n, tag, pt) == GCM_OK;
+}
+
+enum gcm_status aes128_gcm_limits(uint64_t aadn, uint64_t n)
+{
+   /* Two comparisons and nothing else -- no key, no buffer, no allocation --
+    * which is the entire point of it being a separate function. It is what a
+    * test can call with 2^36 and 2^61 without owning that much memory. The
+    * order is documented in gcm.h and depended upon there, so it is not free
+    * to change: aadn is judged first. */
+   if (aadn > GCM_AAD_MAX)
+      return GCM_ERR_AAD_LEN;
+   if (n > GCM_PT_MAX)
+      return GCM_ERR_PT_LEN;
+   return GCM_OK;
 }

@@ -5,8 +5,8 @@
  * The generic construction only. TLS 1.3's HkdfLabel wrapper is a TLS
  * concept, not an HKDF one, so it lives with the TLS code that defines it.
  *
- * See hkdf.h for where each bound comes from and for what the unbounded
- * version of this file used to do instead of refusing.
+ * See hkdf.h for where each bound comes from and for what an unbounded
+ * implementation does rather than refusing.
  */
 #include "hkdf.h"
 #include "hmac.h"

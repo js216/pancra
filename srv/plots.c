@@ -105,8 +105,8 @@ static void img_digits(struct plot_ws *ws, int x, int y, const char *s, int sc)
 /* Readings in (t0, t1], oldest first, into ppts. Buckets are days, so the
  * query asks only for the days the window touches however long the record
  * is. */
-static int load_points(struct plot_ws *ws, struct db *d, long owner, long t0,
-                       long t1)
+static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
+                       int64_t t0, int64_t t1)
 {
    sqlite3_stmt *st =
        db_prep(d, "SELECT line FROM logrow WHERE user_id=?"
@@ -152,7 +152,7 @@ static int load_points(struct plot_ws *ws, struct db *d, long owner, long t0,
     * PTS_MAX means the window simply holds more points than the image can
     * show, which is a rendering limit. Ending on SQLITE_BUSY or a damaged
     * page means the plot would silently omit real readings -- so say the plot
-    * cannot be drawn instead of drawing a convincing wrong one. */
+    * cannot be drawn rather than drawing a convincing wrong one. */
    int ok = (n >= PTS_MAX) || db_finished(rc);
    sqlite3_finalize(st);
    if (!ok)
@@ -172,9 +172,9 @@ static int load_points(struct plot_ws *ws, struct db *d, long owner, long t0,
 }
 
 /* Render (win_start, win_end] over `hours` into a GIF. Returns its size. */
-static size_t plot_gif(struct plot_ws *ws, struct db *d, long owner,
-                       long win_start, long win_end, int hours, int tz_min,
-                       uint8_t *out, size_t cap)
+static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
+                       int64_t win_start, int64_t win_end, int hours,
+                       int tz_min, uint8_t *out, size_t cap)
 {
    int ph = IMG_H - XSTRIP; /* plot rect; labels live in the strip below */
    for (size_t i = 0; i < (size_t)IMG_W * IMG_H; i++)
@@ -183,7 +183,7 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, long owner,
    if (np < 0)
       return 0; /* no image rather than one missing readings, or one that
                  * silently claims the window was empty */
-   long tz = (long)tz_min * 60;
+   int64_t tz = (int64_t)tz_min * 60;
    /* THE PLOT'S CONFIGURATION, passed rather than set: the scale and the
     * marker radius were process globals, so two windows rendered at once
     * could not have different ones -- and this server renders several. */
@@ -217,11 +217,11 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, long owner,
    if (plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref, win_end, hours,
                      cfg, &lx, &ly))
       img_digits(ws, 4, ly - 5, "180", 2);
-   for (long ts = 3600; ts <= (long)hours * 3600; ts += 3600) {
-      ref.t    = win_end - ts;
-      ref.glu  = 100; /* any in-scale value: only x matters here */
-      long loc = ref.t + ((long)tz_min * 60);
-      int hh   = (int)((loc % 86400 + 86400) % 86400) / 3600;
+   for (int64_t ts = 3600; ts <= (int64_t)hours * 3600; ts += 3600) {
+      ref.t       = win_end - ts;
+      ref.glu     = 100; /* any in-scale value: only x matters here */
+      int64_t loc = ref.t + ((int64_t)tz_min * 60);
+      int hh      = (int)((loc % 86400 + 86400) % 86400) / 3600;
       if (hh % 3)
          continue;
       if (!plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref, win_end,
@@ -231,7 +231,10 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, long owner,
       (void)snprintf(lbl, sizeof lbl, "%02d", hh);
       img_digits(ws, lx - 7, (IMG_H - XSTRIP) + 2, lbl, 2);
    }
-   return gif_encode(&ws->gw, out, cap, ws->img, IMG_W, IMG_H, gray, 16);
+   /* The cast is ISO C's, not ours: uint8_t(*)[3] does not convert to
+    * const uint8_t(*)[3] implicitly the way a plain pointer would. */
+   return gif_encode(&ws->gw, out, cap, ws->img, IMG_W, IMG_H,
+                     (const uint8_t(*)[3])gray, 16);
 }
 
 /* THE ONE WORKSPACE THE SERVER RENDERS INTO, and the buffer it encodes to.
@@ -243,8 +246,8 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, long owner,
 static struct plot_ws g_plot_ws;
 static uint8_t gifbuf[256 * 1024];
 
-void h_plot_gif(struct req *r, long owner, long win_start, long win_end,
-                int hours, int tz_min)
+void h_plot_gif(struct req *r, int64_t owner, int64_t win_start,
+                int64_t win_end, int hours, int tz_min)
 {
    size_t n = plot_gif(&g_plot_ws, r->db, owner, win_start, win_end, hours,
                        tz_min, gifbuf, sizeof gifbuf);
@@ -300,19 +303,66 @@ void h_plot_gif(struct req *r, long owner, long win_start, long win_end,
 /* Days that hold data, newest first: one row per local day, from the buckets
  * the record actually has. Buckets ARE days, so this is an index scan and
  * never a walk of the rows. */
-int plot_days(struct db *d, long owner, long *out, int cap)
+/* THE MONTHS, GROUPED BY THE DATABASE. See plots.h for why this is not a
+ * walk over days in C.
+ *
+ * strftime('%Y%m', bucket*86400, 'unixepoch') is SQLite's own UTC calendar,
+ * which is the same calendar the buckets were assigned with -- a bucket IS
+ * floor(instant / 86400), so the two cannot disagree about which month a day
+ * belongs to. DISTINCT over that expression is answered from the index on
+ * (user_id, log, bucket) without materialising anything. */
+int plot_months(struct db *d, int64_t owner,
+                int (*fn)(void *ctx, int year, int mon), void *ctx)
 {
+   if (!fn)
+      return -1;
+   sqlite3_stmt *st =
+       db_prep(d, "SELECT DISTINCT CAST(strftime('%Y%m', bucket * 86400,"
+                  " 'unixepoch') AS INTEGER) FROM logrow"
+                  " WHERE user_id=? AND log='readings'"
+                  " ORDER BY 1 DESC");
+   if (!st)
+      return -1;
+   sqlite3_bind_int64(st, 1, owner);
+   int rc = SQLITE_DONE;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+      int64_t ym = (int64_t)sqlite3_column_int64(st, 0);
+      /* A bucket outside what a calendar can express is not a month. It
+       * cannot come from this server's own writes; it can come from a row a
+       * restore put there, and rendering it would produce a link to a page
+       * that shows nothing. */
+      if (ym < 100001 || ym > 999912)
+         continue;
+      int mon = (int)(ym % 100);
+      if (mon < 1 || mon > 12)
+         continue;
+      if (fn(ctx, (int)(ym / 100), mon) != 0)
+         break;
+   }
+   int ok = db_finished(rc) || rc == SQLITE_ROW; /* a caller may stop early */
+   sqlite3_finalize(st);
+   return ok ? 0 : -1;
+}
+
+int plot_days_in(struct db *d, int64_t owner, int64_t day0, int64_t day1,
+                 int (*fn)(void *ctx, int64_t day), void *ctx)
+{
+   if (!fn || day1 <= day0)
+      return -1;
    sqlite3_stmt *st = db_prep(d, "SELECT DISTINCT bucket FROM logrow"
                                  " WHERE user_id=? AND log='readings'"
+                                 " AND bucket>=? AND bucket<?"
                                  " ORDER BY bucket DESC");
    if (!st)
-      return 0;
+      return -1;
    sqlite3_bind_int64(st, 1, owner);
-   int n  = 0;
+   sqlite3_bind_int64(st, 2, day0);
+   sqlite3_bind_int64(st, 3, day1);
    int rc = SQLITE_DONE;
-   while (n < cap && (rc = sqlite3_step(st)) == SQLITE_ROW)
-      out[n++] = (long)sqlite3_column_int64(st, 0);
-   int ok = (n >= cap) || db_finished(rc);
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+      if (fn(ctx, (int64_t)sqlite3_column_int64(st, 0)) != 0)
+         break;
+   int ok = db_finished(rc) || rc == SQLITE_ROW;
    sqlite3_finalize(st);
-   return ok ? n : -1;
+   return ok ? 0 : -1;
 }

@@ -39,24 +39,37 @@ int *__errno(void);
 #define EINTR  4 /* a write cut short by a signal is not a failed write */
 #endif
 
-/* POSIX file / RNG source */
+/* POSIX file I/O, and the same split the errno block above makes -- for the
+ * same reason, now applied to the whole list rather than to `rename` alone.
+ *
+ * WHAT THE SPLIT IS. On the phone there are no bionic headers, so these are
+ * declared by hand and bound at runtime. On the HOST the real headers exist,
+ * and declaring these a second time is a second declaration of a standard
+ * function whose parameter names are not the libc's -- which is a finding the
+ * linter reports (and reported, on the one test that included <unistd.h> and
+ * these declarations at once). `rename` carried this note already; there was
+ * never a reason the other seven were different, only that nothing had
+ * tidied a unit that saw both.
+ *
+ * INCLUDED HERE, not left to the caller: every hosted unit that includes this
+ * header calls some of these, and moving the include out would mean adding
+ * <unistd.h> to two dozen files to say something this header already says. */
+#if __STDC_HOSTED__
+#include <fcntl.h>  /* open, and the O_* flags below */
+#include <sched.h>  /* sched_yield */
+#include <unistd.h> /* read/write/close/fsync/unlink/ftruncate/lseek */
+#else
 int open(const char *path, int flags, ...);
 long read(int fd, void *buf, size_t n);
 long write(int fd, const void *buf, size_t n);
 int close(int fd);
 int fsync(int fd);
 int unlink(const char *path);
-/* NOT redeclared on a hosted build: rename is the one name in this list that
- * <stdio.h> already provides, so declaring it again here is a second
- * declaration of a standard function -- with different parameter names, which
- * is exactly what the linter reports. Same shape as the errno split above:
- * the freestanding shim has no rename, the hosted libc does. */
-#if !__STDC_HOSTED__
 int rename(const char *from, const char *to);
-#endif
 int ftruncate(int fd, long len);
 int sched_yield(void);
 long lseek(int fd, long off, int whence);
+#endif
 int gettid(void); /* kernel thread id (tell the main looper from BLE threads) */
 #ifndef O_RDONLY
 #define O_RDONLY 0U

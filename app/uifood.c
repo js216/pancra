@@ -15,18 +15,22 @@
  * WHERE IT GOES BACK TO IS RECORDED, NEVER INFERRED. This screen is reached
  * from the ADD menu and from the entry form's TYPE row, and it will be reached
  * from elsewhere later; deciding the exit target here by looking at the app's
- * state is the bug that has recurred about six times in this codebase. The
+ * state is the mistake that has recurred about six times in this codebase.
+ * The
  * origin is written down on the way in -- see nav.h -- and read on the way
  * out. */
-#include "food.h"
 #include "font.h" /* str_len: the page counter is centred on its width */
+#include "food.h"
+#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h" /* fmt_date: the instant, split into YEAR / MM-DD / HH:MM */
 #include "uimodel.h"
 #include "uipriv.h"
-#include "util.h"  /* str_snapshot */
+#include "util.h" /* str_snapshot */
 
+#include "ndk.h"
+#include <stdint.h>
 #include <stdio.h>
 
 /* The LOG FOOD entry form: which food, how much, and when.
@@ -48,12 +52,12 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y        = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, m->food.food_edit ? "EDIT FOOD" : "LOG FOOD",
-            0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+            UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* X discards -- nothing is written before an explicit CONFIRM. The band is
     * 2*lh - 2*sc rather than 2*lh because value_row's target starts at its
     * y - 4*sc, and a full band reaches into the row below it. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc),
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc)),
               MA_FOOD_DISCARD, 0);
    y += 2 * lh;
 
@@ -78,29 +82,34 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
    const char *tname = m->food.food_type != FOOD_TYPE_NONE
                            ? food_type_name(m->food.food_type)
                            : "CHOOSE...";
-   uint32_t tcol =
-       m->food.food_type != FOOD_TYPE_NONE ? 0xFFFFFFFF : 0xFF888888;
+   uint32_t tcol     = m->food.food_type != FOOD_TYPE_NONE ? UI_TEXT : UI_MUTED;
    y = value_row(fb, h, y, sc, "TYPE", tname, tcol, MA_FOOD_EDIT, 0);
    y += lh;
    char gval[16];
    (void)snprintf(gval, sizeof gval, "%d G", m->food.food_g);
-   y = value_row(fb, h, y, sc, "GRAMS", gval, 0xFFFFFFFF, MA_FOOD_EDIT, 1);
+   y = value_row(fb, h, y, sc, "GRAMS", gval, UI_TEXT, MA_FOOD_EDIT, 1);
    y += lh;
-   y = value_row(fb, h, y, sc, "TIME", timep, 0xFFFFFFFF, MA_FOOD_EDIT, 2);
+   y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_FOOD_EDIT, 2);
    y += lh;
-   y = value_row(fb, h, y, sc, "DATE", datep, 0xFFFFFFFF, MA_FOOD_EDIT, 3);
+   y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_FOOD_EDIT, 3);
    y += lh;
-   y = value_row(fb, h, y, sc, "YEAR", yearp, 0xFFFFFFFF, MA_FOOD_EDIT, 4);
+   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_FOOD_EDIT, 4);
    y += 2 * lh;
 
    /* Cancel on TOP, the committing button on the BOTTOM -- the app-wide rule
     * the insulin and weight forms both follow. */
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_FOOD_DISCARD,
-                   0);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_FOOD_DISCARD, 0);
    y += (3 * lh) / 2;
-   (void)menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88,
-                     MA_FOOD_CONFIRM, 0);
+   /* Editing adds DELETE (red) between CANCEL and CONFIRM, mirroring EDIT
+    * WEIGHT and EDIT INSULIN. It only opens a confirmation; it never deletes
+    * on the tap itself. */
+   if (m->food.food_edit) {
+      y = menu_button(fb, h, x, y, bw, sc, "DELETE", UI_DANGER, MA_FOOD_DELETE,
+                      0);
+      y += (3 * lh) / 2;
+   }
+   (void)menu_button(fb, h, x, y, bw, sc, "CONFIRM", UI_OK, MA_FOOD_CONFIRM, 0);
 }
 
 /* THE FOOD LOG: what was eaten, when, and how much.
@@ -112,12 +121,47 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
  * add_hit drops targets past UI_MAX_HITS, and a dropped one draws perfectly
  * while being dead to touch).
  *
- * NO EDIT TARGET PER ROW, which is where it differs. The insulin log opens a
- * dose in its form because insulin.c can rewrite a row by content; food has
- * no such rewrite yet, so a row here would open a form whose CONFIRM appends
- * a second entry rather than amending this one. A row that looks tappable and
- * silently duplicates the record is worse than a row that does nothing, so
- * until food_update exists the rows are text. */
+ * EVERY ROW OPENS ITS ENTRY, now that food_update exists to rewrite one by
+ * content. Until it did, the rows were deliberately inert: a row that looks
+ * tappable and silently appends a duplicate rather than amending the record is
+ * worse than a row that does nothing. */
+/* Confirm deleting one food entry. Mirrors the weight and insulin ones: the
+ * record being destroyed is spelled out, CANCEL is first and DELETE below it.
+ *
+ * THE ORIGINAL ENTRY, not the form's current values. Editing the portion and
+ * then tapping DELETE would otherwise show the edited number while
+ * food_delete removes the row that is on disk -- a confirmation naming a
+ * different record than the one it destroys is worse than none. */
+void render_fooddel(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                    struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 20);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int y        = (fb->height / 20) + (8 * sc);
+
+   draw_str(px, fb, x, y, tsc, "DELETE?", UI_DANGER);
+   y += 3 * lh;
+   char fv[40];
+   char when[20];
+   (void)snprintf(fv, sizeof fv, "%ld G %s", m->food.food_orig_g,
+                  food_type_name(m->food.food_orig_type));
+   fmt_date(m->food.food_orig_t, m->tz_off, when, sizeof when);
+   draw_str(px, fb, x, y, sc, fv, UI_TEXT);
+   y += lh;
+   draw_str(px, fb, x, y, sc, when, UI_TEXT_DIM);
+   y += 2 * lh;
+   draw_str(px, fb, x, y, sc, "This cannot be undone.", UI_MUTED);
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_FOODDEL_NO, 0);
+   y += (3 * lh) / 2;
+   (void)menu_button(fb, h, x, y, bw, sc, "DELETE", UI_DANGER, MA_FOODDEL_YES,
+                     0);
+}
+
 void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h)
 {
@@ -129,16 +173,17 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "FOOD LOG", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_FOODLOG_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "FOOD LOG", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_FOODLOG_BACK,
+              0);
    y += 3 * lh;
 
    if (m->food.nlog <= 0) {
-      draw_str(px, fb, x, y, sc, "Nothing logged yet.", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "Nothing logged yet.", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "TIME              FOOD            G", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "TIME              FOOD            G", UI_MUTED);
    y += lh;
 
    int avail = fb->height - y - (2 * lh);
@@ -166,25 +211,33 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * record the vocabulary can no longer name. */
       (void)snprintf(row, sizeof row, "%s  %-14s %4ld", when,
                      food_type_name(e->type), e->g);
-      draw_str(px, fb, x, y, sc, row, 0xFFCCCCCC);
+      draw_str(px, fb, x, y, sc, row, UI_TEXT_DIM);
+      /* THE WHOLE ROW is the target, carrying the TAIL INDEX -- which the
+       * dispatcher immediately turns into a copy of the row itself, because
+       * an index is only good for as long as the tail is. */
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_FOODLOG_EDIT,
+                 ti);
       y += lh;
    }
 
    if (npages > 1) {
       int navy = fb->height - lh - (4 * sc);
       if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc),
+         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
                     MA_FOODLOG_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, fb->width - (fb->width / 3), navy - (3 * sc),
-                    fb->width / 3, lh + (7 * sc), MA_FOODLOG_NEXT, 0);
+         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(fb->width - (fb->width / 3), navy - (3 * sc),
+                            fb->width / 3, lh + (7 * sc)),
+                    MA_FOODLOG_NEXT, 0);
       }
    }
 }
@@ -200,9 +253,10 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "FOOD", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_FOODTYPE_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "FOOD", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_FOODTYPE_BACK,
+              0);
    y += 3 * lh;
 
    /* NEW FOOD IS FIRST, ALWAYS, and it is the one row that is always here.
@@ -215,7 +269,7 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * It stays at the top rather than after the list, so its position does not
     * move as the vocabulary grows -- the row you reach for to add a food is in
     * the same place on the tenth use as on the first. */
-   menu_button(fb, h, x, y, rx - x, sc, "+ NEW FOOD", 0xFFCCCCCC,
+   menu_button(fb, h, x, y, rx - x, sc, "+ NEW FOOD", UI_TEXT_DIM,
                MA_FOODTYPE_NEW, 0);
    /* A BLANK LINE BELOW IT, because this row is not one of the list. It ADDS
     * to the vocabulary; everything under it PICKS from it. At the same pitch
@@ -227,9 +281,9 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
    int n = m->food.ntypes;
    if (n <= 0) {
-      draw_str(px, fb, x, y, sc, "No foods yet. Add one", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "No foods yet. Add one", UI_MUTED);
       y += lh;
-      draw_str(px, fb, x, y, sc, "and it stays on this list.", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "and it stays on this list.", UI_MUTED);
       return;
    }
 
@@ -262,7 +316,7 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * colour: coming here from the form's TYPE row, "which is currently
        * selected" is the question the screen has to answer at a glance. */
       int chosen      = (ft->id == m->food.food_type);
-      uint32_t col    = chosen ? 0xFFFFFFFF : 0xFFAAAAAA;
+      uint32_t col    = chosen ? UI_TEXT : UI_FAINT;
       const char *val = chosen ? "*" : "";
       char name[3 + FOOD_NAME_MAX + 1];
       (void)snprintf(name, sizeof name, "  %s", ft->name);
@@ -273,18 +327,21 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (npages > 1) {
       int navy = fb->height - lh - (4 * sc);
       if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc),
+         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
                     MA_FOODPAGE_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, (2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
-                    lh + (7 * sc), MA_FOODPAGE_NEXT, 0);
+         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect((2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
+                            lh + (7 * sc)),
+                    MA_FOODPAGE_NEXT, 0);
       }
    }
 }

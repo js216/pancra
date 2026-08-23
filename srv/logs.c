@@ -12,7 +12,7 @@
  * each terminated by a newline. sqlite's default TEXT collation IS bytewise,
  * so `ORDER BY line` is exactly the order the app must sort in. If that ever
  * stops being true the digests silently stop matching, which is why the
- * queries below spell out the ordering instead of relying on the primary
+ * queries below spell out the ordering rather than relying on the primary
  * key's.
  */
 #include "logs.h"
@@ -93,15 +93,15 @@ void h_digest(struct req *r)
    sqlite3_bind_int64(st, 1, r->uid);
    struct sb out                 = {0};
    char cur_log[LOGNAME_MAX + 1] = {0};
-   long cur_bucket               = -1;
-   long rows                     = 0;
+   int64_t cur_bucket            = -1;
+   int64_t rows                  = 0;
    int in_log = 0, in_bucket = 0;
    struct sha256_ctx bh, lh;
 
    int rc;
    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *log = (const char *)sqlite3_column_text(st, 0);
-      long bucket     = (long)sqlite3_column_int64(st, 1);
+      int64_t bucket  = (int64_t)sqlite3_column_int64(st, 1);
       const char *ln  = (const char *)sqlite3_column_text(st, 2);
       if (!log || !ln)
          continue;
@@ -112,7 +112,8 @@ void h_digest(struct req *r)
             hash16(&bh, bhex);
 
             char fold[64];
-            int n = snprintf(fold, sizeof fold, "%ld %s\n", cur_bucket, bhex);
+            int n = snprintf(fold, sizeof fold, "%" PRIwire " %s\n", cur_bucket,
+                             bhex);
             sha256_update(&lh, (const unsigned char *)fold, (size_t)n);
             in_bucket = 0;
          }
@@ -122,7 +123,7 @@ void h_digest(struct req *r)
             char lhex[17];
             hash16(&lh, lhex);
 
-            sb_add(&out, "%s %ld %s\n", cur_log, rows, lhex);
+            sb_add(&out, "%s %" PRIwire " %s\n", cur_log, rows, lhex);
          }
          snprintf(cur_log, sizeof cur_log, "%s", log);
          hash_start(&lh);
@@ -149,14 +150,15 @@ void h_digest(struct req *r)
       hash16(&bh, bhex);
 
       char fold[64];
-      int n = snprintf(fold, sizeof fold, "%ld %s\n", cur_bucket, bhex);
+      int n =
+          snprintf(fold, sizeof fold, "%" PRIwire " %s\n", cur_bucket, bhex);
       sha256_update(&lh, (const unsigned char *)fold, (size_t)n);
    }
    if (in_log) {
       char lhex[17];
       hash16(&lh, lhex);
 
-      sb_add(&out, "%s %ld %s\n", cur_log, rows, lhex);
+      sb_add(&out, "%s %" PRIwire " %s\n", cur_log, rows, lhex);
    }
    send_sb(r, &out);
 }
@@ -178,12 +180,12 @@ void h_digest_log(struct req *r, const char *log)
    sqlite3_bind_int64(st, 1, r->uid);
    sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
    struct sb out = {0};
-   long cur = -1, rows = 0;
+   int64_t cur = -1, rows = 0;
    int in_bucket = 0;
    struct sha256_ctx bh;
    int rc;
    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-      long bucket    = (long)sqlite3_column_int64(st, 0);
+      int64_t bucket = (int64_t)sqlite3_column_int64(st, 0);
       const char *ln = (const char *)sqlite3_column_text(st, 1);
       if (!ln)
          continue;
@@ -191,7 +193,7 @@ void h_digest_log(struct req *r, const char *log)
          char bhex[17];
          hash16(&bh, bhex);
 
-         sb_add(&out, "%ld %ld %s\n", cur, rows, bhex);
+         sb_add(&out, "%" PRIwire " %" PRIwire " %s\n", cur, rows, bhex);
          in_bucket = 0;
       }
       if (!in_bucket) {
@@ -214,7 +216,7 @@ void h_digest_log(struct req *r, const char *log)
       char bhex[17];
       hash16(&bh, bhex);
 
-      sb_add(&out, "%ld %ld %s\n", cur, rows, bhex);
+      sb_add(&out, "%" PRIwire " %" PRIwire " %s\n", cur, rows, bhex);
    }
    send_sb(r, &out);
 }
@@ -223,7 +225,7 @@ void h_digest_log(struct req *r, const char *log)
  *
  * Bounded without a cap of its own: a bucket can only have got here through
  * a PUT, and a PUT body cannot exceed BODY_MAX. */
-void h_bucket_get(struct req *r, const char *log, long bucket)
+void h_bucket_get(struct req *r, const char *log, int64_t bucket)
 {
    if (!log_name_ok(log) || bucket < 0) {
       http_text(r->c, 400, "Bad Request", "bad log or bucket\n");
@@ -262,8 +264,8 @@ void h_bucket_get(struct req *r, const char *log, long bucket)
  * unbound. Returns 0 if the statement could not be prepared or did not
  * produce its row -- see the caller for why that must refuse the write rather
  * than assume zero. */
-static int quota_count(struct db *d, long *out, const char *sql, long uid,
-                       const char *log, long bucket)
+static int quota_count(struct db *d, int64_t *out, const char *sql, int64_t uid,
+                       const char *log, int64_t bucket)
 {
    sqlite3_stmt *st = db_prep(d, sql);
    if (!st)
@@ -302,11 +304,11 @@ static int row_ok(const char *line, size_t len)
  * of editing or deleting a row: a corrected dose, a deleted one and a
  * backfilled reading all reach the server the same way, as "this bucket now
  * contains exactly these lines". The replacement is one transaction, so a
- * connection dropped mid-PUT leaves the old bucket intact rather than half a
- * new one -- a half-written bucket would leave both sides disagreeing with no
- * way to notice.
+ * connection dropped mid-PUT leaves the stored bucket intact rather than
+ * half a new one -- a half-written bucket would leave both sides disagreeing
+ * with no way to notice.
  */
-void h_bucket_put(struct req *r, const char *log, long bucket)
+void h_bucket_put(struct req *r, const char *log, int64_t bucket)
 {
    if (!log_name_ok(log) || bucket < 0 || bucket > 0x7fffffffL) {
       http_text(r->c, 400, "Bad Request", "bad log or bucket\n");
@@ -353,14 +355,14 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
    }
    /* EVERY COUNT IS MANDATORY.
     *
-    * These four queries decide whether the write is allowed. Each used to be
-    * wrapped in `if (st)` with the count left at 0 when prepare failed, and
-    * with a step that was not a row leaving it at 0 too -- so a database
-    * error did not refuse the write, it granted UNLIMITED quota: zero rows
-    * held, zero buckets, zero logs, every cap passed. The one path where the
+    * These four queries decide whether the write is allowed. Wrapped in
+    * `if (st)` with the count left at 0 when prepare fails, and with a step
+    * that is not a row leaving it at 0 too, a database error does not refuse
+    * the write -- it grants UNLIMITED quota: zero rows held, zero buckets,
+    * zero logs, every cap passed. The one path where the
     * server cannot see what it is holding is exactly the path where it must
     * not decide it has room. */
-   long have_rows = 0, have_here = 0, have_logs = 0, have_buckets = 0;
+   int64_t have_rows = 0, have_here = 0, have_logs = 0, have_buckets = 0;
    int counted = 1;
    counted     = counted && quota_count(r->db, &have_rows,
                                         "SELECT count(*) FROM logrow"
@@ -383,7 +385,7 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
       oops(r);
       return;
    }
-   if (have_rows - have_here + (long)nlines > USER_ROWS) {
+   if (have_rows - have_here + (int64_t)nlines > USER_ROWS) {
       db_exec(r->db, "ROLLBACK");
       http_text(r->c, 507, "Insufficient Storage", "at the row cap\n");
       return;
@@ -419,7 +421,7 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
    int ok = sqlite3_step(del) == SQLITE_DONE;
    sqlite3_finalize(del);
 
-   long stored = 0;
+   int64_t stored = 0;
    for (size_t i = 0; ok && i < r->body_len;) {
       size_t j = i;
       while (j < r->body_len && r->body[j] != '\n')
@@ -452,6 +454,6 @@ void h_bucket_put(struct req *r, const char *log, long bucket)
       return;
    }
    char msg[64];
-   snprintf(msg, sizeof msg, "stored %ld rows\n", stored);
+   snprintf(msg, sizeof msg, "stored %" PRIwire " rows\n", stored);
    http_text(r->c, 200, "OK", msg);
 }

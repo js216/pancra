@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
-// jbridge.h --- Every call this app makes into Ble.java, in one place
+// jbridge.h --- Every call this app makes into the Java adapters
 // Copyright 2026 Jakob Kastelic
 //
 /* THE ONLY FILE THAT KNOWS THE JAVA SIDE EXISTS.
  *
- * main.c used to hold the class global-ref, twelve cached jmethodIDs and a
- * hand-written CallStatic*Method at every use site. That is why the rest of
- * main.c could not be split up: any workflow that touched a system service
+ * A class global-ref, twelve cached jmethodIDs and a hand-written
+ * CallStatic*Method at every use site, held in main.c, are why the rest of
+ * main.c cannot be split up: any workflow that touches a system service
  * -- the notification, the settings screen, EXPORT DATA, the scan -- dragged
  * raw JNI state along with it, so it could only live where the ids lived.
  *
@@ -48,11 +48,11 @@ struct ANativeActivity;
  * in our own classes.dex -- so every app class has to come the long way
  * round: the activity object -> its class -> getClassLoader -> loadClass.
  *
- * WHY IT LIVES HERE rather than in main.c, where it was. It is six chained
- * JNI calls, four of which each hand back a LOCAL REFERENCE, and it feeds
- * jb_bind: the class jb_bind globalises is exactly the one this returns. It
- * used to check nothing until the very last step, so a null loader or a
- * pending exception from step two was carried into steps three through six --
+ * WHY IT LIVES HERE rather than in main.c. It is six chained JNI calls, four
+ * of which each hand back a LOCAL REFERENCE, and it feeds jb_bind: the class
+ * jb_bind globalises is exactly the one this returns. Checked only at the
+ * very last step, a null loader or a pending exception from step two is
+ * carried into steps three through six --
  * and under CheckJNI (on for any debuggable build, and for anyone attached
  * with a debugger) making ANY JNI call with an exception pending is not an
  * error you can catch, it is `JNI DETECTED ERROR IN APPLICATION` and an
@@ -66,15 +66,32 @@ struct ANativeActivity;
  * this function acquired on the way to it is released before it returns. */
 int jb_app_class(JNIEnv *env, jobject activity, const char *name, jclass *out);
 
-/* Resolve the class and every method id. `ble_local` is the class as returned
- * by the app's own classloader; a global ref is taken here. Returns 1 on
- * success. Safe to call again -- a relaunch re-enters onCreate in the same
- * process, and re-binding would leak the previous global ref. */
-int jb_bind(JNIEnv *env, jclass ble_local);
+/* Resolve the THREE adapter classes and every method id.
+ *
+ * `ble_local` is com.jk.pancra.Ble as returned by the app's own classloader --
+ * handed in because main.c needs it anyway, to register natives on. The other
+ * two (PancraPlatform, PancraExport) are resolved here by name through
+ * `activity`, since nothing outside this file has a use for them. Global refs
+ * are taken for all three.
+ *
+ * ALL OR NOTHING: a partial bridge is a feature that silently does nothing,
+ * so a failure leaves every id and every class NULL and returns 0. Safe to
+ * call again -- a relaunch re-enters onCreate in the same process, and
+ * re-binding would leak the previous global refs. */
+int jb_bind(JNIEnv *env, jobject activity, jclass ble_local);
 
-/* The bound class, for the callers that must register natives on it
- * themselves (dexble_register, and the advert callback). NULL until bound. */
+/* The bound Ble class, for the callers that must register natives on it
+ * themselves (dexble_register, and the advert callback). NULL until bound.
+ *
+ * NATIVES ARE WHY Ble IS STILL A CLASS OF ITS OWN: RegisterNatives binds them
+ * to one class, so the GATT callbacks and the sync entry points are declared
+ * there whatever else moves out. */
 jclass jb_class(void);
+
+/* The bound PancraPlatform class, for the one caller outside this file that
+ * needs it: dexble.c starts the foreground service, which is a platform
+ * policy and not a BLE operation. NULL until bound. */
+jclass jb_platform_class(void);
 
 /* --- scan lifecycle --- */
 
@@ -99,13 +116,13 @@ int jb_stop(JNIEnv *env);
 /*
  * EVERY ONE OF THESE ANSWERS WHETHER JAVA ACTUALLY DID IT.
  *
- * They used to be `void`, or to return the Java value directly. Both hid the
- * same failure: a JNI call that throws still RETURNS, with a pending
- * exception and a zeroed result. So `jb_battery_ok` reported "not exempt"
- * for a throw exactly as for a real denial, `jb_standby_bucket` returned 0
- * ("active") for one, and every void one reported nothing at all -- while
- * the pending exception waited to abort the VM at the next unrelated JNI
- * call on that thread.
+ * NOT `void`, and not the Java value returned directly. Both hide the same
+ * failure: a JNI call that throws still RETURNS, with a pending exception and
+ * a zeroed result. `jb_battery_ok` would report "not exempt" for a throw
+ * exactly as for a real denial, `jb_standby_bucket` would return 0
+ * ("active") for one, and a void one reports nothing at all -- while the
+ * pending exception waits to abort the VM at the next unrelated JNI call on
+ * that thread.
  *
  * The commands return 1 when Java completed the call. The queries return 1
  * when Java ANSWERED and write the answer through the out-parameter, which

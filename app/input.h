@@ -37,21 +37,15 @@ int on_input(int fd, int events, void *data);
 /* The touch-target list the renderer fills and this file reads. */
 struct hits *input_hits(void);
 
-/* THE IDENTITY HALF OF A PRESS, and the rule a test can reach.
- *
- * input_arm_row latches the device under the finger at touch-DOWN (nothing,
- * for an action whose ix is a value). input_row_value answers at touch-UP:
- * 1 to fire, with *val the value to dispatch -- the DEVICE ID for a device
- * row -- and 0 when the row no longer holds the device that was pressed, in
- * which case nothing fires. See input.c for why. */
-void input_arm_row(int action, int row);
 int input_row_value(int action, int row, int *val);
 
 /* Shade the armed control, if it is still under the finger and still resolves
  * to the same action in the just-rebuilt hit list. */
 void input_press_overlay(struct ANativeWindow_Buffer *buf);
 
-/* Cancel any arming: the screen is about to change under the finger. */
+
+void input_arm_row(int action, int row);
+
 void press_cancel(void);
 
 #endif

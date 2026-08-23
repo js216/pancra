@@ -1,88 +1,224 @@
 // SPDX-License-Identifier: GPL-3.0
-// aes.c --- Portable AES-128 single-block encryption
+// aes.c --- Portable constant-time AES-128 single-block encryption
 // Copyright 2026 Jakob Kastelic
 
-/* Portable AES-128 single-block encryption (public-domain style). No deps. */
+/* Portable AES-128. NO TABLE IS INDEXED BY A SECRET; see aes.h.
+ *
+ * As a 256-byte array the S-box is read at a state- or key-derived offset,
+ * sixteen times a round and sixteen more per key schedule -- the whole of the
+ * Bernstein / Osvik-Shamir-Tromer surface. Here it is COMPUTED, from its
+ * definition, with bitwise operations on bit-sliced data.
+ *
+ * HOW, in one paragraph. The AES S-box is the multiplicative inverse in
+ * GF(2^8) (with 0 mapped to itself) followed by a fixed affine map over GF(2).
+ * The inverse is x^254, by Fermat, and exponentiation is squarings and
+ * multiplications in the field -- all of which are AND and XOR once the data
+ * is transposed so that bit b of every byte lives in plane b. Sixteen bytes go
+ * in one 16-bit word per plane, so the whole SubBytes step is 11 field
+ * operations on 8 words, and the cost per byte falls by sixteen.
+ *
+ * WHY THIS IS NOT "a hand-rolled cryptographic implementation" in the sense
+ * aes.h warns about. Nothing here is a new cipher, a new circuit, or a clever
+ * minimisation: it is the S-box's textbook definition evaluated directly, and
+ * the surrounding rounds are the ordinary byte-oriented ShiftRows, MixColumns
+ * and AddRoundKey. What stands in for a lookup is arithmetic whose
+ * agreement with that lookup is checked EXHAUSTIVELY, for all 256 inputs, in
+ * test/srv/cryptotest.c, alongside the FIPS-197 and GCM vectors the file
+ * already had to pass. The property itself -- no memory read at a
+ * secret-derived index -- is structural and visible: there is one array in
+ * this file, the round-constant table, and its index is the round number. */
 #include "aes.h"
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint8_t sbox[256] = {
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
-    0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
-    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, 0xb7, 0xfd, 0x93, 0x26,
-    0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2,
-    0xeb, 0x27, 0xb2, 0x75, 0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
-    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84, 0x53, 0xd1, 0x00, 0xed,
-    0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f,
-    0x50, 0x3c, 0x9f, 0xa8, 0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
-    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, 0xcd, 0x0c, 0x13, 0xec,
-    0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14,
-    0xde, 0x5e, 0x0b, 0xdb, 0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
-    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79, 0xe7, 0xc8, 0x37, 0x6d,
-    0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f,
-    0x4b, 0xbd, 0x8b, 0x8a, 0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
-    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, 0xe1, 0xf8, 0x98, 0x11,
-    0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f,
-    0xb0, 0x54, 0xbb, 0x16};
+/* ---- GF(2^8), BIT-SLICED --------------------------------------------------
+ *
+ * A value is eight uint16_t planes: bit i of plane b is bit b of byte i. Every
+ * routine below therefore operates on sixteen bytes at once, in parallel, with
+ * no data-dependent control flow and no memory access at a computed index. */
+
+/* THE VALUE TYPE, passed and returned BY VALUE on purpose. Taking
+ * `uint16_t a[8], uint16_t r[8]` pointers gives the compiler operands it must
+ * assume can alias -- so every intermediate goes back to memory between
+ * operations and the cipher runs three times slower than the operation count
+ * says it should. A struct by value cannot alias anything and lives in
+ * registers. */
+struct gf8 {
+   uint16_t p[8];
+};
+
+/* Fold a 15-term carry-less product back into 8 terms, modulo the AES field
+ * polynomial x^8 + x^4 + x^3 + x + 1.
+ *
+ * From x^8 = x^4 + x^3 + x + 1 it follows that a term of degree k >= 8
+ * contributes to degrees k-4, k-5, k-7 and k-8. Folding from the TOP down
+ * matters: k-4 can itself still be >= 8, and going downwards means that term
+ * has not been processed yet. */
+static struct gf8 gf_reduce(uint16_t t[15])
+{
+   struct gf8 r;
+   for (int k = 14; k >= 8; k--) {
+      const uint16_t c = t[k];
+      t[k - 4] ^= c;
+      t[k - 5] ^= c;
+      t[k - 7] ^= c;
+      t[k - 8] ^= c;
+   }
+   for (int i = 0; i < 8; i++)
+      r.p[i] = t[i];
+   return r;
+}
+
+/* a * b. Schoolbook: the coefficient of x^(i+j) collects a_i AND b_j. */
+static struct gf8 gf_mul(struct gf8 a, struct gf8 b)
+{
+   uint16_t t[15] = {0};
+   for (int i = 0; i < 8; i++)
+      for (int j = 0; j < 8; j++)
+         t[i + j] ^= (uint16_t)(a.p[i] & b.p[j]);
+   return gf_reduce(t);
+}
+
+/* a * a. Squaring is linear over GF(2) -- the cross terms cancel in pairs --
+ * so it is a spread of the planes to even degrees and one reduction, which is
+ * why the exponentiation below prefers squarings to multiplications. */
+static struct gf8 gf_sqr(struct gf8 a)
+{
+   uint16_t t[15] = {0};
+   for (int i = 0; i < 8; i++)
+      t[(size_t)i * 2] = a.p[i];
+   return gf_reduce(t);
+}
+
+/* a^-1, and 0 -> 0.
+ *
+ * a^254 = a^-1 for every nonzero a (the group has order 255), and 0^254 = 0,
+ * which is exactly the convention AES wants -- so no special case, and
+ * therefore no branch. The addition chain is 7 squarings and 4 multiplies:
+ *
+ *   x^2 -> x^3 -> x^6 -> x^12 -> x^15 -> x^240 -> x^252 -> x^254 */
+static struct gf8 gf_inv(struct gf8 a)
+{
+   const struct gf8 x2   = gf_sqr(a);
+   const struct gf8 x3   = gf_mul(x2, a);
+   const struct gf8 x6   = gf_sqr(x3);
+   const struct gf8 x12  = gf_sqr(x6);
+   const struct gf8 x15  = gf_mul(x12, x3);
+   struct gf8 x240       = gf_sqr(x15);
+   x240                  = gf_sqr(x240);
+   x240                  = gf_sqr(x240);
+   x240                  = gf_sqr(x240);
+   const struct gf8 x252 = gf_mul(x240, x12);
+   return gf_mul(x252, x2);
+}
+
+/* The S-box's affine half: b_i = a_i ^ a_(i+4) ^ a_(i+5) ^ a_(i+6) ^ a_(i+7)
+ * ^ c_i, indices mod 8, with c = 0x63. The one conditional here is on a bit of
+ * that CONSTANT and on the loop index, neither of which is a secret. */
+static struct gf8 gf_affine(struct gf8 a)
+{
+   struct gf8 o;
+   for (int i = 0; i < 8; i++) {
+      const unsigned u = (unsigned)i;
+      uint16_t v = (uint16_t)((unsigned)a.p[i] ^ (unsigned)a.p[(u + 4U) & 7U] ^
+                              (unsigned)a.p[(u + 5U) & 7U] ^
+                              (unsigned)a.p[(u + 6U) & 7U] ^
+                              (unsigned)a.p[(u + 7U) & 7U]);
+      if (((0x63U >> u) & 1U) != 0U)
+         v = (uint16_t)~v;
+      o.p[i] = v;
+   }
+   return o;
+}
+
+/* ---- THE TRANSPOSE, which is the only cost this scheme adds ---------------
+ *
+ * Both directions are fixed shifts of a fixed number of bytes: the loop bounds
+ * are `n` and 8, never a value. */
+static struct gf8 gf_slice(const uint8_t *s, int n)
+{
+   struct gf8 r;
+   for (int b = 0; b < 8; b++)
+      r.p[b] = 0;
+   for (int i = 0; i < n; i++)
+      for (int b = 0; b < 8; b++)
+         r.p[b] |=
+             (uint16_t)((((unsigned)s[i] >> (unsigned)b) & 1U) << (unsigned)i);
+   return r;
+}
+
+static void gf_unslice(struct gf8 a, uint8_t *s, int n)
+{
+   for (int i = 0; i < n; i++) {
+      unsigned v = 0;
+      for (int b = 0; b < 8; b++)
+         v |= (((unsigned)a.p[b] >> (unsigned)i) & 1U) << (unsigned)b;
+      s[i] = (uint8_t)v;
+   }
+}
+
+/* SubBytes over `n` bytes in place, n <= 16. The whole S-box, for every byte
+ * at once. */
+static void sub_bytes(uint8_t *s, int n)
+{
+   gf_unslice(gf_affine(gf_inv(gf_slice(s, n))), s, n);
+}
 
 /* Multiply by x in GF(2^8): shift left, and fold in the reduction polynomial
  * if a one fell off the top.
  *
- * The fold used to be `(x >> 7) * 0x1b`, a multiply by a secret 0 or 1. Every
- * core this repo targets has a fixed-latency integer multiplier, so that was
+ * The fold is NOT `(x >> 7) * 0x1b`, a multiply by a secret 0 or 1. Every
+ * core this repo targets has a fixed-latency integer multiplier, so that is
  * almost certainly not leaking -- but "almost certainly" is a claim about a
  * microarchitecture, and small cores with early-terminating multipliers exist
  * (this server also builds for a riscv64 board). A mask costs the same and
  * needs no such claim: 0 - (x >> 7) is 0x00 or 0xff, and AND with 0x1b picks
- * the polynomial or nothing.
- *
- * This is a rounding error next to the S-box lookups below, and it is fixed
- * here only because it was free. See aes.h for the leak that matters. */
+ * the polynomial or nothing. */
 static uint8_t xtime(uint8_t x)
 {
    const unsigned hi = (unsigned)x >> 7U; /* 0 or 1 */
    return (uint8_t)(((unsigned)x << 1U) ^ ((0U - hi) & 0x1bU));
 }
 
-/* Expand 16-byte key into 176 bytes (11 round keys). */
-static void expand(const uint8_t key[16], uint8_t rk[176])
+/* Expand a 16-byte key into 176 bytes (11 round keys).
+ *
+ * ONCE PER KEY, NOT ONCE PER BLOCK. Run inside aes128_encrypt, every 16 bytes
+ * of TLS record traffic re-derives the whole schedule -- 40 S-box evaluations
+ * per block on top of the 160 the rounds need. With a computed S-box that
+ * overhead is not a rounding error, which is why struct aes128 exists and why
+ * lib/gcm.c keeps one. */
+void aes128_init(struct aes128 *ctx, const uint8_t key[16])
 {
    static const uint8_t rcon[10] = {0x01, 0x02, 0x04, 0x08, 0x10,
                                     0x20, 0x40, 0x80, 0x1b, 0x36};
+   uint8_t *rk                   = ctx->rk;
    for (int i = 0; i < 16; i++)
       rk[i] = key[i];
    for (int i = 16; i < 176; i += 4) {
       uint8_t t[4] = {rk[i - 4], rk[i - 3], rk[i - 2], rk[i - 1]};
       if (i % 16 == 0) {
-         uint8_t tmp = t[0];
-         t[0]        = sbox[t[1]] ^ rcon[(i / 16) - 1];
-         t[1]        = sbox[t[2]];
-         t[2]        = sbox[t[3]];
-         t[3]        = sbox[tmp];
+         const uint8_t tmp = t[0];
+         t[0]              = t[1];
+         t[1]              = t[2];
+         t[2]              = t[3];
+         t[3]              = tmp; /* RotWord */
+         sub_bytes(t, 4);         /* SubWord */
+         t[0] ^= rcon[(i / 16) - 1];
       }
       for (int j = 0; j < 4; j++)
          rk[i + j] = rk[i - 16 + j] ^ t[j];
    }
 }
 
-void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
-                    uint8_t out[16])
+void aes128_encrypt_ctx(const struct aes128 *ctx, const uint8_t in[16],
+                        uint8_t out[16])
 {
-   uint8_t rk[176];
+   const uint8_t *rk = ctx->rk;
    uint8_t s[16];
-   expand(key, rk);
    for (int i = 0; i < 16; i++)
       s[i] = in[i] ^ rk[i];
    for (int round = 1; round <= 10; round++) {
-      /* SubBytes */
-      for (int i = 0; i < 16; i++)
-         s[i] = sbox[s[i]];
+      sub_bytes(s, 16);
       /* ShiftRows (column-major state: byte index = col*4 + row) */
       uint8_t t[16];
       for (int r = 0; r < 4; r++)
@@ -93,14 +229,14 @@ void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
       /* MixColumns (skip on final round) */
       if (round != 10) {
          for (int c = 0; c < 4; c++) {
-            uint8_t *col = s + ((size_t)c * 4);
-            uint8_t a0   = col[0];
-            uint8_t a1   = col[1];
-            uint8_t a2   = col[2];
-            uint8_t a3   = col[3];
-            col[0]       = (uint8_t)((unsigned)xtime(a0) ^
-                                     ((unsigned)xtime(a1) ^ (unsigned)a1) ^
-                                     (unsigned)a2 ^ (unsigned)a3);
+            uint8_t *col     = s + ((size_t)c * 4);
+            const uint8_t a0 = col[0];
+            const uint8_t a1 = col[1];
+            const uint8_t a2 = col[2];
+            const uint8_t a3 = col[3];
+            col[0]           = (uint8_t)((unsigned)xtime(a0) ^
+                                         ((unsigned)xtime(a1) ^ (unsigned)a1) ^
+                                         (unsigned)a2 ^ (unsigned)a3);
             col[1] =
                 (uint8_t)((unsigned)a0 ^ (unsigned)xtime(a1) ^
                           ((unsigned)xtime(a2) ^ (unsigned)a2) ^ (unsigned)a3);
@@ -118,4 +254,12 @@ void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
    }
    for (int i = 0; i < 16; i++)
       out[i] = s[i];
+}
+
+void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
+                    uint8_t out[16])
+{
+   struct aes128 ctx;
+   aes128_init(&ctx, key);
+   aes128_encrypt_ctx(&ctx, in, out);
 }

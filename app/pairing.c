@@ -10,6 +10,7 @@
 #include "log.h"
 #include "meter.h"
 #include "nav.h"
+#include "paircode.h"
 #include "reconcile.h"
 #include "scan.h"
 #include "scanlogic.h"
@@ -34,12 +35,12 @@
 /* Last connect attempt per link, so a burst of adverts yields ONE connect. */
 /* PER-LINK RECONNECT THROTTLE, claimed atomically.
  *
- * The advert handler read this, compared it against the clock and wrote it
- * back -- a read-modify-write on a binder thread, with one such thread per
- * link and adverts arriving in bursts. Two adverts for the same sensor
- * landing together both saw the old stamp, both decided the window had
- * passed, and both called dexble_pair for the SAME link: two connects raced,
- * and the second reset the first mid-handshake.
+ * Read it, compare it against the clock and write it back and that is a
+ * read-modify-write on a binder thread, with one such thread per link and
+ * adverts arriving in bursts. Two adverts for the same sensor landing
+ * together both read the same stamp, both decide the window has passed, and
+ * both call dexble_pair for the SAME link: two connects race, and the second
+ * resets the first mid-handshake.
  *
  * A compare-exchange makes the claim the same act as the test, so exactly one
  * advert per link per window can win it. */
@@ -145,7 +146,7 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
       return;
    }
 
-   atomic_fetch_add_explicit(&g_total, 1u, memory_order_relaxed);
+   atomic_fetch_add_explicit(&g_total, 1U, memory_order_relaxed);
    /* Which Dexcom families we will talk to at all. Stelo advertises "DX01",
     * G7 "DXCM"; both are supported. The safety property is NOT "never a G7" --
     * it is "never a sensor the user did not choose here":
@@ -199,16 +200,20 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
       if (kidx >= 0 && kkind == KIND_CGM) {
          /* A CGM is registered the moment the user COMMITS to pairing it, so
           * "has a slot" no longer implies "is paired". Exclude it from the
-          * candidate list only once a BONDED session exists -- the state a
-          * slot used to imply. Without this, one failed pairing (wrong code,
-          * out of range) left the sensor registered-but-never-bonded and
+          * candidate list only once a BONDED session exists -- which is not
+          * what a slot implies. Without this, one failed pairing (wrong code,
+          * out of range) leaves the sensor registered-but-never-bonded and
           * permanently missing from ADD SENSOR: unretryable without first
           * forgetting the device, with nothing saying so. */
          int klink = link_for_sensor(kid);
          if (klink >= 0) {
             struct dex_session ks;
-            driver_session_of(klink, &ks);
-            known = ks.bonded;
+            /* A LINK THE DRIVER REFUSES IS NOT A BONDED SESSION. The refusal
+             * zeroes ks, so `known` would come out 0 either way -- but the
+             * answer is read rather than discarded because the two reasons
+             * for 0 are different, and one of them means link_for_sensor
+             * returned something this driver has never heard of. */
+            known = driver_session_of(klink, &ks) && ks.bonded;
          }
       } else {
          known = (kidx >= 0); /* meters keep the pre-existing rule */
@@ -264,9 +269,41 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
          if (link < 0)
             break;
          struct dex_session ls;
-         driver_session_of(link, &ls); /* takes the lock itself */
+         /* takes the lock itself; a link it does not have is treated exactly
+          * like a link with no MAC -- there is nothing to reconnect to */
+         if (!driver_session_of(link, &ls))
+            break;
+         if (!ls.mac[0] && ls.paired) {
+            /* REGISTERED AND KEYED, WITH NOTHING FOR THE LINK TO DIAL.
+             *
+             * The link's address cache (files/stelo.mac.<link>) is written
+             * the first time a session actually STREAMS, so a pairing that
+             * completed its key exchange and then lost the link before its
+             * first reading leaves that link holding a key and no target --
+             * and the startup recovery cannot supply one either, because it
+             * asks the SYSTEM BOND LIST, which a sensor whose bond was
+             * refused is not in. Nothing else revisits such a device: it
+             * stays registered, unreachable, and shown as a healthy sensor
+             * in warmup for as long as the install lasts.
+             *
+             * Everything needed to repair it is already in hand. The
+             * registry holds the address this phone paired, this advert is
+             * that exact device on the air (the identity matched above), and
+             * ls.paired says the link holds its J-PAKE key -- so the
+             * reconnect runs the saved-key path and asks for no applicator
+             * code. Bind the address durably and go on to connect.
+             *
+             * ls.paired IS THE CONDITION, not a detail. Without a key on
+             * this link a connect would demand a fresh pairing with a code
+             * the user no longer has, which is why a link with neither key
+             * nor address is still left to the ADD DEVICE flow below. */
+            if (driver_bind_mac(link, mac) != BIND_PUBLISHED)
+               break; /* target unchanged; the next advert tries again */
+            if (!driver_session_of(link, &ls))
+               break;
+         }
          if (!ls.mac[0])
-            break; /* registered but not yet bonded: ADD SENSOR owns it */
+            break; /* registered but not yet paired: ADD DEVICE owns it */
          /* A sensor advertises repeatedly inside one wake window. Re-issuing
           * connect on every advert would be a connect storm -- hard on the
           * sensor's battery and a good way to strand the link -- so allow one
@@ -287,13 +324,10 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
           * however far the clock moved. */
          long tnow = realtime_s();
          long mnow = mono_s();
-         long mine = 0;
-         store_lock();
-         for (int k = 0; k < hist_count() && !mine; k++)
-            if (hist_at(k).src == (unsigned short)ids[i] &&
-                hist_at(k).kind != KIND_BGM)
-               mine = hist_at(k).t;
-         store_unlock();
+         /* THE QUESTION, ASKED: this sensor's newest CGM instant.
+          * A count/index walk under a hand-taken store lock, with the
+          * not-a-fingerstick rule spelled out, was the fourth copy of it. */
+         long mine = hist_newest_t(ids[i]);
          if (ls.bonded && mine && tnow - mine < 300)
             break; /* this sensor really is streaming */
          /* CLAIM THE WINDOW, or lose it. Not "read, compare, write": that is
@@ -330,10 +364,10 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
        *
        * sensor_reconcile binds meter_src() to the FIRST
        * OneTouch slot it finds, so with two meters registered the second could
-       * never sync: its adverts failed the address test forever, silently, with
-       * no user-visible cause. Matching per advert also keeps the safety
-       * property that made the old test exist -- a stranger's meter is still
-       * ignored, because it has no slot. */
+       * never sync: its adverts fail the address test forever, silently, with
+       * no user-visible cause. Matching per advert keeps the safety property
+       * a fixed address test has -- a stranger's meter is still ignored,
+       * because it has no slot. */
       int mid = -1;
       for (int i = 0; i < v.n && mid < 0; i++) {
          if (v.slot[i].old) /* a disconnected meter is inert */
@@ -358,8 +392,8 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
          /* The advertisement IS the "last seen" event, and it carries an
           * RSSI -- so SIGNAL STRENGTH is stamped from the same advert, not
           * left blank until a connection completes (a meter that advertised
-          * but did not finish a sync used to show LAST SEEN with a "--"
-          * signal). A completed sync's connection RSSI refines it
+          * but did not finish a sync would otherwise show LAST SEEN with a
+          * "--" signal). A completed sync's connection RSSI refines it
           * afterwards, and this must be recorded BEFORE the sync starts,
           * which persists it. */
          /* Already armed? Then the controller is initiating on its own and
@@ -485,8 +519,8 @@ void pair_cancel(void)
  */
 int select_candidate(void)
 {
-   /* Decision in scanlogic.c so `make check` can fail on it. Deleting the
-    * ambiguity rule here used to pass the entire gate. */
+   /* Decision in scanlogic.c so `make check` can fail on it: with the rule
+    * inline here, deleting it passes the entire gate. */
    /* Only candidates heard RECENTLY qualify. The list is never pruned, so a
     * sensor that left the room an hour ago still sits there with its stale
     * RSSI -- and a pending pairing evaluates this on every tick, possibly
@@ -528,13 +562,13 @@ int fresh_candidates(void)
    return n;
 }
 
-/* LAND ON THE NEW DEVICE after a successful pairing commit, instead of
+/* LAND ON THE NEW DEVICE after a successful pairing commit, rather than
  * dropping the user back where they started.
  *
- * Pairing used to end by simply closing the keypad, which returned to the
- * DEVICES list or the main screen with nothing to show for it -- the tap read
- * as having done nothing even though it had worked, because a fresh CGM has no
- * reading for its whole warmup hour. The per-device screen is where that hour
+ * Ending by simply closing the keypad returns to the DEVICES list or the main
+ * screen with nothing to show for it -- the tap reads as having done nothing
+ * even though it worked, because a fresh CGM has no reading for its whole
+ * warmup hour. The per-device screen is where that hour
  * is legible: it carries the WARMUP countdown, the session state and the
  * pairing outcome, so the flow ends looking at the thing it just created.
  *
@@ -551,7 +585,8 @@ void open_new_device(int id)
    nav_go(SCR_SENSOR);
 }
 
-/* Commit to a specific sensor: NOW drop the old bond and pair the chosen MAC
+/* Commit to a specific sensor: NOW drop the existing bond and pair the chosen
+ * MAC
  * with the entered code. Only reached after the code is in and a candidate
  * is chosen (auto or from the list). */
 void commit_pair(const char *mac)
@@ -705,9 +740,9 @@ void commit_pair(const char *mac)
    open_new_device(newdev);
    /* THE OUTCOME AND THE LINK -- NEVER THE CODE, NEVER THE ADDRESS.
     *
-    * This line used to read `pair new sensor %s with code %s on link %d` with
-    * the sensor's BLE address and the four-digit J-PAKE code spelled out in
-    * full. That code is the shared secret the whole EC-J-PAKE exchange proves
+    * `pair new sensor %s with code %s on link %d` spells the sensor's BLE
+    * address and the four-digit J-PAKE code out in full. That code is the
+    * shared secret the whole EC-J-PAKE exchange proves
     * knowledge of: it is what authenticates THIS phone to THAT sensor, it is
     * printed on the applicator and typed once, and it is not rotatable for
     * the life of the wear. Beside it sat the address needed to find the
@@ -735,7 +770,7 @@ int kp_commit_pair(void)
       /* The code is what the J-PAKE exchange proves knowledge of: one that
        * is used but not stored pairs now and fails silently after the next
        * launch, with no way for the user to know why. */
-      if (settings_set_code(code) != SETTINGS_OK) {
+      if (code_set(code) != SETTINGS_OK) {
          /* AND STOP. The setter rolls back, so what is stored is the
           * PREVIOUS code -- and commit_pair reads the stored one, so going
           * on would run the J-PAKE exchange with a secret the user did not
@@ -780,6 +815,17 @@ int kp_commit_pair(void)
          LOGI("pairing armed: awaiting a %s candidate",
               sensor_type_name(sel_add_type()));
          keypad_close();
+         /* END ON THE PENDING ROW, the way a completed pairing ends on the
+          * new device's screen (open_new_device). Arming produces no device,
+          * so the only thing that says the code was accepted is the PENDING
+          * row on the device list -- and closing the keypad alone drops the
+          * user back where the flow began, which from the main screen is a
+          * four-digit code typed for no visible result.
+          *
+          * AFTER keypad_close(), for the reason open_new_device gives: that
+          * call leaves cur_screen() at the flow's own return target, so THAT
+          * is the origin nav_back records for this screen's X. */
+         nav_go(SCR_DEVICES);
       }
    } else {
       return COMMIT_PASS;

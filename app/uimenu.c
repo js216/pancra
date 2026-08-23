@@ -3,9 +3,10 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "uimenu.h"
-#include "font.h"
 #include "exercise.h"
-#include "insulin.h" /* struct ins_rec + INS_* for the INSULIN LOG table */
+#include "font.h"
+#include "insrow.h"  /* INS_SLOW / INS_FAST: which kind a dose row names */
+#include "insulin.h" /* struct ins_rec: the doses the INSULIN LOG table draws */
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h"  /* sensor types, kinds, marker enum */
@@ -26,20 +27,32 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    /* Bounded by height as well as width -- see ui_fit_scale. Worst case is
-    * title (2) + five submenu rows each with a blank line after (10) + the
-    * separator and the EXPORT DATA button (1 + 25/16). */
+    * title (2) + FIVE submenu rows at the pitch below + the separator and the
+    * EXPORT DATA button (1 + 25/16), which the 15 below covers with room.
+    *
+    * Landscape is where this screen is tightest -- 1920x1080, 2340x1080 and
+    * 2400x1080 are the geometries that bite -- so the budget is measured
+    * there rather than at the portrait size a glance is taken at.
+    *
+    * WHITESPACE IS WHAT GIVES WAY when the budget is tight, never the font:
+    * ui_fit_scale's row count is a cliff, and one more row makes every label
+    * on the screen smaller. Three quarters of a blank line between rows still
+    * reads as a calm block. */
    int sc  = ui_fit_scale(fb->width, fb->height, 15);
    int tsc = 2 * sc;
    int lh  = 16 * sc; /* generous pitch: a blank line between rows */
-   int x   = 4 * sc;
-   int rx  = fb->width - (4 * sc);
-   int y   = (fb->height / 20) + (8 * sc);
+   /* THREE QUARTERS of a blank line between submenu rows -- see the budget
+    * above for what forced it and why it is whitespace that gave way. */
+   int rowpitch = (7 * lh) / 4;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
 
    /* title with a right-aligned X to close */
-   draw_str(px, fb, x, y, tsc, "SETTINGS", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "SETTINGS", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* generous close target: title + blank line + DISPLAY header */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 3 * lh, MA_CLOSE, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 3 * lh), MA_CLOSE, 0);
    /* The same 3*lh title gap as every submenu this screen leads to. SETTINGS
     * was itself the odd one out at 2*lh, so the gap CHANGED as you stepped
     * from it into DISPLAY or DEVICES -- the inconsistency was most visible on
@@ -47,21 +60,21 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += 3 * lh;
 
    /* Five submenu rows -- DISPLAY / DEVICES / ALARM / PERMISSIONS / REMOTE --
-    * with a blank line between each, so the doors read as one calm block.
+    * spaced apart so the doors read as one calm block.
     * (The alarm settings live on their own submenu now, render_alarm.)
     *
     * NO ELLIPSIS on any of them. "DISPLAY ..." was the only row carrying one,
     * and it said nothing the row did not: every entry here is a door, so an
     * ellipsis on one of five marks nothing and just reads as ragged.
     *
-    * DEVICES is a door, not a list: the registry used to be inlined here,
-    * which tied the settings screen's height to how many sensors were paired
-    * and pushed EXPORT DATA off the bottom. It now has its own screen -- the
-    * same one the main screen's big number opens. Its value is the live device
+    * DEVICES is a door, not a list: the registry inlined here ties the
+    * settings screen's height to how many sensors are paired and pushes
+    * EXPORT DATA off the bottom. It has its own screen -- the same one the
+    * main screen's big number opens. Its value is the live device
     * count, so the common question ("is everything still connected?") is
     * answered without opening it. */
-   menu_row(fb, h, y, sc, lh, "DISPLAY", "", 0xFFFFFFFF, MA_DISPLAY_OPEN, 0);
-   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "DISPLAY", "", UI_TEXT, MA_DISPLAY_OPEN, 0);
+   y += rowpitch;
    {
       int nlive = 0;
       int nconn = 0;
@@ -87,11 +100,11 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
       char dv[24];
       (void)snprintf(dv, sizeof dv, "%d OF %d ON", nconn, nlive);
       menu_row(fb, h, y, sc, lh, "DEVICES", dv,
-               (nlive > 0 && nconn == nlive) ? 0xFF33FF88 : 0xFFAAAAAA,
+               (nlive > 0 && nconn == nlive) ? UI_OK : UI_FAINT,
                MA_DEVICES_OPEN, 0);
-      y += 2 * lh;
+      y += rowpitch;
    }
-   menu_row(fb, h, y, sc, lh, "ALARM", "", 0xFFFFFFFF, MA_ALARM_OPEN, 0);
+   menu_row(fb, h, y, sc, lh, "ALARM", "", UI_TEXT, MA_ALARM_OPEN, 0);
    /* The row's "value" is the SAME icon language the two main-screen
     * threshold rows use -- speaker / phone / slashed circle / dot -- in the
     * SAME fixed, equally spaced cells (6*sc pitch, right-aligned), each
@@ -105,28 +118,28 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
    {
       int iax = rx - (38 * sc);
       if (m->prefs.sound_on)
-         draw_icon(px, fb, iax, y, sc, icon_speaker, 0xFF888888);
+         draw_icon(px, fb, iax, y, sc, icon_speaker, UI_MUTED);
       if (m->prefs.vib_on)
-         draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
+         draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
       if (m->prefs.disc)
-         draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, 0xFF888888);
+         draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, UI_MUTED);
       int nax = iax + (21 * sc); /* 3 cells + a half-cell group gap */
       if (m->prefs.nudge_sound)
-         draw_icon(px, fb, nax, y, sc, icon_speaker, 0xFF888888);
+         draw_icon(px, fb, nax, y, sc, icon_speaker, UI_MUTED);
       if (m->prefs.nudge_vib)
-         draw_icon(px, fb, nax + (6 * sc), y, sc, icon_vibrate, 0xFF888888);
+         draw_icon(px, fb, nax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
       if (m->prefs.newdata_mode)
-         draw_icon(px, fb, nax + (12 * sc), y, sc, icon_dot, 0xFF888888);
+         draw_icon(px, fb, nax + (12 * sc), y, sc, icon_dot, UI_MUTED);
    }
-   y += 2 * lh;
+   y += rowpitch;
    /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
     * is granted, red CHECK otherwise -- opening the full submenu. */
    {
       int ok = m->sys.perm[0] && m->sys.perm[1] && m->sys.perm[2] &&
                m->sys.batt_ok && !m->sys.bg_restricted;
       menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
-               ok ? 0xFF33FF88 : 0xFF4466FF, MA_PERMS_OPEN, 0);
-      y += 2 * lh;
+               ok ? UI_OK : UI_DANGER, MA_PERMS_OPEN, 0);
+      y += rowpitch;
    }
    /* REMOTE: the value is the push state -- and, when ON, the age of the
     * last push the server actually acknowledged (2xx) -- so whether
@@ -145,12 +158,12 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
       }
    }
    menu_row(fb, h, y, sc, lh, "REMOTE", rmv,
-            m->sync.remote_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_REMOTE_OPEN, 0);
+            m->sync.remote_on ? UI_OK : UI_TEXT, MA_REMOTE_OPEN, 0);
 
    /* EXPORT DATA closes the screen out: build the combined CSV and open the
-    * system share sheet. The device registry used to sit here, inline; it
-    * lives on its own screen now (render_devices, the DEVICES row above), so
-    * this screen's height no longer grows with the sensor count.
+    * system share sheet. The device registry is NOT here, inline: it lives on
+    * its own screen (render_devices, the DEVICES row above), so this screen's
+    * height does not grow with the sensor count.
     *
     * THREE gaps: the button is the one thing on this screen that is not a
     * door into a submenu, and it writes a file and opens a share sheet, so it
@@ -169,7 +182,7 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
          air = 2 * lh;
       y += air;
    }
-   menu_button(fb, h, x, y, fb->width - (2 * x), sc, "EXPORT DATA", 0xFFFFFFFF,
+   menu_button(fb, h, x, y, fb->width - (2 * x), sc, "EXPORT DATA", UI_TEXT,
                MA_EXPORT, 0);
 }
 
@@ -197,7 +210,7 @@ int cgm_expired(const struct ui_sensor *s)
 /* THE LIST'S STATE COLUMN, ABBREVIATED TO FOUR CHARACTERS.
  *
  * Every state a device can report is spelled here at one fixed width, so the
- * column is a column: the eye reads down it instead of re-measuring each row,
+ * column is a column: the eye reads down it rather than re-measuring each row,
  * and the width it does NOT vary by is width the PRIM column can have. The
  * long forms ran from three characters ("OFF") to fifteen ("CONFIRM PAIRING"),
  * and the longest of them decided how far left everything else had to start.
@@ -273,9 +286,9 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx  = fb->width - (4 * sc);
    int y   = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "ALARM", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_ALARM_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "ALARM", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_ALARM_BACK, 0);
    y += 3 * lh;
 
    /* TWO SECTIONS, and the order is the point.
@@ -300,14 +313,14 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* An enabled state reads GREEN, off stays white -- on/off is visible
     * from the colour alone, before reading a word. */
    menu_row(fb, h, y, sc, lh, "SOUND", m->prefs.sound_on ? "ON" : "OFF",
-            m->prefs.sound_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_SOUND, 0);
+            m->prefs.sound_on ? UI_OK : UI_TEXT, MA_SOUND, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "VIBRATION", m->prefs.vib_on ? "ON" : "OFF",
-            m->prefs.vib_on ? 0xFF33FF88 : 0xFFFFFFFF, MA_VIB, 0);
+            m->prefs.vib_on ? UI_OK : UI_TEXT, MA_VIB, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "DISCONNECT",
             ui_disc_lbl[(unsigned)m->prefs.disc & 3U],
-            m->prefs.disc ? 0xFF33FF88 : 0xFFFFFFFF, MA_DISC, 0);
+            m->prefs.disc ? UI_OK : UI_TEXT, MA_DISC, 0);
    y += (5 * lh) / 2; /* two rows' worth, i.e. a blank line between sections */
 
    menu_head(fb, h, y, sc, lh, "NUDGE");
@@ -319,14 +332,14 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
                    m->prefs.units, 1, MA_NUDGE_HIGH);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "SOUND", m->prefs.nudge_sound ? "ON" : "OFF",
-            m->prefs.nudge_sound ? 0xFF33FF88 : 0xFFFFFFFF, MA_NUDGE_SOUND, 0);
+            m->prefs.nudge_sound ? UI_OK : UI_TEXT, MA_NUDGE_SOUND, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "VIBRATION", m->prefs.nudge_vib ? "ON" : "OFF",
-            m->prefs.nudge_vib ? 0xFF33FF88 : 0xFFFFFFFF, MA_NUDGE_VIB, 0);
+            m->prefs.nudge_vib ? UI_OK : UI_TEXT, MA_NUDGE_VIB, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
             ui_newdata_lbl[(unsigned)m->prefs.newdata_mode % 3U],
-            m->prefs.newdata_mode ? 0xFF33FF88 : 0xFFFFFFFF, MA_NEWDATA, 0);
+            m->prefs.newdata_mode ? UI_OK : UI_TEXT, MA_NEWDATA, 0);
 }
 
 /* ---- EXPORT DATA menu (opened from SETTINGS' EXPORT DATA button) ---- */
@@ -342,9 +355,9 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "EXPORT DATA", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_EXP_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "EXPORT DATA", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_EXP_BACK, 0);
    y += 3 * lh;
 
    static const char *const rng[3] = {"30 D", "1 Y", "ALL"};
@@ -352,7 +365,7 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
        fb, h, y, sc, lh, "RANGE",
        rng[(m->sys.exp_range >= 0 && m->sys.exp_range < 3) ? m->sys.exp_range
                                                            : 2],
-       0xFFFFFFFF, MA_EXP_RANGE, 0);
+       UI_TEXT, MA_EXP_RANGE, 0);
    y += 2 * lh;
    chk_row(fb, h, y, sc, lh, "GLUCOSE", m->sys.exp_glu, MA_EXP_GLU);
    y += 2 * lh;
@@ -368,9 +381,19 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int any = m->sys.exp_glu || m->sys.exp_dev || m->sys.exp_ins;
    int bw  = fb->width - (2 * x);
    if (any)
-      menu_button(fb, h, x, y, bw, sc, "EXPORT", 0xFF33FF88, MA_EXP_GO, 0);
+      menu_button(fb, h, x, y, bw, sc, "EXPORT", UI_OK, MA_EXP_GO, 0);
    else
-      draw_str(px, fb, x, y, sc, "NOTHING SELECTED", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "NOTHING SELECTED", UI_MUTED);
+   /* THE REFUSAL, WHERE THE TAP WAS. Under the button, so the eye
+    * that is still on it sees why nothing opened. It says TRY AGAIN because
+    * that is the honest instruction: the failure is a bridge that was not
+    * there this time (a share sheet dismissed as the activity went away, a
+    * method that could not be resolved), and the next tap usually works. */
+   if (m->sys.exp_failed) {
+      y += 2 * lh;
+      draw_str(px, fb, x, y, sc, "EXPORT DID NOT START -- TRY AGAIN",
+               UI_DANGER);
+   }
 }
 
 /* ---- DISPLAY submenu (opened from SETTINGS) ---- */
@@ -386,34 +409,34 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "DISPLAY", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_DISPLAY_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "DISPLAY", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_DISPLAY_BACK,
+              0);
    y += 3 * lh;
 
    menu_row(fb, h, y, sc, lh, "ORIENTATION",
-            ui_orient_lbl[(unsigned)m->prefs.orient & 3U], 0xFFFFFFFF,
-            MA_ORIENT, 0);
+            ui_orient_lbl[(unsigned)m->prefs.orient & 3U], UI_TEXT, MA_ORIENT,
+            0);
    y += 2 * lh;
    /* "GLUCOSE UNITS", not "UNITS": with a weight unit directly below it, a
     * bare "UNITS" is the row that does not say what it governs. */
    menu_row(fb, h, y, sc, lh, "GLUCOSE UNITS",
-            m->prefs.units ? "MMOL/L" : "MG/DL", 0xFFFFFFFF, MA_UNITS, 0);
+            m->prefs.units ? "MMOL/L" : "MG/DL", UI_TEXT, MA_UNITS, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "WEIGHT UNITS", wt_unit_name(m->prefs.wunits),
-            0xFFFFFFFF, MA_WUNITS, 0);
+            UI_TEXT, MA_WUNITS, 0);
    y += 2 * lh;
    /* ALWAYS ON holds the screen awake while the app is open (the historical
     * behaviour); SYSTEM lets the normal display timeout apply. */
    menu_row(fb, h, y, sc, lh, "SCREEN",
-            m->prefs.screen_on ? "ALWAYS ON" : "SYSTEM", 0xFFFFFFFF, MA_SCREEN,
-            0);
+            m->prefs.screen_on ? "ALWAYS ON" : "SYSTEM", UI_TEXT, MA_SCREEN, 0);
    y += 2 * lh;
    char pmv[20];
    char pmvv[8];
    fmt_glu(m->plot.plot_max, m->prefs.units, pmvv, sizeof pmvv);
    (void)snprintf(pmv, sizeof pmv, "%s %s", pmvv, UI_LBL(m->prefs.units));
-   menu_row(fb, h, y, sc, lh, "PLOT MAX", pmv, 0xFFFFFFFF, MA_PLOTMAX, 0);
+   menu_row(fb, h, y, sc, lh, "PLOT MAX", pmv, UI_TEXT, MA_PLOTMAX, 0);
    y += 2 * lh;
    /* Insulin plot styling, one row PER TYPE -- each opens the full marker
     * picker (shape, colour, size) for that type. The value is the ACTUAL
@@ -422,10 +445,10 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
    static const char *const ins_lbl[2] = {"SLOW INSULIN MARKER",
                                           "FAST INSULIN MARKER"};
    for (int k = 0; k < 2; k++) {
-      draw_str(px, fb, x, y, sc, ins_lbl[k], 0xFFCCCCCC);
+      draw_str(px, fb, x, y, sc, ins_lbl[k], UI_TEXT_DIM);
       if (m->ins.ins_marker[k] == MARK_HIDE) {
          int lw = str_len("OFF") * 6 * sc;
-         draw_str(px, fb, rx - lw, y, sc, "OFF", 0xFFAAAAAA);
+         draw_str(px, fb, rx - lw, y, sc, "OFF", UI_FAINT);
       } else {
          /* glyph reflects the configured SIZE too (plot scaling) */
          int gr = (2 * sc * m->ins.ins_size[k]) / MARK_SIZE_DEF;
@@ -438,20 +461,20 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
              rx - (6 * sc), y + (3 * sc), gr, m->ins.ins_marker[k],
              ui_sensor_color(m->ins.ins_color[k]));
       }
-      add_hit_ix(h, 0, y - (3 * sc), fb->width, lh, MA_INSMARK_OPEN, k);
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_INSMARK_OPEN,
+                 k);
       y += 2 * lh;
    }
    /* Status bar value vs plain app icon; lock-screen visibility; and a
     * way back for a swiped-away notification (it also reappears by
     * itself on the next reading). */
    menu_row(fb, h, y, sc, lh, "STATUS BAR",
-            m->prefs.statbar_val ? "NUMBER" : "ICON", 0xFFFFFFFF, MA_STATBAR,
-            0);
+            m->prefs.statbar_val ? "NUMBER" : "ICON", UI_TEXT, MA_STATBAR, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "LOCK SCREEN",
-            m->prefs.lockscr_val ? "SHOW" : "HIDE", 0xFFFFFFFF, MA_LOCKSCR, 0);
+            m->prefs.lockscr_val ? "SHOW" : "HIDE", UI_TEXT, MA_LOCKSCR, 0);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "NOTIFICATION", "REOPEN", 0xFFFFFFFF,
+   menu_row(fb, h, y, sc, lh, "NOTIFICATION", "REOPEN", UI_TEXT,
             MA_NOTIF_REOPEN, 0);
 }
 
@@ -479,9 +502,10 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx  = fb->width - (4 * sc);
    int y   = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "REMOTE", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_REMOTE_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "REMOTE", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_REMOTE_BACK,
+              0);
    y += 3 * lh; /* the DISPLAY menu's title gap -- the house style */
 
    const char *sv = (m->sync.remote_server && m->sync.remote_server[0])
@@ -491,10 +515,10 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * shows NO SERVER (amber), not ON -- nothing leaves the phone until one
     * exists, and pretending otherwise would be a silent lie. */
    const char *pv = "OFF";
-   uint32_t pc    = 0xFFFFFFFF;
+   uint32_t pc    = UI_TEXT;
    if (m->sync.remote_on && sv) {
       pv = "ON";
-      pc = 0xFF33FF88;
+      pc = UI_OK;
    } else if (m->sync.remote_on) {
       pv = "NO SERVER";
       pc = 0xFFAA8844;
@@ -504,11 +528,11 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
    menu_row(fb, h, y, sc, lh, "PUSH", pv, pc, MA_REMOTE_TOGGLE, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "SERVER", sv ? sv : "NOT SET",
-            sv ? 0xFFFFFFFF : 0xFFAAAAAA, MA_REMOTE_IP, 0);
+            sv ? UI_TEXT : UI_FAINT, MA_REMOTE_IP, 0);
    y += 2 * lh;
    char pt[8];
    (void)snprintf(pt, sizeof pt, "%d", m->sync.remote_port);
-   menu_row(fb, h, y, sc, lh, "PORT", pt, 0xFFFFFFFF, MA_REMOTE_PORT, 0);
+   menu_row(fb, h, y, sc, lh, "PORT", pt, UI_TEXT, MA_REMOTE_PORT, 0);
    y += 2 * lh;
    /* The account this phone syncs into, and whether it has been paired with
     * it yet. Both are needed before anything can be sent, so both are shown
@@ -516,27 +540,26 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
    const char *em =
        (m->sync.sync_email && m->sync.sync_email[0]) ? m->sync.sync_email : 0;
    menu_row(fb, h, y, sc, lh, "EMAIL", em ? em : "NOT SET",
-            em ? 0xFFFFFFFF : 0xFFAAAAAA, MA_SYNC_EMAIL, 0);
+            em ? UI_TEXT : UI_FAINT, MA_SYNC_EMAIL, 0);
    y += 2 * lh;
    if (m->sync.sync_paired) {
-      menu_row(fb, h, y, sc, lh, "PAIRED", "YES", 0xFF33FF88, MA_SYNC_UNPAIR,
-               0);
+      menu_row(fb, h, y, sc, lh, "PAIRED", "YES", UI_OK, MA_SYNC_UNPAIR, 0);
       y += 2 * lh;
       /* Only when paired: a restore needs the key, and offering it otherwise
        * would be a row that can only ever fail. */
-      menu_row(fb, h, y, sc, lh, "RESTORE", "FROM SERVER", 0xFFFFFFFF,
+      menu_row(fb, h, y, sc, lh, "RESTORE", "FROM SERVER", UI_TEXT,
                MA_SYNC_RESTORE, 0);
    } else if (!sv) {
       /* Name the ONE thing standing in the way, top to bottom, rather than
        * "SET BOTH" -- which says something is missing without saying what,
        * and is exactly as unhelpful when only one of them is. */
-      menu_row(fb, h, y, sc, lh, "PAIR", "(SET SERVER)", 0xFFAAAAAA,
-               MA_SYNC_PAIR, 0);
+      menu_row(fb, h, y, sc, lh, "PAIR", "(SET SERVER)", UI_FAINT, MA_SYNC_PAIR,
+               0);
    } else if (!em) {
-      menu_row(fb, h, y, sc, lh, "PAIR", "(SET EMAIL)", 0xFFAAAAAA,
-               MA_SYNC_PAIR, 0);
+      menu_row(fb, h, y, sc, lh, "PAIR", "(SET EMAIL)", UI_FAINT, MA_SYNC_PAIR,
+               0);
    } else {
-      menu_row(fb, h, y, sc, lh, "PAIR", "ENTER CODE", 0xFFFFFFFF, MA_SYNC_PAIR,
+      menu_row(fb, h, y, sc, lh, "PAIR", "ENTER CODE", UI_TEXT, MA_SYNC_PAIR,
                0);
    }
    y += 2 * lh;
@@ -546,7 +569,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * -1): it reports, it does not act. */
    {
       char st[16];
-      uint32_t scol = 0xFFAAAAAA;
+      uint32_t scol = UI_FAINT;
       if (!m->sync.remote_on) {
          (void)snprintf(st, sizeof st, "--");
       } else if (m->sync.remote_last_ok > 0) {
@@ -555,8 +578,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
          (void)snprintf(st, sizeof st, "%s AGO", ago);
          /* Fresh is green; a link that has not been acknowledged in over
           * ten minutes is amber, because that is a backlog building up. */
-         scol =
-             (m->now - m->sync.remote_last_ok <= 600) ? 0xFF33FF88 : 0xFFAA8844;
+         scol = (m->now - m->sync.remote_last_ok <= 600) ? UI_OK : 0xFFAA8844;
       } else {
          (void)snprintf(st, sizeof st, "NEVER");
          scol = 0xFFAA8844;
@@ -567,25 +589,26 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * two-line row -- and they answer different questions (WHEN the last
        * batch landed vs WHAT the server said about it). */
       y += 2 * lh;
-      /* ...and WHAT the server said. A refusal used to be invisible here:
-       * the screen showed a happy PUSH ON while every batch was bouncing. */
+      /* ...and WHAT the server said. Without it a refusal is invisible here,
+       * and the screen shows a happy PUSH ON while every batch bounces. */
       const char *rs = (m->sync.remote_status && m->sync.remote_status[0])
                            ? m->sync.remote_status
                            : "--";
       /* Colour by SEVERITY, which the outcome carries.
        *
-       * This used to test rs[0] == '2', a leftover from when the field held
-       * an HTTP status code -- so the green branch was unreachable and
-       * success and failure rendered in identical grey, which is the same
-       * defect the comment two lines above describes this row being added to
-       * fix. Its replacement compared the text against a list of English
-       * phrases, and that list was missing RESTORED and NOTHING TO RESTORE:
-       * a restore that worked rendered grey, like a phone that had never
+       * NOT FROM THE TEXT, and not from its first character. Testing
+       * rs[0] == '2' asks for an HTTP status code, which this field does not
+       * hold, so the green branch is unreachable and success and failure
+       * render in identical grey -- the same defect the comment two lines
+       * above describes this row as existing to fix. Comparing the text
+       * against a list of English phrases fails the same way from the other
+       * end: a phrase missing from the list (RESTORED, NOTHING TO RESTORE)
+       * renders grey, like a phone that has never
        * synced. A list of strings cannot be checked for completeness; a
        * switch over an enum is checked by the compiler (see syncstat.c). */
-      uint32_t rcol = 0xFFAAAAAA; /* nothing has been attempted yet */
+      uint32_t rcol = UI_FAINT; /* nothing has been attempted yet */
       switch (sync_outcome_severity(m->sync.remote_outcome)) {
-         case SYNC_SEV_GOOD: rcol = 0xFF33FF88; break; /* green */
+         case SYNC_SEV_GOOD: rcol = UI_OK; break;      /* green */
          case SYNC_SEV_WARN: rcol = 0xFFFFCC44; break; /* amber: yours to fix */
          case SYNC_SEV_BAD:
             rcol = 0xFFFF5555;
@@ -607,7 +630,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int bar_x = 4 * sc;
       int bar_w = fb->width - (8 * sc);
       int bar_h = 3 * sc;
-      draw_frame(px, fb, bar_x, y, bar_w, bar_h, 0xFF555555);
+      draw_frame(px, fb, bar_x, y, bar_w, bar_h, UI_RULE);
       int fill = ((bar_w - (2 * sc)) * m->sync.sync_permille) / 1000;
       if (fill < 0)
          fill = 0;
@@ -615,17 +638,24 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
          fill = bar_w - (2 * sc);
       for (int by = y + sc; by < y + bar_h - sc; by++)
          for (int bxx = bar_x + sc; bxx < bar_x + sc + fill; bxx++)
-            px[(by * fb->stride) + bxx] = 0xFF33FF88;
+            px[(by * fb->stride) + bxx] = UI_OK;
       y += bar_h + lh;
       char pctxt[16];
       (void)snprintf(pctxt, sizeof pctxt, "%d%%", m->sync.sync_permille / 10);
-      draw_str(px, fb, bar_x, y, sc, "SYNCING", 0xFF888888);
+      draw_str(px, fb, bar_x, y, sc, "SYNCING", UI_MUTED);
       draw_str(px, fb, fb->width - (4 * sc) - (str_len(pctxt) * 6 * sc), y, sc,
-               pctxt, 0xFF888888);
+               pctxt, UI_MUTED);
    }
 }
 
 /* ---- per-sensor screen: attributes above, actions below ---- */
+
+/* The two groups the shortcut buttons are drawn in: the ones that record
+ * something, and the ones that open a log of what was recorded. */
+enum sc_sect {
+   SC_SECT_LOG,
+   SC_SECT_VIEW
+};
 
 /* `id` is what settings.c stores (settings.h, enum shortcut_id) and `code` is
  * the touch code this build happens to use. Two columns, because they answer
@@ -637,29 +667,26 @@ static const struct {
    int code;
    const char *full;
    const char *abbrev;
+   int sect; /* SC_SECT_LOG or SC_SECT_VIEW -- which group it renders in */
 } ui_sc_tab[] = {
-    {SC_INS_FAST, MA_INS_FAST,    "FAST INSULIN",     "FAST"   },
-    {SC_INS_SLOW, MA_INS_SLOW,    "SLOW INSULIN",     "SLOW"   },
-    {SC_INSLOG,   MA_INSLOG_OPEN, "VIEW INSULIN LOG", "INS LOG"},
-    {SC_WEIGHT,   MA_WT_OPEN,     "WEIGHT",           "WEIGHT" },
-    {SC_WTLOG,    MA_WTLOG_OPEN,  "VIEW WEIGHT LOG",  "WT LOG" },
-    {SC_FOOD,     MA_FOOD_OPEN,   "FOOD",             "FOOD"   },
-    /* LAST, and the odd one: every button above opens a form and is finished
-     * when that form is confirmed, while this one records by being LEFT
-     * ALONE. It is in this table so it can be PINNED like the rest; what it
-     * cannot share is the drawing, because its level, colour and countdown
-     * are not a label -- see ui_exercise_button, which both the menu below
-     * and the main screen call. */
-    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",   "FOOD LOG"},
-    {SC_EXERCISE, MA_EXERCISE,    "EXERCISE",         "EXER"   },
+    {SC_INS_FAST, MA_INS_FAST,     "FAST INSULIN",      "FAST",     SC_SECT_LOG },
+    {SC_INS_SLOW, MA_INS_SLOW,     "SLOW INSULIN",      "SLOW",     SC_SECT_LOG },
+    {SC_WEIGHT,   MA_WT_OPEN,      "WEIGHT",            "WEIGHT",   SC_SECT_LOG },
+    {SC_FOOD,     MA_FOOD_OPEN,    "FOOD",              "FOOD",     SC_SECT_LOG },
+    /* LAST IN ITS SECTION, and the odd one: every button above opens a form
+     * and is finished when that form is confirmed, while this one records by
+     * being LEFT ALONE. It is in this table so it can be PINNED like the
+     * rest; what it cannot share is the drawing, because its level, colour
+     * and countdown are not a label -- see ui_exercise_button, which both the
+     * menu below and the main screen call. */
+    {SC_EXERCISE, MA_EXERCISE,     "EXERCISE",          "EXER",     SC_SECT_LOG },
+    {SC_INSLOG,   MA_INSLOG_OPEN,  "VIEW INSULIN LOG",  "INS LOG",  SC_SECT_VIEW},
+    {SC_WTLOG,    MA_WTLOG_OPEN,   "VIEW WEIGHT LOG",   "WT LOG",   SC_SECT_VIEW},
+    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",     "FOOD LOG", SC_SECT_VIEW},
+    {SC_EXLOG,    MA_EXLOG_OPEN,   "VIEW EXERCISE LOG", "EX LOG",   SC_SECT_VIEW},
 };
 
 #define UI_SC_N ((int)(sizeof ui_sc_tab / sizeof ui_sc_tab[0]))
-
-int ui_shortcut_count(void)
-{
-   return UI_SC_N;
-}
 
 int ui_shortcut_code(int slot)
 {
@@ -673,17 +700,16 @@ const char *ui_shortcut_label(int slot, int abbrev)
    return abbrev ? ui_sc_tab[slot].abbrev : ui_sc_tab[slot].full;
 }
 
-int ui_shortcut_slot(int code)
-{
-   for (int i = 0; i < UI_SC_N; i++)
-      if (ui_sc_tab[i].code == code)
-         return i;
-   return -1;
-}
-
 int ui_shortcut_id(int slot)
 {
    return (slot >= 0 && slot < UI_SC_N) ? ui_sc_tab[slot].id : SC_NONE;
+}
+
+/* Which of the two groups the shortcut renders in: SC_SECT_LOG for the
+ * buttons that record something, SC_SECT_VIEW for the ones that open a log. */
+int ui_shortcut_sect(int slot)
+{
+   return (slot >= 0 && slot < UI_SC_N) ? ui_sc_tab[slot].sect : SC_SECT_LOG;
 }
 
 int ui_shortcut_slot_by_id(int id)
@@ -724,11 +750,11 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx  = fb->width - (4 * sc);
    int y   = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "ADD ...", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "ADD ...", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* This menu opens from the MAIN screen, so its X returns there (MA_CLOSE),
     * not into SETTINGS. Generous close target across the title band. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_CLOSE, 0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_CLOSE, 0);
    /* TWO ROWS UNDER THE TITLE, not three. The eleventh button on this screen
     * put the last DEVICES entry and its target below the buffer again --
     * measured at 1080x2280 and 1440x3200 -- and the title band was the only
@@ -745,7 +771,7 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* Three sections. LOG: what the user records by hand -- the insulin type
     * is chosen HERE (FAST / SLOW), so the form opens already knowing it, and
     * weight sits alongside because it is the same kind of act. DEVICES: the
-    * device types from the ADD DEVICE picker, one tap instead of two. */
+    * device types from the ADD DEVICE picker, one tap rather than two. */
    int bw = fb->width - (2 * x);
    /* Air BETWEEN buttons: this screen is nothing but stacked buttons, several
     * of them destructive-adjacent (logging a dose vs. adding a device), so
@@ -821,12 +847,12 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * width at w/(33*6), so bw/4 >= 47*sc. */
    int cbs = 25 * sc;
    int cbx = scx + (((scw - (2 * sc)) - cbs) / 2);
-   draw_str(px, fb, x, y, sc, "LOG", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "LOG", UI_MUTED);
    {
       /* Centred over the boxes, so header and column share one axis. */
       int hw = ((str_len("PIN") * 6) - 1) * sc;
       int hx = cbx + ((cbs - hw) / 2);
-      draw_str(px, fb, hx, y, sc, "PIN", 0xFF888888);
+      draw_str(px, fb, hx, y, sc, "PIN", UI_MUTED);
    }
    y += lh;
    /* The buttons NAME what they log. "FAST" and "SLOW" were only unambiguous
@@ -834,6 +860,8 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * a bare "FAST" is a button whose meaning depends on a header three rows
     * up, which is not a property to rely on when the tap logs a medication. */
    for (int i = 0; i < ui_shortcut_count(); i++) {
+      if (ui_shortcut_sect(i) != SC_SECT_LOG)
+         continue;
       int code = ui_shortcut_code(i);
       int on   = sc_on(m, i);
       int by   = y;
@@ -843,21 +871,76 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (code == MA_EXERCISE)
          y = ui_exercise_button(fb, h, x, y, lbw, sc, m->food.ex_level,
                                 m->food.ex_remaining, EX_SETTLE_S,
-                                ui_shortcut_label(i, 0), 0xFFFFFFFF);
+                                ui_shortcut_label(i, 0), UI_TEXT);
       else
-         y = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0),
-                         0xFFFFFFFF, code, 0);
+         y = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0), UI_TEXT,
+                         code, 0);
       /* The box shares the button's top and bottom edge (they are the same
        * height), and its TARGET is the whole column cell -- this one sits
        * right beside a button that logs a medication, so the two must not be
        * easy to confuse. Recorded AFTER the button and inside its row:
        * ui_hit_idx scans backwards, so the box wins its own rectangle while
        * the rest of the row still logs. */
-      draw_checkbox(px, fb, cbx, by, cbs, sc, on, on ? 0xFF33FF88 : 0xFFAAAAAA);
-      add_hit_ix(h, x + lbw, by, bw - lbw, y - by, MA_SCTOGGLE, i);
+      draw_checkbox(px, fb, cbx, by, cbs, sc, on, on ? UI_OK : UI_FAINT);
+      add_hit_ix(h, ui_rect(x + lbw, by, bw - lbw, y - by), MA_SCTOGGLE, i);
       y += gap;
    }
-   /* THE SECTION BREAK, and it is the last slack this screen had.
+
+   /* ---- VIEW LOG: TWO COLUMNS, AND THAT IS WHAT PAID FOR THE SECTION ----
+    *
+    * The comment above this function has said for three rounds that the
+    * screen is full and "the next one needs pagination or a two-column LOG
+    * section, not another slice off the whitespace". This is that section.
+    * Splitting the VIEW buttons off costs a header (one row) and adding the
+    * exercise log costs a button, which one column cannot absorb -- four
+    * buttons in a 2x2 grid occupy two rows rather than four and pay for both
+    * with room to spare.
+    *
+    * ABBREVIATED LABELS, because a half-width cell cannot hold "VIEW INSULIN
+    * LOG" (16 chars = 96*sc) and ui_fit_scale only guarantees 190*sc of
+    * button width, i.e. ~95*sc per cell. The abbreviations already exist for
+    * the main screen's pins and say the same thing in seven characters; the
+    * word VIEW moves into the header, where it is said once for all four.
+    * The font is NOT what gives way here -- that is a standing prohibition.
+    *
+    * The PIN box goes INSIDE the cell, at its right edge, so each button
+    * keeps the checkbox it had when these were full-width rows. Nothing that
+    * was pinnable stopped being pinnable. */
+   y += lh - gap;
+   draw_str(px, fb, x, y, sc, "VIEW LOG", UI_MUTED);
+   y += lh;
+   {
+      int cellw = (bw - (2 * sc)) / 2; /* two cells, 2*sc of air between */
+      int col   = 0;
+      int rowy  = y;
+      for (int i = 0; i < ui_shortcut_count(); i++) {
+         if (ui_shortcut_sect(i) != SC_SECT_VIEW)
+            continue;
+         int cx = x + (col * (cellw + (2 * sc)));
+         /* The button keeps the cell minus the checkbox, exactly as the LOG
+          * rows keep bw minus the PIN column. */
+         int cbw  = cbs + (2 * sc);
+         int bwid = cellw - cbw;
+         int on   = sc_on(m, i);
+         int ny =
+             menu_button(fb, h, cx, rowy, bwid, sc, ui_shortcut_label(i, 1),
+                         UI_TEXT, ui_shortcut_code(i), 0);
+         draw_checkbox(px, fb, cx + bwid + (2 * sc), rowy, cbs, sc, on,
+                       on ? UI_OK : UI_FAINT);
+         add_hit_ix(h, ui_rect(cx + bwid, rowy, cbw, ny - rowy), MA_SCTOGGLE,
+                    i);
+         col++;
+         if (col == 2) { /* row complete: drop to the next one */
+            col  = 0;
+            rowy = ny + gap;
+         }
+      }
+      /* The y below the grid: a partly filled last row still occupies it. */
+      y = (col == 0) ? rowy - gap : rowy + (25 * sc);
+   }
+
+   /* THE SECTION BREAK before DEVICES, and it is the last slack this screen
+    * had.
     *
     * It was 2*lh - gap (a blank line between the two groups). With EXERCISE
     * added the screen overflowed again -- measured at 1080x2280, 828x1792 and
@@ -866,10 +949,10 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * does its own separating. Whitespace, again, rather than the font. */
    y += lh - gap;
 
-   draw_str(px, fb, x, y, sc, "DEVICES", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "DEVICES", UI_MUTED);
    y += lh;
    for (int t = SENSOR_STELO; t < SENSOR_NTYPES; t++) {
-      y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), 0xFFFFFFFF,
+      y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), UI_TEXT,
                       MA_TYPE, t);
       /* NO GAP AFTER THE LAST ONE. A gap separates two controls, and below
        * the final button there is no second control to separate it from --
@@ -941,9 +1024,9 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
    const char *ttl = "MARKER";
    if (ins)
       ttl = (ity == INS_FAST) ? "FAST MARKER" : "SLOW MARKER";
-   draw_str(px, fb, x, y, tsc, ttl, 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, back, back_ix);
+   draw_str(px, fb, x, y, tsc, ttl, UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), back, back_ix);
    y += 2 * lh;
    int gw = fb->width - (2 * x);
 
@@ -968,7 +1051,7 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int cellmax  = (gridav > gridrows) ? gridav / gridrows : 1;
 
    /* SHAPE grid: each shape as a glyph in the sensor's own colour. */
-   draw_str(px, fb, x, y, sc, "SHAPE", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "SHAPE", UI_MUTED);
    y += lh;
    {
       int cols = 4;
@@ -985,21 +1068,21 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
          if (mk == MARK_HIDE) {
             int lw = str_len("OFF") * 6 * sc;
             draw_str(px, fb, cx + ((cell - lw) / 2),
-                     cy + ((cell - (7 * sc)) / 2), sc, "OFF", 0xFFAAAAAA);
+                     cy + ((cell - (7 * sc)) / 2), sc, "OFF", UI_FAINT);
          } else {
             plot_marker_glyph(
                 (struct plot_fb){px, fb->stride, fb->width, fb->height},
                 cx + (cell / 2), cy + (cell / 2), cell / 5, mk, curcol);
          }
          draw_frame(px, fb, cx + sc, cy + sc, cell - (2 * sc), cell - (2 * sc),
-                    (mk == curm) ? 0xFF33FF88 : 0xFF555555);
-         add_hit_ix(h, cx, cy, cell, cell, MA_MARK_PICK, mk);
+                    (mk == curm) ? UI_OK : UI_RULE);
+         add_hit_ix(h, ui_rect(cx, cy, cell, cell), MA_MARK_PICK, mk);
       }
       y += (((UI_NMARKERS + cols - 1) / cols) * cell) + (lh / 2);
    }
 
    /* COLOR grid: full-colour buttons. */
-   draw_str(px, fb, x, y, sc, "COLOR", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "COLOR", UI_MUTED);
    y += lh;
    {
       int cols = UI_NCOLORS;
@@ -1014,14 +1097,14 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
              cx + (cell / 2), y + (cell / 2), (cell - (4 * sc)) / 2,
              MARK_SQUARE_F, ui_sensor_color(i));
          draw_frame(px, fb, cx + sc, y + sc, cell - (2 * sc), cell - (2 * sc),
-                    (i == curc) ? 0xFF33FF88 : 0xFF555555);
-         add_hit_ix(h, cx, y, cell, cell, MA_COLOR_PICK, i);
+                    (i == curc) ? UI_OK : UI_RULE);
+         add_hit_ix(h, ui_rect(cx, y, cell, cell), MA_COLOR_PICK, i);
       }
       y += cell + (lh / 2);
    }
 
    /* SIZE row: the current shape+colour drawn at each of the 5 sizes. */
-   draw_str(px, fb, x, y, sc, "SIZE", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "SIZE", UI_MUTED);
    y += lh;
    {
       int cols = MARK_SIZE_MAX;
@@ -1042,8 +1125,8 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
              (struct plot_fb){px, fb->stride, fb->width, fb->height},
              cx + (cell / 2), y + (cell / 2), r, shape, curcol);
          draw_frame(px, fb, cx + sc, y + sc, cell - (2 * sc), cell - (2 * sc),
-                    (s == curs) ? 0xFF33FF88 : 0xFF555555);
-         add_hit_ix(h, cx, y, cell, cell, MA_SIZE_PICK, s);
+                    (s == curs) ? UI_OK : UI_RULE);
+         add_hit_ix(h, ui_rect(cx, y, cell, cell), MA_SIZE_PICK, s);
       }
       /* no y advance: the SIZE row is the last thing in this screen */
    }
@@ -1095,10 +1178,10 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    int lh  = 12 * sc;
    int x   = 6 * sc;
    int y   = fb->height / 12;
-   draw_str(px, fb, x, y, tsc, "PERMISSIONS", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, "PERMISSIONS", UI_TEXT);
    y += 3 * lh;
    for (int i = 0; i < (int)(sizeof lines / sizeof lines[0]); i++) {
-      draw_str(px, fb, x, y, sc, lines[i], 0xFFCCCCCC);
+      draw_str(px, fb, x, y, sc, lines[i], UI_TEXT_DIM);
       y += lh;
    }
    y += 2 * lh;
@@ -1111,9 +1194,9 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    int bw          = lw + (2 * padx);
    int bh          = gh + (2 * pady);
    int bx          = (fb->width - bw) / 2;
-   draw_frame(px, fb, bx, y, bw, bh, 0xFF33FF88);
-   draw_str(px, fb, bx + padx, y + pady, bsc, lbl, 0xFF33FF88);
-   add_hit(h, bx, y, bw, bh, ACT_GATE_CONTINUE, 0);
+   draw_frame(px, fb, bx, y, bw, bh, UI_OK);
+   draw_str(px, fb, bx + padx, y + pady, bsc, lbl, UI_OK);
+   add_hit(h, ui_rect(bx, y, bw, bh), ACT_GATE_CONTINUE, 0);
 
    /* disclaimer, dim, at the foot of the screen */
    static const char *disc[] = {
@@ -1128,4 +1211,9 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
       draw_str(px, fb, x, y, sc, disc[i], 0xFF777777);
       y += lh;
    }
+}
+
+int ui_shortcut_count(void)
+{
+   return UI_SC_N;
 }

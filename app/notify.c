@@ -21,8 +21,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* Lock-screen plot bitmap, in pixels. Taller than it was, now that the
- * reading and its time share one title line above it. */
+/* Lock-screen plot bitmap, in pixels. The height leaves room for the reading
+ * and its time to share one title line above it. */
 #define NOTIF_W 512
 #define NOTIF_H 232
 
@@ -69,9 +69,9 @@ static int notify_update(void)
    struct prefs sp;
    settings_get(&sp);
    /* Context and env from the transport, NOT from g_act. g_act is NULL once
-    * the activity is destroyed, and this used to return early on that -- so
-    * after a back-press or task-swipe the notification froze at whatever
-    * value was current at that instant, while readings kept arriving. In
+    * the activity is destroyed, and returning early on that freezes the
+    * notification, after a back-press or task-swipe, at whatever value was
+    * current at that instant while readings keep arriving. In
     * that state the notification is the ONLY glucose display the user has.
     */
    JNIEnv *e    = dexble_env();
@@ -122,7 +122,7 @@ static int notify_update(void)
       char hm[16];
       fmt_glu(cur_glu, sp.units, gv, sizeof gv);
       fmt_trend(cur_trend, tr, sizeof tr);
-      fmt_hms(cur_time, g_tz_off, hm, sizeof hm);
+      fmt_hms(cur_time, tz_off_now(), hm, sizeof hm);
       hm[5] = 0; /* HH:MM */
       (void)snprintf(title, sizeof title, "%s %s  %s   at %s", gv, UNIT_LBL, tr,
                      hm);
@@ -153,15 +153,26 @@ static int notify_update(void)
       sty[nsty++] = (struct notif_sty){v.slot[i].id, v.slot[i].marker,
                                        v.slot[i].color, v.slot[i].size};
 
-   store_lock();
+   /* ONE SNAPSHOT, TAKEN UNDER THE STORE'S OWN LOCK. This walked
+    * hist_count() and hist_at() with the lock taken by hand -- a count and an
+    * indexed read of a table a binder thread appends to, coherent only for as
+    * long as somebody remembered to hold something. hist_copy is that walk,
+    * done once, inside the module that owns the table.
+    *
+    * The buffer is file-static for the same reason g_notify_px is: this
+    * function is serialised against itself by g_notify_flight, and the two
+    * threads that drive it (the activity's 1 Hz timer and the service tick)
+    * would otherwise interleave every buffer here. */
+   static struct reading snap[NHIST];
+   int nsnap = hist_copy(snap, NHIST);
    /* The notification plot mirrors the MAIN screen's plot EXACTLY: every
     * datapoint from every source -- CGM traces AND meter (BGM) fingersticks
     * -- each styled with that device's own marker and colour (a HIDE-marked
     * device is dropped, just as on the main plot), so the two read the same.
     */
    int np = 0;
-   for (int i = 0; i < hist_count(); i++) {
-      int src      = hist_at(i).src;
+   for (int i = 0; i < nsnap; i++) {
+      int src      = snap[i].src;
       int mk       = 0; /* 0 + col 0 = the value-palette main trace */
       uint32_t col = 0; /* (used for src 0 legacy and unmatched primary) */
       int sz       = MARK_SIZE_DEF;
@@ -181,7 +192,7 @@ static int notify_update(void)
        * a distinct MARKER, not a value-palette line vertex reading as CGM
        * data: give it the orphan look. src 0 is legacy CGM and keeps the
        * default. */
-      if (!found && (src != 0 || hist_at(i).kind == KIND_BGM)) {
+      if (!found && (src != 0 || snap[i].kind == KIND_BGM)) {
          if (src != 0) {
             mk  = MARK_CROSS;
             col = 0xFF8A8AA0; /* UI_ORPHAN */
@@ -189,18 +200,17 @@ static int notify_update(void)
       }
       if (hide)
          continue;
-      pts[np].t      = hist_at(i).t;
-      pts[np].glu    = hist_at(i).glu;
+      pts[np].t      = snap[i].t;
+      pts[np].glu    = snap[i].glu;
       pts[np].marker = mk;
       pts[np].col    = col;
       pts[np].size   = sz;
       np++;
    }
-   store_unlock();
    plot_render((struct plot_fb){g_notify_px, NOTIF_W, NOTIF_W, NOTIF_H},
                (struct plot_rect){0, 0, NOTIF_W, NOTIF_H}, pts, np,
                realtime_s(), 3, (struct plot_cfg){sp.plot_max, 3}, white_color,
-               -1, 0, g_tz_off);
+               -1, 0, tz_off_now());
    /* plot_render writes the SCREEN's pixel convention -- raw u32 on a
     * little-endian RGBA surface, i.e. 0xAABBGGRR -- but
     * Bitmap.createBitmap(..., ARGB_8888) reads each int as 0xAARRGGBB.

@@ -5,6 +5,8 @@
 #ifndef PANCRA_UTIL_H
 #define PANCRA_UTIL_H
 
+#include "loadresult.h" /* enum load_result: what a read of a file means */
+
 /* THE CLOCKS MOVED TO clock.h. They were here, in a header otherwise about
  * files, logs and strings -- which was harmless until thread.h needed a
  * millisecond clock and this module needed a mutex, and the two lowest
@@ -12,6 +14,54 @@
 
 int clampn(int n,
            int cap); /* clamp a snprintf length to [0, cap-1] for write() */
+
+/* ---- A BOUNDED TEXT BUILDER THAT FAILS CLOSED ----------------
+ *
+ * WHAT THIS EXISTS TO STOP. Several files build a whole file's text in one
+ * buffer and then replace the file atomically, row by row, like this:
+ *
+ *     for (each row) {
+ *        int n = snprintf(out + used, cap - used, "...", ...);
+ *        if (n <= 0 || n >= cap - used)
+ *           break;                 <-- and the caller writes what it HAS
+ *        used += n;
+ *     }
+ *
+ * The break is the bug. What follows it is an atomic replace of the file with
+ * the rows that DID fit and a report of success, so a registry of eight
+ * sensors becomes a registry of six -- permanently, because the file is the
+ * record and nothing ever notices the two missing rows. That is a paired
+ * sensor the user has to pair again, key and all.
+ *
+ * So the rule is written once, here, and it is: a builder that could not take
+ * a row is BAD FROM THEN ON, and a caller may only publish what it built when
+ * the builder is still good. Nothing is written after the first failure --
+ * the buffer's contents stop being a file anybody should see.
+ *
+ * The append itself stays at the call site (each row's format string is that
+ * module's business, and this codebase has no vsnprintf); what is shared is
+ * the accounting, which is the part that was got wrong. */
+struct textout {
+   char *buf;
+   int cap;
+   int len;
+   int bad; /* sticky: once set, the buffer is not publishable */
+};
+
+void tout_init(struct textout *t, char *buf, int cap);
+
+/* Where the next row goes and how much room it has, or NULL when the builder
+ * is already bad or full -- in which case the loop must stop. `*room` is the
+ * size to pass to snprintf, NUL included. */
+char *tout_room(struct textout *t, int *room);
+
+/* Account for the snprintf that just wrote at tout_room()'s pointer: `n` is
+ * its return value. A row that could not be formatted, or that did not fit,
+ * sets the sticky error. */
+void tout_took(struct textout *t, int n);
+
+/* 1 when every row so far was taken whole. The caller publishes ONLY on 1. */
+int tout_ok(const struct textout *t);
 /* Copy src into a dst of `cap` bytes, always NUL-terminating. Used wherever a
  * borrowed or stack-local string has to outlive its owner. */
 void str_snapshot(char *dst, int cap, const char *src);
@@ -26,8 +76,9 @@ void str_snapshot(char *dst, int cap, const char *src);
  * is a different directory that happens to exist, or that two long names
  * collide in. See the definition. */
 int data_path(char *dst, int cap, const char *dir, const char *name);
-/* Replace a small snapshot atomically. The old file remains intact on every
- * failure. Returns 0 only after the replacement has reached the filesystem. */
+/* Replace a small snapshot atomically. The existing file remains intact on
+ * every failure. Returns 0 only after the replacement has reached the
+ * filesystem. */
 /* All `len` bytes or -1. A short write is not a failure of write(2), it is
  * the contract -- and a caller that takes it for success writes a truncated
  * record. */
@@ -75,6 +126,10 @@ extern _Thread_local int app_fault_fsync_here;
  * before the row is truncated away. A race whose window is two syscalls wide
  * is not tested by running both writers hard and hoping. */
 extern _Thread_local void (*app_fault_gap_here)(void);
+/* Run inside log_replace_with_tail with the append lock held, between the
+ * tail capture and the rename. A claim that a lock closes a window is only
+ * worth what a test that enters the window can say about it. */
+extern _Thread_local void (*app_fault_publish_gap)(void);
 #endif
 
 /* Finish an append durably: flush the data, close (checked), and flush the
@@ -88,8 +143,8 @@ int append_finish(int fd, const char *path, int created);
  * THREE OUTCOMES, because the rename is the point of no return.
  *
  * Everything before the rename can be undone: the temporary is removed and
- * the original file is exactly as it was, so a caller is right to put its
- * memory back and report that nothing happened.
+ * the original file is untouched, so a caller is right to put its memory
+ * back and report that nothing happened.
  *
  * The DIRECTORY FSYNC comes after. If it fails, the new pathname is already
  * visible -- the file HAS been replaced -- and only its durability across a
@@ -114,6 +169,25 @@ enum replace_result {
  * the directory, checking each step. `fd` is consumed. See enum above. */
 enum replace_result replace_finish(int fd, const char *tmp, const char *path);
 
+/* ---- PUBLISH A REBUILT LOG, WITH NO APPEND LOST -------------
+ *
+ * A rebuild (a restore) stages a whole log and renames it over the original.
+ * Between the last byte it copied and the rename, an append can land -- and
+ * the rename then deletes a row the app had already acknowledged and drawn on
+ * screen.
+ *
+ * This closes that window: the tail of `path` past byte `copied` is appended
+ * to `fd`, and the fsync, close and rename happen with the append lock still
+ * held, so no log_append can interleave. The lock stays private to util.c;
+ * what is exported is the OPERATION, because "who may hold the append lock,
+ * and across what" is not a question a caller should have to answer.
+ *
+ * `fd` is the staging file at its end, `tmp` its path. Answers as
+ * replace_finish does, and on REPLACE_FAILED the staging file is already
+ * unlinked and `fd` closed. */
+enum replace_result log_replace_with_tail(const char *path, int fd,
+                                          const char *tmp, long copied);
+
 /* Sync the directory a path lives in, so a rename to it survives power loss. */
 int fsync_dir_of(const char *path);
 
@@ -122,16 +196,17 @@ enum replace_result atomic_replace(const char *path, const void *data, int len);
 /* ---- EVIDENCE THAT A LOG IS EMPTY ON PURPOSE -------------------------
  *
  * WHY THIS EXISTS AT ALL. The phone is authoritative over the server's copy
- * of the record (see sync.h), so "we no longer hold this" is an instruction
- * to delete. That is right for a bucket the user emptied and catastrophically
- * wrong for a log the phone has merely FORGOTTEN -- a reinstall, a cleared
- * app, a restored handset -- and sync.c cannot tell the two apart by looking
- * at the file, because both look like "no rows here". It therefore refuses:
- * an empty local log against a server that holds data fails the sync, every
- * cycle, rather than erasing years of readings in a few hundred requests.
+ * of the record (see sync.h), so "this is not something we hold" is an
+ * instruction to delete. That is right for a bucket the user emptied and
+ * catastrophically wrong for a log the phone has merely FORGOTTEN -- a
+ * reinstall, a cleared app, a restored handset -- and sync.c cannot tell the
+ * two apart by looking at the file, because both look like "no rows here". It
+ * therefore refuses: an empty local log against a server that holds data fails
+ * the sync, every cycle, rather than erasing years of readings in a few hundred
+ * requests.
  *
- * The cost of that refusal is the case this file adds. slots_save() writes
- * the WHOLE registry and nothing else, so removing the last device leaves
+ * The cost of that refusal is the case this file adds. The device registry is
+ * rewritten WHOLE and holds nothing else, so removing the last device leaves
  * slots.csv zero bytes long -- a deliberate, ordinary, user-visible action
  * that the sync then refuses for ever, leaving the server holding devices the
  * user removed and the sync permanently broken for every other log too.
@@ -142,7 +217,7 @@ enum replace_result atomic_replace(const char *path, const void *data, int len);
  *   IT IS DURABLE. Written stage-fsync-rename-fsync like every other record
  *   here (atomic_replace), because evidence that evaporates in a power cut
  *   authorises nothing after the reboot -- and the user's deletion silently
- *   fails to converge, which is the bug this is fixing.
+ *   fails to converge.
  *
  *   IT LIVES NEXT TO THE LOG. Deliberately: the failure it must never
  *   authorise is storage loss, and storage loss takes the whole data
@@ -178,9 +253,98 @@ long log_clear_generation(const char *path);
  * un-recorded while the file records it. */
 enum replace_result log_note_cleared(const char *path);
 
-/* The evidence no longer applies -- the log has rows again. Removing it is
+/* The evidence has stopped applying -- the log has rows again. Removing it is
  * what stops a tombstone minted for one deliberate clear from authorising an
  * ACCIDENTAL emptiness months later. 0 when no tombstone remains. */
 int log_clear_forget(const char *path);
+
+/* ---- EDITING ONE ROW OF A LOG THAT ALLOWS IT -------------------------
+ *
+ * Weight, food and exercise are editable: a row can be corrected or removed.
+ * All three did it the same way -- stream the file, copy every line to a
+ * temporary except the LAST one that matches, publish by rename -- in three
+ * copies, each of whose comments named one of the others. Every durability
+ * rule in that algorithm had to be learned three times, and the copies that
+ * did not learn it failed in somebody's data: a read that fails mid-copy must
+ * not be published, an over-long row must refuse the rewrite rather than be
+ * written back truncated, and a delete that empties the file must leave a
+ * tombstone or the sync client refuses to replicate the emptiness for ever.
+ *
+ * There is one copy now, and the caller supplies only the part that is its
+ * own: which line is the row, and what the replacement says. */
+
+/* THE LONGEST ROW THESE LOGS HAVE. Every editable log's rows are a handful of
+ * numbers or a short name; a line longer than this cannot be one this app
+ * wrote, and the rewrite refuses rather than write back a truncation. */
+#define LOG_EDIT_ROW_MAX 256
+/* Room for a log's path plus ".tmp". */
+#define LOG_EDIT_PATH_MAX 300
+
+struct log_edit {
+   /* IS THIS THE ROW? `line`..`end` is one row of the file without its
+    * newline. Called for every line, on both passes, so it must be pure. */
+   int (*matches)(const char *line, const char *end, void *ctx);
+   /* THE REPLACEMENT ROW, without its newline, into `out` (at most `cap`
+    * bytes). Returns its length, or negative to abandon the rewrite with the
+    * original untouched.
+    *
+    * NULL MEANS DELETE, which is why it is a null check rather than a flag:
+    * "there is no replacement row" and "the row goes away" are the same
+    * statement, and a flag lets a caller say one and mean the other. */
+   int (*format)(char *out, int cap, void *ctx);
+   void *ctx;
+};
+
+/* ---- READ A WHOLE SMALL FILE, EXACTLY ---------------------
+ *
+ * Every state file this app keeps -- the settings, the device info, the
+ * calibration queue, the rescale factor, the session cache, the meter's two
+ * -- is small, fixed-shape, and read in one go. Each loader had its own
+ * version of that, and most of them were ONE `read(fd, b, sizeof b - 1)` with
+ * the result used as the file's length. Three things are wrong with that, and
+ * they are wrong in the direction of PUBLISHING SOMETHING:
+ *
+ *   - a short read is not the end of the file. read() may return fewer bytes
+ *     than asked for at any time (a signal, a filesystem that felt like it),
+ *     and the loader then parses a PREFIX of the record and publishes it.
+ *   - EINTR is a failure to READ, not a file that ends there. Unhandled, a
+ *     signal during startup truncates whatever was being loaded.
+ *   - a full buffer proves nothing about the length. A file LONGER than the
+ *     buffer is not one this app wrote -- it is damage or another program's
+ *     -- and it decodes as a valid prefix.
+ *
+ * ONE reader, and app/meterstore.c's (which had all three right) is where it
+ * comes from. It loops over EINTR and short reads, probes for a byte past the
+ * end, and NUL-terminates.
+ *
+ *   LOAD_ABSENT   no file. A first run: the defaults are correct.
+ *   LOAD_OK       `*len` bytes, and the file ended exactly there.
+ *   LOAD_CORRUPT  the file exists and is not one this build can hold: empty
+ *                 (created and never written -- a torn save) or longer than
+ *                 `cap - 1`.
+ *   LOAD_ERROR    it could not be read. Nothing is known about its contents.
+ *
+ * `buf` is written only on LOAD_OK; every other answer leaves it alone, so a
+ * caller cannot half-publish a file it was told to refuse. */
+/* The largest file this reader will take in one go. Every caller's buffer is
+ * smaller than this (the biggest is the session cache's kilobyte); the bound
+ * exists so the staging copy inside is a fixed local rather than an
+ * allocation, and a caller asking for more than this gets its own buffer's
+ * size and no more -- which the EOF probe then reports as CORRUPT if the file
+ * really is longer. */
+#define MAX_EXACT_READ 4096
+
+enum load_result read_file_exact(const char *path, char *buf, int cap,
+                                 int *len);
+
+/* Rewrite `path`, replacing (or deleting) the LAST row `ed` matches.
+ *
+ * Returns 0 when the file now holds the edit, -1 when it does not -- and on
+ * -1 the original is untouched: nothing is published until the whole
+ * copy has succeeded. -1 also covers "no row matched" and "the log could not
+ * be read", which are the same thing to a caller: the edit did not happen.
+ *
+ * On success the caller still owns its own in-memory tail: reload it. */
+int log_edit_last(const char *path, const struct log_edit *ed);
 
 #endif

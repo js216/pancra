@@ -2,7 +2,9 @@
  * invite.c --- the invitation page and the login form
  * Copyright 2026 Jakob Kastelic
  */
-#include "auth.h"
+#include "authrate.h"
+#include "authsess.h"
+#include "authuser.h"
 #include "db.h"
 #include "http.h"
 #include "oops.h"
@@ -43,10 +45,10 @@ void h_login_post(struct req *r)
    char raw[1024], pw[1024];
    /* BOTH FIELDS MUST BE FIELDS, AND THIS IS DECIDED BEFORE THE THROTTLE.
     *
-    * The old code discarded the decoder's answer, so three shapes reached
+    * Discarding the decoder's answer lets three shapes reach
     * login_throttled, user_by_email, user_check_password and login_failed as
     * though the client had sent them: a password longer than this buffer,
-    * which was CLIPPED to 1023 bytes and then checked -- a different password
+    * CLIPPED to 1023 bytes and then checked -- a different password
     * from the one typed, and a different one again if the buffer size ever
     * changes; an address carrying "%00", which is one string to the NOCASE
     * lookup here and another to anything counting bytes; and "email=a&email=b",
@@ -67,11 +69,11 @@ void h_login_post(struct req *r)
       return;
    }
    /* ONE CANONICAL FORM, AND IT IS FIXED HERE, BEFORE ANYTHING IS LOOKED UP OR
-    * WRITTEN. This used to be a bare `strlen(email) > 254` and the raw field
-    * was then used for the throttle, the lookup and the failure record. The
-    * length half was right and is unchanged in effect; what it could not do is
-    * make the throttle key agree with the account table, which compares under
-    * NOCASE. See util.h: an address spelled a dozen ways is a dozen throttle
+    * WRITTEN. A bare `strlen(email) > 254`, with the raw field then used for
+    * the throttle, the lookup and the failure record, gets the length half
+    * right and cannot make the throttle key agree with the account table,
+    * which compares under NOCASE. See util.h: an address spelled a dozen ways
+    * is a dozen throttle
     * rows and one account, so the throttle never counts to its limit.
     *
     * `email` is what every line below uses. The raw field is not read again --
@@ -99,7 +101,7 @@ void h_login_post(struct req *r)
       return;
    }
    int lookup_failed = 0;
-   long uid          = user_by_email(r->db, email, &lookup_failed);
+   int64_t uid       = user_by_email(r->db, email, &lookup_failed);
    int pwok          = uid ? user_check_password(r->db, uid, pw) : 0;
    /* A STORAGE FAILURE IS NOT A WRONG PASSWORD. Telling the account holder it
     * was one sends them to reset a password that works -- and counts an
@@ -135,34 +137,62 @@ void h_login_post(struct req *r)
    redirect(r, "/", set);
 }
 
-void h_invite(struct req *r, long me, const char *cookie, const char *token)
+void h_invite(struct req *r, int64_t me, const char *cookie, const char *token)
 {
-   sqlite3_stmt *st    = db_prep(r->db, "SELECT owner_id,email FROM share_token"
-                                        " WHERE token=? AND used_at IS NULL"
-                                        " AND expires_at>?");
-   long owner          = 0;
+   /* ---- "NO SUCH INVITATION" IS AN ANSWER, NOT A SHRUG -----
+    *
+    * This collapsed three different things into `found = 0`: a prepare that
+    * failed, a step that answered BUSY or IOERR, and a genuine absence. The
+    * first two are the STORE not answering, and the page then told the
+    * visitor their link was "not valid any more" -- a statement about their
+    * invitation, made on the strength of a database that could not be read.
+    * An invitation is single-use and expires: a person told it is dead does
+    * not try again, they ask for another one, and the one they were holding
+    * may have been perfectly good.
+    *
+    * ABSENCE IS SQLITE_DONE AND NOTHING ELSE. Anything else is a 503 with a
+    * Retry-After, which is the honest answer and the one that invites the
+    * retry that will work. */
+   sqlite3_stmt *st = db_prep(r->db, "SELECT owner_id,email FROM share_token"
+                                     " WHERE token=? AND used_at IS NULL"
+                                     " AND expires_at>?");
+   if (!st) {
+      oops_busy(r);
+      return;
+   }
+   int64_t owner       = 0;
    char inv_email[256] = {0};
    int found           = 0;
-   if (st) {
-      sqlite3_bind_text(st, 1, token, -1, SQLITE_STATIC);
-      sqlite3_bind_int64(st, 2, (long)time(NULL));
-      if (sqlite3_step(st) == SQLITE_ROW) {
-         found = 1;
-         /* NULL owner: a plain signup link, minted from the command line. It
-          * creates an account and grants no access to anybody's data. */
-         if (sqlite3_column_type(st, 0) != SQLITE_NULL)
-            owner = (long)sqlite3_column_int64(st, 0);
-         const char *e = (const char *)sqlite3_column_text(st, 1);
-         snprintf(inv_email, sizeof inv_email, "%s", e ? e : "");
-      }
-      sqlite3_finalize(st);
+   sqlite3_bind_text(st, 1, token, -1, SQLITE_STATIC);
+   sqlite3_bind_int64(st, 2, (int64_t)time(NULL));
+   int rc = sqlite3_step(st);
+   if (rc == SQLITE_ROW) {
+      found = 1;
+      /* NULL owner: a plain signup link, minted from the command line. It
+       * creates an account and grants no access to anybody's data. */
+      if (sqlite3_column_type(st, 0) != SQLITE_NULL)
+         owner = (int64_t)sqlite3_column_int64(st, 0);
+      const char *e = (const char *)sqlite3_column_text(st, 1);
+      snprintf(inv_email, sizeof inv_email, "%s", e ? e : "");
+   }
+   int fin = sqlite3_finalize(st);
+   /* THE FINALIZE'S STATUS COUNTS TOO: sqlite reports a deferred error here
+    * (a statement that failed after stepping), and a row read out of one is a
+    * row nobody should act on. */
+   if (rc != SQLITE_ROW && !db_finished(rc)) {
+      oops_busy(r);
+      return;
+   }
+   if (fin != SQLITE_OK) {
+      oops_busy(r);
+      return;
    }
    if (!found) {
       /* A freshly-created account is already signed in when the signup POST
        * redirects home. If the person then opens the same invitation URL in
        * the app, the token is necessarily spent, but the session cookie is
        * still useful: send them to the public site so that URL opens their
-       * account instead of ending at a dead invitation page. Keep the 404 for
+       * account rather than ending at a dead invitation page. Keep the 404 for
        * signed-out visitors, since for them there is nowhere safe to send a
        * token that may be spent, expired, revoked, or simply invented. */
       if (me) {
@@ -175,13 +205,20 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
    }
    char oe[256] = {0}, oesc[300] = {0};
    if (owner) {
-      email_of(r->db, owner, oe, sizeof oe);
+      /* THIS PAGE ASKS SOMEBODY TO ACCEPT ACCESS TO A NAMED PERSON'S DATA,
+       * and the name is the only thing telling them whose. A database that
+       * could not produce it must not render the invitation with the name
+       * missing -- that is the one field a reader would use to decide. */
+      if (email_of(r->db, owner, oe, sizeof oe) == DB_GET_FAIL) {
+         oops_busy(r);
+         return;
+      }
       html_esc(oesc, sizeof oesc, oe);
    }
 
-   /* GET RENDERS, POST REDEEMS -- and this used to be the only thing standing
-    * between the two: `if (GET) { ...render...; return; }` and then straight
-    * into the redemption below, so HEAD, PUT, DELETE and PATCH all redeemed.
+   /* GET RENDERS, POST REDEEMS -- and a single `if (GET) { ...render...;
+    * return; }` falling straight into the redemption below is not that: HEAD,
+    * PUT, DELETE and PATCH would all redeem.
     * That is the worst instance of the defect in the program: redemption
     * creates an ACCOUNT, issues a session cookie, inserts a share row against
     * somebody else's record and spends the token, it is reachable while signed
@@ -284,7 +321,7 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
          page(r, 400, "Bad Request", "invitation", "<p>Unknown action.</p>");
          return;
    }
-   long viewer         = me;
+   int64_t viewer      = me;
    char newcookie[128] = {0};
    int tx              = 0;
    if (!strcmp(action, "accept")) {
@@ -398,11 +435,28 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
          return;
       }
       tx = 1;
-      if (!viewer && !user_create(r->db, email, pw, &viewer)) {
-         db_durable_rollback(r->db);
-         page(r, 400, "Bad Request", "Pancra Invite",
-              "<p class=err>Need a real email address and a password.</p>");
-         return;
+      if (!viewer) {
+         /* A SERVER FAILURE IS NOT A BAD ADDRESS. This answered
+          * 400 "Need a real email address and a password" for a database that
+          * could not be written -- so somebody accepting an invitation was
+          * told to correct an address that was perfectly good, and would go
+          * on correcting it. */
+         enum user_create_result made = user_create(r->db, email, pw, &viewer);
+         if (made == USER_CREATE_FAIL) {
+            db_durable_rollback(r->db);
+            oops(r);
+            return;
+         }
+         if (made != USER_CREATE_OK) {
+            db_durable_rollback(r->db);
+            page(r, 400, "Bad Request", "Pancra Invite",
+                 made == USER_CREATE_EXISTS
+                     ? "<p class=err>That address already has an account. "
+                       "Sign in instead.</p>"
+                     : "<p class=err>Need a real email address and a "
+                       "password.</p>");
+            return;
+         }
       }
       if (!session_new(r->db, viewer, newcookie, sizeof newcookie)) {
          db_durable_rollback(r->db);
@@ -428,7 +482,7 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
       /* count(*) always yields a row, so DB_GET_NONE here would itself be a
        * fault; either non-VALUE outcome means the cap could not be checked,
        * and a cap that cannot be checked is not a cap. */
-      long nf = 0;
+      int64_t nf = 0;
       if (db_get_long(r->db, "SELECT count(*) FROM share WHERE owner_id=?",
                       owner, &nf) != DB_GET_VALUE) {
          db_durable_rollback(r->db);
@@ -451,7 +505,7 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
       }
       sqlite3_bind_int64(ins, 1, owner);
       sqlite3_bind_int64(ins, 2, viewer);
-      sqlite3_bind_int64(ins, 3, (long)time(NULL));
+      sqlite3_bind_int64(ins, 3, (int64_t)time(NULL));
       int irc = sqlite3_step(ins);
       sqlite3_finalize(ins);
       if (irc != SQLITE_DONE) {
@@ -469,13 +523,25 @@ void h_invite(struct req *r, long me, const char *cookie, const char *token)
       oops(r);
       return;
    }
-   long now = (long)time(NULL);
+   int64_t now = (int64_t)time(NULL);
    sqlite3_bind_int64(up, 1, now);
    sqlite3_bind_text(up, 2, token, -1, SQLITE_STATIC);
    sqlite3_bind_int64(up, 3, now);
    int urc = sqlite3_step(up);
    sqlite3_finalize(up);
-   if (urc != SQLITE_DONE || db_changes(r->db) != 1) {
+   /* THE SAME DISTINCTION AS THE LOOKUP, and it matters more here
+    * because this is the spend. A step that did not FINISH says nothing about
+    * the token: telling the visitor their invitation is "not valid any more"
+    * on the strength of a busy database retires a link that is still good,
+    * and it is single-use, so they cannot check. DONE with no row changed is
+    * the real conflict -- somebody redeemed it first, or it expired between
+    * the page and the button. */
+   if (!db_finished(urc)) {
+      db_durable_rollback(r->db);
+      oops_busy(r);
+      return;
+   }
+   if (db_changes(r->db) != 1) {
       db_durable_rollback(r->db);
       page(r, 409, "Conflict", "invitation",
            "<p>That link is not valid any more.</p>");

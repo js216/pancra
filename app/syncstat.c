@@ -5,12 +5,12 @@
 #include "syncstat.h"
 
 /* EXHAUSTIVE BY CONSTRUCTION. No default: -Wswitch-enum makes an outcome
- * without a label a build error, which is the property the old string-based
- * version could not have -- two of its outcomes reached the screen with no
- * colour and nobody noticed. */
-const char *sync_outcome_label(int outcome)
+ * without a label a build error, which is a property a string-based version
+ * cannot have -- an outcome reaches the screen with no colour and nobody
+ * notices. */
+const char *sync_outcome_label(enum sync_outcome outcome)
 {
-   switch ((enum sync_outcome)outcome) {
+   switch (outcome) {
       case SYNC_IDLE: return "--";
       case SYNC_OK: return "SYNCED";
       case SYNC_PAIRED: return "PAIRED";
@@ -35,9 +35,9 @@ const char *sync_outcome_label(int outcome)
    return "SYNC FAILED";
 }
 
-int sync_outcome_severity(int outcome)
+enum sync_severity sync_outcome_severity(enum sync_outcome outcome)
 {
-   switch ((enum sync_outcome)outcome) {
+   switch (outcome) {
       case SYNC_IDLE: return SYNC_SEV_NONE;
       case SYNC_OK:
       case SYNC_PAIRED:
@@ -67,9 +67,9 @@ int sync_outcome_severity(int outcome)
    return SYNC_SEV_BAD;
 }
 
-int sync_outcome_retries(int outcome)
+int sync_outcome_retries(enum sync_outcome outcome)
 {
-   switch ((enum sync_outcome)outcome) {
+   switch (outcome) {
       /* Retrying cannot help: the identity, the name, the certificate or the
        * key is wrong, and only the user can change any of them. */
       case SYNC_NOT_PAIRED:
@@ -100,9 +100,9 @@ int sync_outcome_retries(int outcome)
    return 1;
 }
 
-int sync_outcome_of_net(int netfail)
+enum sync_outcome sync_outcome_of_net(enum sync_net_fail netfail)
 {
-   switch ((enum sync_net_fail)netfail) {
+   switch (netfail) {
       case SYNC_NET_OK: return SYNC_IDLE;
       case SYNC_NET_DNS: return SYNC_DNS;
       case SYNC_NET_TIMEOUT: return SYNC_TIMEOUT;
@@ -113,7 +113,7 @@ int sync_outcome_of_net(int netfail)
    return SYNC_FAILED;
 }
 
-int sync_outcome_of_status(int status)
+enum sync_outcome sync_outcome_of_status(int status)
 {
    /* Below 100 is not a status at all: it is the transport's "no answer"
     * sentinel, and the caller has a net-failure kind for that case. */
@@ -122,8 +122,8 @@ int sync_outcome_of_status(int status)
    if (status / 100 == 2)
       return SYNC_IDLE;
    /* 401 and 403 are the server saying our signature is not one it accepts --
-    * the one failure a user fixes by pairing again, and the one that used to
-    * be indistinguishable from a flat network. */
+    * the one failure a user fixes by pairing again, and the one worth telling
+    * apart from a flat network. */
    if (status == 401 || status == 403)
       return SYNC_AUTH;
    if (status / 100 == 5)
@@ -131,9 +131,9 @@ int sync_outcome_of_status(int status)
    return SYNC_BAD_REPLY;
 }
 
-int sync_outcome_before_reply(int outcome)
+int sync_outcome_before_reply(enum sync_outcome outcome)
 {
-   switch ((enum sync_outcome)outcome) {
+   switch (outcome) {
       /* Nothing usable came back: a name that did not resolve, a handshake
        * that was refused, no route, no answer in time, or a server that
        * answered only to say it was broken. None of these is a verdict on

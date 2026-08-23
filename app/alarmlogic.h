@@ -18,15 +18,48 @@
  * global here puts the logic back out of reach of the gate. */
 #ifndef ALARMLOGIC_H
 #define ALARMLOGIC_H
+#include <stdbool.h> /* the yes/no observations are bool, not int */
+
+/* FORWARD-DECLARED, NOT INCLUDED, and the difference is a build failure.
+ *
+ * store.h includes ingest.h which includes THIS header, so a translation unit
+ * that reaches store.h first finds PANCRA_STORE_H already defined by the time
+ * the cycle comes back round -- and `struct reading` is then still undefined
+ * where the prototype below needs it. Including store.h here made exactly that
+ * happen.
+ *
+ * A pointer to an incomplete type is all a prototype needs. alarmlogic.c
+ * includes store.h itself for the definition, and this header keeps the
+ * no-dependencies property its own comment claims. */
+struct reading;
+
+/* ---- ONE TYPE PER DOMAIN, AND THE CONVERSIONS NAMED ----------
+ *
+ * AS BARE INTS, the alarm level, the nudge band, the nudge sound mode, the
+ * action to take, Java's notification kind and a dozen yes/no observations
+ * are one type, so the compiler accepts any of them wherever any other is
+ * expected -- and three of the lists overlap numerically. `alarm_want(stale,
+ * zone)` compiles; so does passing a Java kind back in as a level (AJ_HIGH ==
+ * AL_LOW), or a nudge band as an alarm level (NG_HIGH == AL_HIGH by luck,
+ * NG_LOW == AL_LOW by luck, and neither is a promise). The two-numbering
+ * incident recorded under alarm_java_kind below -- where LOW and "nothing
+ * sounding" were the same value and the low-glucose alarm could not fire -- is
+ * the same defect one layer down.
+ *
+ * So each domain is its own enum, with an explicit member for "unknown"
+ * where one exists, and the raw-int boundaries are exactly two: what is
+ * PERSISTED (settings.c reads a file) and what crosses JNI (Alarm.java gets
+ * a kind). Both convert through a checked function here, and neither casts.
+ *
+ * The values are unchanged. ND_* is persisted and AJ_* is a wire protocol
+ * shared with Java, so renumbering either is a data or a protocol break; the
+ * enums state the numbers rather than inventing them. */
 
 /* Internal alarm levels. These deliberately do NOT match Java's `kind` -- see
  * alarm_java_kind below, which is the only correct way to convert. AL_NONE
  * must stay 0 and every real level non-zero, because alarm_apply treats 0 as
  * "nothing should be sounding". */
-#define AL_NONE  0
-#define AL_LOW   1
-#define AL_HIGH  2
-#define AL_STALE 3
+enum alarm_level { AL_NONE = 0, AL_LOW = 1, AL_HIGH = 2, AL_STALE = 3 };
 
 /* How old a reading may be and still count as current, in seconds.
  *
@@ -42,13 +75,13 @@
 
 /* IS A STAMP RECENT ENOUGH TO ACT ON -- and did it come from the PAST?
  *
- * THE BUG THIS EXISTS TO KILL. Every freshness test in the alarm was
- * `now - stamp <= limit`, which is true for every negative age as well as
- * every small positive one. A negative age is not exotic: the phone corrects
- * its clock BACKWARDS routinely -- an NTP step after a flat battery, a
- * timezone database fix, a user setting the date by hand -- and every reading
- * already in the log then carries a timestamp in the future. The alarm's view
- * of the world after such a correction was:
+ * WHAT THIS EXISTS TO KILL. A freshness test spelled `now - stamp <= limit`
+ * is true for every negative age as well as every small positive one. A
+ * negative age is not exotic: the phone corrects its clock BACKWARDS routinely
+ * -- an NTP step after a flat battery, a timezone database fix, a user setting
+ * the date by hand -- and every reading already in the log then carries a
+ * timestamp in the future. The alarm's view of the world after such a
+ * correction was:
  *
  *   - the last reading, however old, is FRESH, and stays fresh forever. The
  *     big number stops ageing. A 58 mg/dL from three hours ago reads as the
@@ -71,20 +104,20 @@
  * correction the newest reading is also future-dated, so the app reports no
  * current data until the next sample arrives -- at most one CGM cadence,
  * about five minutes, after which every stamp is on the corrected clock
- * again. The old behaviour's window was not five minutes, it was unbounded:
- * it lasted until the wall clock caught back up, and throughout it the app
- * asserted a stale value as live. A bounded gap that says "no data" beats an
- * unbounded one that says the wrong number confidently.
+ * again. Without the sanity test the window is not five minutes but
+ * unbounded: it lasts until the wall clock catches back up, and throughout it
+ * the app asserts a stale value as live. A bounded gap that says "no data"
+ * beats an unbounded one that says the wrong number confidently.
  *
  * `now` and `stamp` must be read from the SAME clock. For a persisted fact --
  * a reading, a dose -- that clock is realtime_s(), because the stamp is the
  * record's identity and is shown to a person. For something that only exists
  * inside this process -- when a prediction arrived, when the process started
  * -- it is mono_s(), which no correction can move; see clock.h. */
-static inline int data_fresh(long now, long stamp, long limit)
+static inline bool data_fresh(long now, long stamp, long limit)
 {
    long age = now - stamp;
-   return age >= 0 && age <= limit;
+   return (bool)(age >= 0 && age <= limit);
 }
 
 /* ---- NEW DATAPOINT alert modes (g_newdata_mode, persisted) ----
@@ -94,9 +127,20 @@ static inline int data_fresh(long now, long stamp, long limit)
  *             own previous sample
  * Values are PERSISTED (settings field 7, historically a 0/1 flag), so they
  * must not be renumbered. */
-#define ND_OFF   0
-#define ND_BEEP  1
-#define ND_CHIRP 2
+enum nudge_mode { ND_OFF = 0, ND_BEEP = 1, ND_CHIRP = 2 };
+
+/* THE ONE PLACE A STORED NUMBER BECOMES THIS TYPE. settings.c reads field 7
+ * out of a text file that a previous version wrote (as a 0/1 flag) and that
+ * a person can edit; anything not on the list is ND_OFF, which is the safe
+ * reading -- a mode nobody recognises must not silently sound something.
+ * Pure, so alarmtest executes every branch of it. */
+enum nudge_mode nudge_mode_of(int stored);
+
+/* THE CYCLE THE SETTINGS BUTTON PERFORMS: OFF -> BEEP -> CHIRP -> OFF. Here
+ * rather than in settings.c, where it was `(mode + 1) % 3` -- arithmetic on a
+ * domain that has none, and a wrong answer the day a fourth mode is added
+ * anywhere but the end. */
+enum nudge_mode nudge_mode_next(enum nudge_mode m);
 
 /* CHIRP pitch mapping. The chirp is the beep's duration and starting pitch,
  * then bends by one semitone per CHIRP_MGDL_PER_ST mg/dL of change, up for a
@@ -122,7 +166,7 @@ static inline int data_fresh(long now, long stamp, long limit)
  * MOVING the alarm threshold -- down to 70 after eating, back up when
  * unaware -- and the failure mode of that habit is the dangerous one: the
  * threshold gets left parked low, and the user goes on believing a reminder is
- * armed that can no longer arrive.
+ * armed that cannot arrive.
  *
  * So the NUDGE is the threshold that gets to be permanent. It sits OUTSIDE the
  * alarm's (a higher low, a lower high), fires ONCE, quietly, and is meant to
@@ -140,21 +184,24 @@ static inline int data_fresh(long now, long stamp, long limit)
  *   - IT DOES NOT RE-ARM ON A DROPOUT. Staleness must not clear the latch, or
  *     a flaky link turns one crossing into a nudge every few minutes. Only a
  *     genuine return to range re-arms it. */
-#define NG_NONE 0
-#define NG_LOW  1
-#define NG_HIGH 2
+/* NG_UNKNOWN IS NOT NG_NONE, and the difference is the whole latch. "No
+ * current reading" must HOLD the previous band through a dropout; "in range"
+ * must clear it. As a bare int the unknown was -1 and every caller had to
+ * remember that a negative meant hold -- `nzone <= 0` and `nzone < 0` both
+ * appear below, one of them meaning something different from the other. */
+enum nudge_band { NG_UNKNOWN = -1, NG_NONE = 0, NG_LOW = 1, NG_HIGH = 2 };
 
 /* Which nudge band the current reading is in: 0 in range, 1 low, 2 high, and
  * -1 for NO CURRENT READING -- distinct from 0, because the caller must HOLD
  * the previous latch through a dropout rather than clear it. Thresholds are
  * inclusive, exactly like alarm_zone. */
-int nudge_zone(int glu, long glu_t, long now, int lo, int hi);
+enum nudge_band nudge_zone(int glu, long glu_t, long now, int lo, int hi);
 
 /* The latch to commit, given this tick's zone and the previous latch. Split
  * from nudge_fire so that a SUPPRESSED crossing still updates the latch: a
  * plunge straight past both thresholds must not leave the nudge armed to fire
  * on the way back up, when the user is already looking at a ringing alarm. */
-int nudge_next(int nzone, int prev);
+enum nudge_band nudge_next(enum nudge_band nzone, enum nudge_band prev);
 
 /* NG_NONE, NG_LOW or NG_HIGH: what to sound right now.
  *
@@ -170,7 +217,8 @@ int nudge_next(int nzone, int prev);
  * The two zone-shaped arguments are named apart deliberately: they are the
  * same type and the same shape, and swapping them would silently invert the
  * suppression. */
-int nudge_fire(int nzone, int alarming, int prev);
+enum nudge_band nudge_fire(enum nudge_band nzone, bool alarming,
+                           enum nudge_band prev);
 
 /* Semitones of bend for a delta in mg/dL, in TENTHS of a semitone (the app
  * has no floating point; Java turns tenths into a frequency ratio). A delta
@@ -183,11 +231,39 @@ int chirp_semitone10(int delta_mgdl);
  * `glu < 0` means "no reading". Staleness returns 0 rather than the last
  * zone: a latched zone outranks the stale warning in alarm_want(), so a sensor
  * dropping out while low would otherwise mask the DISCONNECT alarm forever. */
-int alarm_zone(int glu, long glu_t, long now, int lo, int hi);
+enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi);
+
+/* HOW LONG THE USER HAS BEEN CONTINUOUSLY IN RANGE, in seconds, ending at the
+ * newest reading. 0 when the newest reading is itself out of range -- the
+ * streak is lost the moment it breaks, which is the whole point of it.
+ *
+ * `r` is the history NEWEST FIRST, which is the order store.h hands out.
+ *
+ * THE BAND IS [lo, hi] INCLUSIVE, and the caller passes the CLINICAL
+ * time-in-range range (TIR_LOW_MGDL..TIR_HIGH_MGDL, 70-180) rather than the
+ * configured alarm band. A streak is a claim about glucose control, so it is
+ * measured against the published consensus range that TIR itself uses -- and
+ * because stats.c counts 70 and 180 as in range, so does this. Breaking at a
+ * reading TIR calls good would be two numbers on one screen disagreeing about
+ * one sample.
+ *
+ * Note this is the OPPOSITE convention from alarm_zone, which is exclusive at
+ * its limits: an alarm FIRES at the limit, while a range CONTAINS it.
+ *
+ * A GAP BREAKS IT. Readings arrive every five minutes; a hole means the
+ * sensor was off, the phone was away, or the session ended, and nobody knows
+ * what happened in between. Counting straight through would claim credit for
+ * time nobody measured, so a gap longer than `gap_max` seconds ends the
+ * streak at the near side of the hole rather than spanning it.
+ *
+ * Pure, like everything else in this header: the caller passes the history
+ * and the bounds, and alarmtest pins the behaviour. */
+long alarm_streak_s(const struct reading *r, int n, int lo, int hi,
+                    long gap_max);
 /* Combine two sensors' zone verdicts: LOW (1) anywhere outranks HIGH (2)
  * anywhere outranks in-range (0). Commutative and associative, so a caller
  * can fold it over any number of sensors. */
-int alarm_zone_merge(int a, int b);
+enum alarm_level alarm_zone_merge(enum alarm_level a, enum alarm_level b);
 
 /* Is the stale-data ("DISCONNECT") alarm justified?
  *
@@ -212,8 +288,8 @@ int alarm_zone_merge(int a, int b);
  * COMPOSITION here, where a test executes it. The shell has composed this
  * file's pieces by hand before, and the hand-written copy is the one that
  * ran while the tested copy sat unreferenced -- see alarm_actuate_step. */
-int alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
-                long disc_s);
+bool alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
+                 long disc_s);
 
 /* ---- THE IMMINENT-HYPO OVERRIDE'S OWN PREDICATE ----
  *
@@ -237,7 +313,7 @@ int alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
  * app's loudest path, and alarm.c is reachable by no test: the override was
  * once deleted outright (`if (pred_low)` -> `if (pred_low && 0)`) with the
  * whole gate green. The shell folds this over its links; the rule is here. */
-int alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
+bool alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
 
 /* ---- ONE PREDICTION, PUBLISHED AS ONE VALUE -----------------------------
  *
@@ -252,13 +328,13 @@ int alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
  *      stale read. ThreadSanitizer reports it as one.
  *   2. A reader landing between the two stores gets a MIXED PAIR: this
  *      sample's predicted value stamped with the PREVIOUS sample's arrival
- *      time, or the previous value with this arrival time. Item 70 makes the
- *      freshness rule ask whether an age is sane; this makes sure the value
+ *      time, or the previous value with this arrival time. The freshness
+ *      rule asks whether an age is sane; this makes sure the value
  *      and the age belong to each other in the first place. Neither is any
  *      use without the other -- a 48 mg/dL prediction carrying a stamp from
  *      five minutes ago is refused as expired when it is current, and a
  *      recovered value carrying a fresh stamp forces the unsilenceable LOW
- *      over a prediction that no longer says anything.
+ *      over a prediction that has nothing to say.
  *
  * WHY NOT SIMPLY TAKE alarm_lk IN THE WRITER. Because the writer holds the
  * DRIVER lock, and alarm_lk is held across blocking MediaPlayer JNI --
@@ -306,16 +382,13 @@ struct link_pred pred_unpack(unsigned long long word);
  * would lag its own setting. disc_min[] (main.c) starts at 15 min for that
  * reason -- raising AL_FRESH_S means checking that table.
  *
- * Treating that as a stale-data alarm keeps a sound going instead of killing
+ * Treating that as a stale-data alarm keeps a sound going rather than killing
  * one. It cannot mask anything (it IS the stale alarm), it cannot fire while
  * data is fresh, and it cannot fire when the last known reading was in range,
  * so it adds no new alarms the user has not asked for -- it only refuses to
  * cancel one that is already justified. */
-int alarm_stranded(int glu, long glu_t, long now, int lo, int hi);
+bool alarm_stranded(int glu, long glu_t, long now, int lo, int hi);
 
-/* What should be sounding: a glucose excursion outranks a stale-data warning,
- * because it is the more urgent fact and the one the user must act on. */
-int alarm_want(int zone, int stale);
 
 /* What should sound, given that an alarm may ALREADY be sounding.
  *
@@ -336,7 +409,9 @@ int alarm_want(int zone, int stale);
  *     unchanged keeps the acknowledgement intact.
  *
  * So: sustain exactly what was already sounding, or nothing. */
-int alarm_want_sustained(int zone, int stale, int stranded, int prev_want);
+enum alarm_level alarm_want_sustained(enum alarm_level zone, bool stale,
+                                      bool stranded,
+                                      enum alarm_level prev_want);
 
 /* Does `want` correspond to something the user will actually perceive?
  *
@@ -344,7 +419,7 @@ int alarm_want_sustained(int zone, int stale, int stranded, int prev_want);
  * caller uses this to decide whether a tap should be consumed as a silence
  * gesture. Latching "sounding" when nothing sounds swallows the user's next
  * tap with no on-screen explanation. */
-int alarm_audible(int want, int sound_on, int vib_on);
+bool alarm_audible(enum alarm_level want, bool sound_on, bool vib_on);
 
 /* Translate an internal AL_* level to the `kind` Alarm.java expects
  * (0 = low, 1 = high, 2 = stale). Returns -1 for AL_NONE, which must never be
@@ -357,43 +432,75 @@ int alarm_audible(int want, int sound_on, int vib_on);
  * returned early and the LOW GLUCOSE ALARM COULD NEVER FIRE, while HIGH and
  * STALE worked normally, which is exactly the shape that hides from casual
  * testing. Keeping the two spaces separate and converting explicitly here is
- * what stops that recurring. */
-int alarm_java_kind(int want);
+ * what stops that recurring.
+ *
+ * ---- THE KIND IS A PROTOCOL, SO IT HAS NAMES ON BOTH SIDES -------------
+ *
+ * These three numbers cross a language boundary: C computes one and
+ * hands it to Alarm.trigger, which decided what to SAY with a chain of
+ * `kind == 2 ? ... : kind == 1 ? ... : "Glucose LOW"`. Two things were wrong
+ * with that beyond its being unreadable. Nothing named the numbers on either
+ * side, so the two lists agreed only by inspection and a renumbering here
+ * would have relabelled a safety notification silently. And the chain was not
+ * exhaustive: ANY unrecognised kind fell through to LOW, so a future fourth
+ * alarm -- or a corrupted argument -- announces a hypoglycaemic emergency.
+ *
+ * The names are AJ_* here and Alarm.KIND_* there, the values are stated once
+ * on each side, and `make -f test/Makefile javacheck` compares them literally.
+ * An edit to either list that the other does not match fails the build. */
+enum java_kind {
+   AJ_NONE  = -1, /* not a level Java can sound: alarm_apply stays quiet */
+   AJ_LOW   = 0,
+   AJ_HIGH  = 1,
+   AJ_STALE = 2
+};
+
+/* THE OTHER RAW-INT BOUNDARY. The JNI call takes an int, so this is where
+ * the type stops; every caller converts here and nothing casts. */
+enum java_kind alarm_java_kind(enum alarm_level want);
 
 /* What alarm_apply should DO, given the level it computed and what is already
  * committed. Pure, so the sequences can be tested; main.c holds the state and
  * performs the actuation.
  *
  * `act` is one of: */
-#define AL_ACT_NONE    0 /* nothing changed -- do not re-chime */
-#define AL_ACT_TRIGGER 1 /* announce o->want (convert with alarm_java_kind) */
-#define AL_ACT_SILENCE 2 /* stop whatever is sounding */
+enum alarm_act {
+   AL_ACT_NONE    = 0, /* nothing changed -- do not re-chime */
+   AL_ACT_TRIGGER = 1, /* announce o->want (convert with alarm_java_kind) */
+   AL_ACT_SILENCE = 2  /* stop whatever is sounding */
+};
+
+/* `sounding` and `acked` are TRISTATE here and nowhere else: AL_KEEP means
+ * the caller keeps what it has. They were -1 in an int field, which is the
+ * kind of thing a reader has to be told; named, the decision below can still
+ * say "unchanged" without a bool having to mean three things. */
+#define AL_KEEP (-1)
 
 struct alarm_out {
-   int act;
-   int want;     /* level to commit */
-   int sounding; /* arms the tap-to-silence gesture; see alarm_audible */
-   int acked;    /* acknowledgement state to commit */
+   enum alarm_act act;
+   enum alarm_level want; /* level to commit */
+   int sounding;          /* arms the tap-to-silence gesture, or AL_KEEP */
+   int acked;             /* acknowledgement state to commit, or AL_KEEP */
 };
 
 /* prev_acked records that the user DISMISSED prev_want. It is deliberately not
  * an input to the decision below -- a dismissal suppresses re-ANNOUNCING the
  * same level (see alarm_reactuate_allowed), it does not suppress a genuine
  * change of level, which is a new alarm the user has not seen. */
-void alarm_decide(int want, int prev_want, int sound_on, int vib_on,
-                  struct alarm_out *o);
+void alarm_decide(enum alarm_level want, enum alarm_level prev_want,
+                  bool sound_on, bool vib_on, struct alarm_out *o);
 
 /* May a re-actuation request (an audible-setting change) re-announce the
  * currently committed level?
  *
- * Only if the user has not already dismissed it. Acknowledgement used to be
- * recorded implicitly as "prev_want still equals this level", which a
- * re-actuation destroys by design -- so toggling SOUND or VIBRATION restarted
- * an alarm the user had silenced, from a settings screen reachable only
- * because it had gone quiet. The distinction that matters: a level that was
+ * Only if the user has not already dismissed it. Recorded implicitly as
+ * "prev_want still equals this level", acknowledgement is destroyed by a
+ * re-actuation by design -- so toggling SOUND or VIBRATION restarts an alarm
+ * the user has silenced, from a settings screen reachable only because it had
+ * gone quiet. The distinction that matters: a level that was
  * DISMISSED must stay quiet, while one that was never audible at all (both
  * settings off) must still be able to sound once one is enabled. */
-int alarm_reactuate_allowed(int acked);
+bool alarm_reactuate_allowed(bool acked);
 
 /* Convert a keypad entry into mg/dL for a CALIBRATION, or return -1 to refuse.
  *
@@ -440,7 +547,6 @@ int cal_entry_mgdl(const char *digits, int n, int units);
  * user choices, unlike the stepper-era [AL_MIN, AL_MAX] clamp. */
 #define AL_ENTRY_MAX 999
 
-void alarm_step(int which, int *lo, int *hi);
 
 /* THE LEVEL TO AIM FOR, INCLUDING THE IMMINENT-HYPO OVERRIDE.
  *
@@ -460,14 +566,14 @@ void alarm_step(int which, int *lo, int *hi);
  * evaluation sees a fresh NONE->LOW edge and re-triggers. THAT re-trigger is
  * what makes the alarm unsilenceable. */
 struct alarm_plan {
-   int want;      /* the level to aim for */
-   int sound_on;  /* possibly forced on by the override */
-   int prev_want; /* what alarm_decide compares against */
+   enum alarm_level want;      /* the level to aim for */
+   bool sound_on;              /* possibly forced on by the override */
+   enum alarm_level prev_want; /* what alarm_decide compares against */
 };
 
-void alarm_plan_next(int zone, int stale, int stranded, int acked, int pred_low,
-                     int prev_want, int sounding, int sound_on,
-                     struct alarm_plan *out);
+void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
+                     bool acked, bool pred_low, enum alarm_level prev_want,
+                     bool sounding, bool sound_on, struct alarm_plan *out);
 
 /* ================= THE ALARM ACTUATION WORKFLOW =====================
  *
@@ -484,32 +590,33 @@ void alarm_plan_next(int zone, int stale, int stranded, int acked, int pred_low,
  * whether the user has dismissed it, `sounding` whether anything is actually
  * audible or tactile (which is what arms the tap-to-silence gesture). */
 struct alarm_state {
-   int want;
-   int acked;
-   int sounding;
+   enum alarm_level want;
+   bool acked;
+   bool sounding;
 };
 
 /* What the shell is asked to DO. Nothing here touches Java; the shell does. */
 struct alarm_effect {
-   int act;  /* AL_ACT_NONE / AL_ACT_TRIGGER / AL_ACT_SILENCE */
-   int kind; /* Java's kind for a trigger, -1 when there is nothing to say */
-   int sound, vib; /* the outputs that trigger should use */
+   enum alarm_act act;
+   enum java_kind kind; /* AJ_NONE when there is nothing to say */
+   bool sound, vib;     /* the outputs that trigger should use */
 };
 
 /* What the shell OBSERVED this tick. Every input the decision needs, so the
  * transition can be pure -- no clock, no globals, no locks. */
 struct alarm_obs {
-   int zone;             /* 0 in range, AL_LOW, AL_HIGH from the reading */
-   int stale;            /* the current reading has aged out */
-   int stranded;         /* the sensor is gone, not merely quiet */
-   int pred_low;         /* a CGM predicts an imminent hypo */
-   int sound_on, vib_on; /* the user's alarm output settings */
+   enum alarm_level zone; /* AL_NONE in range, AL_LOW, AL_HIGH */
+   bool stale;            /* the current reading has aged out */
+   bool stranded;         /* the sensor is gone, not merely quiet */
+   bool pred_low;         /* a CGM predicts an imminent hypo */
+   bool sound_on, vib_on; /* the user's alarm output settings */
 };
 
 /* state + observation -> next state + one effect. Pure.
  *
  * The caller commits `next` ONLY if the effect it performs succeeds; a failed
- * JNI call must leave the old state, so the next tick tries again. That
+ * JNI call must leave the state unchanged, so the next tick tries again.
+ * That
  * retry-by-level is the whole error-recovery story for the alarm, which is
  * why the transition never assumes its effect happened. */
 void alarm_actuate_step(const struct alarm_state *st,

@@ -4,10 +4,9 @@
 //
 /* THE OUTCOME IS A CODE, NOT A SENTENCE.
  *
- * Every sync, pair and restore used to report an English string that was
- * carried to the screen and then pattern-matched to decide a colour --
- * a pair of string comparisons against "SYNCED" and "PAIRED". Two things went
- * wrong, and both are the kind that never announce themselves:
+ * AN ENGLISH STRING carried to the screen and pattern-matched to decide a
+ * colour -- a pair of string comparisons against "SYNCED" and "PAIRED" --
+ * goes wrong in two ways, both of the kind that never announce themselves:
  *
  *   - RESTORED and NOTHING TO RESTORE matched nothing, so a restore that
  *     worked rendered in the same grey as a screen that had never synced;
@@ -70,7 +69,7 @@ enum sync_severity {
  * hand a C enum back across JNI, so it classifies the exception into one of
  * these and passes the number; the mapping to an outcome is the switch below,
  * in C, where it can be tested. These values are mirrored by
- * BoundaryLogic.NET_* and the two are compared by `make javacheck` -- a
+ * NetPolicy.NET_* and the two are compared by `make javacheck` -- a
  * renumbering on one side alone would silently turn a timeout into a DNS
  * failure on the screen. */
 enum sync_net_fail {
@@ -82,31 +81,42 @@ enum sync_net_fail {
    SYNC_NET_OTHER
 };
 
-/* The outcome a transport failure means. SYNC_NET_OK maps to SYNC_IDLE: no
- * failure to report. */
-int sync_outcome_of_net(int netfail);
+/* ---- THE TYPE TRAVELS --------------------------------------
+ *
+ * Every one of these declared `int` and every caller kept the answer in an
+ * `int`, so the enum above described a domain nothing enforced: a status
+ * code, a net-failure code and an outcome are three unrelated numbering
+ * schemes, all of them assignable to each other without a word from the
+ * compiler. sync_outcome_of_status(SYNC_NET_TLS) compiles perfectly, and
+ * what it produces is a label about something else.
+ *
+ * The types are end to end now. The raw `int` remains at exactly two
+ * boundaries and both are named: the HTTP status, which is a number off the
+ * wire, and the Java NET_* code, which crosses JNI. Each converts through the
+ * function below that takes it. */
+enum sync_outcome sync_outcome_of_net(enum sync_net_fail netfail);
 
 /* The outcome an HTTP status means, or SYNC_IDLE for a status that is not a
  * failure. A status is the server ANSWERING, so it outranks anything the
  * transport guessed. */
-int sync_outcome_of_status(int status);
+enum sync_outcome sync_outcome_of_status(int status);
 
 /* The one place a code becomes words. Bounded, upper-case, and short enough
  * for the LAST STATUS row (12 characters). */
-const char *sync_outcome_label(int outcome);
+const char *sync_outcome_label(enum sync_outcome outcome);
 
 /* Whether the failure happened BEFORE the server gave a usable answer, so it
  * says nothing about what was sent. A pairing uses this to tell "your code
  * was refused" from "the server was never reached", which look identical from
  * inside sync.c. */
-int sync_outcome_before_reply(int outcome);
+int sync_outcome_before_reply(enum sync_outcome outcome);
 
 /* Its severity, for the renderer. */
-int sync_outcome_severity(int outcome);
+enum sync_severity sync_outcome_severity(enum sync_outcome outcome);
 
 /* Whether the app will retry this on its own. A user reading "TIMEOUT" should
  * not have to wonder; a user reading "NOT PAIRED" should not wait for a retry
  * that will never help. */
-int sync_outcome_retries(int outcome);
+int sync_outcome_retries(enum sync_outcome outcome);
 
 #endif

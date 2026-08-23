@@ -29,7 +29,7 @@
  *   reduced accepted three encodings of every signature whose r or s falls
  *   below 2^256 - n -- two of which the signer never produced. Measured on
  *   this code before the check: (r, s), (r + n, s) and (r, s + n) all
- *   verified. srv/test/cryptotest.c pins all three.
+ *   verified. test/srv/cryptotest.c pins all three.
  *
  *   d AND k ARE SCALARS, and reducing them turned "you supplied n" into "you
  *   supplied zero", reported one layer below where it happened.
@@ -57,13 +57,6 @@
 #include "p256.h"
 #include <stddef.h>
 #include <stdint.h>
-
-static void sc_to_be(uint8_t out[32], const struct u256 *a)
-{
-   for (size_t i = 0; i < 4; i++)
-      for (size_t j = 0; j < 8; j++)
-         out[31 - ((i * 8) + j)] = (uint8_t)(a->v[i] >> (8U * j));
-}
 
 int ecdsa_p256_sign(const uint8_t d_be[32], const uint8_t hash[32],
                     const uint8_t k_be[32], uint8_t r_be[32], uint8_t s_be[32])
@@ -103,8 +96,11 @@ int ecdsa_p256_sign(const uint8_t d_be[32], const uint8_t hash[32],
    if (p256_sc_is_zero(&s))
       return 0;
 
-   sc_to_be(r_be, &r);
-   sc_to_be(s_be, &s);
+   /* p256_sc_to_be, not a loop here: the byte order of a signature is the
+    * curve layer's business, and two encoders that drift agree with each
+    * other and with nobody else (see p256.h). */
+   p256_sc_to_be(&r, r_be);
+   p256_sc_to_be(&s, s_be);
    return 1;
 }
 
@@ -118,45 +114,43 @@ int ecdsa_p256_verify(const uint8_t qx[32], const uint8_t qy[32],
    struct u256 w;
    struct u256 u1;
    struct u256 u2;
-   /* CHECKED, not reduced. This is the malleability fix: r + n and s + n are
-    * not this signature, they are 32 bytes that reduce to it, and a verifier
-    * that cannot tell the difference accepts pairs its signer never emitted.
-    * The zero and the exactly-n cases fall out of the same decode -- both are
-    * P256_SCALAR_ZERO and P256_SCALAR_RANGE respectively, where the old code
-    * reported "zero" for both. */
-   const enum p256_scalar rst = p256_sc_from_be_checked(&r, r_be);
-   const enum p256_scalar sst = p256_sc_from_be_checked(&s, s_be);
-   p256_sc_from_be(&z, hash); /* REDUCED: the hash, as in signing */
-   if (rst != P256_SCALAR_OK || sst != P256_SCALAR_OK)
+   struct u256 v;
+   /* CHECKED, NOT REDUCED, and this is the malleability boundary: see the
+    * head of this file and ecdsa.h for what accepting r + n costs. */
+   const enum p256_scalar rs = p256_sc_from_be_checked(&r, r_be);
+   const enum p256_scalar ss = p256_sc_from_be_checked(&s, s_be);
+   if (rs != P256_SCALAR_OK || ss != P256_SCALAR_OK)
       return 0;
 
-   /* The public key must be validated, not merely decoded: p256_from_xy
-    * checks the point is on the curve, which is what stops a forged key from
-    * steering the arithmetic off it. */
-   struct jpoint pub;
-   if (!p256_from_xy(&pub, qx, qy))
+   /* THE PUBLIC KEY IS VALIDATED HERE, by the decode: p256_from_xy refuses a
+    * pair that is not an affine point of this curve. A verifier that skipped
+    * it would compute u2*Q on a point of some other curve entirely, where the
+    * arithmetic is still defined and the answer means nothing. */
+   struct jpoint q;
+   if (!p256_from_xy(&q, qx, qy))
       return 0;
 
-   struct jpoint u1g;
-   struct jpoint u2q;
-   struct jpoint sum;
-   p256_sc_inv(&w, &s);
+   p256_sc_from_be(&z, hash); /* REDUCED: e = digest mod n, FIPS 186-4 6.4 */
+   p256_sc_inv(&w, &s);       /* w = s^-1 */
    p256_sc_mul(&u1, &z, &w);
    p256_sc_mul(&u2, &r, &w);
-   p256_mul_g(&u1g, &u1);
-   p256_mul(&u2q, &u2, &pub);
-   p256_padd(&sum, &u1g, &u2q);
-   if (p256_is_inf(&sum))
+
+   struct jpoint a;
+   struct jpoint b;
+   struct jpoint sum;
+   p256_mul_g(&a, &u1);
+   p256_mul(&b, &u2, &q);
+   p256_padd(&sum, &a, &b);
+
+   uint8_t vx[32];
+   uint8_t vy[32];
+   /* The sum is the point at infinity for a signature that satisfies
+    * u1*G = -u2*Q, which has no x-coordinate and so no v to compare. */
+   if (!p256_to_xy(&sum, vx, vy))
       return 0;
-   uint8_t sx[32];
-   uint8_t sy[32];
-   if (!p256_to_xy(&sum, sx, sy))
-      return 0;
-   /* REDUCED for the same reason r was when it was computed: this is an
-    * x-coordinate becoming a scalar, not a scalar arriving from outside. */
-   struct u256 v;
-   p256_sc_from_be(&v, sx);
-   struct u256 diff;
-   p256_sc_sub(&diff, &v, &r);
-   return p256_sc_is_zero(&diff);
+   /* REDUCED, and on this side too: v is DEFINED as x(u1G + u2Q) mod n, and x
+    * lives mod p. */
+   p256_sc_from_be(&v, vx);
+   p256_sc_sub(&v, &v, &r);
+   return p256_sc_is_zero(&v);
 }

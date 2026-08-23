@@ -17,14 +17,18 @@
  * flag, and the "server acknowledged" timestamp is atomic. Without the gate,
  * two overlapping pushes send the same rows twice.
  */
+#include "syncstat.h" /* enum sync_outcome: the answer this reports */
+
 #ifndef REMOTE_H
 #define REMOTE_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: an answer no caller may drop */
 
 /* Consider syncing NOW: does nothing unless something changed, the backoff
  * has expired and no attempt is already in flight. Called from the SERVICE
  * tick as well as the activity's timer -- the activity's looper dies with the
  * activity, and a phone with the app backgrounded must still deliver its
- * readings, which is precisely the window in which points used to pile up
+ * readings -- precisely the window in which points otherwise pile up
  * unsent. */
 void pancra_remote_sync(void);
 
@@ -32,26 +36,48 @@ void pancra_remote_sync(void);
  * Ble.remotePush's worker thread; just timestamps the last success. */
 void pancra_remote_ok(void);
 
-/* The configured SERVER changed: drop the paired identity. There is no cursor
- * to forget any more -- the next sync asks the new server what it has -- but
- * the identity belongs to the old server and must not be offered to another
- * one. */
 /* Try again as soon as the next tick allows, clearing any backoff. For the
  * moment the user fixes what a failure was about -- a server name, a
- * pairing -- so the fix is not hidden behind a schedule the old settings
- * earned. */
+ * pairing -- so the correction is not hidden behind a schedule the settings
+ * they just corrected earned. */
 void remote_retry_now(void);
 
-void remote_forget_cursor(void);
-
-/* HOW THE LAST SYNC ENDED, and WHEN the server last acknowledged a push.
+/* ---- DROPPING THE PAIRED IDENTITY --------------------------
  *
- * Written by the sync worker thread, read by the main thread building a
- * frame. `remote_outcome` is an enum sync_outcome; syncstat.c turns it into
- * words with the lifetime of the process. */
-void remote_note_outcome(int outcome);
-int remote_outcome(void);
-void remote_note_ok(long when);
+ * WHAT IT DOES, AND THE NAME SAYS IT. This DELETES THE PAIRED IDENTITY --
+ * the account id and the signing key, out of the settings file -- zeroes the
+ * key the sync worker signs with, and resets the retry schedule. Re-pairing
+ * needs a fresh code from the server, so it is not an operation a caller
+ * should be able to make by accident, and a name has to be consequential
+ * enough that a reader of the call site knows what it costs.
+ *
+ * WHEN IT IS RIGHT: the configured SERVER changed. The identity belongs to
+ * the server it was minted against and must not be offered to another one;
+ * there is nothing to
+ * carry over, because the next sync asks the new server what it holds.
+ *
+ * DURABILITY. The identity is not gone until the settings file says so. If
+ * the file cannot be replaced, NOTHING is dropped -- the id and the key come
+ * back whole, because an app that believes it is unpaired while the file
+ * still names an account re-pairs into a SECOND account on the next code.
+ * That is the IDENTITY_KEPT answer, and it is not a retry that will happen
+ * later: the caller has already persisted a new server, so the phone is
+ * configured for one server and paired to another until somebody acts.
+ *
+ * WHICH IS WHY THE ANSWER MAY NOT BE DROPPED. The caller has to tell the
+ * user, because only they can re-pair. */
+enum identity_drop {
+   IDENTITY_DROPPED, /* gone from memory and from the file */
+   IDENTITY_KEPT /* the file refused; nothing changed, and it is still ours */
+};
+
+PANCRA_MUST_USE enum identity_drop remote_drop_identity(void);
+
+enum sync_outcome remote_outcome(void);
 long remote_ok_time(void);
+
+/* What the two above report, published by the push as it finishes. */
+void remote_note_ok(long when);
+void remote_note_outcome(int outcome);
 
 #endif

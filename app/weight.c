@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0
-// weight.c --- Body-weight log: append-only CSV + in-memory tail
+// weight.c --- Body-weight log: an editable CSV + in-memory tail
 // Copyright 2026 Jakob Kastelic
 
 /* See weight.h. Freestanding like insulin.c, whose shape this follows
@@ -9,31 +9,69 @@
 #include "weight.h"
 #include "csvcur.h" /* the shared CSV cursor; the grammar stays here */
 #include "dexlibc.h"
+#include "log.h"    /* LOGW: an edit that landed but could not be re-read */
+#include "thread.h" /* wt_lk: the tail is published, not filled in place */
 #include "util.h"
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
 #include <stdio.h> /* snprintf, SEEK_END */
 
-static struct wt_rec g_wt[NWT];
-static int g_nwt;
+/* ---- THE TAIL IS A VALUE, AND IT IS PUBLISHED ---------------
+ *
+ * Same shape and the same reason as insulin.c's: zeroing the count and
+ * refilling the array in place is a torn read waiting for a RESTORE, which
+ * calls weight_load on the sync worker while the main thread is drawing the
+ * weight table out of it.
+ * A reader landing mid-load sees an empty log, or a short one, or rows the
+ * count says are there and the previous contents actually left. So the tail
+ * is one object behind a leaf lock, and a load builds a separate one and
+ * publishes it with a single assignment. */
+struct wt_tail {
+   struct wt_rec r[NWT];
+   int n;
+};
 
+static struct wt_tail g_live;
+
+/* A LEAF: taken innermost, never held across another module's call and never
+ * across file I/O -- every writer here appends or rewrites the file first
+ * and takes this only to bring the tail into line. See app/thread.h. */
+static struct mutex wt_lk = MUTEX_INIT;
+
+#ifdef APP_FAULTS
+void (*weight_fault_before_reload)(void);
+#endif
 int wt_count(void)
 {
-   return g_nwt;
+   mutex_lock(&wt_lk);
+   int n = g_live.n;
+   mutex_unlock(&wt_lk);
+   return n;
 }
 
 struct wt_rec wt_at(int i)
 {
    struct wt_rec z = {0, 0};
-   if (i < 0 || i >= g_nwt)
-      return z;
-   return g_wt[i];
+   mutex_lock(&wt_lk);
+   if (i >= 0 && i < g_live.n)
+      z = g_live.r[i];
+   mutex_unlock(&wt_lk);
+   return z;
 }
 
 struct wt_rec wt_newest(void)
 {
-   return wt_at(g_nwt - 1);
+   /* THE INDEX AND THE READ IN ONE HOLD. Asking wt_count() and then wt_at()
+    * is two holds with a restore able to publish between them, which answers
+    * with a row that is not the newest -- or with nothing, on a log that has
+    * just got shorter. */
+   struct wt_rec z = {0, 0};
+   mutex_lock(&wt_lk);
+   if (g_live.n > 0)
+      z = g_live.r[g_live.n - 1];
+   mutex_unlock(&wt_lk);
+   return z;
 }
 
 int wt_copy(struct wt_rec *out, int cap)
@@ -41,8 +79,10 @@ int wt_copy(struct wt_rec *out, int cap)
    int n = 0;
    if (!out || cap <= 0)
       return 0;
-   for (; n < cap && n < g_nwt; n++)
-      out[n] = g_wt[n];
+   mutex_lock(&wt_lk);
+   for (; n < cap && n < g_live.n; n++)
+      out[n] = g_live.r[n];
+   mutex_unlock(&wt_lk);
    return n;
 }
 
@@ -88,21 +128,21 @@ int wt_to_tenths(long g, int units)
 
 /* ---- OVERFLOW EVICTS THE OLDEST BY TIME, NOT THE OLDEST BY ARRIVAL ------
  *
- * This used to drop element ZERO and then let the caller's wt_sort() tidy up,
- * and element zero is whichever row was PUSHED first -- which is only the
- * oldest row when the file happens to be in chronological order. It very often
- * is not. Rows arrive in FILE order, and a user who imports a scale's history,
- * or types in a weigh-in they forgot to log last month, appends rows whose
- * timestamps are older than everything already in the tail.
+ * Dropping element ZERO and letting the caller's wt_sort() tidy up discards
+ * whichever row was PUSHED first -- which is the oldest row only when the file
+ * happens to be in chronological order. It very often is not. Rows arrive in
+ * FILE order, and a user who imports a scale's history, or types in a weigh-in
+ * they forgot to log last month, appends rows whose timestamps are older than
+ * everything already in the tail.
  *
- * WHAT THAT LOOKED LIKE ON THE PHONE. A full tail, a backdated import, and the
+ * WHAT THAT LOOKS LIKE ON THE PHONE. A full tail, a backdated import, and the
  * weigh-ins from the last few days disappear from the table -- one per
  * imported row -- while the imported month-old ones sit there instead. Nothing
  * is lost from the file, so a restart brings the recent ones back for as long
  * as the tail has room again; it reads exactly like a display bug that fixes
  * itself, which is the hardest kind to be believed about.
  *
- * THE RULE NOW: the tail holds the NEWEST NWT rows BY TIME. Equivalently --
+ * THE RULE: the tail holds the NEWEST NWT rows BY TIME. Equivalently --
  * and this is how to read the code -- insert the row, sort, drop element zero.
  * Written out rather than actually done that way because the array has no
  * spare slot and the load pushes thousands of times:
@@ -121,38 +161,38 @@ int wt_to_tenths(long g, int units)
  *
  * The scan is linear over a 256-entry array and runs only once the tail is
  * full, which on a load is once per row past the first NWT. That is a few
- * thousand comparisons on a log of years -- far cheaper than the shift it
- * replaces did on every one of them. */
-static void wt_push(const struct wt_rec *r)
+ * thousand comparisons on a log of years -- far cheaper than shifting the
+ * whole array on every one of them. */
+static void wt_push(struct wt_tail *t, const struct wt_rec *r)
 {
-   if (g_nwt < NWT) {
-      g_wt[g_nwt++] = *r;
+   if (t->n < NWT) {
+      t->r[t->n++] = *r;
       return;
    }
    int oldest = 0;
-   for (int i = 1; i < g_nwt; i++)
-      if (g_wt[i].t < g_wt[oldest].t)
+   for (int i = 1; i < t->n; i++)
+      if (t->r[i].t < t->r[oldest].t)
          oldest = i;
-   if (r->t < g_wt[oldest].t)
+   if (r->t < t->r[oldest].t)
       return; /* the arriving row is the oldest: it evicts nobody */
-   for (int i = oldest + 1; i < g_nwt; i++)
-      g_wt[i - 1] = g_wt[i];
-   g_wt[g_nwt - 1] = *r;
+   for (int i = oldest + 1; i < t->n; i++)
+      t->r[i - 1] = t->r[i];
+   t->r[t->n - 1] = *r;
 }
 
 /* Oldest first. A backdated entry files into place immediately, so the table
  * never shows one row out of order until the next launch. Insertion sort: the
  * log is already sorted but for the row just added. */
-static void wt_sort(void)
+static void wt_sort(struct wt_tail *t)
 {
-   for (int i = 1; i < g_nwt; i++) {
-      struct wt_rec k = g_wt[i];
+   for (int i = 1; i < t->n; i++) {
+      struct wt_rec k = t->r[i];
       int j           = i - 1;
-      while (j >= 0 && g_wt[j].t > k.t) {
-         g_wt[j + 1] = g_wt[j];
+      while (j >= 0 && t->r[j].t > k.t) {
+         t->r[j + 1] = t->r[j];
          j--;
       }
-      g_wt[j + 1] = k;
+      t->r[j + 1] = k;
    }
 }
 
@@ -181,12 +221,13 @@ static int wt_parse_rec(const char *p, const char *e, struct wt_rec *r)
 /* 1 = a record was taken, 0 = the line was the header (nothing to take),
  * -1 = A ROW WAS REJECTED.
  *
- * The third answer is the one that used to be missing. A corrupt row was
- * skipped and the load reported success, so the app showed a history with a
- * hole in it and said nothing -- and this file is never rewritten, so the
- * hole is permanent and silent. Skipping is still right (a row that does not
- * parse is not a weight), but the CALLER has to know it happened. */
-static int wt_parse_line(const char *p, const char *e)
+ * The third answer is the one that is easy to leave out. Skip a corrupt row
+ * and report success and the app shows a history with a hole in it and says
+ * nothing -- and nothing here ever goes back over the file to find it, so the
+ * hole is permanent and silent (the edit path replaces one named row and
+ * reads nothing else). Skipping is right (a row that does not parse is not a
+ * weight), but the CALLER has to know it happened. */
+static int wt_parse_line(struct wt_tail *t, const char *p, const char *e)
 {
    if (p < e && *p == '#')
       return 0; /* the header */
@@ -199,7 +240,7 @@ static int wt_parse_line(const char *p, const char *e)
    struct wt_rec r = {0, 0};
    if (!wt_parse_rec(p, e, &r))
       return -1;
-   wt_push(&r);
+   wt_push(t, &r);
    return 1;
 }
 
@@ -209,7 +250,7 @@ static int wt_parse_line(const char *p, const char *e)
  * The distinction is the point, and "incomplete" is wider than "the read
  * failed". What is lost is not a file, it is RECORD: every weight the user has
  * logged, and the trend drawn from them. All four of these produce a short
- * history, and only the first used to be reported:
+ * history, and only the first is one the read itself reports:
  *
  *   - read(2) failed partway (a dying card);
  *   - a row did not parse, or held a value no scale produces;
@@ -218,13 +259,25 @@ static int wt_parse_line(const char *p, const char *e)
  *   - the file ends mid-line, which means it was cut while being written.
  *
  * Whatever parsed is KEPT -- a prefix of the truth beats an empty screen --
- * and the caller says so instead of presenting a short history as complete. */
+ * and the caller says so rather than presenting a short history as complete. */
+/* THE STAGING TAIL, private to the loader (see insulin.c for the reasoning;
+ * it is static for the same reason -- this runs on a service thread). */
+static struct wt_tail g_stage;
+
 int weight_load(void)
 {
-   g_nwt  = 0;
-   int fd = open(g_wt_path, O_RDONLY, 0);
-   if (fd < 0)
+   struct wt_tail *t = &g_stage;
+   t->n              = 0;
+   int fd            = open(g_wt_path, O_RDONLY, 0);
+   if (fd < 0) {
+      /* A LOG THAT IS NOT THERE IS A PUBLISHED RESULT TOO: the zeroing used
+       * to happen to the live tail, so this path emptied it on the way past
+       * and a restore-to-empty must still do that. */
+      mutex_lock(&wt_lk);
+      g_live = *t;
+      mutex_unlock(&wt_lk);
       return errno == ENOENT ? 0 : -1;
+   }
    /* Stream the whole file a line at a time (the insulin.c pattern): the tail
     * keeps only the last NWT rows, so memory stays bounded however many years
     * the file has grown. */
@@ -240,7 +293,7 @@ int weight_load(void)
             /* Two ways to lose a row -- longer than any row can be, or a
              * row that does not parse -- and one thing to say about both:
              * what you are looking at is short. */
-            if (over || wt_parse_line(line, line + llen) < 0)
+            if (over || wt_parse_line(t, line, line + llen) < 0)
                damaged = 1;
             llen = 0;
             over = 0;
@@ -255,16 +308,23 @@ int weight_load(void)
       /* A FINAL LINE WITH NO NEWLINE is a file that was cut while being
        * written -- power loss, or a full disk mid-append. Its bytes may parse
        * perfectly and still be half a record, so it is kept if it parses (the
-       * prefix rule) and reported either way. It used to be accepted in
-       * silence, and the test asserted that as correct. */
+       * prefix rule) and reported either way -- never accepted in silence. */
       /* NOT PARSED. The bytes may make a perfectly valid pair -- and still be
        * half a record, because what says a row is finished is the newline the
-       * file does not have. Publishing it puts a weight the user never logged
-       * into a log that is never rewritten. */
+       * file does not have. Publishing it puts a weight the user never
+       * logged into the record, where only the user noticing it and deleting
+       * it by hand would ever take it out again. */
       damaged = 1;
    }
    close(fd);
-   wt_sort();
+   wt_sort(t);
+   /* PUBLISHED WHOLE: one assignment under the leaf lock, so a
+    * reader holds the log from before this call or the one after it. A
+    * damaged file still publishes its prefix -- unchanged rule -- and the
+    * caller is still told. */
+   mutex_lock(&wt_lk);
+   g_live = *t;
+   mutex_unlock(&wt_lk);
    return (n < 0 || damaged) ? -1 : 0;
 }
 
@@ -278,172 +338,131 @@ int weight_append(long t, long g, long tz)
    int n = snprintf(b, sizeof b, "%ld,%ld,%ld\n", t, g, tz);
    n     = clampn(n, sizeof b);
    /* ONE OPERATION for the whole append, including the header on a new file:
-    * see log_append. This used to be open/lseek/write-header/write-row/close
-    * here, with the same two holes every other log had -- a first record that
-    * was not atomic, and a failed rollback reported as a clean failure. */
+    * see log_append. Done here as open/lseek/write-header/write-row/close it
+    * carries the two holes every hand-rolled log has -- a first record that is
+    * not atomic, and a failed rollback reported as a clean failure. */
    int rc = log_append(g_wt_path, g_wt_hdr, (int)sizeof g_wt_hdr - 1, b, n);
    if (rc != LOG_OK)
       return rc; /* LOG_DAMAGED travels: the file may hold a partial row */
    struct wt_rec r = {t, g};
-   wt_push(&r);
-   wt_sort();
+   /* THE FILE FIRST, THEN THE TAIL UNDER THE LOCK -- the leaf is never held
+    * across the append. */
+   mutex_lock(&wt_lk);
+   wt_push(&g_live, &r);
+   wt_sort(&g_live);
+   mutex_unlock(&wt_lk);
    record_mutated(); /* a synced record changed: see util.h */
    return 0;
 }
 
-/* Shared worker for update/delete: stream the file, copy every line to
- * <path>.tmp except the LAST row matching `orig`, which is replaced (or
- * skipped when del). Rewrite-and-rename so a crash never truncates the log.
- * The insulin.c original, with its two-field key. */
+/* WHAT MAKES A LINE THE ROW BEING EDITED, and what the replacement says.
+ * Everything else about the rewrite -- the two passes, the temporary, the
+ * durable publish, the tombstone when a delete empties the file -- is
+ * log_edit_last's (see util.h), so there is no copy of it here. */
+struct wt_edit {
+   struct wt_rec orig; /* the row the user is editing */
+   long t, g, tz;      /* what it becomes (unused for a delete) */
+};
+
+static int wt_edit_matches(const char *line, const char *end, void *ctx)
+{
+   const struct wt_edit *e = ctx;
+   struct wt_rec r;
+   /* BOTH FIELDS. A weight log can hold two rows with the same instant (the
+    * same second, two entries) and two with the same value; only the pair
+    * names one row. */
+   return wt_parse_rec(line, end, &r) && r.t == e->orig.t && r.g == e->orig.g;
+}
+
+static int wt_edit_format(char *out, int cap, void *ctx)
+{
+   const struct wt_edit *e = ctx;
+   return snprintf(out, (size_t)cap, "%ld,%ld,%ld", e->t, e->g, e->tz);
+}
+
+/* APPLY A COMMITTED EDIT TO THE TAIL, without touching the file.
+ *
+ * Only ever called when the file rewrite SUCCEEDED and the re-read did not,
+ * so the edit it applies is the one already on disk. It finds the row by the
+ * same pair wt_edit_matches uses -- the instant AND the value, because either
+ * alone can repeat -- and then edits or removes it.
+ *
+ * WHAT IT CANNOT DO, and what that costs: a delete leaves the tail one row
+ * short of the NWT it could hold, because the row that should be pulled in to
+ * replace it is older than anything in memory and only the file has it. The
+ * next successful load fills it. One missing OLD row for one session is a
+ * different order of wrong from a table that contradicts the file. */
+/* CALLER HOLDS wt_lk. */
+static void wt_tail_patch(const struct wt_rec *orig, int del, long t, long g)
+{
+   for (int i = 0; i < g_live.n; i++) {
+      if (g_live.r[i].t != orig->t || g_live.r[i].g != orig->g)
+         continue;
+      if (del) {
+         for (int j = i + 1; j < g_live.n; j++)
+            g_live.r[j - 1] = g_live.r[j];
+         g_live.n--;
+      } else {
+         g_live.r[i].t = t;
+         g_live.r[i].g = g;
+         wt_sort(&g_live); /* the instant may have moved: keep oldest-first */
+      }
+      return;
+   }
+   /* Not in the tail at all -- the user edited a row older than the newest
+    * NWT, which the table cannot show anyway. Nothing to do. */
+}
+
 static int wt_rewrite(const struct wt_rec *orig, int del, long t, long g,
                       long tz)
 {
-   /* pass 1: how many rows match? (we edit the LAST one) */
-   int fd = open(g_wt_path, O_RDONLY, 0);
-   if (fd < 0)
+   if (!orig)
       return -1;
-   char buf[1024];
-   char line[256];
-   int llen   = 0;
-   int nmatch = 0;
-   long n     = 0;
-   struct wt_rec r;
-   while ((n = read(fd, buf, sizeof buf)) > 0)
-      for (long i = 0; i < n; i++) {
-         if (buf[i] == '\n') {
-            if (llen < (int)sizeof line &&
-                wt_parse_rec(line, line + llen, &r) && r.t == orig->t &&
-                r.g == orig->g)
-               nmatch++;
-            llen = 0;
-         } else if (llen < (int)sizeof line) {
-            line[llen++] = buf[i];
-         } else {
-            llen = (int)sizeof line; /* over-long: cannot match */
-         }
-      }
-   close(fd);
-   if (nmatch == 0)
+   struct wt_edit e = {*orig, t, g, tz};
+   struct log_edit ed;
+   ed.matches = wt_edit_matches;
+   ed.format  = del ? 0 : wt_edit_format;
+   ed.ctx     = &e;
+   if (log_edit_last(g_wt_path, &ed) != 0)
       return -1;
-
-   /* pass 2: copy, altering only match #nmatch */
-   char tmp[sizeof g_wt_path + 4];
-   int tn = snprintf(tmp, sizeof tmp, "%s.tmp", g_wt_path);
-   if (tn <= 0 || tn >= (int)sizeof tmp)
-      return -1;
-   fd = open(g_wt_path, O_RDONLY, 0);
-   if (fd < 0)
-      return -1;
-   int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (out < 0) {
-      close(fd);
-      return -1;
+   /* ---- THE FILE IS RIGHT; NOW MAKE MEMORY SAY SO --------------------
+    *
+    * `(void)weight_load();` is not enough, whatever a comment about "memory
+    * holding the pre-edit rows, which is the honest state" claims:
+    * weight_load clears the tail as its FIRST act, so a reload that then
+    * fails to open the file leaves the screen showing an EMPTY weight log
+    * after an edit that succeeded. In the milder version -- a partial read --
+    * the row the user just changed can still show its pre-edit value, with
+    * the edit reported committed. Either way the caller is told the edit
+    * landed and the tail disagrees with the file.
+    *
+    * The rewrite is already validated (log_edit_last matched exactly one row
+    * and formatted its replacement, or removed it), so THE TAIL CAN BE
+    * PUBLISHED FROM IT rather than re-read: keep a copy, try the reload, and
+    * if the reload does not produce a tail, restore the copy and apply the
+    * very edit that just went to disk. Memory then agrees with the file by
+    * construction rather than by a second I/O that may not happen. */
+   struct wt_tail save;
+   mutex_lock(&wt_lk);
+   save = g_live;
+   mutex_unlock(&wt_lk);
+#ifdef APP_FAULTS
+   /* THE ONE MOMENT THIS FAILURE CAN BE ARRANGED, and the only way a test can
+    * reach it: between a rewrite that succeeded and the re-read that must
+    * follow it. Never compiled into the app -- nothing that ships defines
+    * APP_FAULTS -- and weighttest uses it to make the log unreadable exactly
+    * here (test/app/weighttest.c). */
+   if (weight_fault_before_reload)
+      weight_fault_before_reload();
+#endif
+   if (weight_load() != 0) {
+      mutex_lock(&wt_lk);
+      g_live = save;
+      wt_tail_patch(orig, del, t, g);
+      mutex_unlock(&wt_lk);
+      LOGW("weight: the log was rewritten but could not be re-read; the "
+           "table was updated from the edit itself");
    }
-   int seen = 0;
-   int ok   = 1;
-   /* HOW MANY BYTES THE REWRITE KEPT. Zero means this delete removed the last
-    * line in the file -- see the tombstone at the bottom of this function. */
-   long kept = 0;
-   llen      = 0;
-   /* `ok` used to be cleared only by a WRITE failure. A read error returns -1,
-    * which fails this loop's `> 0` test and left ok == 1 -- so the rename
-    * below swapped in whatever prefix had been copied and the rest of the
-    * weight log was gone. The rewrite-and-rename is what makes this file
-    * crash-safe; it must not also be what truncates it. */
-   while (ok && (n = read(fd, buf, sizeof buf)) > 0)
-      for (long i = 0; ok && i < n; i++) {
-         if (buf[i] != '\n') {
-            /* -1: the newline below is appended UNCONDITIONALLY, so the last
-             * byte of `line` belongs to it (the insulin.c overflow). */
-            if (llen < (int)sizeof line - 1)
-               line[llen++] = buf[i];
-            else
-               ok = 0; /* over-long row: refuse to rewrite blind */
-            continue;
-         }
-         int hit = wt_parse_rec(line, line + llen, &r) && r.t == orig->t &&
-                   r.g == orig->g && ++seen == nmatch;
-         if (hit && del) {
-            llen = 0;
-            continue; /* the deleted row is simply not copied */
-         }
-         if (hit)
-            llen = snprintf(line, sizeof line, "%ld,%ld,%ld", t, g, tz);
-         line[llen++] = '\n';
-         if (write(out, line, llen) != llen)
-            ok = 0;
-         else
-            kept += llen;
-         llen = 0;
-      }
-   if (n < 0)
-      ok = 0; /* the read failed mid-file: see the loop above */
-   /* a final line with no trailing newline gets the same treatment (the
-    * appender always terminates rows, but the file is user-copyable) */
-   if (ok && llen > 0 && llen < (int)sizeof line) {
-      int hit = wt_parse_rec(line, line + llen, &r) && r.t == orig->t &&
-                r.g == orig->g && ++seen == nmatch;
-      if (!(hit && del)) {
-         if (hit)
-            llen = snprintf(line, sizeof line, "%ld,%ld,%ld", t, g, tz);
-         line[llen++] = '\n';
-         if (write(out, line, llen) != llen)
-            ok = 0;
-         else
-            kept += llen;
-      }
-   }
-   close(fd);
-   /* DURABLY, or not at all.
-    *
-    * This used to close(out) unchecked and rename -- no fsync of the new
-    * contents, no check that close flushed them, no sync of the directory the
-    * rename lands in. A power loss in that window leaves the log EMPTY: the
-    * rename is visible while the bytes it points at never reached the disk,
-    * and the user's whole weight history is a file of nothing. Every other
-    * rewrite in the app goes through this same finish (see util.h). */
-   if (!ok) {
-      close(out);
-      (void)unlink(tmp);
-      return -1;
-   }
-   /* Only a rename that never happened is a failure here: past it the log
-    * file already holds the rewritten rows, and reporting failure would
-    * leave the caller's tail disagreeing with the file it just wrote. */
-   if (replace_finish(out, tmp, g_wt_path) == REPLACE_FAILED)
-      return -1;
-   /* THE OTHER HALF OF A DELETE THAT REMOVED THE LAST LINE.
-    *
-    * This log is synced, and the phone is authoritative over the server's
-    * copy of it -- so an empty log is an instruction to delete the replica.
-    * The sync client refuses that instruction unless it can tell a deliberate
-    * emptying from a phone that lost its storage, and it cannot tell by
-    * looking: both are a log with no rows. It therefore refuses, and would go
-    * on refusing for ever, with the user's deletion never reaching the server
-    * and every other log's sync stopped behind it.
-    *
-    * Only the code that did the emptying knows it was meant, so it is this
-    * code that says so. `kept == 0` is exactly that case and nothing else: a
-    * delete that removed the only line. In practice the '#' header keeps this
-    * file non-empty, so the tombstone is minted for a header-less log (one
-    * written by an older build, or copied in by hand) -- which is precisely
-    * the log whose last delete would otherwise wedge the sync silently.
-    *
-    * The reverse is stated too, because a rewrite that still keeps lines is
-    * proof the log is NOT empty, and evidence of emptiness must not outlive
-    * the emptiness it describes. */
-   if (kept == 0)
-      (void)log_note_cleared(g_wt_path);
-   else
-      (void)log_clear_forget(g_wt_path);
-   /* An EDIT or a DELETE is exactly the mutation file sizes can miss: a
-    * corrected weight of the same length leaves the log byte-for-byte as long
-    * as it was. */
-   record_mutated();
-   /* The tail mirrors the file again. A read that fails here leaves memory
-    * holding the pre-edit rows, which is the honest state: the FILE is
-    * correct and the next load will agree with it. */
-   (void)weight_load();
    return 0;
 }
 
@@ -481,7 +500,8 @@ void wt_form_open(struct wt_form *f, long last_g, int units, long now)
 int weight_paths(const char *dir)
 {
    int ok = 1;
-   ok &= data_path(g_wt_path, sizeof g_wt_path, dir, "/weight.csv");
+   if (!(data_path(g_wt_path, sizeof g_wt_path, dir, "/weight.csv")))
+      ok = 0;
    return ok;
 }
 

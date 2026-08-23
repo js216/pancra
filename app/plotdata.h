@@ -18,10 +18,9 @@
  *
  * PLOT_LONG_MAX sizes the frame's point array, which is uimodel.h's; the
  * struct those points are is uimodel.h's too. Declaring the constants here
- * and the struct there made the two headers include each other -- a cycle
- * that the note formerly at the top of this file described and worked
- * around ("NOT #include ui.h ... would be circular") rather than removed.
- * One vocabulary, one owner: the model that the plot is drawn from. */
+ * and the struct there makes the two headers include each other -- a cycle
+ * to be removed rather than worked around. One vocabulary, one owner: the
+ * model that the plot is drawn from. */
 #include "uimodel.h" /* struct ui_point, PLOT_LONG_MAX, PLONG_MIN */
 
 /* Points to draw for a span ending at `now`, or NULL when the caller should

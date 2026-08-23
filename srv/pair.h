@@ -15,22 +15,30 @@ struct db; /* db.h: every storage call names its database */
 #include "proto.h" /* struct req, and the protocol constants */
 
 /* ---- pair.c ---------------------------------------------------------- */
+/* ONE PAIRING ROUND, SERIALISED BY THIS MODULE.
+ *
+ * The four rounds share one in-memory exchange, and they land on different
+ * workers. Left to the CALLER -- a lock/unlock pair exported from this
+ * header, with every caller bracketing its own call -- it is a rule a header
+ * states and nothing enforces, and it breaks: the settings page's Unpair path
+ * calls pair_unpair() without the
+ * lock, and pair_unpair resets the exchange, so clicking Unpair while a phone
+ * was pairing freed a crypto context another worker was using.
+ *
+ * Every entry point below now takes the lock itself. There is nothing to
+ * bracket and nothing to forget. */
 void h_pair(struct req *r, int round);
-/* The pairing rounds share one in-memory exchange; the router holds this
- * across each round. */
-void pair_lock(void);
-void pair_unlock(void);
 /* Mint (or replace) the displayed code for a user; `out` gets the digits. */
-int pair_code_new(struct db *d, long uid, char *out, size_t cap);
+int pair_code_new(struct db *d, int64_t uid, char *out, size_t cap);
 /* Revoke the paired app's key. 1 when it is GONE from the database; 0 when
- * the delete did not run, in which case the old key still signs requests and
+ * the delete did not run, in which case that key still signs requests and
  * the caller must not say the app is unpaired. */
-int pair_unpair(struct db *d, long uid);
+int pair_unpair(struct db *d, int64_t uid);
 /* IS THIS ACCOUNT PAIRED? Three answers, because a database that cannot say
  * is not the same as an account with no app: 1 paired, 0 not paired, -1 the
  * question could not be answered. A caller that treats -1 as "not paired"
  * offers to pair a phone that is already paired, and one that treats it as
  * "paired" hides the pairing screen from someone who needs it. */
-int pair_is_paired(struct db *d, long uid);
+int pair_is_paired(struct db *d, int64_t uid);
 
 #endif

@@ -4,33 +4,35 @@
  *
  * THE GRAMMAR, ON ITS OWN, so it can be tested against the wire vectors.
  *
- * This used to live inside sync.c's dispatcher as a sequence of strncmp
- * prefixes and one strtol, wrapped around a database, a socket and a lock --
- * which meant the only way to ask "is /v1/pair/1junk a route?" was to start a
- * server and send it. So nothing asked, and for a while the answer was yes:
- * strtol reports success on what it managed to read, so three spellings of
- * round 1 reached the one endpoint that is served WITHOUT a signature.
+ * Inside sync.c's dispatcher, as a sequence of strncmp prefixes and one
+ * strtol wrapped around a database, a socket and a lock, the only way to ask
+ * "is /v1/pair/1junk a route?" is to start a server and send it. So nothing
+ * asks, and the answer is yes: strtol reports success on what it managed to
+ * read, so three spellings of round 1 reach the one endpoint that is served
+ * WITHOUT a signature.
  *
  * A route is the WHOLE path. No prefix of a route is that route, and no
  * decoration of one is either -- leading or trailing: " 1", "+1", "01" and
  * "1junk" are none of them round 1. See lib/wirevec.h for the grammar this
- * implements and srv/test/wiretest.c for the vectors it is checked against.
+ * implements and for the vectors it is checked against.
  *
  * route_of TAKES A PATH AND NOTHING ELSE. The signature is a separate gate
  * that runs before any of these, and choosing the handler is the dispatcher's
  * job: it has the request, this function has a string.
  *
  * WHICH METHODS A ROUTE ANSWERS is nevertheless a fact about the ROUTE, so it
- * is declared here with the routes themselves -- see route_allow below. That
- * used to be three `strcmp(r->method, ...)` tests scattered through the
- * dispatcher's switch, each with its own hand-typed refusal string, plus a
- * fourth in another file entirely (srv/pair.c), so "which methods does
- * /v1/digest take?" had no single place to read the answer. route_allow does
+ * is declared here with the routes themselves -- see route_allow below. As
+ * three `strcmp(r->method, ...)` tests scattered through the dispatcher's
+ * switch, each with its own hand-typed refusal string, plus a fourth in
+ * another file entirely (srv/pair.c), "which methods does /v1/digest take?"
+ * has no single place to read the answer. route_allow does
  * not choose a handler and does not look at a request; it answers, per route,
  * the question the dispatcher then enforces.
  */
 #ifndef PANCRA_ROUTE_H
 #define PANCRA_ROUTE_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
 
 #include "proto.h" /* LOGNAME_MAX: a route carries a log name */
 
@@ -80,7 +82,7 @@ struct route {
    enum route_kind kind;
    int round;                 /* RT_PAIR: 1..4 */
    char log[LOGNAME_MAX + 1]; /* RT_DIGEST_LOG, RT_BUCKET */
-   long bucket;               /* RT_BUCKET: 0..ROUTE_BUCKET_MAX */
+   int64_t bucket;            /* RT_BUCKET: 0..ROUTE_BUCKET_MAX */
 };
 
 /* ---- THE ONE NUMBER GRAMMAR A PATH MAY CONTAIN ---------------------------
@@ -98,7 +100,7 @@ struct route {
  * bucket path whose number is unusable is a 400 whatever made it unusable,
  * and a pairing path whose round is unusable is a 404. This distinction is
  * therefore not visible in `struct route` by design -- it is visible HERE, so
- * srv/test/rowtest.c can check each rule against the rule and not against
+ * each rule can be checked against the rule itself rather than against
  * whichever later check happens to catch the same value. */
 enum route_num {
    ROUTE_NUM_OK       = 0, /* digits, and the value is all of them */
@@ -131,8 +133,7 @@ enum route_num {
  * that ignores the status reads whatever it initialised the long to -- which
  * is zero at every call site here, and zero is a real bucket. The compiler
  * refuses that rather than trusting the next person to notice. */
-enum route_num route_number(const char *s, long *out)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum route_num route_number(const char *s, int64_t *out);
 
 /* Classify `path` (already percent-decoded, no query). Never fails: an
  * unrecognised path is RT_NONE. `out` is fully initialised either way. */
@@ -146,9 +147,8 @@ void route_of(const char *path, struct route *out);
  * round, GET for a digest, and GET or PUT for a bucket -- and the signature
  * covers the method, so these masks ARE the wire contract. lib/wirevec.h pins
  * them from outside both implementations (vector E: DELETE on a bucket and PUT
- * on a digest are both 405), and app/test/interoptest.c sends every one of
- * those vectors to a running server. Widening a mask here is changing the
- * protocol; it is not a way to make something pass.
+ * on a digest are both 405). Widening a mask here is changing the protocol; it
+ * is not a way to make something pass.
  *
  * The two "BAD" kinds and RT_NONE allow nothing: they are answered 400 and 404
  * respectively, whatever the method, because a malformed or nonexistent route

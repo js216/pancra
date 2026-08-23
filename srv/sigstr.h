@@ -19,6 +19,8 @@
 #ifndef PANCRA_SIGSTR_H
 #define PANCRA_SIGSTR_H
 
+#include "wireint.h" /* int64_t and PRIwire: the wire's scalars, exactly */
+
 #include <stddef.h>
 
 /* METHOD LF TARGET LF TS LF NONCE LF BODYHASH, with NO trailing newline.
@@ -30,7 +32,7 @@
  * Returns the length written, or 0 if it would not fit (in which case
  * nothing is signed, rather than a truncated string being). */
 int sig_signing_string(char *out, size_t cap, const char *method,
-                       const char *target, long ts, const char *nonce,
+                       const char *target, int64_t ts, const char *nonce,
                        const char *bodyhash);
 
 #endif

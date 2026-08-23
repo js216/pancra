@@ -3,15 +3,17 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "syncrow.h"
-#include "sha256.h"
+#include "wirehex.h" /* the ONE hex/hash codec both halves use */
+#include <stddef.h>
+#include <stdint.h>
 
 /* ---- hex, hashing ---------------------------------------------------- */
 
 /* strlen/strchr are not in the freestanding shim, and adding them there would
  * mean adding symbols to stub_c.c for two one-line loops. */
-long s_len(const char *p)
+int64_t s_len(const char *p)
 {
-   long n = 0;
+   int64_t n = 0;
    while (p[n])
       n++;
    return n;
@@ -25,53 +27,41 @@ const char *s_chr(const char *p, char c)
    return 0;
 }
 
-static const char hexd[] = "0123456789abcdef";
-
+/* ---- THE HEX AND THE HASH ARE lib/wirehex.h's --------------
+ *
+ * These three were written out here AND in srv/util.c: two encoders, two
+ * decoders, two truncated hashes, for a protocol whose entire purpose is that
+ * both sides produce the same bytes. The copies had already diverged where it
+ * mattered -- this decoder wrote each byte as it went and returned 0 at the
+ * first bad character, leaving a PREFIX of the caller's buffer modified,
+ * while the server's validated the whole string first and left a refused
+ * call's output untouched.
+ *
+ * They are one implementation now and it is the failure-atomic one. The names
+ * below stay because a dozen call sites in this half use them, and each is a
+ * line long. */
 void hexify(const uint8_t *in, int n, char *out)
 {
-   for (size_t i = 0; i < (size_t)n; i++) {
-      out[2 * i]       = hexd[in[i] >> 4U];
-      out[(2 * i) + 1] = hexd[in[i] & 15U];
-   }
-   out[2 * (size_t)n] = '\0';
+   wire_hex(in, (size_t)(n < 0 ? 0 : n), out);
 }
 
 int unhex(const char *in, int hexchars, uint8_t *out)
 {
-   for (int i = 0; i < hexchars; i += 2) {
-      unsigned hi = 16;
-      unsigned lo = 16;
-      for (unsigned k = 0; k < 16; k++) {
-         if (((unsigned)in[i] | 0x20U) == (unsigned char)hexd[k])
-            hi = k;
-         if (((unsigned)in[i + 1] | 0x20U) == (unsigned char)hexd[k])
-            lo = k;
-      }
-      if (hi > 15 || lo > 15)
-         return 0;
-      out[i / 2] = (uint8_t)((hi << 4U) | lo);
-   }
-   return 1;
+   return hexchars < 0 ? 0 : wire_unhex(in, (size_t)hexchars, out);
 }
 
-/* The protocol's hash: first 16 hex chars of SHA-256. */
-void hash16(const char *data, long len, char out[17])
+/* The protocol's hash: first 16 hex chars of SHA-256 (lib/wirehex.h). */
+void hash16(const char *data, int64_t len, char out[17])
 {
-   uint8_t h[32];
-   char hex[65];
-   sha256((const uint8_t *)data, (size_t)len, h);
-   hexify(h, 32, hex);
-   for (int i = 0; i < 16; i++)
-      out[i] = hex[i];
-   out[16] = '\0';
+   wire_hash16(data, (size_t)(len < 0 ? 0 : len), out);
 }
 
-/* The app's own HMAC used to live here. It truncated the message at
- * SYNC_BUF_MAX, so it was a MAC over a PREFIX for anything longer -- while
- * lib/hmac.c pre-hashed past 512 bytes, which is a third function again. Both
- * ends of this protocol have to compute the same MAC, so there is one
- * implementation now (lib/hmac.c, streamed, pinned to the RFC 4231 vectors)
- * and this file calls it. */
+/* NO SECOND HMAC LIVES HERE. An app-local one truncating the message at
+ * SYNC_BUF_MAX is a MAC over a PREFIX for anything longer, while lib/hmac.c
+ * pre-hashes past 512 bytes -- a third function again. Both ends of this
+ * protocol have to compute the same MAC, so there is one implementation
+ * (lib/hmac.c, streamed, pinned to the RFC 4231 vectors) and this file calls
+ * it. */
 
 /* ---- reading a log into rows ----------------------------------------- */
 
@@ -120,12 +110,12 @@ int row_ok(const char *p, int len)
 /* The row's bucket: its leading decimal field divided into UTC days. A row
  * with no leading number (a '#' header) lands in bucket 0, which is stable on
  * both sides and therefore harmless. */
-long row_bucket(const char *p, size_t len, int bucketed)
+int64_t row_bucket(const char *p, size_t len, int bucketed)
 {
    if (!bucketed)
       return 0;
-   long v   = 0;
-   size_t i = 0;
+   int64_t v = 0;
+   size_t i  = 0;
    while (i < len && p[i] >= '0' && p[i] <= '9') {
       if (i < 18)
          v = (v * 10) + (p[i] - '0');
@@ -134,7 +124,7 @@ long row_bucket(const char *p, size_t len, int bucketed)
    return v / 86400;
 }
 
-int want_has(const long *want, int nwant, long b)
+int want_has(const int64_t *want, int nwant, int64_t b)
 {
    for (int i = 0; i < nwant; i++)
       if (want[i] == b)

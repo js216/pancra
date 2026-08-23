@@ -10,5 +10,10 @@ void (*signal(int sig, void (*handler)(int)))(int);
 int raise(int sig);
 
 #define SIG_DFL ((void (*)(int))0)
+/* WHAT signal() ANSWERS WHEN IT REFUSES. Bionic and glibc alike
+ * define this as (void (*)(int))-1; it is here because a caller that does not
+ * check it cannot tell an installed handler from one the kernel would not
+ * take -- and this program's crash reporting is exactly that check. */
+#define SIG_ERR ((void (*)(int)) - 1)
 
 #endif

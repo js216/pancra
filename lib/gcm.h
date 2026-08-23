@@ -9,6 +9,8 @@
  */
 #ifndef GCM_H
 #define GCM_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,10 +46,10 @@
  * capacity, which is why one constant below is derived from the other and the
  * two are tied together by a _Static_assert in gcm.c.
  *
- * WHAT THE OLD CODE DID, written out for whoever is reading this because their
- * traffic was decrypted. gctr() held the counter in a `uint32_t` and did
- * `ctr++` per block, and nothing anywhere compared the length against
- * anything. Past the bound the counter simply wrapped, silently, and produced
+ * WHAT AN UNBOUNDED COUNTER DOES, written out for whoever is reading this
+ * because their traffic was decrypted. Held in a `uint32_t` with `ctr++` per
+ * block and nothing comparing the length against anything, past the bound the
+ * counter simply wraps, silently, and produces
  * PERFECTLY WELL-FORMED CIPHERTEXT with a tag that verified. There was no
  * error, no log line and no return value -- aes128_gcm_seal returned void.
  * From byte 2^36 - 32 onward one message's own keystream repeats every 2^36
@@ -69,7 +71,7 @@
 
 /* The block-count capacity of a 32-bit counter that starts at 2 and must never
  * wrap. Spelled as a suffixed integer constant, not a cast, so it can be used
- * in #if -- srv/test/cryptotest.c needs that to decide whether this platform's
+ * in #if -- test/srv/cryptotest.c needs that to decide whether this platform's
  * size_t can even express a length past the bound. */
 #define GCM_CTR_BLOCKS_MAX 0xFFFFFFFEull /* 2^32 - 2 */
 
@@ -104,29 +106,6 @@ enum gcm_status {
    GCM_ERR_TAG      /* unseal only: the tag did not verify */
 };
 
-/* THE LENGTH RULE ON ITS OWN, as a pure function of two byte counts.
- *
- * It is split out because it is the only part of this file a test can actually
- * DRIVE TO ITS BOUNDARY. GCM_PT_MAX is 64 GiB and GCM_AAD_MAX is 2 EiB; no
- * test allocates those, so "a plaintext of exactly GCM_PT_MAX is accepted" can
- * never be asserted against the sealer. Asserted against this, it can --
- * exactly, and one byte either side of exactly.
- *
- * Both parameters are uint64_t and NOT size_t on purpose. The bounds belong to
- * SP 800-38D, not to this platform's address space, so they are stated in the
- * width the standard's own arithmetic needs; a 32-bit size_t would otherwise
- * silently reinterpret them as "whatever fits". aes128_gcm_seal and
- * aes128_gcm_unseal widen their size_t arguments and call this, so the sealer
- * and the test are pinned to the same predicate rather than to two copies of a
- * comparison. Read the test's claims accordingly: the sealer's REFUSALS are
- * executed, and so is this predicate at both boundaries, but the sealer has
- * never been run at a legal 64 GiB and says so.
- *
- * aadn is judged before n, so a call that breaks both reports GCM_ERR_AAD_LEN.
- * Fixed order, stated here, because a test that cannot predict which rule fires
- * cannot isolate either one. */
-enum gcm_status aes128_gcm_limits(uint64_t aadn, uint64_t n)
-    __attribute__((warn_unused_result));
 
 /* GCM_OK, or a status with NEITHER `ct` NOR `tag` TOUCHED.
  *
@@ -144,21 +123,24 @@ enum gcm_status aes128_gcm_limits(uint64_t aadn, uint64_t n)
  * NO warn_unused_result, DELIBERATELY, AND THIS IS A LOOSE END rather than a
  * decision I am happy with. Adding it is a one-line change and the attribute
  * belongs here; what stops it is srv/tls.c:451, which calls this as a bare
- * statement and would fail to compile under -Werror. srv/tls.c is mid-audit
- * for TODO items 56-57 and is not mine to edit, so the attribute waits for the
- * patch quoted in the report for item 64. Note what is and is not at risk in
- * the meantime: the void return is gone, the limits are enforced, and a refused
- * seal writes nothing -- so the keystream reuse is closed. What remains is that
- * that one call site cannot NOTICE a refusal, and would transmit a record built
+ * statement and would fail to compile under -Werror. What is and is not at
+ * risk: the limits are enforced and a refused seal writes nothing, so
+ * keystream reuse is impossible. What remains is that that one call site
+ * cannot NOTICE a refusal, and would transmit a record built
  * from an uninitialised stack buffer if one ever happened. It cannot happen
  * there: `inner` is at most REC_MAX + 1. */
-enum gcm_status aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
-                                const uint8_t *aad, size_t aadn,
-                                const uint8_t *pt, size_t n, uint8_t *ct,
-                                uint8_t tag[16])
-    __attribute__((warn_unused_result));
+/* The two length rules on their own (SP 800-38D 5.2.1.1), with no key and no
+ * buffers: aadn is judged first, then n. Every seal and unseal runs this
+ * before it touches a byte. */
+PANCRA_MUST_USE enum gcm_status aes128_gcm_limits(uint64_t aadn, uint64_t n);
 
-/* GCM_OK with `pt` written, or a status with `pt` LEFT EXACTLY AS IT WAS.
+PANCRA_MUST_USE enum gcm_status aes128_gcm_seal(const uint8_t key[16],
+                                                const uint8_t iv[12],
+                                                const uint8_t *aad, size_t aadn,
+                                                const uint8_t *pt, size_t n,
+                                                uint8_t *ct, uint8_t tag[16]);
+
+/* GCM_OK with `pt` written, or a status with `pt` LEFT UNTOUCHED.
  * The tag comparison is constant time.
  *
  * WHAT AN OPENER HAS TO REJECT, AND WHY IT IS NOT OBVIOUS. The instinct is
@@ -171,9 +153,9 @@ enum gcm_status aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
  *     GCM_PT_MAX therefore CANNOT HAVE BEEN PRODUCED BY A CONFORMING SEALER.
  *     Accepting it is agreeing to process something no honest peer ever sent,
  *     and doing so is what turns our own defect into interoperability: two
- *     copies of the old code would have agreed with each other perfectly, both
- *     wrapping the counter identically, and the tag would have verified. A bug
- *     both ends share is a bug no test over the wire can see.
+ *     copies of a wrapping implementation agree with each other perfectly,
+ *     both wrapping the counter identically, and the tag verifies. A bug both
+ *     ends share is a bug no test over the wire can see.
  *   - The tag we would compute for it is not GCM's tag, because its length
  *     block is the wrapped one described above. "Verified" would not mean what
  *     the word means.
@@ -182,11 +164,10 @@ enum gcm_status aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
  *     block is also refusing the denial of service.
  *
  * So the same two bounds, the same fixed order, checked before any work. */
-enum gcm_status aes128_gcm_unseal(const uint8_t key[16], const uint8_t iv[12],
-                                  const uint8_t *aad, size_t aadn,
-                                  const uint8_t *ct, size_t n,
-                                  const uint8_t tag[16], uint8_t *pt)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum gcm_status
+aes128_gcm_unseal(const uint8_t key[16], const uint8_t iv[12],
+                  const uint8_t *aad, size_t aadn, const uint8_t *ct, size_t n,
+                  const uint8_t tag[16], uint8_t *pt);
 
 /* 1 if the ciphertext was authentic AND acceptable, 0 otherwise -- and on 0 the
  * plaintext is NOT written, so a caller that ignores the result still cannot
@@ -208,9 +189,9 @@ enum gcm_status aes128_gcm_unseal(const uint8_t key[16], const uint8_t iv[12],
  * NULL argument", not only "the tag did not match". Both sites reject on 0.
  * Callers wanting to tell a forgery from a caller bug -- for a log line, or a
  * metric -- should call aes128_gcm_unseal and read the status. */
-int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
-                    const uint8_t *aad, size_t aadn, const uint8_t *ct,
-                    size_t n, const uint8_t tag[16], uint8_t *pt)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
+                                    const uint8_t *aad, size_t aadn,
+                                    const uint8_t *ct, size_t n,
+                                    const uint8_t tag[16], uint8_t *pt);
 
 #endif

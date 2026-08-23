@@ -10,6 +10,8 @@
 #ifndef UTIL_H
 #define UTIL_H
 
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
+
 #include "proto.h" /* struct req, and the protocol constants */
 
 /* ---- util.c ---------------------------------------------------------- */
@@ -28,18 +30,16 @@ struct sb {
  * group of three silently made vsnprintf read past the end of the list and
  * take the server down with it. The attribute turns that into a build
  * error. */
-int sb_add(struct sb *s, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+int sb_add(struct sb *s, const char *fmt, ...) PANCRA_PRINTF(2, 3);
 int sb_raw(struct sb *s, const void *data, size_t n);
 void sb_free(struct sb *s);
 
 /* ---- THE CAPACITY THIS BUFFER WOULD NEED, AND WHY IT IS A FUNCTION ------
  *
- * WHAT THE ARITHMETIC USED TO DO. sb_room asked `if (s->n + need + 1 <=
- * s->cap) return 1;` and then grew with `while (cap < s->n + need + 1) cap *=
- * 2;`. Both expressions are size_t, both wrap, and neither was checked. Two
- * things followed, and both were measured against the code as it stood rather
- * than reasoned about:
+ * WHY THE ARITHMETIC IS A FUNCTION. `if (s->n + need + 1 <= s->cap) return
+ * 1;` with growth by `while (cap < s->n + need + 1) cap *= 2;` is two size_t
+ * expressions that both wrap, neither checked. Two things follow, and both
+ * were measured rather than reasoned about:
  *
  *   * n + need + 1 WRAPS TO SOMETHING SMALL and the test passes. `need` of
  *     SIZE_MAX makes the sum zero, and zero is <= any capacity, so a builder
@@ -71,12 +71,15 @@ void sb_free(struct sb *s);
  * buffer, so there is no capacity to name. *out is written FIRST in every
  * case. */
 #define SB_MIN_CAP 4096 /* the first allocation, unchanged: one page */
-
-int sb_cap_for(size_t n, size_t cap, size_t need, size_t *out)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE int sb_cap_for(size_t n, size_t cap, size_t need, size_t *out);
 
 void rnd_bytes(uint8_t *out, size_t n);
-void rnd_hex(char *out, size_t hexlen); /* hexlen chars + NUL */
+/* EXACTLY `hexlen` hex characters plus a NUL into `out`, which holds `cap`.
+ * 1 on success; 0 -- with `out` set to the empty string -- when hexlen is odd,
+ * would not fit in cap, or is more than this can draw at once. Void, it
+ * answers a too-long or odd request with a SHORTER token, which every caller
+ * here would mint as a credential. See the definition. */
+PANCRA_MUST_USE int rnd_hex(char *out, size_t cap, size_t hexlen);
 void hex_of(const uint8_t *in, size_t n, char *out);
 int hex_to(const char *in, size_t hexchars, uint8_t *out);
 /* ct_eq moved to lib/ct.h: it is a crypto primitive, and srv/tls.c needs it
@@ -90,10 +93,10 @@ void html_esc(char *out, size_t cap, const char *in);
 
 /* ---- WHAT A FORM FIELD IS, AND THE FOUR WAYS IT IS NOT ONE --------------
  *
- * The decoder this replaces answered a yes/no question -- "was there a field
- * of this name?" -- and could not say no to anything else. Four behaviours
- * hid behind that one bit, and every one of them is reachable from an
- * unsigned, unauthenticated POST:
+ * A decoder that answers a yes/no question -- "was there a field of this
+ * name?" -- cannot say no to anything else. Four behaviours hide behind that
+ * one bit, and every one of them is reachable from an unsigned,
+ * unauthenticated POST:
  *
  *   %00 DECODED TO AN EMBEDDED NUL. url_decode turned "%00" into a real NUL
  *      byte in the middle of the caller's buffer, and every caller then used
@@ -108,8 +111,8 @@ void html_esc(char *out, size_t cap, const char *in);
  *      vlen = cap - 1;` -- a value one byte too long silently became a
  *      DIFFERENT value, and the caller was told it was the field the client
  *      sent. Nothing in the caller could tell "the user typed this" from
- *      "the user typed this and 900 bytes more". (Item 47 established by
- *      execution that today's truncation cannot produce a value that
+ *      "the user typed this and 900 bytes more". (It was established by
+ *      execution that the truncation here cannot produce a value that
  *      VALIDATES, because it truncates the still-ENCODED prefix and a cut
  *      "%"-escape then decodes to literal characters. That is a property of
  *      where the cut lands, not a rule anybody wrote; it held for `tz`, and
@@ -130,9 +133,9 @@ void html_esc(char *out, size_t cap, const char *in);
  *
  * So the answer is typed. FORM_ABSENT stays 0 so that "no field" remains the
  * falsy answer, but the FUNCTION was renamed on purpose: every one of the
- * thirteen call sites had to be reopened by the compiler, because a call
- * site testing the old name for truth would have silently kept compiling and
- * would have read MALFORMED, TOO_LONG and DUPLICATE as "present, carry on".
+ * thirteen call sites had to be reopened by the compiler: a call site
+ * testing the former name for truth would go on compiling silently and read
+ * MALFORMED, TOO_LONG and DUPLICATE as "present, carry on".
  *
  * `out` is always NUL-terminated, and is set to "" for every answer but
  * FORM_OK -- a caller that ignores the answer gets an empty value, not a
@@ -144,18 +147,17 @@ enum form_field {
    FORM_TOO_LONG,   /* the decoded value does not fit `cap`; NOT truncated */
    FORM_DUPLICATE,  /* the name appears more than once: no single answer */
 };
-
-enum form_field form_field(const char *body, size_t len, const char *name,
-                           char *out, size_t cap)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum form_field form_field(const char *body, size_t len,
+                                           const char *name, char *out,
+                                           size_t cap);
 
 /* THE WHOLE BODY, JUDGED BEFORE ANYBODY IS AUTHENTICATED.
  *
  * form_field answers about ONE name, which means a malformed or duplicated
  * field is only noticed if some handler happens to ask for it -- and the
  * handler that asks runs after the session lookup, after the route, and in
- * some cases after a row has been written. Item 120 asks for these refused
- * "before authentication or mutation", so the browser half runs this over the
+ * some cases after a row has been written. These have to be refused before
+ * authentication or mutation, so the browser half runs this over the
  * entire body first (see web_route_locked): one pass, no names, purely a
  * question about whether the document is a well-formed
  * application/x-www-form-urlencoded one at all.
@@ -168,9 +170,7 @@ enum form_body {
    FORM_BODY_MALFORMED, /* a bad escape, or a NUL, anywhere in it */
    FORM_BODY_DUPLICATE, /* some name appears more than once */
 };
-
-enum form_body form_body_check(const char *body, size_t len)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum form_body form_body_check(const char *body, size_t len);
 /* One HTTP header value from the header block. 1 if found. */
 int hdr_get(const char *hdr, const char *name, char *out, size_t cap);
 
@@ -246,6 +246,16 @@ int email_canon(const char *in, char *out, size_t cap);
  * empty: a misconfigured origin falls back to the compiled default rather than
  * producing a link with a hole in it.
  */
+/* SETTLE IT BEFORE ANY WORKER STARTS. Called once from main, on
+ * the one thread that exists then; it reads the environment, validates it,
+ * and says so on stderr if the value is not usable. After this the origin is
+ * immutable and public_origin() is a read of a pointer.
+ *
+ * A server that forgets to call this serves the compiled default -- correct
+ * but possibly not what the deployment configured -- rather than resolving it
+ * from whichever request happened to ask first. */
+void public_origin_init(void);
+
 const char *public_origin(void);
 
 /* 1 when `s` is a plausible host[:port] -- letters, digits, dot, hyphen, and at

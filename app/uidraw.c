@@ -4,10 +4,12 @@
 
 #include "uidraw.h"
 #include "alarmlogic.h" /* AL_ENTRY_MAX: the ceiling a threshold row shows */
-#include "exercise.h" /* EX_MAX_LEVEL: the button draws its own level */
+#include "civil.h"      /* civil_ymd: ONE days-to-civil conversion */
+#include "exercise.h"   /* EX_MAX_LEVEL: the button draws its own level */
 #include "font.h"
 #include "ndk.h"
-#include "sensors.h" /* sensor types, kinds, marker enum */
+#include "sensors.h"
+#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: one definition of the range */ /* sensor types, kinds, marker enum */
 #include "style.h"
 #include "uiact.h"
 #include "uifmt.h"
@@ -28,19 +30,47 @@ _Static_assert(MARK_SQUARE == 2, "MARK_SQUARE must be plot.c shape 2");
 _Static_assert(MARK_TRIANGLE == 3, "MARK_TRIANGLE must be plot.c shape 3");
 _Static_assert(MARK_HIDE == 4, "plot.c draws shapes 0..3; HIDE follows them");
 
-/* Fill one sc*sc glyph cell at (bx,by), clipped to the buffer. */
+/* Fill one sc*sc glyph cell at (bx,by), clipped to the buffer.
+ *
+ * CLIPPED ONCE, NOT PER PIXEL. This tested every pixel's x and y against the
+ * buffer inside the inner loop -- four comparisons and a branch to decide a
+ * single 32-bit store -- which is the whole of the app's text drawing and,
+ * measured, the whole of its frame time: the offline harness spent 18 seconds
+ * of its 18.4 rendering, and the phone pays the same shape once a second
+ * forever on a core far slower than this one.
+ *
+ * The visible sub-rectangle is computed here, the count of dropped pixels is
+ * arithmetic rather than a branch per pixel, and what remains is a store loop
+ * a compiler can vectorise. Same pixels, same clip count, ~10x the speed. */
 static void draw_cell(uint32_t *px, const struct ANativeWindow_Buffer *buf,
                       int bx, int by, int sc, uint32_t color)
 {
-   for (int dy = 0; dy < sc; dy++)
-      for (int dx = 0; dx < sc; dx++) {
-         int x = bx + dx;
-         int y = by + dy;
-         if (x >= 0 && x < buf->width && y >= 0 && y < buf->height)
-            px[(y * buf->stride) + x] = color;
-         else
-            ui_clip_bump(1);
-      }
+   if (sc <= 0)
+      return;
+   int x0 = bx < 0 ? 0 : bx;
+   int y0 = by < 0 ? 0 : by;
+   int x1 = bx + sc;
+   int y1 = by + sc;
+   if (x1 > buf->width)
+      x1 = buf->width;
+   if (y1 > buf->height)
+      y1 = buf->height;
+   /* WHAT FELL OUTSIDE, counted exactly as the per-pixel test counted it: the
+    * cell's area less the part that landed. ui_clip_bump is what the tests
+    * read to say a glyph was cut off, so this number is load-bearing. */
+   int vw   = x1 - x0;
+   int vh   = y1 - y0;
+   long vis = (vw > 0 && vh > 0) ? (long)vw * vh : 0;
+   long all = (long)sc * sc;
+   if (vis < all)
+      ui_clip_bump((int)(all - vis));
+   if (vis == 0 || !px)
+      return;
+   for (int y = y0; y < y1; y++) {
+      uint32_t *row = px + ((long)y * buf->stride);
+      for (int x = x0; x < x1; x++)
+         row[x] = color;
+   }
 }
 
 void draw_str(uint32_t *px, const struct ANativeWindow_Buffer *buf, int ox,
@@ -77,6 +107,8 @@ void draw_frame(uint32_t *px, const struct ANativeWindow_Buffer *buf, int x,
       ui_clip_bump(1);
       return;
    }
+   if (!px)
+      return; /* laid out, not drawn: see the note on `bits` in uidraw.h */
    for (int i = 0; i < w; i++) {
       px[(y * buf->stride) + x + i]           = c;
       px[((y + h - 1) * buf->stride) + x + i] = c;
@@ -97,9 +129,16 @@ void fill_rect(uint32_t *px, const struct ANativeWindow_Buffer *buf, int x,
       ui_clip_bump(1);
       return;
    }
-   for (int j = 0; j < h; j++)
+   if (!px)
+      return; /* laid out, not drawn: see the note on `bits` in uidraw.h */
+   /* One row pointer per row, then a straight store loop: the address
+    * arithmetic is not redone per pixel (see draw_cell for what that
+    * costs). */
+   for (int j = 0; j < h; j++) {
+      uint32_t *row = px + ((long)(y + j) * buf->stride) + x;
       for (int i = 0; i < w; i++)
-         px[((y + j) * buf->stride) + x + i] = c;
+         row[i] = c;
+   }
 }
 
 /* A CHECKBOX AT AN ARBITRARY SIZE, with a border `th` thick.
@@ -162,13 +201,21 @@ void fmt_glu(int mgdl, int units, char *out, int n)
 void clear_fb(struct ANativeWindow_Buffer *fb, uint32_t c)
 {
    uint32_t *px = fb->bits;
-   for (int32_t y = 0; y < fb->height; y++)
+   if (!px)
+      return; /* laid out, not drawn: see the note on `bits` in uidraw.h */
+   for (int32_t y = 0; y < fb->height; y++) {
+      uint32_t *row = px + ((long)y * fb->stride);
       for (int32_t x = 0; x < fb->width; x++)
-         px[(y * fb->stride) + x] = c;
+         row[x] = c;
+   }
 }
 
-int add_hit(struct hits *h, int x, int y, int w, int hgt, int kind, int arg)
+int add_hit(struct hits *h, struct ui_rect r, int kind, int arg)
 {
+   const int x   = r.x;
+   const int y   = r.y;
+   const int w   = r.w;
+   const int hgt = r.h;
    if (h->n >= UI_MAX_HITS) {
       /* LOUD, not silent. A dropped box draws normally and is dead to
        * touch, which is indistinguishable from a control that simply does
@@ -201,13 +248,13 @@ int add_hit(struct hits *h, int x, int y, int w, int hgt, int kind, int arg)
  * (MA_SENSOR, 3), not MA_SENSOR + 3, so no code can run into the next one
  * however many sensors, digits, colours or characters there turn out to be.
  * `ix` is 0 for the codes that name one control and nothing else. */
-int add_hit_ix(struct hits *h, int x, int y, int w, int hgt, int code, int ix)
+int add_hit_ix(struct hits *h, struct ui_rect r, int code, int ix)
 {
-   int slot = add_hit(h, x, y, w, hgt, ACT_MENU, ix);
+   int slot = add_hit(h, r, ACT_MENU, ix);
    /* THE SLOT THIS CALL FILLED, never box[n-1]. On a full table add_hit
-    * leaves n where it was, so n-1 is the PREVIOUS control -- a real one,
-    * drawn and tappable -- and stamping this code onto it silently made
-    * BACK forget the device. The drop is already reported by `overflow`;
+    * leaves n unchanged, so n-1 is the PREVIOUS control -- a real one, drawn
+    * and tappable -- and stamping this code onto it silently makes BACK
+    * forget the device. The drop is already reported by `overflow`;
     * this keeps it from taking a working control down with it.
     *
     * `>= 0` and not a truth test: slot 0 is the first legitimate box, so
@@ -226,14 +273,14 @@ int add_hit_ix(struct hits *h, int x, int y, int w, int hgt, int code, int ix)
  * then the last box belongs to somebody else, who would get a glow rect
  * pointing at pixels that are not theirs. UI_HIT_DROPPED (and any other
  * non-slot) is a no-op. */
-void add_glow(struct hits *h, int slot, int x, int y, int w, int hgt)
+void add_glow(struct hits *h, int slot, struct ui_rect r)
 {
    if (slot < 0 || slot >= h->n)
       return;
-   h->box[slot].gx = x;
-   h->box[slot].gy = y;
-   h->box[slot].gw = w;
-   h->box[slot].gh = hgt;
+   h->box[slot].gx = r.x;
+   h->box[slot].gy = r.y;
+   h->box[slot].gw = r.w;
+   h->box[slot].gh = r.h;
 }
 
 /* THE EXERCISE BUTTON, WHEREVER IT IS DRAWN.
@@ -259,6 +306,50 @@ void add_glow(struct hits *h, int slot, int x, int y, int w, int hgt)
  * and never at rest.
  *
  * Returns the y below the button, like menu_button. */
+/* ONE TABLE FOR THE THREE PLACES A LEVEL IS SHOWN.
+ *
+ * The button on the ADD menu, the row in the log, and the LEVEL field of the
+ * edit form all colour the same three values, and a level that is "moderate
+ * orange" on one screen and something else on another is three controls
+ * disagreeing about one number. It lived inside the button, which is where it
+ * was needed first and not where it belongs.
+ *
+ * Only 1..3 get a colour, deepening towards saturated blue, so the blue means
+ * "exercise is being recorded" and nothing else does. Level 0 is not a state
+ * worth colouring -- it is the ABSENCE of one -- so it takes `rest_col`,
+ * whatever the caller's ordinary text is: white in the ADD menu, the dimmer
+ * shade on the main screen's shortcut row. It once had a grey of its own,
+ * which made an inactive control look subtly disabled beside identical
+ * buttons that were not. */
+/* The label colour that stays readable on `bg`, which is ABGR8888.
+ *
+ * Rec. 709 luminance, in integer arithmetic: the eye weights green far above
+ * red and red above blue, so a plain average of the three calls a saturated
+ * blue as bright as a mid grey and puts black text on it. The split is at
+ * half of full scale -- black above it, white below. */
+uint32_t ui_text_on(uint32_t bg)
+{
+   unsigned r = bg & 0xFFU;
+   unsigned g = (bg >> 8U) & 0xFFU;
+   unsigned b = (bg >> 16U) & 0xFFU;
+   unsigned y = ((2126U * r) + (7152U * g) + (722U * b)) / 10000U;
+
+   return (y >= 128U) ? 0xFF000000U : UI_TEXT;
+}
+
+uint32_t ui_ex_color(int level, uint32_t rest_col)
+{
+   static const uint32_t exc[EX_MAX_LEVEL + 1] = {
+       0,          /* unused: level 0 takes rest_col */
+       0xFFFF9955, /* 1 */
+       0xFFFF6622, /* 2 */
+       0xFFFF3300  /* 3: ABGR, so these deepen towards saturated blue */
+   };
+   if (level < EX_MIN_LEVEL || level > EX_MAX_LEVEL)
+      return rest_col;
+   return exc[level];
+}
+
 int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
                        int y, int w, int sc, int level, int remaining,
                        int settle_s, const char *name, uint32_t rest_col)
@@ -273,19 +364,36 @@ int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
     *
     * Only 1..3 get a colour, deepening towards saturated blue, so the blue
     * means "exercise is being recorded" and nothing else does. */
-   static const uint32_t exc[EX_MAX_LEVEL + 1] = {
-       0, /* unused: level 0 takes rest_col */
-       0xFFFF9955, /* 1 */
-       0xFFFF6622, /* 2 */
-       0xFFFF3300  /* 3: ABGR, so these deepen towards saturated blue */
-   };
-   int lv       = (level < 0 || level > EX_MAX_LEVEL) ? 0 : level;
-   uint32_t col = lv > 0 ? exc[lv] : rest_col;
+   int lv = (level < 0 || level > EX_MAX_LEVEL) ? 0 : level;
    char lbl[28];
    if (lv > 0)
       (void)snprintf(lbl, sizeof lbl, "%s  %d", name, lv);
    else
       (void)snprintf(lbl, sizeof lbl, "%s", name);
+
+   /* ---- THE LEVEL IS THE BACKGROUND, NOT THE LETTERS -------------------
+    *
+    * Tinting the LABEL said the same thing in the least visible way there
+    * is: a few dozen coloured pixels inside an otherwise identical button,
+    * on a screen of otherwise identical buttons. A filled button is legible
+    * from across a room and at a glance, which is what a control you press
+    * mid-walk needs to be.
+    *
+    * THE TEXT COLOUR IS THEN NOT A CHOICE, it is a consequence: the three
+    * shades run from a light blue to a saturated one, and a single label
+    * colour cannot be readable on both ends. So it is computed from the
+    * background's luminance -- see ui_text_on -- which also means the next
+    * person to adjust a shade does not have to remember to adjust the text.
+    *
+    * AT REST NOTHING IS FILLED. Level 0 is the absence of a state, not a
+    * state, and a filled button at rest would make an idle control the
+    * loudest thing on the menu. */
+   uint32_t bg  = ui_ex_color(lv, 0);
+   uint32_t col = rest_col;
+   if (lv > 0) {
+      fill_rect(px, fb, x, y, w, 25 * sc, bg);
+      col = ui_text_on(bg);
+   }
    int below = menu_button(fb, h, x, y, w, sc, lbl, col, MA_EXERCISE, 0);
    /* INSIDE the button's own rectangle, not below it: the row pitch is fixed
     * by the caller's layout, and a bar drawn under the button would either eat
@@ -297,21 +405,13 @@ int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
          bwid = w;
       if (bwid < 1)
          bwid = 1; /* a bar with a second left is still a bar */
+      /* IN THE LABEL'S COLOUR, which is now the CONTRASTING one. The bar used
+       * to be drawn in the level's colour -- which is the background now, so
+       * it would be a bar of exactly the shade it sits on: invisible, on the
+       * one control whose whole point is a countdown you can watch. */
       fill_rect(px, fb, x, below - bh - sc, bwid, bh, col);
    }
    return below;
-}
-
-/* big-number colour by fixed medical range (0xAABBGGRR) */
-uint32_t glu_color(int g)
-{
-   if (g < 50)
-      return 0xFF0000FF; /* red    */
-   if (g < 70)
-      return 0xFF0080FF; /* orange */
-   if (g < 180)
-      return 0xFF33FF88; /* green  */
-   return 0xFFFFFFFF;    /* white  */
 }
 
 /* THE SAME NUMBER, COLOURED BY THE USER'S OWN ALARM BAND AS WELL.
@@ -358,7 +458,7 @@ uint32_t glu_color_band(int g, int alarm_low, int alarm_high, int nudge_low,
       return fixed;
    /* The fixed scale already says hypo: keep it. Its red and orange are the
     * more urgent statement, and they are about a number, not a preference. */
-   if (fixed == 0xFF0000FF || fixed == 0xFF0080FF)
+   if (fixed == UI_ALERT || fixed == 0xFF0080FF)
       return fixed;
    return pick;
 }
@@ -366,7 +466,7 @@ uint32_t glu_color_band(int g, int alarm_low, int alarm_high, int nudge_low,
 uint32_t white_color(int g)
 {
    (void)g;
-   return 0xFFFFFFFF; /* plot dots */
+   return UI_TEXT; /* plot dots */
 }
 
 /* The 5x7 icon BITMAPS live in font.c with the glyph tables (all the pixel
@@ -414,19 +514,26 @@ void fmt_date(long epoch, long tz, char *out, int n)
       secs += 86400;
       z--;
    }
-   /* days -> civil date (Howard Hinnant's algorithm, shifted to a 0000-03-01
-    * era so leap years fall at the end of the cycle) */
-   z += 719468;
-   long era          = (z >= 0 ? z : z - 146096) / 146097;
-   unsigned long doe = (unsigned long)(z - (era * 146097));
-   unsigned long yoe =
-       (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365;
-   unsigned long doy  = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100));
-   unsigned long mp   = ((5 * doy) + 2) / 153;
-   unsigned long dday = doy - (((153 * mp) + 2) / 5) + 1;
-   unsigned long mon  = mp < 10 ? mp + 3 : mp - 9;
-   long year          = (long)yoe + (era * 400) + (mon <= 2 ? 1 : 0);
-   (void)snprintf(out, n, "%04ld-%02lu-%02lu %02ld:%02ld", year, mon, dday,
+   /* THE SHARED CONVERSION, NOT A SECOND COPY OF IT.
+    *
+    * Howard Hinnant's days-to-civil algorithm written out here would be the
+    * same twelve lines civil.c already holds, with its own era shift, its own
+    * negative-era correction and its own leap rule. Two copies of an
+    * algorithm nobody re-derives when they touch it is a drift waiting for
+    * one of them to be fixed: the dates a person reads off the screen and
+    * the dates the log is keyed by would then disagree, and only for the
+    * inputs that are awkward to reach on purpose (an epoch before 1970, a
+    * century year, the 400-year boundary). civil.c's copy is the one the
+    * tests execute.
+    *
+    * What stays here is the SECONDS-OF-DAY half, because that is this
+    * function's own business: `secs` has already been floored into [0,86400)
+    * above, together with the day count that made it. */
+   long year = 0;
+   long mon  = 0;
+   long dday = 0;
+   civil_ymd(z, &year, &mon, &dday);
+   (void)snprintf(out, n, "%04ld-%02ld-%02ld %02ld:%02ld", year, mon, dday,
                   secs / 3600, (secs % 3600) / 60);
 }
 
@@ -470,10 +577,9 @@ void fmt_dur(long seconds, char *out, int n)
  * glucose palette so a sensor's colour is never mistaken for a value. */
 /* Framebuffer is RGBA_8888 and pixels are written as raw u32 on a little-endian
  * device, so the byte order is 0xAABBGGRR (low byte = red) -- the same encoding
- * glu_color uses (its "red" is 0xFF0000FF). These were previously written as
- * standard 0xAARRGGBB, which swaps red and blue: BLUE rendered orange, AMBER
- * rendered blue, etc. Encoded correctly (R and B swapped) they now match their
- * names. */
+ * glu_color uses (its "red" is 0xFF0000FF). Written as standard 0xAARRGGBB
+ * they swap red and blue: BLUE renders orange, AMBER renders blue, and so on.
+ * Encoded here with R and B swapped, they match their names. */
 /* One constant, so the two tables and the two guards below cannot drift:
  * a colour index comes from a settings file the user can hand-edit, and a
  * table that outgrew its guard would read past its end. */
@@ -484,11 +590,11 @@ _Static_assert(UI_NCOLORS == SET_NCOLORS,
 static const uint32_t ui_sensor_colors[UI_NCOLORS] = {
     0xFF88FF33 /* GREEN */,
     0xFFFFAA44 /* BLUE */,
-    0xFF44CCFF /* AMBER */,
+    UI_BUSY /* AMBER */,
     0xFFAA66FF /* PINK */,
     0xFFEEFF66 /* CYAN */,
     0xFFFF88BB /* VIOLET */,
-    0xFFFFFFFF /* WHITE -- the default primary-trace colour */};
+    UI_TEXT /* WHITE -- the default primary-trace colour */};
 
 /* (ui_color_names and ui_marker_names went with ui_color_name and
  * ui_marker_name: the two accessors were exported and called by nothing, and
@@ -556,11 +662,11 @@ int ui_devices_scale(int w, int h)
     * in the 16*sc lines ui_fit_scale counts, the list side is
     * UI_MIN_SLOTS*1.5 -> UI_DEV_MIN_ROWS (rounded up), i.e.
     *   h - h/20 >= sc * (8 + (UI_DEV_ABOVE + UI_DEV_MIN_ROWS + 1) * 16).
-    * An earlier version omitted the +8 from `start`, leaving the two functions
-    * 8*sc apart -- so on heights where the slack fell in that gap, capacity
-    * still came out below UI_MIN_SLOTS and the renderer still took its
-    * early return, hiding the device list and the ADD button. That band
-    * included 1080x2280 (Galaxy S10 / Redmi Note 7 / Moto G7) and 1440x3200
+    * Omit the +8 from `start` and the two functions sit 8*sc apart -- so on
+    * heights where the slack falls in that gap, capacity comes out below
+    * UI_MIN_SLOTS and the renderer takes its early return, hiding the device
+    * list and the ADD button. That band includes 1080x2280 (Galaxy S10 /
+    * Redmi Note 7 / Moto G7) and 1440x3200
     * (S20-S22 Ultra at QHD+). Derive it from the same expression so they
     * cannot drift. */
    /* UI_DEV_MIN_ROWS, not UI_MIN_SLOTS: device rows are spaced at
@@ -617,17 +723,17 @@ const char *ui_bucket_label(int b)
  * tap target carrying the menu_action `code` (code < 0 = read-only, no
  * target). `rx` is explicit so a screen that reserves a right-hand column --
  * the DEVICES screen's PRIMARY checkboxes -- can pull the value text clear of
- * it instead of drawing the two on top of each other. */
+ * it rather than drawing the two on top of each other. */
 void menu_row_at(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
                  int lh, int rx, const char *name, const char *value,
                  uint32_t valcol, int code, int ix)
 {
    uint32_t *px = fb->bits;
-   draw_str(px, fb, 4 * sc, y, sc, name, 0xFFCCCCCC);
+   draw_str(px, fb, 4 * sc, y, sc, name, UI_TEXT_DIM);
    int vw = str_len(value) * 6 * sc;
    draw_str(px, fb, rx - vw, y, sc, value, valcol);
    if (code >= 0)
-      add_hit_ix(h, 0, y - (3 * sc), fb->width, lh, code, ix);
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), code, ix);
 }
 
 /* The ordinary row: value right-aligned on the screen's own right margin. */
@@ -671,9 +777,9 @@ int menu_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int y,
                             * (4*sc -> 6*sc -> 9*sc; +50% padding app-wide) */
    int lw  = str_len(label) * 6 * sc;
    int lhh = 7 * sc;
-   draw_frame(px, fb, x, y, w, bh, 0xFF888888);
+   draw_frame(px, fb, x, y, w, bh, UI_MUTED);
    draw_str(px, fb, x + ((w - lw) / 2), y + ((bh - lhh) / 2), sc, label, col);
-   add_hit_ix(h, x, y, w, bh, action, ix);
+   add_hit_ix(h, ui_rect(x, y, w, bh), action, ix);
    return y + bh;
 }
 
@@ -685,28 +791,21 @@ void menu_head(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
    uint32_t *px = fb->bits;
    /* DIMMER THAN A ROW NAME (0xCCCCCC), and that is now the whole of it.
     *
-    * There used to be a rule under the caption, edge to edge, and the reason
-    * was real: drawn at the row colour with no value beside it, a caption
-    * reads as a row whose value failed to render -- and on THIS screen "a
-    * threshold with no value" is the most alarming thing the UI could say by
-    * accident. The rule made the caption structure rather than content.
+    * NO RULE UNDER THE CAPTION, tempting though one is: drawn at the row
+    * colour with no value beside it, a caption reads as a row whose value
+    * failed to render -- and on THIS screen "a threshold with no value" is
+    * the most alarming thing the UI could say by accident.
     *
-    * It was also the only horizontal rule in the entire app. Every other menu
-    * separates its sections with a blank line and nothing else, so the one
-    * screen that drew a line read as a different kind of screen -- and the
-    * fix for an inconsistency between one screen and all the others is to
-    * change the one. The dim colour carries the job alone; what actually
+    * But a rule here would be the only horizontal rule in the app. Every
+    * other menu separates its sections with a blank line and nothing else, so
+    * the one screen that drew a line would read as a different kind of
+    * screen. The dim colour carries the job alone; what actually
     * distinguishes a caption from a broken row is that a row always has a
-    * value column and a caption never does, which no rule was needed to say.
+    * value column and a caption never does, which no rule is needed to say.
     *
-    * The blank line above each caption (the callers' 5*lh/2 step) is doing
-    * the separating now, exactly as it does everywhere else. */
-   draw_str(px, fb, 4 * sc, y, sc, name, 0xFF888888);
-}
-
-int thresh_off(int mgdl, int ishigh)
-{
-   return ishigh ? (mgdl >= AL_ENTRY_MAX) : (mgdl <= 0);
+    * The blank line above each caption (the callers' 5*lh/2 step) does the
+    * separating, exactly as it does everywhere else. */
+   draw_str(px, fb, 4 * sc, y, sc, name, UI_MUTED);
 }
 
 void fmt_thresh(int mgdl, int units, int ishigh, char *out, int n)
@@ -720,7 +819,7 @@ void fmt_thresh(int mgdl, int units, int ishigh, char *out, int n)
 /* lx0 / rx1 are the row's EXACT left and right ink edges, not a column to be
  * distributed inside. They are the progress bar's leftmost pixel and the right
  * edge of the units label beside the big number, so these two rows share their
- * margins with the top of the screen instead of using the content column's own
+ * margins with the top of the screen rather than using the content column's own
  * wider one -- three different left margins in one vertical line was the thing
  * that made the screen look untidy even when every individual row was fine. */
 int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
@@ -728,8 +827,8 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
                int isalarm)
 {
    uint32_t *px      = fb->bits;
-   const uint32_t gy = 0xFF888888;
-   const uint32_t wt = 0xFFFFFFFF;
+   const uint32_t gy = UI_MUTED;
+   const uint32_t wt = UI_TEXT;
    int cwid          = 6 * sc;
    char lo[8];
    char hi[8];
@@ -756,10 +855,10 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int icon_w = 23 * sc;
    /* FIXED COLUMNS, SIZED FROM BOTH ROWS.
     *
-    * The widths used to come from THIS row's own tokens, so the two rows
-    * disagreed the moment their values differed in length: with ALARM 95/300
-    * and NUDGE 100/250 the nudge row was one character wider, which shrank
-    * its gap and shifted everything left -- measured 3 px on the icons and up
+    * Taking the widths from THIS row's own tokens makes the two rows
+    * disagree the moment their values differ in length: with ALARM 95/300
+    * and NUDGE 100/250 the nudge row is one character wider, which shrinks
+    * its gap and shifts everything left -- measured 3 px on the icons and up
     * to 9 px on the labels. The two rows are read as a table, so every column
     * must start at the same x whatever the numbers happen to be. Take each
     * column's width from the WIDER of the two rows and use it for both. */
@@ -782,7 +881,7 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * them -- no leading or trailing gap, because the row's outer edges are
     * given, not derived. The last column's ink stops one unit short of its
     * cell (draw_str emits no trailing gap), so add that sc back before
-    * dividing or the row lands a pixel inside rx1 instead of on it. */
+    * dividing or the row lands a pixel inside rx1 rather than on it. */
    int g = ((rx1 - lx0) + sc - total) / 5;
    if (g < cwid)
       g = cwid;
@@ -798,12 +897,11 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
    ax += icon_w + g;
    int al_y = y - (3 * sc);
    /* EXACTLY the row advance, so consecutive rows ABUT rather than overlap.
-    * It used to be (3 + 7)*sc + pad while the advance is (7*sc) + pad, i.e.
-    * 3*sc taller than its own row -- harmless while ALARM was the only such
-    * row, and a mis-actuation the moment NUDGE appeared below it: ui_hit_idx
-    * scans backwards, so the bottom 3*sc of "ALARM HIGH" (9 px at 1080x1920)
-    * opened the NUDGE HIGH keypad instead. Measured at every geometry before
-    * this line changed. */
+    * At (3 + 7)*sc + pad against an advance of (7*sc) + pad it is 3*sc
+    * taller than its own row -- harmless while ALARM is the only such row,
+    * and a mis-actuation the moment NUDGE appears below it: ui_hit_idx scans
+    * backwards, so the bottom 3*sc of "ALARM HIGH" (9 px at 1080x1920) opens
+    * the NUDGE HIGH keypad instead. Measured at every geometry. */
    int al_h = (7 * sc) + pad;
    /* Three targets on the row: everything LEFT of "LOW" (the icons and the
     * ALARM label, from the screen's leftmost pixel) opens the ALARM
@@ -817,7 +915,7 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (i == 1 || i == 3)
          pair_x = ax; /* start of the LOW / HIGH pair */
       if (i == 1)
-         add_hit_ix(h, 0, al_y, ax - (g / 2), al_h, MA_ALARM_OPEN, 0);
+         add_hit_ix(h, ui_rect(0, al_y, ax - (g / 2), al_h), MA_ALARM_OPEN, 0);
       /* Values RIGHT-aligned in their column so the digits line up under one
        * another; labels left-aligned. Advance by the COLUMN width, never by
        * this token's own width, or the columns drift apart again. */
@@ -845,7 +943,7 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
           * loud. Unreachable at any real geometry; skip rather than record a
           * lie if one ever gets there. */
          if (hw > 0)
-            add_hit_ix(h, hx, al_y, hw, al_h, code, 0);
+            add_hit_ix(h, ui_rect(hx, al_y, hw, al_h), code, 0);
       }
       ax += colw[i] + g;
    }
@@ -865,7 +963,7 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
       (void)snprintf(lv, sizeof lv, "%s", v);
    else
       (void)snprintf(lv, sizeof lv, "%s %s", v, UI_LBL(units));
-   menu_row(fb, h, y, sc, lh, name, lv, 0xFFFFFFFF, code, 0);
+   menu_row(fb, h, y, sc, lh, name, lv, UI_TEXT, code, 0);
 }
 
 /* One checkbox row: name left, the checkbox ICON right (font.c: icon_box /
@@ -876,10 +974,10 @@ void chk_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
 {
    uint32_t *px = fb->bits;
    int rx       = fb->width - (4 * sc);
-   draw_str(px, fb, 4 * sc, y, sc, name, 0xFFCCCCCC);
+   draw_str(px, fb, 4 * sc, y, sc, name, UI_TEXT_DIM);
    draw_icon(px, fb, rx - (5 * sc), y, sc, on ? icon_boxck : icon_box,
-             on ? 0xFF33FF88 : 0xFF888888);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, lh, code, 0);
+             on ? UI_OK : UI_MUTED);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), code, 0);
 }
 
 int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
@@ -891,10 +989,12 @@ int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
    int vsc      = 2 * sc;
    int vw       = str_len(val) * 6 * vsc;
    draw_str(px, fb, 4 * sc, y + (((7 * vsc) - (7 * sc)) / 2), sc, name,
-            0xFFCCCCCC);
+            UI_TEXT_DIM);
    draw_str(px, fb, rx - vw, y, vsc, val, vcol);
-   add_hit_ix(h, fb->width / 2, y - (4 * sc), fb->width / 2,
-              (7 * vsc) + (8 * sc), code, ix);
+   add_hit_ix(h,
+              ui_rect(fb->width / 2, y - (4 * sc), fb->width / 2,
+                      (7 * vsc) + (8 * sc)),
+              code, ix);
    return y + (7 * vsc) + (8 * sc);
 }
 
@@ -930,4 +1030,21 @@ void fmt_rescale_pct(int pm, char *out, int n)
    int d = pm - 1000; /* tenths of a percent */
    int a = (d < 0) ? -d : d;
    (void)snprintf(out, n, "%c%d.%d%%", (d < 0) ? '-' : '+', a / 10, a % 10);
+}
+
+/* big-number colour by fixed medical range (0xAABBGGRR) */
+uint32_t glu_color(int g)
+{
+   if (g < 50)
+      return 0xFF0000FF; /* red    */
+   if (g < 70)
+      return 0xFF0080FF; /* orange */
+   if (g < 180)
+      return 0xFF33FF88; /* green  */
+   return 0xFFFFFFFF;    /* white  */
+}
+
+int thresh_off(int mgdl, int ishigh)
+{
+   return ishigh ? (mgdl >= AL_ENTRY_MAX) : (mgdl <= 0);
 }

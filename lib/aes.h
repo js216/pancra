@@ -4,67 +4,101 @@
 
 /* Portable AES-128 single-block encrypt.
  *
- * TABLE-DRIVEN, THEREFORE NOT CONSTANT-TIME. THIS IS THE ONE THING TO KNOW.
+ * CONSTANT-TIME BY CONSTRUCTION: NO TABLE IS INDEXED BY A SECRET.
  *
- * aes.c is the textbook implementation: a 256-byte S-box indexed by a state
- * byte, sixteen times a round, ten rounds a block, plus sixteen more lookups
- * per block for the key schedule. Every one of those indices is derived from
- * the key. The values do not leak, but which cache lines were touched does,
- * and that is the whole of the Bernstein / Osvik-Shamir-Tromer family of
- * attacks: an observer who can see the cache-line access pattern for enough
- * blocks recovers the key, with no fault, no oracle and no protocol flaw.
+ * THE TEXTBOOK IMPLEMENTATION CANNOT SAY THAT SENTENCE. A 256-byte S-box
+ * read at a state-derived offset, sixteen times a round, ten rounds a block,
+ * plus forty more lookups for the key schedule, takes every one of those
+ * indices from the key. The values do
+ * not leak, but which cache lines were touched did, and that is the whole of
+ * the Bernstein / Osvik-Shamir-Tromer family: an observer sharing a cache
+ * recovers the key from the access pattern, with no fault, no oracle and no
+ * protocol flaw.
  *
- * Note what does and does not follow. A cache attack needs the observer to
- * share a cache with this code -- co-resident code on the same core, another
- * container on the same host, another process on the same board. It is not a
- * network attack. lib/p256.c's problem is the opposite shape: there the leak is
- * timing, which does travel over a network. So the two are not the same risk
- * even though they are both "not constant-time".
+ * The S-box is now COMPUTED. It is defined as the multiplicative inverse in
+ * GF(2^8) followed by a fixed affine map, and aes.c evaluates exactly that:
+ * the inverse as x^254 (Fermat, which also sends 0 to 0 without a special
+ * case), over bit-sliced data, so the arithmetic is AND and XOR on eight
+ * words. Sixteen bytes are transposed into eight 16-bit planes and done at
+ * once. The rounds around it -- ShiftRows, MixColumns, AddRoundKey -- are
+ * unchanged from the version that passed every vector in this repo.
  *
- * WHO CALLS THIS, AND WHAT EACH ONE IS EXPOSED TO:
+ * WHAT IS LEFT TO BE SURE OF. The property is structural rather than argued:
+ * there is one array in aes.c, the ten round constants, and its index is the
+ * round number. Nothing else is read at a computed offset, and there is no
+ * branch on a data value anywhere in the cipher. That is a claim a reader can
+ * check by looking, which is the strongest form available without a reviewed
+ * implementation.
+ *
+ * WHAT IS CHECKED, and how far it goes. test/srv/cryptotest.c evaluates all
+ * 256 S-box inputs against the published table -- not a sample -- and then the
+ * FIPS-197 C.1 vector, both entry points, and the NIST GCM vectors on top. In
+ * migration the whole cipher was diffed against the table-driven version over
+ * 200000 random (key, block) pairs, byte for byte, with no mismatch. A
+ * computed S-box that is wrong for a single input is a cipher that is wrong
+ * for a fraction of blocks, and the exhaustive test is there because that is
+ * exactly the failure a known-answer vector can miss.
+ *
+ * WHAT IT COSTS, measured on a fast x86 host at 200000 blocks:
+ *
+ *     table-driven, key schedule per block      1.43 us/block
+ *     computed, key schedule per block         23.9  us/block
+ *     computed, key schedule held (struct)     14.8  us/block
+ *
+ * So about 10x, which is what a table buys and is the honest price of not
+ * having one: ~1 MB/s here.
+ *
+ * AND ON THE BOARD THE SERVER ACTUALLY RUNS ON, measured rather than scaled --
+ * this binary cross-compiled for riscv64 and run on the Milk-V Duo: 124 us per
+ * block with the key held, which is 126 KB/s. For what this server moves -- a
+ * few kilobytes of CSV per sync, a plot page of tens of kilobytes -- that is
+ * a couple of hundred milliseconds at worst, next to the 100 ms the same board
+ * spends on the handshake signature. If it ever does become the bound, the
+ * answer is not a return to tables: widen the plane word and run four or
+ * eight blocks of the GCM counter stream through the rounds together, which
+ * amortises the transpose and the S-box over four times the data.
+ *
+ * HOLD THE KEY SCHEDULE. aes128_encrypt expands the key and encrypts one
+ * block, which was the only entry point and meant TLS record traffic re-derived
+ * the schedule for every sixteen bytes. With a computed S-box that is a third
+ * of the work, so lib/gcm.c now keeps a struct aes128 for the whole message.
+ * A caller with one block to encrypt (app/dexcom.c) can still use the one-shot
+ * form.
+ *
+ * WHO CALLS THIS:
  *
  *   srv/tls.c, via lib/gcm.c, for TLS_AES_128_GCM_SHA256 record protection.
- *   The keys are per-connection traffic secrets from the handshake, the
- *   attacker chooses much of the plaintext, and the number of blocks is
- *   unbounded -- which is everything a cache attack wants EXCEPT the shared
- *   cache. On the deployment this repo actually ships to (srv/deploy: a
- *   dedicated Milk-V Duo running this one binary, reached through a front
- *   door) there is no second tenant to be co-resident with, and an attacker
- *   who can already run code on that board does not need the AES key. On a
- *   shared VPS the same binary would be genuinely exposed, and that is a
- *   deployment decision this header cannot make.
+ *   The keys are per-connection traffic secrets, the attacker chooses much of
+ *   the plaintext, and the number of blocks is unbounded -- everything a
+ *   cache attack wants except the shared cache, which is why no table is
+ *   indexed by a secret here.
  *
  *   app/dexcom.c dexcom_dex8, for the Dexcom per-connection auth hash over
- *   BLE. The observer would have to be malicious code on the same phone
- *   defeating the Android sandbox to watch this process's cache, at which
- *   point the sensor key is the least of the problems. This is the threat
- *   model the file was written for and it still holds.
+ *   BLE. One block per connection; the threat model was never the issue here.
  *
- * WHAT WOULD ACTUALLY FIX IT, and what each costs here:
- *
- *   - A hardware backend. aarch64 has the ARMv8 AES extension and the phone
- *     has it, so the app side could be made both constant-time and much
- *     faster. The riscv64 board this server runs on (C906) has no AES
- *     instructions at all, so the side that needs it most cannot have it.
- *     Two backends plus a runtime feature check plus a portable fallback is
- *     three implementations where there is now one.
- *   - A bitsliced or masked software backend. Constant-time by construction
- *     and portable, but it is a real cryptographic implementation, and a
- *     hand-rolled one that is subtly wrong is worse than this file: it would
- *     claim a property nothing in this repo can test for. No test here can
- *     detect a timing leak, which is exactly why the claim has to come from
- *     code that has been reviewed by people who do that for a living.
- *   - Vendoring a vetted implementation. The correct answer for the TLS side,
- *     and a policy question: this repo vendors nothing but sqlite.
- *
- * So the position, stated rather than implied: the app-side use is fine, the
- * TLS use is acceptable only because the server runs alone on its own board,
- * and closing it properly means adopting an outside implementation. Until that
- * decision is made, do not deploy this server anywhere it shares a CPU with
- * code you do not control. See TODO item 57. */
+ * WHAT WOULD STILL BE BETTER. A reviewed, audited implementation, or the
+ * ARMv8 AES instructions on the phone (the riscv64 C906 the server runs on has
+ * none, so that route cannot cover the side that matters). Both remain worth
+ * doing and neither is a precondition for this file being safe to run beside
+ * other tenants. */
 #ifndef DEX_AES_H
 #define DEX_AES_H
 #include <stdint.h>
+
+/* AN EXPANDED KEY. Hold one and encrypt many blocks with it: the schedule
+ * costs 40 S-box evaluations, and through the one-shot call below alone they
+ * would be recomputed for every 16 bytes. */
+struct aes128 {
+   uint8_t rk[176];
+};
+
+void aes128_init(struct aes128 *ctx, const uint8_t key[16]);
+void aes128_encrypt_ctx(const struct aes128 *ctx, const uint8_t in[16],
+                        uint8_t out[16]);
+
+/* Key schedule and one block, for callers with one block to encrypt. */
 void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
                     uint8_t out[16]);
+
+
 #endif

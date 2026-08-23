@@ -3,6 +3,7 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "meterlogic.h"
+#include "civil.h"
 
 void meter_tick_eval(int busy, long start, const long *idle_since, int nlinks,
                      long now, struct meter_tick *out)
@@ -53,7 +54,7 @@ struct meter_stamp meter_stamp_step(struct meter_seq *sq, long naive,
    struct meter_stamp s = {r.t, r.off, r.t, 0, r.fix == CIVIL_NONEXISTENT};
 
    if (r.fix != CIVIL_AMBIGUOUS) {
-      /* THE ORDINARY PATH, and it must stay byte-for-byte what it was: one
+      /* THE ORDINARY PATH, and it must stay byte-for-byte this: one
        * civil time, one instant, no state consulted. A disambiguator that
        * moves a record outside the repeated hour has broken every timestamp
        * in the log to fix two hours a year. The run state is CLEARED here

@@ -11,11 +11,12 @@
  * thing it buys -- an error on one side does not automatically become the
  * definition of correct -- is only real if something PINS the wire itself.
  *
- * Until now nothing did. srv/proto.h said "these constants and the app's are
- * the only record that the two sides agree", and the only mechanical check
- * was one Makefile grep comparing a single number. Everything else -- the
- * canonical bytes of a bucket, the exact signing string, what a hash is taken
- * over -- was agreement by inspection, and the two implementations pass
+ * THIS FILE IS THAT PIN. Without it, "these constants and the app's are the
+ * only record that the two sides agree" is the whole guarantee, with one
+ * Makefile grep comparing a single number as the only mechanical check --
+ * and the canonical bytes of a bucket, the exact signing string and what a
+ * hash is taken over are agreement by inspection, while the two
+ * implementations pass
  * end-to-end tests against EACH OTHER, which cannot notice that both drifted
  * the same way.
  *
@@ -91,7 +92,7 @@
  *     decline its own request rather than truncate one;
  *   - no implementation may SEND more than the wire allows;
  *   - a limit may only be RAISED by a new route, never in place: a phone in
- *     the field already refuses what it was built to refuse.
+ *     the field goes on refusing what its own build refuses.
  *
  * The mirrored WV_LIMIT_* values below are the wire's half, and both
  * srv/proto.h and app/sync.h are checked against them at compile time.
@@ -170,7 +171,7 @@ static const char wv_b_mac[] =
  * digest is what a GET wants and what a bug produces -- so the body hash was
  * pinned by a vector that could not tell the two apart. This one's body is
  * vector A's canonical text, so a signature computed over "no body", over the
- * body's LENGTH, or over the arrival-order rows instead of the canonical ones
+ * body's LENGTH, or over the arrival-order rows rather than the canonical ones
  * all give a different MAC.
  *
  * Same key as vector B, different nonce: a nonce is never reused, and the
@@ -290,11 +291,11 @@ static const struct wv_route wv_e_routes[WV_E_NROUTES] = {
      * THE SPACE IS PERCENT-ENCODED BECAUSE A RAW ONE CANNOT TRAVEL. A request
      * target with a literal space in it is not a request line at all (RFC 9112
      * 3: no whitespace is permitted inside the three components, and a
-     * recipient MUST reject a message that has it), so since item 119 this
-     * server refuses such a line with 400 before any route is consulted. The
-     * vector said "/v1/pair/ 1" and expected 404, which was only ever
-     * reachable because the old parser split on the FIRST space and silently
-     * dropped the rest -- the very defect item 119 exists to remove. "%20" is
+     * recipient MUST reject a message that has it), so this server refuses
+     * such a line with 400 before any route is consulted. A vector of
+     * "/v1/pair/ 1" expecting 404 is reachable only by a parser that splits
+     * on the FIRST space and silently drops the rest, which is the defect the
+     * 400 exists to remove. "%20" is
      * how a client that means a space actually sends one, and it still is not
      * a round: the server percent-decodes the path and the route grammar
      * refuses " 1" exactly as before. */
@@ -307,8 +308,8 @@ static const struct wv_route wv_e_routes[WV_E_NROUTES] = {
  *
  * The PROTOCOL's numbers, not either implementation's. srv/proto.h and
  * app/sync.h each _Static_assert against these, so a limit cannot be changed
- * on one side alone -- which is what "manually duplicated code is the only
- * record of the agreement" used to mean in practice.
+ * on one side alone. Duplicated constants are not a record of an agreement;
+ * they are two guesses that happen to match.
  *
  * A capacity (the app's SYNC_BUF_MAX, SYNC_MAX_LOGS) is NOT here on purpose:
  * it is allowed to differ, and it is asserted to be no LARGER than the wire

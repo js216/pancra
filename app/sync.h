@@ -8,10 +8,10 @@
  *
  * The record is a set of named LOGS. A log is a set of ROWS; a row is one
  * line of text and ITS BYTES ARE ITS IDENTITY -- nothing here reformats,
- * reorders or normalises a row, because the server hashes exactly what it was
- * given and the two hashes have to agree. Rows are partitioned into BUCKETS
- * of one UTC day, taken from the row's leading timestamp field; a log that is
- * really one small file uses the single bucket 0.
+ * reorders or normalises a row, because the server hashes exactly the bytes
+ * it is given and the two hashes have to agree. Rows are partitioned into
+ * BUCKETS of one UTC day, taken from the row's leading timestamp field; a log
+ * that is really one small file uses the single bucket 0.
  *
  * Sync compares two levels of hash and pushes only what differs:
  *
@@ -33,6 +33,7 @@
 #define PANCRA_SYNC_H
 
 #include "syncrow.h" /* SYNC_ROW_MAX and what a row IS: the bottom of this */
+#include "wireint.h" /* int64_t and PRIwire: the wire's scalars, exactly */
 #include "wirevec.h" /* WV_LIMIT_*: the wire's own numbers, pinned */
 #include <stddef.h>
 #include <stdint.h>
@@ -46,45 +47,63 @@
  * naming it is how the header says the operations are serialized without
  * offering a way to opt out.
  *
- * What this replaced: transport, identity, log registry and three growing
- * scratch buffers as independent process-wide globals, read field by field by
- * operations that took no context at all. A pairing that succeeded mid-run
- * could hand a run the new uid with the old key; sync_clear_logs plus three
- * sync_add_log calls is a four-store rewrite an operation could walk through;
- * and two operations sharing a reallocating buffer is not a stale read but a
- * freed one. */
+ * WHAT A CONTEXT PREVENTS: transport, identity, log registry and three
+ * growing scratch buffers as independent process-wide globals, read field by
+ * field by operations that take no context at all. A pairing that succeeds
+ * mid-run hands a run one account's uid with another's key; a clear plus
+ * three adds is a four-store rewrite an operation can walk through; and two
+ * operations sharing a reallocating buffer is not a stale read but a freed
+ * one. */
 struct sync_ctx;
 
 #define SYNC_KEY_LEN  16
 #define SYNC_MAX_LOGS 12
-/* BUCKETS THIS APP WILL ENUMERATE in one sync, remote and local. Capacities,
- * like the two above: the wire allows LOG_BUCKETS (20000) per log, and these
- * are what one phone will hold in memory while comparing the two sides. Both
- * are ~11 and ~22 years of daily buckets.
+/* BUCKETS THIS APP WILL ENUMERATE in one sync, remote and local: THE WIRE'S
+ * OWN LIMIT, and not a smaller number of somebody's choosing.
  *
- * Named and asserted here rather than left as `sizeof rb / sizeof rb[0]` at
- * five call sites, which is how the two ends came to disagree about what a
- * full log even is with nobody having decided it. Crossing either REFUSES the
- * sync -- an incomplete picture of what the server holds drives a loop that
- * deletes. */
-#define SYNC_REMOTE_BUCKETS 4096
-#define SYNC_LOCAL_BUCKETS  8192
+ * They were 4096 and 8192 -- about eleven and twenty-two years of daily
+ * buckets -- and crossing either REFUSES the sync, because an incomplete
+ * picture of what the server holds drives a loop that deletes. That refusal
+ * is right and it stays; what was wrong was where the line sat. A log the
+ * protocol still accepts (LOG_BUCKETS is 20000, and the server enforces it)
+ * would have been refused BY THE PHONE, for ever, with the only remedy being
+ * to delete history the user asked to keep. A limit that turns age into a
+ * permanent failure has to be the protocol's, so that both ends agree about
+ * what a full log is.
+ *
+ * THE MEMORY IS NOT PAID UP FRONT. At the wire limit these lists are about a
+ * megabyte between them, which is not something to reserve in BSS on a phone
+ * for an operation most users run a few times a day. They are allocated on
+ * first use and kept (see sync_scratch in app/sync.c); an allocation that
+ * fails refuses the sync exactly as a fixed ceiling would. */
+#define SYNC_REMOTE_BUCKETS WV_LIMIT_LOG_BUCKETS
+#define SYNC_LOCAL_BUCKETS  WV_LIMIT_LOG_BUCKETS
 /* Longest bucket this will build or accept. One UTC day of two CGMs plus a
  * meter is a few tens of kB; the server's own body ceiling is 512 kB. */
 #define SYNC_BUF_MAX                                                           \
-   (256L * 1024) /* long: it is compared against file offsets */
-/* THE MACHINE THIS APP ASSUMES, asserted where the protocol is described.
+   (256L * 1024) /* compared against int64_t buffer lengths                    \
+                  */
+/* THE MACHINE THIS APP ASSUMES: NONE, and that is the change.
  *
- * Every id, timestamp and bucket the app signs, writes or parses is a C
- * `long` (%ld on both sides of the wire), and the server asserts the same
- * thing in srv/proto.h. On a 32-bit `long` the code still compiles, the tests
- * still pass, and timestamps stop being representable in 2038 -- so the
- * boundary is declared rather than discovered. The shipped artifact is
- * arm64-v8a alone (LP64); apkcheck.sh refuses a package with any other ABI. */
-_Static_assert(sizeof(long) >= 8,
-               "LP64 only: an id, an instant and a bucket are all C longs "
-               "here, and a 32-bit one is the 2038 problem with no build "
-               "error to warn of it");
+ * Every id, timestamp and bucket the app signs, writes or parses is an
+ * int64_t, printed and parsed with PRIwire/SCNwire (lib/wireint.h), which is
+ * the same 64 bits on every data model. A C `long` printed with %ld would
+ * make each of them a property of the MACHINE, and none of these values
+ * belongs to a machine: they are decimal text on a wire between two of them,
+ * and the wire says nothing about either. An assertion that sizeof(long) >= 8
+ * is an honest guard on a dishonest design.
+ *
+ * THE FILE AND THE WIRE ARE UNAFFECTED: decimal digits either way, so a phone
+ * parses its own stored rows and the server's answers identically. What the
+ * types buy is that a 32-bit host is not a silent 2038 bug. `make -f
+ * test/Makefile
+ * wirecheck` compiles these units for ILP32 to prove it, and that compile is
+ * the only thing that can SEE a leftover %ld -- on LP64, %ld and PRIwire are
+ * the same three characters.
+ *
+ * The shipped artifact is still arm64-v8a alone (apkcheck.sh refuses a
+ * package with any other ABI). That is a packaging fact now, not a
+ * correctness one. */
 
 /* WHAT THE WIRE ALLOWS, AND WHAT THIS PHONE HOLDS, are two different claims
  * and only the first is shared. A row is the wire's row: send a longer one
@@ -115,23 +134,12 @@ _Static_assert(SYNC_KEY_LEN == 16, "the pairing key is 128 bits on this wire");
  * from the wire. These build the path or fail; they never truncate one, and a
  * truncated path is a DIFFERENT bucket, not a broken request.
  *
- * Exported because app/test/interoptest.c checks them against the paths the
+ * Exported because test/app/interoptest.c checks them against the paths the
  * route vectors name: the vectors are only worth anything if the shipping
  * code is what produces those bytes. Returns the length, or 0 if it would
  * not fit. */
-int sync_path_bucket(char *out, size_t cap, const char *log, long bucket);
+int sync_path_bucket(char *out, size_t cap, const char *log, int64_t bucket);
 int sync_path_digest(char *out, size_t cap, const char *log);
-
-/* ONE ARBITRARY SIGNED REQUEST, through the app's OWN signing.
- *
- * Exported for app/test/interoptest.c, which drives the route and boundary
- * vectors (lib/wirevec.h) against the real server. A test that built its own
- * Authorization header would be a third implementation of the signing rule,
- * and would agree with itself no matter what the app does; this sends what
- * the phone sends. Returns the HTTP status, or a negative value if the
- * request could not be made (which includes having no key). */
-int sync_request(const char *method, const char *path, const char *body,
-                 int blen, char *out, int outcap);
 
 /* THE KEY-CONFIRMATION TAG: the first 32 hex characters of
  * HMAC-SHA256(shared key, label), lower case. `out` must hold 33 bytes.
@@ -141,16 +149,14 @@ int sync_request(const char *method, const char *path, const char *body,
  * it is what proves the key both sides derived is the SAME key. Truncate
  * differently, upper-case the hex, or swap the labels, and pairing still
  * succeeds against a partner with the same bug and fails against every
- * correct one. lib/wirevec.h pins the tags for one fixed key, and
- * app/test/interoptest.c holds this function to them. */
-void sync_confirm_tag(const uint8_t key[SYNC_KEY_LEN], const char *label,
-                      char out[33]);
-
-/* THE TWO LABELS, named rather than typed out where they are used, for the
- * same reason as the server's (srv/proto.h): they are protocol constants and
- * a typo in one succeeds against a partner with the same typo. */
-#define SYNC_CONFIRM_LABEL_SERVER "pancra-confirm-server"
-#define SYNC_CONFIRM_LABEL_CLIENT "pancra-confirm-client"
+ * correct one.
+ *
+ * THE CONSTRUCTION AND THE LABELS ARE lib/pairtag.h's NOW: this
+ * side and the server's had a copy each, four places for one twelve-line
+ * rule. What is still independent -- deliberately -- is the VECTORS:
+ * lib/wirevec.h pins the tags for one fixed key, and test/app/interoptest.c
+ * holds the app's production path to them while test/srv/wiretest.c holds the
+ * server's. */
 
 /* THE EXACT BYTES THIS APP TAKES A REQUEST MAC OVER:
  *
@@ -166,7 +172,7 @@ void sync_confirm_tag(const uint8_t key[SYNC_KEY_LEN], const char *label,
  * Returns the length written, or 0 if it would not fit -- and then nothing is
  * signed, rather than a truncated string being. */
 int sync_signing_string(char *out, size_t cap, const char *method,
-                        const char *path, long ts, const char *nonce,
+                        const char *path, int64_t ts, const char *nonce,
                         const char *bodyhash);
 
 /* THE NONCE a signed request carries, as 32 hex characters (128 bits) from
@@ -195,24 +201,79 @@ typedef int (*sync_http_fn)(const char *method, const char *path,
 void sync_set_http(sync_http_fn fn);
 
 /* The paired identity. `uid` 0 means "not paired" and every call fails. */
-void sync_set_key(long uid, const uint8_t key[SYNC_KEY_LEN]);
+void sync_set_key(int64_t uid, const uint8_t key[SYNC_KEY_LEN]);
 
-/* Register a file to sync. `bucketed` splits it by UTC day on the row's
- * leading timestamp; 0 puts the whole file in bucket 0. Returns 0 on success.
- */
-int sync_add_log(const char *name, const char *path, int bucketed);
-void sync_clear_logs(void);
+/* ONE FILE THE CALLER WANTS SYNCED. `bucketed` splits it by UTC day on the
+ * row's leading timestamp; 0 puts the whole file in bucket 0. */
+struct sync_log_spec {
+   const char *name;
+   const char *path;
+   int bucketed;
+};
+
+/* PUBLISH THE WHOLE REGISTRY, IN ONE STORE.
+ *
+ * Returns 0 when `n` entries were published, -1 when NONE were: too many for
+ * SYNC_MAX_LOGS, or a name or path that does not fit its field. There is no
+ * partial outcome, and that is the point of the shape.
+ *
+ * WHY THERE IS NO add() AND NO clear(), which is the whole shape of this
+ * call. A clear followed by eight adds, each taking the configuration lock
+ * on its own, lets a sync starting anywhere inside the sequence snapshot a
+ * PREFIX of the registry, upload that, and report success. A sync that sends
+ * five of eight logs and says it is done is worse than one that fails: the
+ * digests agree, both sides believe they match, and nothing ever revisits it.
+ * The sequence was a clear followed by eight adds, each taking the
+ * configuration lock on its own.
+ *
+ * A caller cannot express that any more. The list is built and validated
+ * off-lock, and one store swaps `{logs, nlog}` together, so an operation's
+ * snapshot is always a registry SOMEBODY REGISTERED, never a prefix of
+ * one. */
+int sync_set_logs(const struct sync_log_spec *specs, int n);
 
 /* Pair with a 6-digit code (EC-J-PAKE over P-256, four steps -- see sync.c).
  * On success the key is stored via sync_set_key and copied to `out_key`.
  * Returns 0 on success, -1 on a wrong code or any protocol failure. */
 int sync_pair(const char *email, const char *code,
-              uint8_t out_key[SYNC_KEY_LEN], long *out_uid);
+              uint8_t out_key[SYNC_KEY_LEN], int64_t *out_uid);
 
-/* How far the running sync has got: `done` of `total` buckets examined.
- * Returns 1 while a sync is in flight, 0 otherwise. Written from the sync
- * worker and read by the UI thread; the values are plain ints, so a reader
- * can at worst catch a stale pair, never a torn one. */
+/* ---- HOW FAR THE RUNNING SYNC HAS GOT -----------------------
+ *
+ * ONE STATE, NOT THREE VALUES. Three atomics read one at a time promise "at
+ * worst a stale pair, never a torn one" about ONE pair, and there is more
+ * than one: a run can END and another BEGIN between two of those loads, so a
+ * reader pairs one run's `done` with the next run's `total` and draws 900 of
+ * 12. Everything is published in
+ * one 64-bit word now (see sync.c for the layout and why there is no lock).
+ *
+ * THE CONTRACT: what comes back existed -- one run's flag, its total and a
+ * `done` that belonged to it -- and may be a few buckets old. Fields from two
+ * different runs cannot appear together. `gen` changes when a new run starts,
+ * so two reads carrying the same `gen` describe the same run; it wraps, and
+ * is for telling runs apart rather than counting them.
+ *
+ * `total` and `done` are clamped at 2^24-1 rather than wrapped: a wrapped
+ * denominator is a plausible-looking wrong number. */
+struct sync_prog {
+   int active;   /* 1 while a run is in flight */
+   int done;     /* buckets examined so far */
+   int total;    /* buckets this run set out to examine */
+   unsigned gen; /* which run these belong to */
+};
+
+
+/* The same state for a caller that only wants the two numbers. Kept because
+ * every existing caller reads exactly this; it is one read of the word, so
+ * the pair it returns is coherent for the same reason. */
+struct sync_prog sync_progress_get(void);
+
+/* Bracket one run: begin names how many buckets it set out to examine, end
+ * marks it finished without disturbing the counts. One writer only -- the
+ * sync worker -- which is why neither needs a compare-exchange. */
+void sync_progress_begin(int total);
+void sync_progress_end(void);
+
 int sync_progress(int *done, int *total);
 
 /* Run one sync. Returns 0 when both sides provably match afterwards, -1
@@ -249,12 +310,12 @@ int sync_restore(void);
 
 /* ---- ONE LINE OF A DIGEST REPLY, exposed for tests --------------------
  *
- * THREE ANSWERS, BECAUSE THERE ARE THREE SITUATIONS. This used to be static in
- * sync.c and to answer 1 for a row and 0 for everything else -- where
- * "everything else" was the end of the reply AND every syntax failure,
- * reported identically. All three callers loop until 0 and then treat what
- * they have as the server's complete list, so a reply truncated by a dropped
- * connection was accepted as the whole truth, and a restore over it reported
+ * THREE ANSWERS, BECAUSE THERE ARE THREE SITUATIONS. Answering 1 for a row
+ * and 0 for everything else makes "everything else" the end of the reply AND
+ * every syntax failure, reported identically. All three callers loop until 0
+ * and then treat what they have as the server's complete list, so a reply
+ * truncated by a dropped connection is accepted as the whole truth, and a
+ * restore over it reports
  * SUCCESS with a count: the user asked for their record and was told it came
  * back, short.
  *
@@ -272,19 +333,17 @@ enum dline {
 /* Parse "<name> <count> <hash>\n" at *p, advancing *p past it on DLINE_ROW.
  * Requires: a non-empty name that fits `ncap`, an all-digits count that fits a
  * long, a hash of EXACTLY 16 bytes, and a terminating newline. */
-enum dline digest_line(const char **p, char *name, int ncap, long *count,
+enum dline digest_line(const char **p, char *name, int ncap, int64_t *count,
                        char hash[17]);
 
-/* Canonical text of one bucket, for tests and for the push path: the log's
- * rows for `bucket`, sorted bytewise, each newline-terminated. Returns the
- * length written, or -1 if it does not fit.
+/* The canonical text of one bucket of `log_idx` -- its rows, sorted,
+ * de-duplicated, newline-terminated -- which is the text whose hash the two
+ * sides of a sync compare. NUL-terminated; returns the length written, or -1
+ * if the bucket does not exist or does not fit `cap`.
  *
- * ALSO NUL-TERMINATED, and one byte of `cap` is reserved for that -- the
- * length is what the push uses, but the buffer is read as a C string too. */
-long sync_bucket_text(int log_idx, long bucket, char *out, long cap);
-
-/* Fetch the server's canonical text for one registered bucket through the
- * authenticated production request path. Returns its byte length, or -1. */
-long sync_fetch_bucket(int log_idx, long bucket, char *out, long cap);
+ * Declared here for the same reason digest_line above is: the agreement it
+ * encodes is with a REMOTE implementation, and the only way to hold it to
+ * that is to render a known log and look at the bytes. */
+int64_t sync_bucket_text(int log_idx, int64_t bucket, char *out, int64_t cap);
 
 #endif

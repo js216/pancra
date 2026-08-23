@@ -64,7 +64,7 @@
  *   beyond the tolerance: the clock has really moved, and this module's rule
  *     is that a reference it cannot vouch for EXPIRES VISIBLY rather than
  *     being applied. The queue resolves FAILED and the pending rescale reports
- *     EXPIRED, so the user is told to enter the value again instead of the app
+ *     EXPIRED, so the user is told to enter the value again rather than the app
  *     silently pushing an unknown-age fingerstick into the sensor.
  *
  * A FORWARD-SKEWED AGE -- a positive age larger than the window -- is already
@@ -83,7 +83,8 @@
  * from the sensor's own number are far likelier to be a mistyped entry, a
  * fingerstick taken during a fast change, or a failing sensor than a real
  * calibration offset. Refusing them is the conservative direction -- a
- * rejected calibration leaves the old value, an accepted wrong one rewrites
+ * rejected calibration leaves the stored value, an accepted wrong one
+ * rewrites
  * every reading the sensor produces.
  *
  * LOAD-BEARING: app/store.h derives STORE_GLU_MIN/MAX from this pair, so
@@ -94,15 +95,15 @@
 /* ---- WHAT A CALIBRATION OR RESCALE CHANGE ANSWERS ----------------------
  *
  * Every transition below is a TRANSACTION: it changes the state, rewrites the
- * one-line file, and if that rewrite fails it puts the state back exactly as
- * it was. Two outcomes, and the caller can act on either.
+ * one-line file, and if that rewrite fails it puts the state back untouched.
+ * Two outcomes, and the caller can act on either.
  *
- * They used to be `void`, with atomic_replace's result dropped. So a
+ * They are NOT `void` with atomic_replace's result dropped: that leaves a
  * calibration the user confirmed -- the most consequential write this app
- * makes -- was queued in memory, reported as queued on screen, and gone at
- * the next launch; and a rescale STOP that could not be written left the
- * factor off on screen and on again after a restart, silently scaling every
- * reading from that sensor.
+ * makes -- queued in memory, reported as queued on screen, and gone at the
+ * next launch; and a rescale STOP that cannot be written leaves the factor
+ * off on screen and on again after a restart, silently scaling every reading
+ * from that sensor.
  *
  * CALIB_UNSAVED means NOTHING CHANGED, in memory or on disk. Both files are
  * replaced by rename, so a failed write leaves the previous file whole and
@@ -218,8 +219,8 @@ void calib_view(int sensor_id, struct calib_view *out);
 /* ---- what this module needs from its host ---- */
 
 /* (This module's only upward call is shell_ui_dirty(), which shell.h already
- * declares, so there is nothing for this header to declare. NOTES.md has the
- * second name this replaced and why it was one too many.) */
+ * declares, so there is nothing for this header to declare. It replaced a
+ * second name for the same thing, which is one too many for a repaint.) */
 
 /* THE SENSOR'S ANSWER to a calibration write: 0 accepted, >0 rejected.
  * Clears or surfaces the durably-queued calibration. Called from the driver,
@@ -232,20 +233,20 @@ void calib_view(int sensor_id, struct calib_view *out);
  * three match what is queued right now. Anything else is discarded with a
  * warning in the log.
  *
- * WHY THAT IS NOT PEDANTRY. This used to take the result alone, and the driver
- * carried only a boolean "something we sent is awaiting a reply". So a reply
- * resolved whatever was queued at the instant it landed, which is a different
- * calibration whenever the user replaced one before the sensor answered: the
- * new value was recorded APPLIED (or REJECTED) having never been sent, and the
- * LAST CAL row then told the user the sensor holds a number it was never
- * given. A CGM calibrated to a value nobody chose misreports glucose until the
- * next calibration, and the screen says everything is fine.
+ * WHY THAT IS NOT PEDANTRY. Take the result alone, over a driver carrying
+ * only a boolean "something we sent is awaiting a reply", and a reply resolves
+ * whatever is queued at the instant it lands -- a different calibration
+ * whenever the user replaced one before the sensor answered. The new value is
+ * recorded APPLIED (or REJECTED) having never been sent, and the LAST CAL row
+ * then tells the user the sensor holds a number it was never given. A CGM
+ * calibrated to a value nobody chose misreports glucose until the next
+ * calibration, and the screen says everything is fine.
  *
  * A DISCARDED REPLY IS NOT A LOST CALIBRATION. The value the user actually has
  * queued stays queued, its send throttle was never stamped against it (see
  * calq_attempt_locked), and the next stream attempt writes it -- so the outcome
  * of the interleaving above is now "180 is still PENDING and goes out", which
  * is what the user asked for. */
-void pancra_cal_result(int result, int sensor_id, int mg_dl, unsigned gen);
+void calib_cal_result(int result, int sensor_id, int mg_dl, unsigned gen);
 
 #endif

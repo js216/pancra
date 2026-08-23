@@ -25,19 +25,23 @@
  *
  * THE FORMAT, as app/store.c writes it (see app/store.h):
  *
- *     epoch,glucose,trend10,rssi,recv_lag,source_id,raw_time,tz_off,kind[,rescale]
+ *     epoch,glucose,trend10,rssi,recv_lag,source_id,raw_time,tz_off,kind
+ *         [,rescale[,warm]]
  *
  * `rssi` is EMPTY when the sample carried none -- the one field that may be
  * blank, because the writer emits it blank. Trailing fields beyond `kind`
- * (today: the rescale factor) are provenance and are ignored, which is what
- * lets the format grow: a reader of an older build must keep reading rows a
- * newer one writes.
+ * (the rescale factor, and what the sensor said about its own warm-up) are
+ * provenance and are ignored, which is what lets the format grow: a reader of
+ * an older build must keep reading rows a newer one writes.
  *
- * Pure: no globals, no clock, no database. srv/test/rowtest.c holds the
- * malformed vectors.
+ * Pure: no globals, no clock, no database.
  */
 #ifndef ROWDEC_H
 #define ROWDEC_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
+
+#include "wireint.h" /* int64_t and PRIwire: the wire's scalars, exactly */
 
 /* What a row says. Only fields the server actually uses are exposed; the rest
  * are still REQUIRED to be well-formed, because a row with a corrupt field we
@@ -45,15 +49,15 @@
  *
  * THE int FIELDS HOLD WHAT THE ROW SAID, or the row was refused. They are
  * narrower than the longs the decoder parses into, and a row whose field does
- * not fit an int is not a row with a different value in it -- see the narrow()
- * comment in rowdec.c for what the old bare casts stored instead. */
+ * not fit an int is not a row with a different value in it -- see the
+ * narrow() comment in rowdec.c for what a bare cast stores instead. */
 struct row_reading {
-   long t;    /* epoch seconds, > 0 */
-   long glu;  /* mg/dL, within the plausible band below */
-   int trend; /* mg/dL per 10 min, as stored; any int */
-   int kind;  /* ROW_KIND_*, or ROW_KIND_NONE when the row does not say */
-   int tz;    /* the offset in force when it was taken, SECONDS east of UTC */
-   int src;   /* the registry id of the device that produced it; any int */
+   int64_t t;   /* epoch seconds, > 0 */
+   int64_t glu; /* mg/dL, within the plausible band below */
+   int trend;   /* mg/dL per 10 min, as stored; any int */
+   int kind;    /* ROW_KIND_*, or ROW_KIND_NONE when the row does not say */
+   int tz;      /* the offset in force when it was taken, SECONDS east of UTC */
+   int src;     /* the registry id of the device that produced it; any int */
 };
 
 /* The kinds a row may state. These are app/sensors.h's KIND_* values: they
@@ -69,9 +73,8 @@ struct row_reading {
  * blank a long-standing account's older months. The HEADLINE does not: the
  * number at the top of the page is the one a person reads before deciding
  * whether to eat or to inject, and a row that does not say what device made
- * it may not supply it. The old code made that decision once, in the
- * headline's favour and wrongly -- it took the absence of the field as proof
- * of CGM. */
+ * it may not supply it. Taking the absence of the field as proof of CGM
+ * decides that question in the headline's favour, and wrongly. */
 #define ROW_KIND_NONE (-1)
 
 #define ROW_KIND_CGM 0
@@ -106,12 +109,12 @@ struct row_reading {
  * is a well-formed reading that does not state its provenance; see above.
  *
  * warn_unused_result, as lib/hkdf.h and lib/pbkdf2.h carry it. This decoder
- * exists because four readers used to take a partial parse for an answer, and
+ * exists so that four readers cannot take a partial parse for an answer, and
  * `out` is UNTOUCHED on a refusal -- callers here scan thousands of rows
  * through one struct, so ignoring the status does not read zeroes, it reads
  * the PREVIOUS row and draws it twice. That is not a mistake to leave to
  * review. */
-int row_decode(const char *line, int len, struct row_reading *out)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE int row_decode(const char *line, int len,
+                               struct row_reading *out);
 
 #endif

@@ -4,8 +4,8 @@
 
 /* FOUR ANSWERS, BECAUSE THERE ARE FOUR SITUATIONS.
  *
- * Every loader in this app used to return void. Each of them collapsed three
- * quite different things into "the state is now whatever it is":
+ * A loader that returns void collapses three quite different things into
+ * "the state is now whatever it is":
  *
  *   - the file is not there, which on a first run is CORRECT and means the
  *     compiled defaults apply;

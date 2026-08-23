@@ -13,6 +13,7 @@
 #include "font.h"
 #include "keypad.h" /* what each mode IS: slots, title, dot, unit */
 #include "ndk.h"
+#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h"
@@ -41,16 +42,11 @@
 const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -.@_+";
 #define UI_LABEL_COLS 6
 
-/* (The assertion that used to stand here -- that this array had not grown
- * into MA_WTTAB's action range -- is gone with the ranges themselves. A key
- * is (MA_CHAR, index) now, so however long this string gets it cannot reach
- * another control. It once could: a tap on the weight plot's "1M" tab
- * dispatched a letter into the rename keypad.) */
-
-int ui_label_nchars(void)
-{
-   return (int)(sizeof ui_label_chars) - 1;
-}
+/* (No assertion is needed here that this array has not grown into MA_WTTAB's
+ * action range: a key is (MA_CHAR, index), so however long this string gets
+ * it cannot reach another control. With a base+index range it could -- a tap
+ * on the weight plot's "1M" tab dispatching a letter into the rename
+ * keypad.) */
 
 void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
                   struct hits *h)
@@ -78,16 +74,16 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
       what = "SERVER";
    else if (m->entry.label_field == 2)
       what = "EMAIL";
-   draw_str(px, fb, x, y, tsc, what, 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, x, y, tsc, what, UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    y += 2 * lh;
 
    /* What has been typed so far, with a caret so an empty field is still
     * obviously an entry field.
     *
-    * WRAPPED, not shrunk. This used to be one line in a 16-byte buffer, which
-    * was fine for a sensor name and useless for an email address: anything
-    * past 15 characters simply was not shown. Shrinking the text to fit would
+    * WRAPPED, not shrunk. One line in a 16-byte buffer is fine for a sensor
+    * name and useless for an email address: anything past 15 characters is
+    * simply not shown. Shrinking the text to fit would
     * make a long address unreadable exactly when the user most needs to check
     * it letter by letter, so the text keeps its size and takes as many lines
     * as it needs. */
@@ -116,12 +112,12 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
          line[i] = shown[off + i];
       line[len] = 0;
       int dw    = len * 6 * dsc;
-      draw_str(px, fb, (fb->width - dw) / 2, y, dsc, line, 0xFF33FF88);
+      draw_str(px, fb, (fb->width - dw) / 2, y, dsc, line, UI_OK);
       y += 7 * dsc;
    }
    y += 8 * sc;
-   add_hit_ix(h, 0, ty - (3 * sc), fb->width, y - (ty - (3 * sc)), MA_KP_CLOSE,
-              0);
+   add_hit_ix(h, ui_rect(0, ty - (3 * sc), fb->width, y - (ty - (3 * sc))),
+              MA_KP_CLOSE, 0);
 
    int n      = ui_label_nchars();
    int rows   = (n + UI_LABEL_COLS - 1) / UI_LABEL_COLS;
@@ -140,22 +136,22 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int cy      = y + ((i / UI_LABEL_COLS) * ch);
       char lbl[2] = {ui_label_chars[i], 0};
       draw_str(px, fb, cx + ((cw - (6 * ksc)) / 2), cy + ((ch - (7 * ksc)) / 2),
-               ksc, lbl, 0xFFFFFFFF);
-      add_hit_ix(h, cx, cy, cw, ch, MA_CHAR, i);
+               ksc, lbl, UI_TEXT);
+      add_hit_ix(h, ui_rect(cx, cy, cw, ch), MA_CHAR, i);
    }
    /* DEL and OK share the last row */
    int cy = y + (rows * ch);
    int hw = gw / 2;
    draw_frame(px, fb, gm + (2 * sc), cy + (2 * sc), hw - (4 * sc),
-              ch - (4 * sc), 0xFF555555);
+              ch - (4 * sc), UI_RULE);
    draw_str(px, fb, gm + ((hw - (3 * 6 * ksc)) / 2),
-            cy + ((ch - (7 * ksc)) / 2), ksc, "DEL", 0xFFFFFFFF);
-   add_hit_ix(h, gm, cy, hw, ch, MA_BACKSPACE, 0);
+            cy + ((ch - (7 * ksc)) / 2), ksc, "DEL", UI_TEXT);
+   add_hit_ix(h, ui_rect(gm, cy, hw, ch), MA_BACKSPACE, 0);
    draw_frame(px, fb, gm + hw + (2 * sc), cy + (2 * sc), hw - (4 * sc),
-              ch - (4 * sc), 0xFF555555);
+              ch - (4 * sc), UI_RULE);
    draw_str(px, fb, gm + hw + ((hw - (2 * 6 * ksc)) / 2),
-            cy + ((ch - (7 * ksc)) / 2), ksc, "OK", 0xFF33FF88);
-   add_hit_ix(h, gm + hw, cy, hw, ch, MA_OK, 0);
+            cy + ((ch - (7 * ksc)) / 2), ksc, "OK", UI_OK);
+   add_hit_ix(h, ui_rect(gm + hw, cy, hw, ch), MA_OK, 0);
 }
 
 /* One keypad key: framed cell, centred label (in `col`), full-cell ACT_MENU
@@ -166,20 +162,20 @@ static void pad_key(struct ANativeWindow_Buffer *fb, struct hits *h, int cx,
                     int ix, uint32_t col)
 {
    uint32_t *px = fb->bits;
-   draw_frame(px, fb, cx, cy, cw, ch, 0xFF555555);
+   draw_frame(px, fb, cx, cy, cw, ch, UI_RULE);
    int lw  = str_len(lab) * 6 * ksc;
    int lhh = 7 * ksc;
    draw_str(px, fb, cx + ((cw - lw) / 2), cy + ((ch - lhh) / 2), ksc, lab, col);
    if (code >= 0)
-      add_hit_ix(h, cx, cy, cw, ch, code, ix);
+      add_hit_ix(h, ui_rect(cx, cy, cw, ch), code, ix);
 }
 
 /* Pairing / plot-max keypad: a title, a fixed-width entry field, and a 3x4
  * digit grid. Every key carries a NAMED code and, separately, which key it
- * is -- the grid used to spell its digits as the bare integers 100..109,
- * which is the base+index namespace at its least visible: nothing in
- * "101, 102, 103" says "digit one, two, three", and nothing would have
- * complained if MA_BACKSPACE had been renumbered on top of them. */
+ * is. Spelling the digits as the bare integers 100..109 is the base+index
+ * namespace at its least visible: nothing in "101, 102, 103" says "digit one,
+ * two, three", and nothing complains if MA_BACKSPACE is renumbered on top of
+ * them. */
 
 void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
                    struct hits *h)
@@ -204,14 +200,14 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
    const char *kp_title = pair_title;
    /* TABLE-DRIVEN, AND THE FALLBACK IS AN ERROR, NOT A SCREEN.
     *
-    * This was an if/else chain ending in `else -> pairing keypad`, so "no
-    * title for this mode" rendered a REAL, PLAUSIBLE screen: a mode added
-    * without a title silently became PAIR NEW <sensor>. The WEIGHT keypad did
-    * exactly that -- tapping a weight opened the sensor-pairing flow and
+    * An if/else chain ending in `else -> pairing keypad` renders a REAL,
+    * PLAUSIBLE screen for "no title for this mode": a mode added without a
+    * title silently becomes PAIR NEW <sensor>, so tapping a weight opens the
+    * sensor-pairing flow and
     * nothing about it looked wrong. A default branch must never name a
     * different feature. Pairing is KP_PAIR_CODE and ONLY that; anything unknown
     * says so, in red, where it cannot be mistaken for working. */
-   uint32_t title_col = 0xFFFFFFFF;
+   uint32_t title_col = UI_TEXT;
    if (m->entry.kp_mode == KP_PAIR_CODE) {
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->dev.add_type ? m->dev.add_type : "SENSOR");
@@ -220,12 +216,12 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
    } else {
       (void)snprintf(pair_title, sizeof pair_title, "BAD KP MODE %d",
                      m->entry.kp_mode);
-      title_col = 0xFF4466FF; /* red: a bug, not a feature */
+      title_col = UI_DANGER; /* red: a bug, not a feature */
    }
    /* Leave room for the X, which is right-aligned at 6*tsc. */
    (void)draw_title_fit(px, fb, x, y, tsc, kp_title, title_col,
                         rx - x - (7 * tsc));
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    y += 2 * lh;
    if (kp_is_thresh(m->entry.kp_mode)) {
       /* the accepted ceiling, in the entry's own units, then a blank row;
@@ -234,15 +230,15 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
       char mx[24];
       fmt_glu(AL_ENTRY_MAX, m->prefs.units, mv, sizeof mv);
       (void)snprintf(mx, sizeof mx, "MAX: %s %s", mv, UI_LBL(m->prefs.units));
-      draw_str(px, fb, x, y, sc, mx, 0xFF888888);
+      draw_str(px, fb, x, y, sc, mx, UI_MUTED);
       y += 2 * lh;
    }
 
-   /* WHY the last entry was refused, in red, where the eye already is. The
-    * keypad used to answer a rejected value by clearing the field and saying
-    * nothing at all, which reads exactly like a mistyped key -- so the user
-    * retypes the same rejected value. It cost weeks of a nudge threshold that
-    * was never accepted looking like a nudge that no longer worked. */
+   /* WHY the last entry was refused, in red, where the eye already is.
+    * Answering a rejected value by clearing the field and saying nothing at
+    * all reads exactly like a mistyped key, so the user retypes the same
+    * rejected value -- weeks of a nudge threshold that is never accepted
+    * looking like a nudge that no longer works. */
    if (m->entry.kp_err[0]) {
       draw_str(px, fb, x, y, sc, m->entry.kp_err, 0xFFFF5555);
       y += 2 * lh;
@@ -254,10 +250,9 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * the remote port a TCP port's 5. dsc is sized for the widest label so the
     * field -- and the keypad below -- is identical across modes. */
    int nslots = kp_slots(m->entry.kp_mode);
-   /* glucose entries carry the unit label: plot max / cal / rescale and the
-    * two alarm thresholds */
-   int has_unit   = kp_info(m->entry.kp_mode)->unit;
-   const char *en = m->entry.entry ? m->entry.entry : "";
+   /* which unit suffix this mode carries, if any -- the table decides */
+   enum kp_unit un = kp_info(m->entry.kp_mode)->unit;
+   const char *en  = m->entry.entry ? m->entry.entry : "";
    char shown[24];
    int k = 0;
    /* Both bounds are belt-and-braces: the widest mode is 15 slots plus
@@ -266,13 +261,18 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * appeared -- a silent stack overrun for a one-character change. */
    for (int i = 0; i < nslots && k < (int)sizeof shown - 1; i++)
       shown[k++] = *en ? *en++ : '_'; /* typed digits, then '_' for the rest */
-   if (has_unit) {
-      /* The WEIGHT keypad is the one entry that is not a glucose value, so
-       * it must not be labelled with the glucose unit. */
-      const char *ul = (m->entry.kp_mode == KP_WEIGHT)
-                           ? wt_unit_name(m->prefs.wunits)
-                           : UI_LBL(m->prefs.units);
-      int w          = snprintf(shown + k, sizeof shown - k, " %s", ul);
+   /* The suffix comes from the mode's own row, never from a guess about what
+    * kind of number this is -- see enum kp_unit. No default: a new unit must
+    * fail to compile here rather than inherit somebody else's label. */
+   const char *ul = 0;
+   switch (un) {
+      case KP_UNIT_NONE: break;
+      case KP_UNIT_GLU: ul = UI_LBL(m->prefs.units); break;
+      case KP_UNIT_WT: ul = wt_unit_name(m->prefs.wunits); break;
+      case KP_UNIT_G: ul = "G"; break;
+   }
+   if (ul) {
+      int w = snprintf(shown + k, sizeof shown - k, " %s", ul);
       if (w > 0)
          k += (w < (int)sizeof shown - k) ? w : (int)sizeof shown - k - 1;
    }
@@ -288,12 +288,12 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (dsc < sc)
       dsc = sc;
    int dw = str_len(shown) * 6 * dsc;
-   draw_str(px, fb, (fb->width - dw) / 2, y, dsc, shown, 0xFF33FF88);
+   draw_str(px, fb, (fb->width - dw) / 2, y, dsc, shown, UI_OK);
    y += (7 * dsc) + (12 * sc);
 
    /* Generous close target: the whole area above the keypad closes it. */
-   add_hit_ix(h, 0, ty - (3 * sc), fb->width, y - (ty - (3 * sc)), MA_KP_CLOSE,
-              0);
+   add_hit_ix(h, ui_rect(0, ty - (3 * sc), fb->width, y - (ty - (3 * sc))),
+              MA_KP_CLOSE, 0);
 
    /* 3x4 grid: digits, then 0 / DEL / OK. The title's X cancels. The IP mode
     * -- and the two alarm-threshold modes in mmol/L, where the value carries
@@ -369,18 +369,23 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
       for (int col = 0; col < 3; col++) {
          int idx      = (r * 3) + col;
          int code     = aa[idx];
-         uint32_t kcl = 0xFFFFFFFF;
+         uint32_t kcl = UI_TEXT;
          if (code == MA_OK && ok_dead) {
             code = -1;
-            kcl  = 0xFF555555;
+            kcl  = UI_RULE;
          }
          pad_key(fb, h, gm + (col * cw), y + (r * ch), cw - (2 * sc),
                  ch - (2 * sc), ksc, kk[idx], code, ai[idx], kcl);
       }
    if (dotkey)
       pad_key(fb, h, gm, y + (4 * ch), (3 * cw) - (2 * sc), ch - (2 * sc), ksc,
-              "OK", ok_dead ? -1 : MA_OK, 0, ok_dead ? 0xFF555555 : 0xFFFFFFFF);
+              "OK", ok_dead ? -1 : MA_OK, 0, ok_dead ? UI_RULE : UI_TEXT);
 }
 
 /* Pairing candidate picker: scanned sensors strongest-first; a tap pairs one
  * (MA_DEV_PICK with the index), the X cancels (MA_DEV_CANCEL). */
+
+int ui_label_nchars(void)
+{
+   return (int)(sizeof ui_label_chars) - 1;
+}

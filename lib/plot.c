@@ -63,8 +63,8 @@ enum plot_geom plot_fb_check(struct plot_fb fb)
     * question without performing the multiply that would wrap. INT rather
     * than size_t because int is the domain this API speaks -- a buffer whose
     * last pixel cannot be counted in an int is not one these four ints can
-    * describe -- and because it is the int multiply that used to wrap
-    * negative and index backwards out of the allocation. */
+    * describe -- and because it is the int multiply that wraps negative and
+    * indexes backwards out of the allocation. */
    if (fb.h > INT_MAX / fb.stride)
       return PLOT_GEOM_OVERFLOW;
    return PLOT_GEOM_OK;
@@ -191,8 +191,8 @@ static void mark(struct clip cl, uint32_t *fb, int stride, int fbw, int fbh,
       case PLOT_MARK_W: {
          /* A letter W: FOUR strokes, drawn as segments.
           *
-          * The first version stepped two diagonals from the top corners to
-          * the bottom centre, where they met -- which is a V, not a W. A W
+          * Two diagonals stepped from the top corners to the bottom centre,
+          * where they meet, draw a V, not a W. A W
           * needs two valleys either side of a centre peak, and the peak must
           * stop short of the top or the middle stroke closes into an X at
           * this size. Half height for the peak reads correctly down to r=2.
@@ -219,6 +219,19 @@ static void mark(struct clip cl, uint32_t *fb, int stride, int fbw, int fbh,
          wseg(cl, fb, stride, fbw, fbh, cx - hw, cy - r, cx - hw, cy + r, c);
          wseg(cl, fb, stride, fbw, fbh, cx - hw, cy - r, cx + hw, cy - r, c);
          wseg(cl, fb, stride, fbw, fbh, cx - hw, mid, cx + (hw / 2), mid, c);
+         return;
+      }
+      case PLOT_MARK_E: {
+         /* A letter E: the F's three strokes with a fourth along the bottom,
+          * and the middle arm SHORTER than the other two -- which is what
+          * keeps the E and the F apart at three or four pixels tall, where
+          * two full-width arms and one short one is the only difference a
+          * reader has to go on. */
+         int hw = r;
+         wseg(cl, fb, stride, fbw, fbh, cx - hw, cy - r, cx - hw, cy + r, c);
+         wseg(cl, fb, stride, fbw, fbh, cx - hw, cy - r, cx + hw, cy - r, c);
+         wseg(cl, fb, stride, fbw, fbh, cx - hw, cy, cx + (hw / 2), cy, c);
+         wseg(cl, fb, stride, fbw, fbh, cx - hw, cy + r, cx + hw, cy + r, c);
          return;
       }
       case 1: /* cross */
@@ -300,7 +313,7 @@ void plot_marker_glyph(struct plot_fb b, int cx, int cy, int r, int shape,
 
 /* THE SCALE, FROM THE CALLER. `glu_max` 0 means "the default", so a caller
  * that has no preference passes {0} and gets PLOT_GLU_MAX; the clamp is the
- * one plot_set_max used to apply, applied here where the value is used. */
+ * a process-wide setter would apply, applied here where the value is used. */
 static int cfg_max(struct plot_cfg cfg)
 {
    int m = cfg.glu_max ? cfg.glu_max : PLOT_GLU_MAX;
@@ -430,7 +443,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
     * (3 lines for 3D, 7 for 7D) so multi-day plots aren't a picket fence */
    long gstep = (span <= 24L * 3600) ? 3600 : 24L * 3600;
    /* Anchor lines to exact clock boundaries -- the last full hour (or day)
-    * before now -- so every vertical line lands on a round time instead of an
+    * before now -- so every vertical line lands on a round time rather than an
     * arbitrary offset back from now. (Whole-hour time zones; sub-hour zones
     * shift slightly as this layer carries no tz.) */
    /* In LOCAL time: the boundary the user reads off the axis is local
@@ -497,6 +510,32 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
          rr = 1;
       if (rr > rmax)
          rr = rmax;
+      /* THE RULE THAT GIVES A POINT A LENGTH, drawn UNDER the glyph so the
+       * letter stays readable where the two meet.
+       *
+       * The span ends earlier in `dt` terms than the point begins -- dt counts
+       * backwards from now -- so the end is to the RIGHT, and a span reaching
+       * into the future (a session still running, measured against a clock
+       * that has moved on) clamps to dt = 0, the right edge, rather than
+       * wrapping round.
+       *
+       * TOO SHORT AND IT IS NOT DRAWN. Under about two glyph widths the rule
+       * is a smudge on the letter's shoulder that says less than the letter
+       * alone; the threshold is in PIXELS, not seconds, so a ten-minute
+       * session shows a rule on a 3 h plot and correctly shows none on a
+       * 30 d one, where it would be a single pixel claiming to be a duration.
+       */
+      if (pts[i].span > 0) {
+         long dt_end = dt - pts[i].span;
+         if (dt_end < 0)
+            dt_end = 0;
+         int ex     = t_to_x(dt_end, x, w, span, t_margin);
+         int from   = px + (int)rr + 1;
+         int min_px = (int)(4 * rr);
+         if (ex - px > min_px)
+            for (int gx = from; gx <= ex; gx++)
+               putc_clipped(cl, fb, stride, fbw, fbh, gx, py, c);
+      }
       mark(cl, fb, stride, fbw, fbh, px, py, (int)rr, pts[i].marker, c);
    }
    if (hx >= 0) {
@@ -545,7 +584,7 @@ int plot_point_xy(struct plot_rect rc, struct plot_pt p, long now, int hours,
  * drawn but permanently unscrubbable. A dose and a weight recorded in the same
  * sitting is the ordinary case of this, not a corner one.
  *
- * The fix is to give each of them its own place to be picked FROM. A group of
+ * So each of them gets its own place to be picked FROM. A group of
  * markers on one column already owns, between them, the run of plot from
  * halfway to the marker on their left to halfway to the one on their right;
  * this shares that run out equally, spreading the group symmetrically about

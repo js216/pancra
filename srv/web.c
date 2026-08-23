@@ -8,7 +8,7 @@
  * to be reached the same way.
  */
 #include "web.h"
-#include "auth.h"
+#include "authsess.h"
 #include "http.h"
 #include "page.h"
 #include "plots.h"
@@ -32,10 +32,10 @@ static void web_route_locked(struct req *r);
 
 /* ---- WHICH METHODS EACH BROWSER ROUTE ANSWERS ----------------------------
  *
- * ONE TABLE, and it is the whole policy for this half. What it replaces was a
+ * ONE TABLE, and it is the whole policy for this half. The alternative is a
  * single `int get = !strcmp(r->method, "GET")` at the top of the router and
- * then, per route, either `get` or `!get` -- which meant "not GET" was the
- * condition for CHANGING THINGS. Every method nobody had thought of was on
+ * then, per route, either `get` or `!get` -- which makes "not GET" the
+ * condition for CHANGING THINGS. Every method nobody has thought of is on
  * that side:
  *
  *   PUT    /login              ran h_login_post: session minted, cookie set,
@@ -59,11 +59,11 @@ static void web_route_locked(struct req *r);
  * not "GET is special": /logout does not answer GET at all, and no route here
  * answers HEAD (http.h says why).
  *
- * ENFORCED BEFORE web_user(), deliberately. session_user() extends a session's
- * expiry as a side effect of reading it (auth.c's rolling expiry), so gating
- * after it would let a method that is about to be refused still write a row.
- * A refusal must leave the database exactly as it found it, and that is what
- * srv/test/synctest.sh asserts with a sentinel.
+ * ENFORCED BEFORE web_user(), deliberately. web_user() is the request-policy
+ * boundary that pairs session_verify with session_refresh (srv/page.c), and
+ * the refresh extends a session's expiry -- so gating after it would let a
+ * method that is about to be refused still write a row.
+ * A refusal must leave the database exactly as it found it.
  *
  * A path that is in no rule below is NOT gated here: it has no methods to
  * advertise, and it is answered by the router's own 404 (or, when signed out,
@@ -225,9 +225,9 @@ static void web_route_locked(struct req *r)
 
    /* ---- THE BODY IS JUDGED BEFORE ANYBODY IS AUTHENTICATED ----
     *
-    * Item 120 asks for a malformed, NUL-bearing or duplicated form field to
-    * be refused "before authentication or mutation", and a per-field check
-    * cannot do that: form_field answers about ONE name, so a bad `csrf` is
+    * A malformed, NUL-bearing or duplicated form field has to be refused
+    * before authentication or mutation, and a per-field check cannot do
+    * that: form_field answers about ONE name, so a bad `csrf` is
     * only noticed by the handler that asks for it -- and the handler runs
     * after web_user() below has looked the session up and refreshed it, after
     * the route has been chosen, and in some branches after a row has been
@@ -263,7 +263,7 @@ static void web_route_locked(struct req *r)
 
    char cookie[128];
    int sess_failed = 0;
-   long me         = web_user(r, cookie, sizeof cookie, &sess_failed);
+   int64_t me      = web_user(r, cookie, sizeof cookie, &sess_failed);
    /* GET and POST are now the only two that reach a route below, and each
     * route is named by the bit it holds rather than by "not the other one":
     * `!get` was the condition that let every unconsidered method mutate. */
@@ -300,7 +300,8 @@ static void web_route_locked(struct req *r)
    }
    if (!strcmp(r->path, "/login")) {
       /* GET or POST, per WEB_RULES; `post` rather than `!get`, so a method the
-       * gate somehow let through does nothing instead of signing someone in. */
+       * gate somehow let through does nothing rather than signing someone in.
+       */
       if (post)
          h_login_post(r);
       else
@@ -336,10 +337,10 @@ static void web_route_locked(struct req *r)
       /* THE REDIRECT IS THE CLAIM, so it may only be sent once the server
        * side really is gone.
        *
-       * This was `session_drop(r->db, cookie);` -- a void call -- followed
-       * unconditionally by the cookie-clearing redirect. session_drop threw
-       * away both its prepare and its step results (see auth.h), so a logout
-       * over a busy, full or damaged database looked exactly like a logout
+       * `session_drop(r->db, cookie);` as a void call, followed
+       * unconditionally by the cookie-clearing redirect, throws away both the
+       * prepare and the step result (see authsess.h) -- so a logout over a
+       * busy, full or damaged database looks exactly like a logout
        * that worked: the browser's cookie was deleted, the login form
        * appeared, and the session row sat there with a year left on it. Any
        * copy of that cookie -- taken on a shared machine, by an extension, out
@@ -379,7 +380,7 @@ static void web_route_locked(struct req *r)
       return;
    }
    if (!strcmp(r->path, "/units") && get) {
-      long owner = viewed_owner(r, me, NULL);
+      int64_t owner = viewed_owner(r, me, NULL);
       if (owner)
          h_units(r, owner);
       return;

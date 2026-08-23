@@ -11,13 +11,13 @@
  * only symptom is a file that LOOKS fine to the sender and is wrong in
  * somebody else's app, hours later.
  *
- * WHAT USED TO HAPPEN, twice over:
+ * THE TWO WAYS AN EXPORT GOES WRONG QUIETLY:
  *
- *   1. A PARTIAL FILE WAS PUBLISHED. The whole export sat in one broad
- *      try/catch. A read, a write or a close that threw part-way jumped to
- *      the catch -- which logged a line -- while the snapshot it had already
- *      half-written kept the name the share sheet was about to hand out. The
- *      input streams were closed only on the normal path, so the same throw
+ *   1. A PARTIAL FILE IS PUBLISHED. With the whole export in one broad
+ *      try/catch, a read, a write or a close that throws part-way jumps to
+ *      the catch -- which logs a line -- while the snapshot it has already
+ *      half-written keeps the name the share sheet is about to hand out. With
+ *      the input streams closed only on the normal path, the same throw
  *      also leaked a descriptor until the finaliser got round to it. What the
  *      doctor received was a truncated export with no marker of any kind:
  *      CSV has no length field and no terminator, so half a file parses.
@@ -84,8 +84,8 @@ final class ExportSnapshot {
     /* ---- ONE SECTION OF THE EXPORT ------------------------------------ */
 
     /* An OPENER rather than a File, so the test can hand in a stream that
-     * fails half way through a read -- the case that used to leak the
-     * descriptor and publish the prefix. */
+     * fails half way through a read -- the case that leaks the descriptor and
+     * publishes the prefix. */
     interface Section {
         /* The bytes to copy, or NULL when this section has nothing on disk.
          * Null is not an error: a user who has logged no insulin still gets
@@ -108,7 +108,7 @@ final class ExportSnapshot {
         /* exists(), NOT isFile(). A missing source is an ordinary state and is
          * skipped; a source that exists and is not a regular file is not a
          * state this app produces, and letting the open throw fails the export
-         * loudly instead of shipping one silently missing section. */
+         * loudly rather than shipping one silently missing section. */
         @Override public InputStream open() throws IOException {
             if (src == null || !src.exists()) return null;
             return new FileInputStream(src);
@@ -120,7 +120,7 @@ final class ExportSnapshot {
     /* ---- WHERE THE BYTES GO, AND WHEN THEY BECOME SHAREABLE ------------
      *
      * Three calls rather than a File, for the same reason ServiceOps in
-     * BoundaryLogic is an interface: the ORDER is the safety property. With
+     * ExportPolicy is an interface: the ORDER is the safety property. With
      * the rename written inline next to the stream, no test could observe
      * that publish happens after the close and not before it, and "after"
      * is the entire fix. */
@@ -133,13 +133,22 @@ final class ExportSnapshot {
         void publish() throws IOException;
 
         /* Leave nothing behind: no temporary, and no file under the
-         * shareable name either. */
-        void discard();
+         * shareable name either.
+         *
+         * ANSWERS, rather than trying and hoping. Returns null
+         * when the directory is clean and a human-readable description of
+         * what is still there when it is not -- because "a failed export
+         * leaves nothing" is a contract, and a contract nothing checks is a
+         * comment. A leftover under the SHAREABLE name is the dangerous one:
+         * it is a zero-byte or half-written file with a name the provider
+         * will serve, so an implementation that cannot delete it must make
+         * it unservable before it reports. */
+        String discard();
     }
 
     /* WHAT A HALF-WRITTEN SNAPSHOT IS CALLED, and why the suffix matters more
      * than it looks. `pancra-DDDDDDDDDD-HHHHHHHH.csv.part` is 34 characters,
-     * so BoundaryLogic.exportNameValid refuses it on the length check alone:
+     * so ExportPolicy.exportNameValid refuses it on the length check alone:
      * the provider cannot serve it, and Ble.cleanupExports -- which only
      * considers files whose names are valid snapshot names -- will not delete
      * it either. That is the right pair of answers while an export is in
@@ -154,7 +163,7 @@ final class ExportSnapshot {
 
     static boolean isPartialName(String name) {
         if (name == null || !name.endsWith(PART_SUFFIX)) return false;
-        return BoundaryLogic.exportNameValid(
+        return ExportPolicy.exportNameValid(
             name.substring(0, name.length() - PART_SUFFIX.length()));
     }
 
@@ -165,13 +174,22 @@ final class ExportSnapshot {
      * Safe to run at the start of an export because exports are serialised by
      * the thing that starts them -- the EXPORT DATA menu item, on the UI
      * thread -- so a `.part` found here belongs to a run that is over. */
-    static void sweepPartials(File dir) {
-        if (dir == null) return;
+    static String sweepPartials(File dir) {
+        if (dir == null) return null;
         File[] all = dir.listFiles();
-        if (all == null) return;
-        for (File f : all)
-            if (f.isFile() && isPartialName(f.getName()))
-                f.delete();
+        if (all == null) return null;
+        String left = null;
+        for (File f : all) {
+            if (!f.isFile() || !isPartialName(f.getName())) continue;
+            /* ANSWERED, NOT ATTEMPTED. A temporary that survives
+             * the sweep is not dangerous on its own -- nothing serves a
+             * .part -- but it is evidence about the directory this export is
+             * about to write into, and the one case that matters is when the
+             * survivor is the temporary this run needs. See open(). */
+            if (!f.delete())
+                left = (left == null) ? f.getName() : left + ", " + f.getName();
+        }
+        return left;
     }
 
     /* The real one: write beside the snapshot, publish with a rename.
@@ -194,18 +212,41 @@ final class ExportSnapshot {
         File temporary() { return tmp; }
 
         @Override public OutputStream open() throws IOException {
-            sweepPartials(tmp.getParentFile());
+            String left = sweepPartials(tmp.getParentFile());
+            /* THE ONE SURVIVOR THAT MATTERS IS OUR OWN. Another run's
+             * leftover .part is unservable and will be swept again next
+             * time; refusing this export over it would turn one stuck file
+             * into no exports at all. But a temporary under the name this
+             * run is about to write is a file that could not be deleted, so
+             * opening it would either fail obscurely or -- worse, if it is
+             * writable after all -- append this export onto the wreckage of
+             * an older one. */
+            if (left != null && left.contains(tmp.getName()))
+                throw new IOException("cannot clear " + tmp.getName());
             return new FileOutputStream(tmp);
         }
 
         /* READ-ONLY BEFORE THE RENAME, not after. Set afterwards there is a
          * window in which the shareable name is writable, and the whole point
          * of the read-only bit is that a future change which opens a snapshot
-         * for writing fails loudly instead of truncating a file somebody is
+         * for writing fails loudly rather than truncating a file somebody is
          * reading. It does not impede the retention delete: unlinking needs
          * write permission on the DIRECTORY, not on the file. */
         @Override public void publish() throws IOException {
-            tmp.setReadOnly();
+            /* THE READ-ONLY BIT IS REQUIRED, NOT ATTEMPTED.
+             * setReadOnly()'s answer was dropped, so a filesystem that does
+             * not carry the bit -- or a directory the app cannot chmod in --
+             * published a WRITABLE snapshot while this code claimed an
+             * immutable one. Asked twice, deliberately: setReadOnly() can
+             * report success on a filesystem that then reports the file
+             * writable anyway (FAT-backed shared storage does exactly this),
+             * and canWrite() is the property the comment above actually
+             * promises. Refusing here is right because the alternative is
+             * publishing under the promise and breaking it silently; the
+             * caller discards, and the user is told the export failed. */
+            if (!tmp.setReadOnly() || tmp.canWrite())
+                throw new IOException("cannot seal " + tmp.getName()
+                                      + " read-only");
             if (!tmp.renameTo(dest))
                 throw new IOException("cannot publish " + dest.getName());
         }
@@ -213,11 +254,53 @@ final class ExportSnapshot {
         /* BOTH, always. The temporary is the partial data; `dest` is the
          * empty file the caller created to reserve the name, and leaving it
          * would publish a zero-byte export under a name that passes every
-         * check the provider makes. */
-        @Override public void discard() {
-            tmp.delete();
-            dest.delete();
+         * check the provider makes.
+         *
+         * THE TWO ARE NOT THE SAME KIND OF LEFTOVER. A surviving `.part` is
+         * already harmless: its name fails ExportPolicy.exportNameValid, so
+         * the provider will not serve it and the retention sweep will not
+         * touch it, and sweepPartials removes it at the start of the next
+         * export. A surviving `dest` is the opposite -- a servable name over
+         * a file that is empty or half written -- so if it cannot be deleted
+         * it is RENAMED into the .part space, which makes it unservable and
+         * puts it in front of the next sweep. Both are still reported: a
+         * quarantine is a leftover that has been made safe, not a success. */
+        @Override public String discard() {
+            String left = null;
+            if (tmp.exists() && !tmp.delete())
+                left = tmp.getName();
+            String d = removeOrQuarantine(dest);
+            if (d != null)
+                left = (left == null) ? d : left + ", " + d;
+            return left;
         }
+    }
+
+    /* Delete `f`, or -- failing that -- move it somewhere nothing will serve
+     * it from. Returns null when the file is gone, and what is still on disk
+     * when it is not.
+     *
+     * The quarantine name is the .part name for `f`, which is exactly the
+     * name a temporary for this snapshot would have. That is safe HERE and
+     * only here: this runs from discard(), after the temporary has already
+     * been dealt with, so the name is free unless the temporary is the thing
+     * that could not be deleted -- in which case the rename fails, and the
+     * leftover is reported rather than hidden. */
+    static String removeOrQuarantine(File f) {
+        if (f == null || !f.exists()) return null;
+        if (f.delete()) return null;
+        /* ONLY A FILE IS QUARANTINED. Anything else under a snapshot's name
+         * is not something this code wrote -- a directory is the shape that
+         * makes the rename in publish() fail in the first place -- and
+         * moving it would be this module tidying up somebody else's object
+         * into a name it reserves for its own. The provider serves files, so
+         * a non-file under the name is already unservable; it is reported
+         * and left exactly where it is. */
+        if (!f.isFile()) return f.getName();
+        File q = new File(f.getParentFile(), partialName(f.getName()));
+        if (!q.exists() && f.renameTo(q))
+            return f.getName() + " (quarantined as " + q.getName() + ")";
+        return f.getName();
     }
 
     /* ---- THE EXPORT ITSELF --------------------------------------------- */
@@ -231,12 +314,22 @@ final class ExportSnapshot {
      * failure, and by the time it leaves this method the temporary and the
      * destination are both gone.
      *
-     * try-with-resources ON EVERY STREAM, input side included. The old code
-     * closed the sources only on the normal path, so the throw that mattered
-     * -- the one that abandoned the export -- was exactly the one that leaked
-     * the descriptor. */
+     * try-with-resources ON EVERY STREAM, input side included. Closing the
+     * sources only on the normal path leaves the throw that matters -- the
+     * one that abandons the export -- as exactly the one that leaks the
+     * descriptor. */
     static boolean write(Sink sink, Section[] secs) throws IOException {
         boolean published = false;
+        /* THE PRIMARY FAILURE OUTRANKS THE CLEANUP'S. A cleanup
+         * that cannot finish has to be surfaced -- silence is how "a failed
+         * export leaves nothing" stopped being true -- but thrown from the
+         * finally it would REPLACE the exception that says why the export
+         * failed at all, and that one is the one worth reading. So the
+         * primary is caught, the cleanup's failure is attached to it, and it
+         * is rethrown; with no primary, the cleanup failure is itself the
+         * failure. Throwable, not IOException: an Error propagating out of a
+         * write must not be masked either. */
+        Throwable primary = null;
         try {
             long total = 0;
             /* BUFFERED, so the close below is a real flush and a real place
@@ -262,12 +355,23 @@ final class ExportSnapshot {
             sink.publish();
             published = true;
             return true;
+        } catch (Throwable t) {
+            primary = t;
+            throw t;
         } finally {
             /* Every path that is not a successful publish leaves NOTHING: a
              * failed write, a failed close, a failed rename, an empty export.
              * A partial file that nobody shared is still a partial file the
              * next mistake can share. */
-            if (!published) sink.discard();
+            if (!published) {
+                String left = sink.discard();
+                if (left != null) {
+                    IOException ce = new IOException(
+                        "export: could not remove " + left);
+                    if (primary != null) primary.addSuppressed(ce);
+                    else throw ce;
+                }
+            }
         }
     }
 
@@ -347,16 +451,15 @@ final class ExportSnapshot {
      *   - a file whose tail is a row native is still appending exports
      *     without that tail, and every byte before it byte for byte;
      *   - a file that ends exactly at a newline exports in full. This is the
-     *     obvious way to break the fix -- stopping one row short is invisible
-     *     unless something checks it, and the last row is the newest reading,
-     *     the one the doctor is looking at;
+     *     obvious way to break the rule -- stopping one row short is
+     *     invisible unless something checks it, and the last row is the
+     *     newest reading, the one the doctor is looking at;
      *   - a file with no newline anywhere exports as empty, because nothing
      *     in it is a proven row. NOT as one row: manufacturing a terminator
-     *     is the bug this replaces.
+     *     is what turns a fragment into a row.
      *
-     * No newline is ever added. The old path wrote `line + '\n'`, which is
-     * what turned a fragment into a row; here the terminator is copied from
-     * the source or the bytes are not copied at all.
+     * No newline is ever added: the terminator is copied from the source, or
+     * the bytes are not copied at all.
      *
      * The cutoff filter is applied per complete row and cannot reintroduce
      * the problem: a dropped row is dropped whole. */

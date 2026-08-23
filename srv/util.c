@@ -5,9 +5,11 @@
 #include "util.h"
 #include "ct.h"
 #include "hmac.h"
+#include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
 #include "proto.h"
 #include "rand.h"
 #include "sha256.h"
+#include "wirehex.h" /* the ONE hex/hash codec both halves use */
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -62,18 +64,18 @@ int sb_cap_for(size_t n, size_t cap, size_t need, size_t *out)
    /* GUARDED DOUBLING, WITH A FINAL EXACT CAPACITY.
     *
     * Doubling from 4096 is what keeps a page that appends a thousand small
-    * rows from being a thousand reallocs, and that part is unchanged. What is
-    * new is that the loop can now END. It used to be
+    * rows from being a thousand reallocs. The guard is what makes the loop
+    * TERMINATE. Written as
     *
     *     while (cap < s->n + need + 1) cap *= 2;
     *
-    * and `cap` is a size_t holding a power of two: 4096, 8192, ... 2^63, and
-    * then 2^63 * 2 == 0. Zero doubled is zero, so for any target above 2^63
+    * and with `cap` a size_t holding a power of two -- 4096, 8192, ... 2^63,
+    * then 2^63 * 2 == 0 -- zero doubled is zero, so for any target above 2^63
     * the condition 0 < target is true forever and the loop never leaves. Not a
     * wrong answer, not a crash -- a worker thread that never returns, holding
-    * the page mutex, with every other user's page queued behind it. Measured
-    * against the old code: need = 2^63 span forever; so did need =
-    * SIZE_MAX - 4000 on a builder that already had 4096 bytes.
+    * the page mutex, with every other user's page queued behind it. Measured:
+    * need = 2^63 spins forever, and so does need = SIZE_MAX - 4000 on a
+    * builder that already holds 4096 bytes.
     *
     * So the doubling stops one step short of the wrap and takes the exact size
     * instead. The result is no longer always a power of two, which nothing
@@ -92,7 +94,7 @@ int sb_cap_for(size_t n, size_t cap, size_t need, size_t *out)
 }
 
 /* Grow to at least `need` more bytes. A failure is recorded and every later
- * append becomes a no-op, so callers check `err` once at the end instead of
+ * append becomes a no-op, so callers check `err` once at the end rather than
  * after every line -- the alternative is an error check on every append,
  * which is exactly the check that gets forgotten.
  *
@@ -212,39 +214,80 @@ void rnd_bytes(uint8_t *out, size_t n)
    }
 }
 
-static const char HEX[] = "0123456789abcdef";
-
+/* ---- THE HEX AND THE HASH ARE lib/wirehex.h's --------------
+ *
+ * This half and the phone's each had their own encoder, decoder and truncated
+ * hash for a protocol whose whole point is that both produce the same bytes,
+ * and the two decoders had already diverged: this one validated the input
+ * before writing anything, the phone's wrote as it went and left a prefix
+ * behind on a refusal. One implementation now, the failure-atomic one; the
+ * names here stay because the server uses them everywhere and each is a line.
+ */
 void hex_of(const uint8_t *in, size_t n, char *out)
 {
-   for (size_t i = 0; i < n; i++) {
-      out[2 * i]     = HEX[in[i] >> 4];
-      out[2 * i + 1] = HEX[in[i] & 15];
-   }
-   out[2 * n] = '\0';
+   wire_hex(in, n, out);
 }
 
-void rnd_hex(char *out, size_t hexlen)
+/* EXACTLY `hexlen` CHARACTERS, OR NOTHING AT ALL.
+ *
+ * As `void` it silently returns a SHORTER string than asked for, in two
+ * different ways:
+ *
+ *   - `hexlen / 2` floors, so an ODD request produced one character fewer
+ *     than promised. The header said "hexlen chars + NUL".
+ *   - the byte count was capped at the size of the local buffer, so a request
+ *     for more than 128 characters quietly got 128.
+ *
+ * Every caller is minting a SECURITY TOKEN -- a session selector, a validator,
+ * an invitation token, a signing nonce. A token quietly shorter than the
+ * caller believes is a token with less entropy than the caller believes, and
+ * nothing anywhere would have said so. Today's callers all pass small even
+ * constants, so none of them was wrong; the next one is a coin flip.
+ *
+ * So: the capacity is explicit, an odd or oversized request is REFUSED, and
+ * the answer is a status the caller can act on. On refusal `out` is left with
+ * an empty string rather than a partial token, so a caller that ignores the
+ * return publishes nothing rather than something weak. */
+int rnd_hex(char *out, size_t cap, size_t hexlen)
 {
+   if (!out || cap == 0)
+      return 0;
+   out[0] = '\0';
+   if (hexlen % 2)
+      return 0; /* half a byte is not a thing to ask for */
+   if (hexlen + 1 > cap)
+      return 0; /* it would not fit, and truncating is the defect */
    uint8_t b[64];
    size_t n = hexlen / 2;
    if (n > sizeof b)
-      n = sizeof b;
+      return 0; /* more entropy than this function can draw at once */
    rnd_bytes(b, n);
    hex_of(b, n, out);
+   return 1;
 }
 
+/* TWO PASSES: VALIDATE EVERYTHING, THEN WRITE ANYTHING.
+ *
+ * This decoded straight into `out` and reported a malformed pair only when it
+ * reached one -- so a REFUSED call still left every byte before the bad pair
+ * decoded in the caller's buffer. That is the shape of the defect: the value
+ * is attacker-chosen (these are tokens, selectors and MACs off the wire), the
+ * caller has been told "no", and the buffer it is about to reuse or compare
+ * holds a prefix the attacker picked. A caller that checks the return and
+ * then, say, logs the buffer, or leaves a stale tail from an earlier decode,
+ * is publishing chosen bytes.
+ *
+ * "Refused" has to mean the output is untouched, so the grammar is checked
+ * over the whole input before a single byte is written. No temporary buffer:
+ * the input is validated in place and then decoded, which costs one extra
+ * pass over at most a few dozen characters and needs no bound on the length.
+ *
+ * A NULL in or out with a nonzero length is refused rather than dereferenced;
+ * a length of zero writes nothing and succeeds, which is what "decode these
+ * no characters" means. */
 int hex_to(const char *in, size_t hexchars, uint8_t *out)
 {
-   if (hexchars % 2)
-      return 0;
-   for (size_t i = 0; i < hexchars; i += 2) {
-      const char *p = strchr(HEX, in[i] | 0x20);
-      const char *q = strchr(HEX, in[i + 1] | 0x20);
-      if (!p || !q || !in[i] || !in[i + 1])
-         return 0;
-      out[i / 2] = (uint8_t)(((p - HEX) << 4) | (q - HEX));
-   }
-   return 1;
+   return wire_unhex(in, hexchars, out);
 }
 
 /* Compare without an early exit. Used on password hashes and MACs, where the
@@ -252,9 +295,7 @@ int hex_to(const char *in, size_t hexchars, uint8_t *out)
  * guess were right and turn 2^256 into 32 x 256. */
 void sha256_hex(const void *in, size_t n, char *out64)
 {
-   uint8_t h[32];
-   sha256(in, n, h);
-   hex_of(h, 32, out64);
+   wire_sha256_hex(in, n, out64);
 }
 
 /* hmac_sha256 comes from lib/hmac.c -- one implementation, checked against
@@ -287,10 +328,26 @@ size_t url_decode(char *s)
 
 void html_esc(char *out, size_t cap, const char *in)
 {
-   /* NOT strlen(out): this used to append, and every one of its callers
-    * passes a fresh zeroed buffer, so the only thing the behaviour bought was
-    * that a forgotten "= {0}" turned into an out-of-bounds write at a garbage
-    * offset -- in the HTML escaping path, on a request handler's stack. */
+   /* A ZERO CAPACITY IS NOT A ONE-BYTE BUFFER. The loop below is guarded by
+    * `k + 8 < cap`, so with cap == 0 it does not run -- and then the
+    * terminator at the bottom wrote out[0] anyway, which is a one-byte
+    * overflow into a buffer that has no bytes. That is the whole shape of
+    * the shape to watch for: the guard is on the LOOP and the unconditional
+    * write is outside it. A NULL destination is refused for the same reason:
+    * there is nowhere to put the terminator either.
+    *
+    * A NULL `in` is an empty string, not a fault. Callers pass fields that
+    * may legitimately be absent, and "escape nothing" is what that means. */
+   if (!out || cap == 0)
+      return;
+   if (!in) {
+      out[0] = '\0';
+      return;
+   }
+   /* NOT strlen(out): appending buys nothing -- every caller passes a fresh
+    * zeroed buffer -- while turning a forgotten "= {0}" into an out-of-bounds
+    * write at a garbage offset, in the HTML escaping path, on a request
+    * handler's stack. */
    size_t k = 0;
    for (; *in && k + 8 < cap; in++) {
       const char *rep = NULL;
@@ -315,12 +372,12 @@ void html_esc(char *out, size_t cap, const char *in)
 
 /* ---- ONE FORM DECODER, WITH FOUR WAYS TO SAY NO -------------------------
  *
- * util.h states what each answer means and what the old single bit hid. What
- * follows is the mechanism, and it is deliberately two passes over the value:
- * MEASURE and JUDGE first, COPY only once the answer is FORM_OK. The old code
- * copied first (clipped to `cap`) and decoded afterwards, which is why an
- * over-long value became a different value rather than an error -- there was
- * nothing left to measure by the time anyone could have complained.
+ * util.h states what each answer means and what a single yes/no bit hides.
+ * What follows is the mechanism, and it is deliberately two passes over the
+ * value: MEASURE and JUDGE first, COPY only once the answer is FORM_OK.
+ * Copying first (clipped to `cap`) and decoding afterwards is what turns an
+ * over-long value into a DIFFERENT value rather than an error -- there is
+ * nothing left to measure by the time anyone could complain.
  *
  * `+` still means space: that is the encoding (RFC 1866 8.2.1, kept by the
  * WHATWG URL standard's form serialiser), not a leniency. */
@@ -338,8 +395,8 @@ static long decoded_len(const char *v, size_t n, int *sawnul)
          uint8_t b;
          char h[3];
          /* A "%" with fewer than two characters after it inside THIS value is
-          * a truncated escape. It used to decode to a literal "%" -- so a
-          * value cut off mid-escape produced text the client never sent. */
+          * a truncated escape, not a literal "%" -- decoded as one, a value
+          * cut off mid-escape produces text the client never sent. */
          if (i + 2 >= n)
             return -1;
          h[0] = v[i + 1];
@@ -367,9 +424,13 @@ static void decode_into(const char *v, size_t n, char *out)
    size_t w = 0;
    for (size_t i = 0; i < n; i++) {
       if (v[i] == '%') {
-         uint8_t b;
+         /* Initialised because the write is hex_to's to make and its result
+          * is discarded here: decoded_len rejected the body if this pair was
+          * not two hex digits, so it cannot fail -- but nothing in THIS
+          * function says so, and a zero is the harmless answer if it did. */
+         uint8_t b = 0;
          char h[3] = {v[i + 1], v[i + 2], 0};
-         (void)hex_to(h, 2, &b); /* validated already */
+         (void)hex_to(h, 2, &b);
          out[w++] = (char)b;
          i += 2;
       } else if (v[i] == '+') {
@@ -480,9 +541,19 @@ enum form_body form_body_check(const char *body, size_t len)
 
 int hdr_get(const char *hdr, const char *name, char *out, size_t cap)
 {
+   /* Same rule as html_esc: the copy is bounded by `k + 1 < cap` and the
+    * terminators are not, so cap == 0 wrote out[0] on both the found and the
+    * not-found paths. A header nobody has room for is a header that was not
+    * retrieved -- 0, and nothing written. */
+   if (!out || cap == 0 || !name)
+      return 0;
+   if (!hdr) {
+      out[0] = '\0';
+      return 0;
+   }
    size_t nlen = strlen(name);
    for (const char *h = hdr; h && *h;) {
-      if (!strncasecmp(h, name, nlen) && h[nlen] == ':') {
+      if (sys_ncaseeq(h, name, nlen) && h[nlen] == ':') {
          const char *v = h + nlen + 1;
          while (*v == ' ' || *v == '\t')
             v++;
@@ -633,17 +704,31 @@ int origin_ok(const char *s)
    return ncolon == 0 || nport > 0;
 }
 
-const char *public_origin(void)
+/* ---- THE ORIGIN IS SETTLED BEFORE ANY WORKER EXISTS --------
+ *
+ * Resolved LAZILY, in a function-static, on whichever request first asks for
+ * it, the worker pool is already running and several threads can be in here
+ * at once. Two of them racing write the same pointer (harmless) and print the
+ * "not a host[:port]" diagnostic twice or not at
+ * all (not harmless: it is the only thing that tells an operator their share
+ * links are about to name the compiled default rather than the host they
+ * configured).
+ *
+ * It is resolved once, in main, before a single thread is started, and read
+ * afterwards. There is nothing to synchronise because there is nothing that
+ * writes: a handler sees an immutable string.
+ *
+ * READ ONCE FROM THE ENVIRONMENT for the reason the header gives: a value
+ * that could change between the link shown and the link revoked is a link
+ * pointing at a host this server was never configured with. */
+static const char *g_origin = PANCRA_DEFAULT_ORIGIN;
+
+void public_origin_init(void)
 {
-   /* READ ONCE. A getenv per request is not the cost that matters; a value
-    * that could change between the link shown and the link revoked is. */
-   static const char *cached;
-   if (cached)
-      return cached;
    const char *env = getenv("PANCRA_ORIGIN");
    if (env && origin_ok(env)) {
-      cached = env;
-      return cached;
+      g_origin = env;
+      return;
    }
    if (env && *env)
       fprintf(stderr,
@@ -651,6 +736,10 @@ const char *public_origin(void)
               "default %s. Share links must not name a host this server was "
               "not configured with.\n",
               PANCRA_DEFAULT_ORIGIN);
-   cached = PANCRA_DEFAULT_ORIGIN;
-   return cached;
+   g_origin = PANCRA_DEFAULT_ORIGIN;
+}
+
+const char *public_origin(void)
+{
+   return g_origin;
 }

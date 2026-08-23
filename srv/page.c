@@ -3,11 +3,12 @@
  * Copyright 2026 Jakob Kastelic
  */
 #include "page.h"
-#include "auth.h"
+#include "authsess.h"
 #include "db.h"
 #include "http.h"
 #include "oops.h"
 #include "pair.h"
+#include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
 #include "rowdec.h"
 #include "util.h"
 #include <sqlite3.h>
@@ -30,13 +31,14 @@ void sub_page(struct req *r, const char *title, const char *body_html)
 
 /* A redirect is a RESPONSE, and goes out the same way every other one does.
  *
- * It used to hand-write its own header block and push it straight down the
- * socket. Every caller of this -- login, logout, accepting an invitation,
- * saving a setting -- is reached from web_route_locked, i.e. while the page
- * mutex is HELD. So a client that asked for a redirect and then stopped
- * reading blocked that mutex, and with it every page for every other user, at
- * the peer's pace. That is precisely the failure the buffered model exists to
- * prevent, and web_route's own comment describes it -- while this function sat
+ * Hand-writing its own header block and pushing it straight down the socket
+ * is what it must not do. Every caller of this -- login, logout, accepting an
+ * invitation, saving a setting -- is reached from web_route_locked, i.e.
+ * while the page mutex is HELD. So a client that asks for a redirect and then
+ * stops reading blocks that mutex, and with it every page for every other
+ * user, at the peer's pace. That is precisely the failure the buffered model
+ * exists to prevent, and web_route's own comment describes it -- while such a
+ * function would sit
  * outside the model and did it anyway.
  *
  * Now it fills in the response like page() does, and web_route flushes it
@@ -105,7 +107,7 @@ void page_refresh(struct req *r, int code, const char *reason,
    r->resp_ctype  = "text/html";
 }
 
-long web_user(struct req *r, char *cookie, size_t cap, int *failed)
+int64_t web_user(struct req *r, char *cookie, size_t cap, int *failed)
 {
    char all[1024];
    cookie[0] = '\0';
@@ -129,21 +131,61 @@ long web_user(struct req *r, char *cookie, size_t cap, int *failed)
       *failed = 0;
    if (!cookie[0])
       return 0;
-   return session_user(r->db, cookie, failed);
+   /* THE REQUEST-POLICY BOUNDARY, and the only place the two halves meet.
+    *
+    * session_verify answers and writes nothing; session_refresh does the
+    * housekeeping that answer implies. They are separate because the router
+    * gates methods BEFORE this is called (srv/web.c) -- a rule that only
+    * works if it is visible, and it was not while one function called
+    * `session_user` quietly wrote a row on every page view. Anything that
+    * needs to know WHO without touching the database calls session_verify
+    * directly and does not come through here. */
+   int64_t uid             = 0;
+   int64_t seen            = 0;
+   enum session_check what = session_verify(r->db, cookie, &uid, &seen);
+   session_refresh(r->db, cookie, what, seen);
+   if (what == SESSION_UNAVAILABLE && failed)
+      *failed = 1;
+   return what == SESSION_OK ? uid : 0;
 }
 
-void email_of(struct db *d, long uid, char *out, size_t cap)
+enum db_get email_of(struct db *d, int64_t uid, char *out, size_t cap)
 {
+   /* FOUR DIFFERENT THINGS, NOT ONE EMPTY STRING: a prepare that failed, a
+    * step that failed, a user id that matches nothing, and a row whose email
+    * column is NULL. Collapsed, every caller renders "" -- an empty
+    * identity on a page that says whose data it is showing, which reads as
+    * "this account has no address" rather than "this server could not
+    * answer". On the sharing pages it is worse: the page names the account
+    * you are about to grant access to.
+    *
+    * The three answers are the ones enum db_get already names, and using it
+    * rather than inventing a second vocabulary means a caller that handles a
+    * DB failure here handles it the same way it does everywhere else. */
    out[0]           = '\0';
    sqlite3_stmt *st = db_prep(d, "SELECT email FROM user WHERE id=?");
    if (!st)
-      return;
+      return DB_GET_FAIL;
    sqlite3_bind_int64(st, 1, uid);
-   if (sqlite3_step(st) == SQLITE_ROW) {
+   int rc        = sqlite3_step(st);
+   enum db_get g = DB_GET_FAIL;
+   if (rc == SQLITE_ROW) {
       const char *e = (const char *)sqlite3_column_text(st, 0);
-      snprintf(out, cap, "%s", e ? e : "");
+      /* A NULL COLUMN IS NOT AN ADDRESS. The schema says NOT NULL, so this is
+       * a database somebody has edited or one written by a version that did
+       * not -- either way the honest answer is that there is no email here,
+       * not that it is the empty string. */
+      if (e) {
+         snprintf(out, cap, "%s", e);
+         g = DB_GET_VALUE;
+      } else {
+         g = DB_GET_NONE;
+      }
+   } else if (rc == SQLITE_DONE) {
+      g = DB_GET_NONE; /* no such user */
    }
    sqlite3_finalize(st);
+   return g;
 }
 
 /* Minutes east of UTC for rendering this user's timestamps.
@@ -158,11 +200,11 @@ void email_of(struct db *d, long uid, char *out, size_t cap)
  * offset of 0 because the user is on UTC is not the same as 0 because no
  * reading has ever arrived, and the settings page must not present the second
  * as though it were the first. */
-int tz_resolve(struct db *d, long uid, int *have)
+int tz_resolve(struct db *d, int64_t uid, int *have)
 {
    if (have)
       *have = 1;
-   long v        = 0;
+   int64_t v     = 0;
    enum db_get g = db_get_long(d,
                                "SELECT tz_offset FROM user WHERE id=? AND"
                                " tz_offset IS NOT NULL",
@@ -221,20 +263,20 @@ int tz_resolve(struct db *d, long uid, int *have)
    return off;
 }
 
-int tz_of(struct db *d, long uid)
+int tz_of(struct db *d, int64_t uid)
 {
    return tz_resolve(d, uid, NULL);
 }
 
-void stamp_local(long t, int tz_min, char *out, size_t cap)
+void stamp_local(int64_t t, int tz_min, char *out, size_t cap)
 {
-   time_t local = (time_t)(t + (long)tz_min * 60);
+   time_t local = (time_t)(t + (int64_t)tz_min * 60);
    struct tm tm;
    /* A TIMESTAMP THAT COULD NOT BE COMPUTED IS NOT A TIMESTAMP. gmtime_r
     * fails on a time_t it cannot represent as a date, and leaves `tm`
     * untouched -- so the fields printed below were whatever the stack held,
     * rendered as a date beside a real glucose reading. Say it is unknown. */
-   if (!gmtime_r(&local, &tm)) {
+   if (!sys_gmtime(local, &tm)) {
       snprintf(out, cap, "(unknown time)");
       return;
    }
@@ -244,7 +286,7 @@ void stamp_local(long t, int tz_min, char *out, size_t cap)
 
 /* May `viewer` see `owner`'s record? Ownership, or a share row. Followers are
  * read-only by construction: no write path in this program consults share. */
-int may_view(struct db *d, long viewer, long owner)
+int may_view(struct db *d, int64_t viewer, int64_t owner)
 {
    if (viewer == owner)
       return 1;
@@ -295,7 +337,7 @@ void nav(struct sb *s, const char *email, const char *cookie)
 
 struct hpt {
    int slot;
-   long glu;
+   int64_t glu;
    int ty;
 };
 
@@ -306,8 +348,9 @@ void set_cookie_str(const char *cookie, char *out, size_t cap)
     * from becoming a stolen year-long login. Lax: the login survives a normal
     * link from elsewhere, but does not ride along on a cross-site POST. */
    snprintf(out, cap,
-            "sid=%s; Max-Age=%ld; Path=/; HttpOnly; Secure; SameSite=Lax",
-            cookie, (long)SESS_TTL);
+            "sid=%s; Max-Age=%" PRIwire
+            "; Path=/; HttpOnly; Secure; SameSite=Lax",
+            cookie, (int64_t)SESS_TTL);
 }
 
 /* Every state-changing form carries the token; without this check a page on
@@ -317,14 +360,13 @@ int csrf_guard(struct req *r, const char *cookie)
    char sent[128];
    /* THE TOKEN MUST BE THE ONLY ONE, AND IT MUST BE A TOKEN.
     *
-    * This used to read the field and throw the decoder's answer away -- one
-    * bit of an answer, which is all there was -- and go straight into
-    * csrf_ok on whatever had been written. Two shapes got past it:
+    * Read the field, throw the decoder's answer away and go straight into
+    * csrf_ok on whatever was written, and two shapes get past:
     *
-    *   "csrf=<valid>%00anything"  decoded to a NUL-terminated <valid>, and
-    *      csrf_ok is a string compare, so it PASSED -- while a proxy, a log
-    *      or a WAF counting bytes saw a different value entirely.
-    *   "csrf=<valid>&csrf=<junk>" was answered with the first, silently. Any
+    *   "csrf=<valid>%00anything"  decodes to a NUL-terminated <valid>, and
+    *      csrf_ok is a string compare, so it PASSES -- while a proxy, a log
+    *      or a WAF counting bytes sees a different value entirely.
+    *   "csrf=<valid>&csrf=<junk>" is answered with the first, silently. Any
     *      other reader of the same body is free to prefer the last.
     *
     * Neither is a token this browser was given, so neither is a form this
@@ -355,10 +397,10 @@ int csrf_guard(struct req *r, const char *cookie)
 /* A viewer looking at their OWN record needs no marker; one looking at a
  * shared record needs every link to say so, or the next click silently lands
  * them back on their own. */
-static void set_who(struct req *r, long owner, long me)
+static void set_who(struct req *r, int64_t owner, int64_t me)
 {
    if (owner > 0 && owner != me)
-      (void)snprintf(r->who, sizeof r->who, "?who=%ld", owner);
+      (void)snprintf(r->who, sizeof r->who, "?who=%" PRIwire "", owner);
    else
       r->who[0] = '\0';
 }
@@ -371,13 +413,13 @@ static void set_who(struct req *r, long owner, long me)
  * look at. If they have no readings, no paired app and follow exactly one
  * person, that record IS their page. An explicit "who=" always wins: it is
  * the viewer saying which record they want. */
-long viewed_owner(struct req *r, long me, int *have_own)
+int64_t viewed_owner(struct req *r, int64_t me, int *have_own)
 {
    int own_dummy = 0;
    if (!have_own)
       have_own = &own_dummy;
-   long owner = owner_of(r, me);
-   *have_own  = 0;
+   int64_t owner = owner_of(r, me);
+   *have_own     = 0;
    if (!owner || owner != me || strstr(r->target, "who=")) {
       set_who(r, owner, me);
       return owner;
@@ -394,13 +436,20 @@ long viewed_owner(struct req *r, long me, int *have_own)
                                 " log='readings' LIMIT 1",
                                 me, NULL);
    int mine       = (gm != DB_GET_NONE); /* VALUE or FAIL */
-   *have_own      = mine || pair_is_paired(r->db, me) != 0;
+   /* `!= 0` INCLUDES THE FAILURE ANSWER, and that is the documented
+    * conservative choice here: treated as "yes, their own", the
+    * worst case is an empty page about the RIGHT account, while treating it
+    * as "no" would re-point the view at somebody else's readings because a
+    * query errored. The other three callers do not get to make that trade --
+    * see settings.c and home.c, where the same -1 blocked recovery or
+    * asserted a state nobody established. */
+   *have_own = mine || pair_is_paired(r->db, me) != 0;
    if (*have_own) {
       set_who(r, owner, me);
       return owner;
    }
 
-   long only = 0;
+   int64_t only = 0;
    /* ONLY an actual row re-points the view. A failure here leaves `owner` as
     * the viewer, which is the conservative answer: showing somebody their own
     * empty record is recoverable, showing them a stranger's is not. */
@@ -415,12 +464,12 @@ long viewed_owner(struct req *r, long me, int *have_own)
    return owner;
 }
 
-long owner_of(struct req *r, long me)
+int64_t owner_of(struct req *r, int64_t me)
 {
-   long owner    = me;
+   int64_t owner = me;
    const char *q = strstr(r->target, "who=");
    if (q)
-      owner = strtol(q + 4, NULL, 10);
+      owner = strtoll(q + 4, NULL, 10);
    if (owner <= 0)
       owner = me;
    if (!may_view(r->db, me, owner)) {

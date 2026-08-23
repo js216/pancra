@@ -3,6 +3,7 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "senslogic.h"
+#include <stdint.h>
 
 uint32_t sens_project_clock(uint32_t last_clock, long recv_mono, long now_mono)
 {
@@ -12,8 +13,8 @@ uint32_t sens_project_clock(uint32_t last_clock, long recv_mono, long now_mono)
    /* NONNEGATIVE FIRST. On a monotonic pair this cannot happen in a healthy
     * process, which is exactly why it must be handled: the only ways to reach
     * it are a stamp that was never written and a read that raced the write,
-    * and both used to produce a projection that ran away rather than one that
-    * stood still. */
+    * and unhandled both produce a projection that runs away rather than one
+    * that stands still. */
    if (dt < 0)
       dt = 0;
    if (dt > SENS_PROJECT_MAX_S)

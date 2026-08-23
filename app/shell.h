@@ -24,8 +24,8 @@ struct ANativeActivity;
  *
  * MONOTONIC, not wall clock, and the rename is the point: everything that
  * asks this question is measuring an INTERVAL ("how long have we been up",
- * "how long has this link been quiet"), never naming an instant. It was
- * realtime_s(), and a phone that finds a network shortly after boot -- which
+ * "how long has this link been quiet"), never naming an instant. Measured
+ * with realtime_s(), a phone that finds a network shortly after boot -- which
  * is exactly when this app starts -- steps its clock underneath every one of
  * those intervals at once. Forward past the DISCONNECT threshold ends the
  * launch grace early and announces a disconnected sensor over data that was
@@ -57,11 +57,11 @@ struct ANativeActivity *shell_activity(void);
  * stranded links, pushing to the server, re-arming a meter, reconciling the
  * registry -- happens here.
  *
- * It is ONE call because the transport should not know that list. dexble.c's
- * tick used to name six functions from six modules, so the BLE transport --
- * the layer furthest from any of them -- was the place that knew which
- * workflows exist and in what order they run. Adding a seventh meant editing
- * the transport. The shell owns the list, as it already does for the
+ * It is ONE call because the transport should not know that list. A tick in
+ * dexble.c naming six functions from six modules makes the BLE transport --
+ * the layer furthest from any of them -- the place that knows which workflows
+ * exist and in what order they run, and adding a seventh means editing the
+ * transport. The shell owns the list, as it already does for the
  * activity's own timer; the transport asks for a tick. */
 void shell_service_tick(void);
 
@@ -78,7 +78,15 @@ void shell_apply_screen_on(void);
 int shell_on_main(void);
 
 /* The first-run permission RATIONALE screen: modal, and shown before any
- * permission dialog so the user knows what they are being asked for. */
+ * permission dialog so the user knows what they are being asked for.
+ *
+ * ARMED THROUGH A FUNCTION, not by assigning a file static. It is
+ * raised whenever the BLE permissions are missing -- which is far beyond
+ * first run: Android revokes them from apps that go unused -- and it is the
+ * one screen that swallows every press but its own, so a build where it can
+ * be raised and not lowered is a dead phone. One owner, three verbs, and the
+ * suite that drives the screen uses the same three the shell does. */
+void shell_gate_arm(void);
 int shell_gate(void);
 void shell_gate_done(void);
 

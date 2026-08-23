@@ -99,6 +99,19 @@ void render_meterhelp(struct ANativeWindow_Buffer *fb, const struct screen *m,
 void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  struct hits *h);
 
+/* Confirm deleting one food entry. */
+/* THE EXERCISE LOG and its correction form -- uiex.c, which explains why the
+ * log has an edit screen and no logging screen. */
+void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                  struct hits *h);
+void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                   struct hits *h);
+void render_exdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                  struct hits *h);
+
+void render_fooddel(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                    struct hits *h);
+
 /* The FOOD LOG: entries newest first, paginated. */
 void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h);
@@ -111,6 +124,9 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
                    struct hits *h);
 void render_pairconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
                      struct hits *h);
+/* Confirm giving up on an armed pairing: KEEP WAITING / STOP. */
+void render_pendcancel(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                       struct hits *h);
 void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
                   struct hits *h);
 void render_reconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
@@ -137,10 +153,5 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                   const struct ui_prefs *prefs, long now, long tz_off,
                   struct hits *h);
 
-/* Glyph-cell clipping counter, for the offline harness. Clipping is otherwise
- * invisible: content laid out past an edge is silently dropped. Reset before a
- * render, read after; a non-zero count means text did not fit. */
-void ui_clip_reset(void);
-long ui_clipped(void);
 
 #endif

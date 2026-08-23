@@ -7,7 +7,7 @@
  * The UI is a pure function of an immutable snapshot: the shell fills a
  * `struct screen` each frame (model.c), ui_render draws exactly that and
  * nothing else -- no globals, no callbacks -- and a tap is mapped back through
- * the hit table (uiact.h). So the whole UI is driven offline from app/test/:
+ * the hit table (uiact.h). So the whole UI is driven offline from test/app/:
  * feed a model, get a PPM; feed a tap, get an action.
  *
  * WHY A COPY AND NOT A VIEW. The registry and the driver sessions are mutated
@@ -19,16 +19,19 @@
  * Split out of ui.h with the actions and the primitives; ui.h includes all
  * three, so no call site had to change.
  */
+#include "syncstat.h" /* enum sync_outcome: what the sync row shows */
+
 #ifndef PANCRA_UIMODEL_H
 #define PANCRA_UIMODEL_H
 
 #include "clock.h"
+#include "exercise.h" /* struct ex_rec: the EXERCISE LOG table rows */
+#include "food.h"     /* struct food_type: the FOOD TYPE picker rows */
 #include "insulin.h"  /* struct ins_rec: the INSULIN LOG table rows */
 #include "keypad.h"   /* enum keypad_mode: what the keypad collects */
 #include "sensors.h"  /* sensor types/kinds the model and renderer share */
 #include "settings.h" /* SC_MAX: the main-screen PIN slots */
 #include "uifmt.h"    /* UI_MAX_SLOTS and the presentation constants */
-#include "food.h"     /* struct food_type: the FOOD TYPE picker rows */
 #include "weight.h"   /* struct wt_rec: the WEIGHT LOG table rows */
 #include <stdint.h>
 
@@ -58,26 +61,32 @@ enum ui_screen {
    SCR_COLORPICK,  /* colour picker */
    SCR_METERHELP,  /* OneTouch: how-to-connect + Scan button */
    SCR_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
+   /* confirm giving up on an armed pairing: KEEP WAITING / STOP WAITING */
+   SCR_PENDCANCEL,
    /* confirm pulling the server's record back down onto this phone */
    SCR_SYNCRESTORE,
-   SCR_ADDMENU, /* main-screen '+': ADD ... (NEW DEVICE / INSULIN) */
-   SCR_INSULIN, /* LOG INSULIN entry form */
-   SCR_DEVICES, /* the device registry: active, old, and ADD NEW DEVICE */
-   SCR_PERMS,   /* permissions + background controls, moved off SETTINGS */
-   SCR_OLDDEV,  /* previously-used (forgotten) devices: restyle their trace */
-   SCR_RECONF,  /* confirm reconnecting an EXPIRED old device */
-   SCR_REMOTE,  /* remote push: enable/disable, server IP and port */
-   SCR_INSLOG,  /* insulin dose log: paginated when/type/units table */
-   SCR_WEIGHT,  /* LOG WEIGHT entry form */
-   SCR_WTLOG,   /* weight log: table + trend plot */
-   SCR_WTDEL,   /* confirm deleting a weight entry */
-   SCR_DISPLAY, /* display settings submenu (off SETTINGS) */
-   SCR_INSDEL,  /* confirm deleting an insulin dose: DELETE / CANCEL */
-   SCR_ALARM,   /* alarm submenu: LOW/HIGH thresholds + outputs */
-   SCR_EXPORT,  /* EXPORT DATA: range + section checkboxes + the button */
-   SCR_FOOD,    /* LOG FOOD entry form: type, grams, time, date, year */
+   SCR_ADDMENU,  /* main-screen '+': ADD ... (NEW DEVICE / INSULIN) */
+   SCR_INSULIN,  /* LOG INSULIN entry form */
+   SCR_DEVICES,  /* the device registry: active, old, and ADD NEW DEVICE */
+   SCR_PERMS,    /* permissions + background controls, moved off SETTINGS */
+   SCR_OLDDEV,   /* previously-used (forgotten) devices: restyle their trace */
+   SCR_RECONF,   /* confirm reconnecting an EXPIRED old device */
+   SCR_REMOTE,   /* remote push: enable/disable, server IP and port */
+   SCR_INSLOG,   /* insulin dose log: paginated when/type/units table */
+   SCR_WEIGHT,   /* LOG WEIGHT entry form */
+   SCR_WTLOG,    /* weight log: table + trend plot */
+   SCR_WTDEL,    /* confirm deleting a weight entry */
+   SCR_DISPLAY,  /* display settings submenu (off SETTINGS) */
+   SCR_INSDEL,   /* confirm deleting an insulin dose: DELETE / CANCEL */
+   SCR_ALARM,    /* alarm submenu: LOW/HIGH thresholds + outputs */
+   SCR_EXPORT,   /* EXPORT DATA: range + section checkboxes + the button */
+   SCR_FOOD,     /* LOG FOOD entry form: type, grams, time, date, year */
    SCR_FOODTYPE, /* pick a food from the vocabulary, or add a new one */
    SCR_FOODLOG,  /* the food entries, paginated, newest first */
+   SCR_FOODDEL,  /* confirm deleting a food entry */
+   SCR_EXLOG,    /* the exercise entries, paginated, newest first */
+   SCR_EXEDIT,   /* EDIT EXERCISE: level, time, date, year */
+   SCR_EXDEL,    /* confirm deleting an exercise entry */
    SCR_N
 };
 
@@ -93,8 +102,11 @@ enum {
 struct ui_point {
    long t;
    int glu;
-   int src;  /* sensor id, for marker/colour lookup */
-   int kind; /* KIND_CGM plots as a line vertex, KIND_BGM as a marker */
+   int src; /* sensor id, for marker/colour lookup */
+   /* THE ENUM, NOT AN int: a plot point's kind decides whether it
+    * is drawn as a line vertex or a marker, and as an `int` any number in the
+    * app was assignable to it. */
+   enum sensor_kind kind;
 }; /* one plotted reading */
 
 /* One configured sensor: everything the list row AND the detail screen need,
@@ -112,7 +124,10 @@ struct ui_sensor {
    long cal_t;        /* when the last calibration RESOLVED; 0 = never */
    long activation;   /* provenance session start (epoch); for an OLD device,
                        * STARTED/ENDS come from this, not the live clock */
-   int sess_state;    /* SENSOR_STATE_* from its link's last 4e; 0 unknown */
+   /* THE SAME WIRE BYTE, carried verbatim: SENSOR_STATE_* names
+    * what the app acts on, 0 is "nothing decoded yet", and anything else is
+    * a state this build does not know rather than a value to reject. */
+   int sess_state;
    int id, type, kind;
    int color, marker, primary, size;
    int old; /* 1 = DISCONNECTED: shown under OLD DEVICES, state EXPIRED, but
@@ -122,10 +137,13 @@ struct ui_sensor {
     * The WEAR row must show which, because the two behave differently over
     * time: a resolved length improves when a new model is recognised, a
     * pinned one never does. A G7 paired before the SW14758 (15 Day) model was
-    * known, then pinned to 10 by one tap of what used to be a two-state
-    * toggle, went on reporting a 10-day budget for a 15-day sensor with
-    * nothing on screen to say the model rule had been overruled. */
+    * known, then pinned to 10 by one tap of a two-state toggle, goes on
+    * reporting a 10-day budget for a 15-day sensor with nothing on screen to
+    * say the model rule was overruled. */
    int wear_auto;
+   /* 1 = wear_len is the type default standing in for a model this device
+    * has not reported yet (see struct sensor_wear). */
+   int wear_prov;
    int glu, trend, predicted, sequence;
    int rssi, rssi_ok, connected;
    /* OS bond state, in the framework's own constants: 0 = never heard,
@@ -133,8 +151,8 @@ struct ui_sensor {
     *
     * Distinct from `connected` and from the Dexcom app-layer auth: a device
     * can be registered, reachable and still unbonded because the user never
-    * answered the system pairing dialog. That state was previously invisible
-    * -- the row just never came alive and nothing said why -- which is the
+    * answered the system pairing dialog. Without this the state is invisible
+    * -- the row just never comes alive and nothing says why -- which is the
     * whole reason the bond-state receiver exists. */
    int bond;
    /* Calibration state for this CGM's LAST CAL row. cal_pending!=0 means a
@@ -214,6 +232,17 @@ struct ui_plotview {
    const struct ui_point *hist; /* plot history, newest-first (borrowed) */
    /* plot: point count, scrub cursor (-1 = none), span, vertical max */
    int nhist, scrub, plot_hours, plot_max;
+   /* Seconds CONTINUOUSLY in range, ending at the newest reading; 0 when the
+    * newest reading is out of range, which is also when nothing is drawn.
+    * See alarm_streak_s for the rule, including what a gap in the readings
+    * does to it. */
+   long streak_s;
+   /* THE RECORD THIS ONE IS MEASURED AGAINST, in seconds, or 0 when there is
+    * no record yet. Copied from the stored preferences, not recomputed here:
+    * the record is raised on the reading path (reading.c), so a frame only
+    * ever reads it -- and a frame that recomputed it would be a frame that
+    * wrote a file. */
+   long best_streak_s;
    struct ui_stat stat[5]; /* rolling stats: 1d / 3d / 7d / 30d / 90d */
 };
 
@@ -246,16 +275,16 @@ struct ui_entry {
     * includes nothing at all, so carrying the enum across this boundary
     * costs the renderer no dependency and buys a compiler that checks it.
     * What each mode draws -- title, digit slots, unit suffix, decimal point
-    * -- is that table's business, not this comment's: it used to say "0 =
-    * pairing code, 1 = plot-max entry" and stopped there, while sixteen
-    * modes existed. */
+    * -- is that table's business, not this comment's: a list here says "0 =
+    * pairing code, 1 = plot-max entry" and stops there while sixteen modes
+    * exist. */
    enum keypad_mode kp_mode;
-   /* Why the last entry was refused, or empty. The keypad used to answer a
-    * bad value by clearing the field and saying nothing -- "the cleared entry
-    * is the feedback" -- which is indistinguishable from a mistyped key, and
-    * is exactly how a nudge threshold that was never accepted looked like a
-    * broken nudge for weeks. A refusal that does not say why is a refusal the
-    * user will repeat. */
+   /* Why the last entry was refused, or empty. Answering a bad value by
+    * clearing the field and saying nothing -- "the cleared entry is the
+    * feedback" -- is indistinguishable from a mistyped key, and is exactly how
+    * a nudge threshold that is never accepted looks like a broken nudge for
+    * weeks. A refusal that does not say why is a refusal the user will
+    * repeat. */
    char kp_err[40];
 };
 
@@ -274,7 +303,8 @@ struct ui_devview {
    int stored, ndev;
    int add_kind; /* KIND_CGM / KIND_BGM of that type */
    /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none. The
-    * DEVICES screen shows it as a tappable PENDING row (MA_PEND_CANCEL). */
+    * DEVICES screen shows it as a PENDING row whose tap asks whether to stop
+    * waiting (MA_PEND_CANCEL), and SCR_PENDCANCEL names the type from here. */
    int pend_type;
    int old_page; /* OLD DEVICES: which page of the list is showing */
    int dev_page; /* DEVICES: which page of the LIVE device list is showing */
@@ -339,6 +369,11 @@ struct ui_foodview {
    int food_type; /* the chosen type id; FOOD_TYPE_NONE = nothing chosen yet */
    int food_g;    /* grams */
    int food_edit; /* 1 = editing an existing entry, not logging a new one */
+   /* The entry EDIT FOOD is editing, as it was on disk. The delete
+    * confirmation must name THIS, not the form's current (possibly edited)
+    * values -- it is what food_delete will actually remove. */
+   long food_orig_t, food_orig_g;
+   int food_orig_type;
    /* The EXERCISE button: what it shows, and how much of the settling period
     * is left. `ex_remaining` is 0 when nothing is pending, which is also what
     * makes the progress bar disappear. */
@@ -347,6 +382,28 @@ struct ui_foodview {
     * like the tail it comes from; the table renders it newest FIRST. */
    const struct food_rec *log;
    int nlog, log_page;
+   /* THE EXERCISE LOG table (SCR_EXLOG) and the entry SCR_EXEDIT holds, on
+    * the same terms: a frame-owned snapshot, oldest first, rendered newest
+    * first. `ex_edit` is 1 while an existing row is being corrected -- which
+    * is the only way this form is ever open, since a NEW entry is made by the
+    * button and its settling rule, never by typing. The two orig fields are the
+    * row as it was on disk, which is what the delete confirmation must name and
+    * what exercise_update matches on. */
+   const struct ex_rec *exlog;
+   int nexlog, exlog_page;
+   long ex_t;         /* the instant the form holds */
+   long ex_form_dur;  /* the duration it holds, SECONDS, 0 = not known */
+   int ex_edit;       /* 1 = correcting an existing entry */
+   /* 1 = the row being corrected is the session running right now, so its
+    * length is not settled: the MINUTES row reads ACTIVE and is not a
+    * control. See exercise_row_running. */
+   int ex_running;
+   /* Why the last CONFIRM on the edit form was refused; empty when there is
+    * nothing to say. COPIED into the frame, like every other borrowed text. */
+   char ex_err[26];
+   int ex_form_level; /* the level the form holds, EX_MIN..EX_MAX */
+   long ex_orig_t;
+   int ex_orig_level;
 };
 
 /* Cloud sync: the account, the server, and what the last attempt got back. */
@@ -359,7 +416,11 @@ struct ui_syncview {
     * once invisible outside logcat; then they were English strings the
     * renderer pattern-matched, and two of them matched nothing. The screen
     * colours by sync_outcome_severity(), never by reading the words. */
-   int remote_outcome;
+   /* THE ENUM, NOT AN int. A frame is a snapshot of typed state,
+    * and this field spent it: the renderer colours by
+    * sync_outcome_severity() and a plain int here made every other numbering
+    * scheme in the app assignable to it. */
+   enum sync_outcome remote_outcome;
    const char *remote_status;
    int sync_paired;            /* 1 once an app identity is stored */
    int sync_active;            /* 1 while a sync is in flight */
@@ -377,6 +438,10 @@ struct ui_sysview {
    /* EXPORT DATA menu state: range 0 = 30 D, 1 = 1 Y, 2 = ALL; the three
     * section checkboxes (1 = included) */
    int exp_range, exp_glu, exp_dev, exp_ins, exp_wt;
+   /* The last EXPORT tap did not reach Java: the screen says so
+    * rather than leaving the user tapping a button that appears to do
+    * nothing. Cleared by an accepted attempt or by leaving the screen. */
+   int exp_failed;
 };
 
 /* Everything a frame needs to draw itself. Built fresh by the shell; the UI
@@ -386,9 +451,22 @@ struct screen {
     * it: which screen, when it is, the zone to render times in, and the one
     * line of status across the top. */
    enum ui_screen scr;
-   long now;           /* realtime_s() at frame time */
-   long tz_off;        /* local timezone offset (seconds) */
-   const char *status; /* top status text */
+   long now;    /* realtime_s() at frame time */
+   long tz_off; /* local timezone offset (seconds) */
+   /* THE STATUS TEXT, COPIED INTO THE FRAME rather than pointed at.
+    *
+    * As a `const char *` it aims straight at the shared g_status buffer that
+    * set_status rewrites -- from a BLE binder thread, while the main looper
+    * is walking the same bytes to draw them. A renderer reading a
+    * string mid-rewrite can walk past a terminator that has moved, and there
+    * is no lock in the world that helps when what is shared is a pointer the
+    * frame keeps.
+    *
+    * Everything else in this struct is already a snapshot for exactly this
+    * reason (see the device list, the log tails, the model view). The status
+    * was the last live pointer left. 40 characters, which is more than the
+    * widest thing set_status is given and more than any screen shows. */
+   char status[40];
 
    struct ui_reading reading;
    struct ui_plotview plot;
@@ -405,12 +483,12 @@ struct screen {
 
 /* ---- THE PLOT'S GEOMETRY, which is the model's, not the reader's -------
  *
- * These sat in plotdata.h, which is the module that READS the log and fills
- * points in. But what they size is the frame's array, and what they count is
- * this file's struct ui_point -- so plotdata.h had to declare `struct
- * ui_point;` and refuse to include this header, with a comment explaining
- * that including it back "would be circular". It was. The vocabulary belongs
- * with the type it describes; plotdata.h includes this one now, one way. */
+ * WHY THEY ARE HERE and not in plotdata.h, which is the module that READS
+ * the log and fills points in: what they size is the frame's array, and what
+ * they count is this file's struct ui_point. Declared there, plotdata.h has
+ * to forward-declare `struct ui_point;` and refuse to include this header to
+ * avoid a cycle. The vocabulary belongs with the type it describes;
+ * plotdata.h includes this one, one way. */
 
 /* Spans up to this are drawn from the live RAM window instead. */
 #define PLONG_MIN (24L * 3600)
@@ -418,8 +496,8 @@ struct screen {
 /* The MOST points a long span can return. Every consumer must size its
  * arrays for this: copying the result into an NHIST-sized buffer truncates
  * it, and because the log is in arrival order the survivors are all recent,
- * so the old half of a 30-day plot vanishes -- the same truncation bug one
- * level up from where it was fixed. */
+ * so the older half of a 30-day plot vanishes -- the same truncation one
+ * level up from the array it is being copied into. */
 #define PLOT_COLS 768 /* x columns we ever draw into */
 /* 64: a 56-minute column holds roughly two dozen readings with two CGMs and
  * a meter, so this is headroom rather than a guess -- and plottest asserts

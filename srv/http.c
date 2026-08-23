@@ -3,6 +3,7 @@
  * Copyright 2026 Jakob Kastelic
  */
 #include "http.h"
+#include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
 #include "util.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -72,9 +73,9 @@ const char *http_conn_value(const struct http_conn *c)
  *
  * WHAT EACH LINE IS FOR.
  *
- * frame-ancestors 'none' CARRIES THE WEIGHT. Item 48 made every state change
- * POST-only and every one of them carries a CSRF token, so cross-site FORM
- * submission is closed. What that leaves is CLICKJACKING: a page on another
+ * frame-ancestors 'none' CARRIES THE WEIGHT. Every state change is POST-only
+ * and every one of them carries a CSRF token, so cross-site FORM submission
+ * is closed. What that leaves is CLICKJACKING: a page on another
  * site puts /settings in a transparent iframe, positions it under something
  * the visitor wants to click, and the visitor -- who is signed in, whose
  * cookie is SameSite=Lax and so IS sent on a top-level-ish subresource load
@@ -116,8 +117,8 @@ const char *http_conn_value(const struct http_conn *c)
  * both of its failure paths, and http_respond_hdr appends charset only to
  * types beginning "text/", so it is "image/gif" and not the charset-bearing
  * "image/gif; charset=utf-8" which some
- * browsers do reject). srv/test/synctest.sh fetches a plot and asserts on the
- * type, because "the page still renders" is not something a reader can check.
+ * browsers do reject). The type is worth asserting on directly, because "the
+ * page still renders" is not something a reader can check.
  *
  * Referrer-Policy: no-referrer, and this one is specific to what these URLs
  * CONTAIN. An invitation link is /invite/<token> -- the token IS the
@@ -278,8 +279,8 @@ void http_method_not_allowed(const struct http_conn *c, unsigned allow)
 
 /* ---- THE REQUEST LINE, SPLIT ON ONE GRAMMAR AND NO OTHER ---------------
  *
- * See http.h for the shapes this replaces and for why a second parser in
- * front of this one makes them a smuggling primitive rather than untidiness.
+ * See http.h for the shapes it refuses and for why a second parser in front
+ * of this one makes them a smuggling primitive rather than untidiness.
  * What follows is RFC 9112 3 read literally.
  *
  * tchar, from RFC 9110 5.6.2: the characters a token may be built from. It is
@@ -303,7 +304,7 @@ enum reqline http_reqline(const char *req, char *method, size_t mcap,
    /* EMPTIED FIRST, on every path. A caller that somehow ignored the return
     * -- the reason this is warn_unused_result -- then routes on "" and gets a
     * 404, rather than on whatever half of a request line happened to parse.
-    * The old code left `target` holding "/\r\nHost:" in exactly that case. */
+    * Left unemptied, `target` holds "/\r\nHost:" in exactly that case. */
    if (method && mcap)
       method[0] = '\0';
    if (target && tcap)
@@ -314,9 +315,9 @@ enum reqline http_reqline(const char *req, char *method, size_t mcap,
    if (!req || !method || !mcap || !target || !tcap)
       return REQL_BAD;
 
-   /* method = 1*tchar, then exactly ONE space. Two spaces ("GET  /") used to
-    * produce an EMPTY target, because the second strchr found the space that
-    * had already been consumed as the separator. */
+   /* method = 1*tchar, then exactly ONE space. Split with strchr, two spaces
+    * ("GET  /") produce an EMPTY target, because the second search finds the
+    * space already consumed as the separator. */
    size_t m = 0;
    while (is_tchar((unsigned char)req[m]))
       m++;
@@ -411,6 +412,53 @@ static void reqline_refuse(const struct http_conn *c, enum reqline rl)
    http_text(c, 400, "Bad Request", "bad request line\n");
 }
 
+/* HOW LONG ONE REQUEST MAY OCCUPY THE SERVER, when the deployment wants less
+ * than the transport's own budget.
+ *
+ * The budget belongs to the transport -- plain HTTP and TLS are different
+ * conversations with different costs -- and HTTP_DEADLINE_S explains why the
+ * default is short. What this adds is a ceiling over both, and it can only
+ * SHORTEN: a knob that lengthened the deadline would be a way to hold every
+ * worker in the pool for as long as one liked.
+ *
+ * WHY IT IS SETTABLE AT ALL. The deadline is the only thing that ends a
+ * request whose peer declares a body and then stops sending it, so it is also
+ * the only way to observe what the server does with one -- and observing it
+ * otherwise means waiting out the production number. A value that is not a
+ * number in range is ignored, loudly.
+ */
+#define HTTP_DEADLINE_MIN_S 0.05
+
+static double deadline_cap(void)
+{
+   const char *v = getenv("PANCRA_HTTP_DEADLINE_S");
+   if (!v || !*v)
+      return 0;
+   char *end = NULL;
+   double d  = strtod(v, &end);
+   if (end && !*end && d >= HTTP_DEADLINE_MIN_S && d <= (double)HTTP_DEADLINE_S)
+      return d;
+   fprintf(stderr,
+           "sync: PANCRA_HTTP_DEADLINE_S='%s' is not %g..%d seconds; "
+           "the transport's own deadline stands\n",
+           v, HTTP_DEADLINE_MIN_S, HTTP_DEADLINE_S);
+   return 0;
+}
+
+/* The budget in force for this connection: the transport's, capped. */
+double http_deadline_capped(double budget)
+{
+   double cap = deadline_cap();
+   return (cap > 0 && cap < budget) ? cap : budget;
+}
+
+static double conn_deadline(const struct http_conn *c)
+{
+   double d = (c && c->tp && c->tp->deadline_s > 0) ? c->tp->deadline_s
+                                                    : (double)HTTP_DEADLINE_S;
+   return http_deadline_capped(d);
+}
+
 /* THE PLAIN TRANSPORT. Named and const, rather than four mutable globals a
  * second module reaches over and overwrites at startup. */
 static ssize_t plain_read(const struct http_conn *c, void *buf, size_t n)
@@ -421,8 +469,8 @@ static ssize_t plain_read(const struct http_conn *c, void *buf, size_t n)
 /* ALL THE BYTES, OR AN ERROR -- which is what http.h has always promised and
  * what tls_send already did.
  *
- * This was one write(2). On a blocking socket that is usually the whole
- * buffer, which is why it looked fine: the short write needs BACKPRESSURE.
+ * ONE write(2) is not enough. On a blocking socket it is usually the whole
+ * buffer, which is why it looks fine: the short write needs BACKPRESSURE.
  * Every accepted connection carries SO_SNDTIMEO of one second (see
  * http_accept_setup), so a client that stops reading -- a phone that loses
  * signal mid-response, a browser fetching a plot over a slow link -- makes
@@ -461,9 +509,18 @@ static ssize_t plain_write(const struct http_conn *c, const void *buf, size_t n)
 {
    const unsigned char *p = buf;
    size_t sent            = 0;
-   double deadline        = http_mono_s() + HTTP_DEADLINE_S;
+   /* THE BUDGET COMES FROM THE TRANSPORT, not from the macro directly. The
+    * struct has carried a `deadline_s` field all along and this loop ignored
+    * it, so the one number the field exists to state was unreachable -- and
+    * a test for "gives up when the peer stops reading" had no choice but to
+    * wait out the real three seconds. Same value in production (the plain and
+    * TLS transports are initialised from HTTP_DEADLINE_S); injectable by a
+    * caller that copies the transport. A transport with no budget set gets the
+    * compiled-in one rather than an instant timeout. */
+   double budget   = conn_deadline(c);
+   double deadline = http_mono_s() + budget;
    while (sent < n) {
-      ssize_t w = send(c->fd, p + sent, n - sent, MSG_DONTWAIT | MSG_NOSIGNAL);
+      ssize_t w = (ssize_t)sys_send_quiet(c->fd, p + sent, n - sent);
       if (w > 0) {
          sent += (size_t)w;
          continue;
@@ -474,9 +531,9 @@ static ssize_t plain_write(const struct http_conn *c, const void *buf, size_t n)
          continue;
       if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
          /* The peer's window is full. Wait for room, for AT MOST what is left
-          * of the budget -- so the total time spent here is bounded by
-          * HTTP_DEADLINE_S whatever the peer does, including doing nothing at
-          * all for ever. */
+          * of the budget -- so the total time spent here is bounded by the
+          * transport's deadline whatever the peer does, including doing
+          * nothing at all for ever. */
          double left = deadline - http_mono_s();
          if (left <= 0)
             return -1;
@@ -551,9 +608,9 @@ int http_give_way(const struct http_conn *c, double started)
 }
 
 /* Is another client queued on the listening socket right now? The socket
- * comes from the CONNECTION, which got it from its pool -- it used to be a
- * file-scope int set by a call the caller had to remember to make before
- * serving, and forgetting it silently disabled the whole fairness rule. */
+ * comes from the CONNECTION, which got it from its pool -- as a file-scope
+ * int set by a call the caller has to remember to make before serving,
+ * forgetting it silently disables the whole fairness rule. */
 int http_others_waiting(const struct http_conn *c)
 {
    if (!c || c->watch_fd < 0)
@@ -643,7 +700,7 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
     * arrive inside the usual deadline. */
    /* The idle budget belongs to a FOLLOW-UP request only. A first request is
     * one the client has already paid a handshake for, and giving it the
-    * 2-second idle allowance instead of the full deadline dropped slow mobile
+    * 2-second idle allowance rather than the full deadline dropped slow mobile
     * connections the board had just spent hundreds of milliseconds on.
     *
     * The clock starts AFTER the idle wait, so waiting for the client does not
@@ -653,7 +710,7 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
    double startat = http_mono_s();
    while (got < req_cap - 1) {
       double waited = http_mono_s() - startat;
-      if (waited > c->tp->deadline_s)
+      if (waited > conn_deadline(c))
          return 0; /* too slow to be honest: give the server back */
       /* Silent so far, and somebody is queued: this connection has neither
        * sent nor been sent anything, so dropping it costs it a reconnect and
@@ -710,12 +767,12 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
          http_text(c, 400, "Bad Request", "malformed headers\n");
          return 0;
       }
-      if (!strncasecmp(h, "Transfer-Encoding:", 18)) {
+      if (sys_ncaseeq(h, "Transfer-Encoding:", 18)) {
          *c->last_on_conn = 1;
          http_text(c, 400, "Bad Request", "transfer encoding unsupported\n");
          return 0;
       }
-      if (!strncasecmp(h, "Content-Length:", 15)) {
+      if (sys_ncaseeq(h, "Content-Length:", 15)) {
          if (have_cl) {
             *c->last_on_conn = 1;
             http_text(c, 400, "Bad Request", "duplicate content length\n");
@@ -753,13 +810,13 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
    }
    /* A client that says it is done gets closed, whatever we would prefer. */
    for (char *h = req; h < hdr_end;) {
-      if (!strncasecmp(h, "Connection:", 11)) {
+      if (sys_ncaseeq(h, "Connection:", 11)) {
          /* Case-insensitive on the VALUE too: "Connection: Close" is as valid
           * as "close", and matching only the lower-case spelling left the
           * connection open against the client's wishes. */
          char *nl = strchr(h, '\n');
          for (char *v = h + 11; v && nl && v < nl; v++)
-            if (!strncasecmp(v, "close", 5)) {
+            if (sys_ncaseeq(v, "close", 5)) {
                *saw_close = 1;
                *c->last_on_conn =
                    1; /* so the reply says so, per RFC 9112 9.6 */
@@ -785,10 +842,10 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
    /* Pull in the rest of the declared body. A read that merely TIMED OUT is
     * not the end of the body: the socket carries a 1 s timeout so the
     * deadline below is enforced rather than slept through, and treating that
-    * EAGAIN as end-of-body used to abandon the request silently, before it
-    * could be refused. Only a close or a hard error ends it early. */
+    * EAGAIN as end-of-body abandons the request silently, before it can be
+    * refused. Only a close or a hard error ends it early. */
    while (got - body_off < clen && got < req_cap - 1) {
-      if (http_mono_s() - startat > c->tp->deadline_s)
+      if (http_mono_s() - startat > conn_deadline(c))
          break;
       ssize_t r = c->tp->read(c, req + got, req_cap - 1 - got);
       if (r > 0) {
@@ -803,9 +860,9 @@ static int serve_one(const struct http_conn *c, http_handler handle, void *user,
       /* REFUSE it; do NOT hand the handler a short body as if it were whole.
        * h_bucket_put's contract is "this bucket now contains exactly these
        * lines", implemented as DELETE then insert -- so a body cut off by the
-       * deadline used to commit as an authoritative deletion of every row
-       * that had not yet arrived. A dropped connection was always safe (the
-       * handler never ran); a SLOW one silently was not. */
+       * deadline would commit as an authoritative deletion of every row that
+       * had not yet arrived. A dropped connection is safe (the handler never
+       * runs); a SLOW one silently is not. */
       *c->last_on_conn = 1; /* answering, then closing: say so (see the 413) */
       http_text(c, 400, "Bad Request", "incomplete body\n");
       return 0;
@@ -886,8 +943,13 @@ fail_bind: {
 int http_accept_setup(int fd)
 {
    /* One second, so a blocked read returns often enough for the deadline to
-    * be enforced rather than slept through. */
+    * be enforced rather than slept through -- and never longer than the
+    * deadline itself, or the check between reads would be reached after the
+    * budget it is checking had already run out. */
+   double cap        = deadline_cap();
    struct timeval tv = {1, 0};
+   if (cap > 0 && cap < 1.0)
+      tv = (struct timeval){0, (suseconds_t)(cap * 1e6)};
    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0 ||
        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0) {
       perror("sync: required socket timeout");
@@ -941,8 +1003,35 @@ static void *worker(void *arg)
             nanosleep(&pause, NULL);
             continue;
          }
+         /* ---- A PERMANENT ACCEPT FAILURE ENDS THE PROCESS ------------
+          *
+          * NOT `return NULL`, quietly retiring one worker. Two things are
+          * wrong with that, and the second is worse.
+          *
+          * EVERY WORKER SHARES ONE LISTENING SOCKET, so whatever made accept
+          * fail permanently will fail for all of them -- they retire one by
+          * one, and the process stays alive holding the port with nothing
+          * behind it. The front door still forwards to it, the health check
+          * still connects, and the service is dead in the one way nothing
+          * outside can see.
+          *
+          * AND THE CALLING THREAD IS A WORKER TOO. Its return unwinds
+          * http_run_pool and http_serve, and the pool those detached workers
+          * are still dereferencing lives on http_serve's STACK. The comment
+          * at that call reads "never returns", which is what made the frame
+          * safe to put it in; it was not true.
+          *
+          * Exiting is the honest answer: a server that cannot accept is not
+          * serving, and a process that is gone is visible to the supervisor,
+          * to the front door and to the health check. _exit rather than exit
+          * because this is an arbitrary worker thread and running another
+          * thread's atexit handlers from it is a second failure on top of the
+          * first. */
          fprintf(stderr, "sync: accept failed permanently: %s\n", strerror(e));
-         return NULL;
+         fprintf(stderr, "sync: every worker shares this socket, so this is "
+                         "fatal -- exiting so it is visible\n");
+         fflush(stderr);
+         _exit(1);
       }
       if (!http_accept_setup(fd)) {
          close(fd);
@@ -990,7 +1079,11 @@ int http_run_pool(struct http_pool *p, int nworkers)
       close(p->srv);
       return 1;
    }
-   worker(p); /* this thread is a worker too, and never returns */
+   /* This thread is a worker too. It returns only if accept fails
+    * permanently -- and that path exits the process rather than unwinding
+    * (see the accept loop), so nothing below is reached in practice. The
+    * return is here because the compiler needs one. */
+   worker(p);
    return 1;
 }
 
@@ -1009,11 +1102,34 @@ int http_serve(int port, const char *name, http_handler handle,
    /* The policy is COPIED into the pool, and from there into each
     * connection. There is no setter and no ordering rule to remember: a
     * server that has not been given one gets the default. */
-   struct http_pool p = {.srv     = srv,
-                         .handle  = handle,
-                         .user    = user,
-                         .pol     = pol ? *pol : g_pol_default,
-                         .prepare = plain_prepare,
-                         .finish  = NULL};
-   return http_run_pool(&p, HTTP_WORKERS);
+   /* ---- THE POOL OUTLIVES THIS FRAME, so it cannot live in it ---------
+    *
+    * The workers are DETACHED and never joined, and every one of them holds
+    * this pointer for the life of the process. A pool on this function's
+    * stack is therefore only safe for as long as this function never returns
+    * -- which was true by accident and stopped being true the moment a
+    * worker could give up (see the accept loop above).
+    *
+    * Allocated and never freed, deliberately. There is nothing to free it
+    * FROM: the last user is whichever detached worker happens to run last,
+    * and no one can know which that is. A leak of one struct for the life of
+    * a process that is serving until it exits is not a leak in any sense that
+    * matters; a dangling pointer shared by ten threads is.
+    *
+    * NOT a static, which would have been shorter: http.h promises that a
+    * second pool in this process is simply a second value, and a static would
+    * quietly make the second one overwrite the first. */
+   struct http_pool *p = calloc(1, sizeof *p);
+   if (!p) {
+      fprintf(stderr, "sync: cannot allocate the HTTP pool\n");
+      close(srv);
+      return 1;
+   }
+   p->srv     = srv;
+   p->handle  = handle;
+   p->user    = user;
+   p->pol     = pol ? *pol : g_pol_default;
+   p->prepare = plain_prepare;
+   p->finish  = NULL;
+   return http_run_pool(p, HTTP_WORKERS);
 }

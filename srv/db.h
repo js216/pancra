@@ -20,9 +20,9 @@
  * something, not its internals. main() opens it and hands it to the server,
  * which puts it in every request; a helper that touches storage takes one.
  *
- * The alternative -- what this replaces -- was a static path and a
- * thread-local handle with no name, so "which database" was a question no
- * signature could ask and no caller could answer. */
+ * The alternative is a static path and a thread-local handle with no name, so
+ * "which database" is a question no signature can ask and no caller can
+ * answer. */
 struct db;
 
 /* Open (creating and migrating if need be). NULL on failure, with the reason
@@ -45,7 +45,8 @@ struct sqlite3_stmt *db_prep(struct db *d, const char *sql);
  * the server holds look absent, and a restore hands back a partial history
  * that reads as complete. For a page it is a list quietly missing entries.
  *
- * So every loop ends by asking this what kind of end it was. It logs the real
+ * So every loop ends by asking this what kind of end it reached. It logs the
+ * real
  * result and returns 0 for anything but DONE; the caller discards what it
  * built and says so. */
 int db_finished(int rc);
@@ -127,15 +128,63 @@ enum backup_dest db_backup_dest(struct db *d, const char *out_path);
  *
  *   - opening a database creates a -wal and a -shm beside it. Verifying a
  *     backup must not litter the backups directory with them.
- *   - so this used to note which sidecars were absent, open the file, and
- *     then unlink `<path>-wal` and `<path>-shm` BY NAME. Between the note and
- *     the unlink, a server starting on that database creates real ones -- and
- *     verification deleted a live write-ahead log, which is every commit since
- *     the last checkpoint. restore.sh verifies a staged file in the LIVE data
- *     directory, so the window is not theoretical.
+ *   - noting which sidecars are absent, opening the file, and then unlinking
+ *     `<path>-wal` and `<path>-shm` BY NAME does not work: between the note
+ *     and the unlink, a server starting on that database creates real ones --
+ *     and verification deletes a live write-ahead log, which is every commit
+ *     since the last checkpoint. restore.sh verifies a staged file in the
+ *     LIVE data directory, so the window is not theoretical.
  *
- * Nothing outside the private directory is ever unlinked. */
-int db_verify(const char *path);
+ * Nothing outside the private directory is ever unlinked.
+ *
+ * ---- AND THE COPY IS PART OF THE ANSWER --------------------
+ *
+ * The scratch copy is a COMPLETE COPY OF THE DATABASE: every session cookie,
+ * every password hash, every row of every user's record, sitting in a
+ * world-readable directory's private subdirectory under a predictable name.
+ * Removing it is not tidying up; it is the second half of the operation.
+ *
+ * So a cleanup that fails is its own outcome and not a footnote on stderr.
+ * As a footnote -- scratch_drop returning void, db_verify returning whatever
+ * the integrity check said -- `sync verify` prints "verifies" and exits 0
+ * with a copy of the live database still on disk, and an operator reading the
+ * exit status (which is what restore.sh and every cron wrapper read) is told
+ * everything is fine.
+ *
+ * THE INTEGRITY VERDICT STILL WINS when both go wrong. VERIFY_BAD means the
+ * file is not a usable backup, which is the thing the operator asked about
+ * and the thing that must not be masked by a cleanup complaint; the leftover
+ * is named on stderr in that case too. */
+enum verify_result {
+   VERIFY_OK,       /* a usable backup, and nothing was left behind */
+   VERIFY_BAD,      /* not a usable backup (the leftover, if any, is named) */
+   VERIFY_LEFTOVER, /* a usable backup -- but a copy of it is still on disk */
+};
+
+/* Verify `path`. Prints the reason for anything but VERIFY_OK, and for
+ * VERIFY_LEFTOVER prints the exact path that has to be dealt with by hand. */
+enum verify_result db_verify(const char *path);
+
+/* ---- REPAIRING ROWS WHOSE OWNER IS GONE -------------------------------
+ *
+ * db_open REFUSES a database holding them, because an orphan `session` row is
+ * a live cookie for a deleted account and the next account to be given that
+ * user id inherits it. This is the supported way to clear them: explicit, run
+ * by an operator with the server stopped, in one transaction, and it reports
+ * every row it removes.
+ *
+ * `fix` = 0 lists them and changes nothing. 1 on success (including "there
+ * were none"), 0 when the scan or the repair failed -- and then the file is
+ * untouched. `removed` receives the count when non-NULL. Only CHILD rows are
+ * ever deleted; see the definition. */
+int db_fsck(struct db *d, int fix, int64_t *removed);
+
+/* Open a database that db_open would REFUSE for holding orphan rows, so they
+ * can be removed. The only caller is the fsck verb; every other check --
+ * schema shape, version support, the pragmas -- is applied exactly as usual,
+ * because a repair against a layout this build does not know would be a
+ * repair guessing. */
+struct db *db_open_repair(const char *path);
 
 /* Run a statement with no results; 1 on success. */
 int db_exec(struct db *d, const char *sql);
@@ -159,6 +208,19 @@ int db_durable_begin(struct db *d);
 int db_durable_commit(struct db *d);
 void db_durable_rollback(struct db *d);
 
+/* ---- IS THIS THREAD'S CONNECTION UNUSABLE -------------------
+ *
+ * 1 when a transaction could not be finalized on it -- a ROLLBACK that
+ * failed, or one that reported success while sqlite3_get_autocommit still
+ * says the connection is inside a transaction. Such a connection is never
+ * handed to another request: the next db call on this thread closes it and
+ * opens a fresh one, which is what discards the transaction.
+ *
+ * Production has nothing to do with this answer (the recovery is automatic
+ * and the caller has already failed); it exists so a test can state that the
+ * poisoning happened, and that the connection afterwards is a working one. */
+int db_conn_poisoned(void);
+
 /* 1 when a transaction is ALREADY open on this connection.
  *
  * For the one shape sqlite does not support: a helper that must be atomic in
@@ -178,10 +240,9 @@ int db_in_transaction(struct db *d);
 
 /* ---- ONE NUMBER, AND WHY THERE IS OR IS NOT ONE ----------------------
  *
- * THREE OUTCOMES, NOT TWO. Its predecessor answered "the value, and a found
- * flag", which meant a prepare that failed, a step that errored (BUSY,
- * LOCKED, CORRUPT, IOERR) and a query that simply matched nothing were all
- * the same answer: not found, value 0.
+ * THREE OUTCOMES, NOT TWO. "The value, and a found flag" makes a prepare
+ * that failed, a step that errored (BUSY, LOCKED, CORRUPT, IOERR) and a query
+ * that simply matched nothing one answer: not found, value 0.
  *
  * That is the difference between "this user has no time zone" and "the
  * database could not be read", and the pages acted on the first while the
@@ -201,8 +262,9 @@ enum db_get {
 
 /* `sql` takes one bound integer parameter and selects one column.
  * DB_GET_NONE requires SQLITE_DONE: anything else is DB_GET_FAIL. */
-enum db_get db_get_long(struct db *d, const char *sql, long arg, long *out);
-long db_last_id(struct db *d);
+enum db_get db_get_long(struct db *d, const char *sql, int64_t arg,
+                        int64_t *out);
+int64_t db_last_id(struct db *d);
 int db_changes(struct db *d);
 
 #endif

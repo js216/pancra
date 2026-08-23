@@ -4,10 +4,11 @@
 
 #include "reconcile.h"
 #include "clock.h"
+#include "devtag.h" /* a log may not carry an address; see there */
 #include "dexdriver.h"
+#include "linkinfo.h"
 #include "log.h"
 #include "meter.h"
-#include "reading.h"
 #include "selection.h"
 #include "senslogic.h"
 #include "sensors.h"
@@ -30,12 +31,12 @@ static struct flight g_reconcile_flight = FLIGHT_INIT;
 
 /* Map a sensor slot to its transport link, BY ADDRESS.
  *
- * This used to derive the link from a sensor's ORDINAL among the CGM slots,
- * which is not stable: sensor_forget() shifts g_slot while the remaining
+ * BY ADDRESS AND NOT BY ORDINAL, because a sensor's ordinal among the CGM
+ * slots is not stable: sensor_forget() shifts g_slot while the remaining
  * sensors keep their live GATT connections, driver contexts and per-link key
- * files. Forgetting the first of two CGMs therefore re-pointed the survivor at
- * an emptied context, after which commit_pair() would call driver_forget() on
- * the link the survivor was ACTUALLY using and destroy its bond; calibration
+ * files. Forgetting the first of two CGMs would re-point the survivor at an
+ * emptied context, after which commit_pair() calls driver_forget() on the link
+ * the survivor is ACTUALLY using and destroys its bond; calibration
  * went to a dead context while still logging "submitted"; and the survivor's
  * adverts stopped resolving to a live link. Resolving by the session address
  * -- the one identity a shift cannot move -- removes the whole class.
@@ -124,30 +125,23 @@ void sensor_reconcile(void)
    if (!flight_enter(&g_reconcile_flight))
       return;
    meter_sync_watchdog();
-   /* Flush the session cache at most once a minute. sessc_put marks it dirty
-    * from the draw path, which runs far more often than the 5-minute cadence
-    * that actually changes anything; rate-limiting here keeps a redraw storm
-    * from becoming a write storm on a file whose only job is to survive the
-    * next launch. Losing up to a minute of it costs nothing -- the clock is
-    * projected forward from whatever instant was stored. */
-   sess_flush(realtime_s());
 
    /* Walk every CGM link so a newly bonded second sensor is registered too,
     * not just whichever one happened to connect first. */
    struct sens_slot_obs sobs[MAX_SLOTS];
    int nsobs = 0;
    /* THE DRIVER AS ONE INSTANT, then the registry under its own lock. Held by
-    * hand, the two used to be one critical section here; a snapshot gives the
-    * same thing the walk actually needed -- every link's session as it was at
-    * one moment -- without this file taking the driver's lock. */
+    * hand the two become ONE critical section here; a snapshot gives what the
+    * walk actually needs -- every link's session as it was at one moment --
+    * without this file taking the driver's lock. */
    struct dex_session sess[LINK_MAX];
    driver_snapshot(sess, -1, 0);
+   long now = realtime_s();
    /* ot_drv_done mutates the registry from a binder thread (sensor_mint ->
-    * srec_push), so this walk reads ONE snapshot -- it is the walk that
-    * decides g_cur_src, the fallback provenance stamped into the permanent
-    * log. Held as a lock instead, it also spanned link_for_slot, which takes
-    * the DRIVER's lock: registry -> driver, the inverse of the documented
-    * order. A snapshot cannot invert anything, because it is over. */
+    * srec_push), so this walk reads ONE snapshot. Held as a lock instead, it
+    * also spanned link_for_slot, which takes the DRIVER's lock: registry ->
+    * driver, the inverse of the documented order. A snapshot cannot invert
+    * anything, because it is over. */
    struct sensor_view rv;
    sensors_view_get(&rv);
    for (int i = 0; i < rv.n; i++) {
@@ -159,6 +153,30 @@ void sensor_reconcile(void)
       if (l < 0)
          continue;
       struct dex_session ls = sess[l];
+      /* THE SESSION IS RECORDED HERE, NOT WHILE DRAWING.
+       *
+       * A sessc_put in build_model -- once per CGM row per frame -- makes
+       * the durable session clock a side effect of the REDRAW: a screen
+       * nobody is looking at records nothing, and a busy one records several
+       * times a second. That is the wrong dependency in
+       * both directions. The one that cost something is the first -- with
+       * the activity gone the service tick is the only thing running, it
+       * draws nothing, and the cache it is flushing every minute therefore
+       * never changed. The restore this cache exists for was doing nothing
+       * on exactly the launches it was written for.
+       *
+       * This walk is the right place because it already has what the record
+       * needs and takes no new lock to get it: one driver snapshot, every
+       * CGM slot, and the same instant for all of them. It runs on the 1 Hz
+       * timer AND on the service tick, so the record survives the activity;
+       * and it runs at a fixed cadence, so nothing about the screen can
+       * change what is stored.
+       *
+       * `now` is read once, above, for the same reason the snapshot is taken
+       * once: two rows stamped from two instants are two different answers
+       * to "when was this clock read". */
+      if (ls.have_reading)
+         sessc_put(rv.slot[i].id, &ls, now);
       /* OBSERVE here, choose in sens_primary_pick -- including the "prefer the
        * primary and stop at it" rule, which is pinned by senstest. */
       sobs[nsobs].id     = rv.slot[i].id;
@@ -169,13 +187,21 @@ void sensor_reconcile(void)
       sobs[nsobs].primary = rv.slot[i].primary;
       nsobs++;
    }
-   /* USE the result. This loop previously assigned a local that was never
-    * read, so the whole "prefer the primary" fix above was a dead store and
-    * g_cur_src kept whatever the registration block below left it -- which,
-    * once any CGM had a slot, was never anything at all (see there). */
-   int primary_src = sens_primary_pick(sobs, nsobs);
-   if (primary_src > 0)
-      reading_set_src(primary_src);
+   /* AND THEN THE FILE, at most once a minute (senslogic.h). AFTER the walk
+    * above, so a session recorded on this tick can be written by this tick
+    * rather than waiting for the next one; the rate limit is what keeps that
+    * from becoming a write per tick. Losing up to a minute costs nothing --
+    * the clock is projected forward from whatever instant was stored. */
+   sess_flush(now);
+
+   /* THE PRIMARY, CHOSEN AND THEN NOT STAMPED ANYWHERE. This used
+    * to publish the answer as reading_set_src -- the ambient provenance the
+    * ingest path fell back to -- which is exactly the identity that outlived
+    * its sensor and mis-stamped a new one's first reading. The pick itself is
+    * still made and still pinned by senstest, because sens_primary_pick's
+    * "prefer the primary and stop at it" rule is what the SCREEN uses; what
+    * is gone is the global it fed. */
+   (void)sens_primary_pick(sobs, nsobs);
 
    /* Only a CGM is registered from a dex_session. Without this guard, adding a
     * meter would leave sel_add_type() on ONETOUCH and the next CGM to bond
@@ -186,9 +212,9 @@ void sensor_reconcile(void)
    /* The link a new pairing would use. Note this must not be left selected on
     * return: the caller's stall watchdog and build_model() both read the
     * driver afterwards, and an unused link reports an empty session. */
-   /* Recover the meter's id FIRST and unconditionally. It used to sit after
-    * the CGM early-return below, so a meter-only user never recovered it after
-    * a restart and their meter could never auto-sync again. */
+   /* Recover the meter's id FIRST and unconditionally -- after the CGM
+    * early-return below, a meter-only user never recovers it after a restart
+    * and their meter can never auto-sync again. */
    /* Only seed this when it is not already pointing at a registered meter.
     *
     * The advert handler now selects the meter per advert (any registered one,
@@ -217,15 +243,15 @@ void sensor_reconcile(void)
    /* Find a CGM link carrying a live bonded session that NO slot claims yet --
     * that is the sensor which still needs registering.
     *
-    * This used to probe link_for_slot(slot_count()), i.e. "the link a new
-    * pairing would use". Once link resolution became address-based that became
-    * a guaranteed dead end: link_for_slot for an unregistered index returns a
-    * FREE link, and a free link is by definition one with no session, so
-    * s.mac[0] was always 0 and this entire block stopped executing. Nothing
-    * was ever minted or slotted, so every reading fell back to source id 0
-    * ("pre-registry legacy") in a log that is never rewritten, and the
-    * advert-driven reconnect loop -- which iterates slots -- had an empty body.
-    * Scanning for the unclaimed session asks the question directly. */
+    * NOT link_for_slot(slot_count()), "the link a new pairing would use":
+    * with address-based link resolution that is a guaranteed dead end.
+    * link_for_slot for an unregistered index returns a FREE link, and a free
+    * link is by definition one with no session, so s.mac[0] is always 0 and
+    * this entire block stops executing -- nothing minted or slotted, every
+    * reading falling back to source id 0 ("pre-registry legacy") in a log
+    * that is never rewritten, and the advert-driven reconnect loop (which
+    * iterates slots) left with an empty body. Scanning for the unclaimed
+    * session asks the question directly. */
    struct dex_session s;
    memset(&s, 0, sizeof s);
    int s_link = -1;
@@ -280,28 +306,28 @@ void sensor_reconcile(void)
           * row that is never rewritten. */
          char amodel[24] = {0};
          char afw[24]    = {0};
-         reading_dis(s_link, amodel, sizeof amodel, afw, sizeof afw);
+         linkinfo_dis(s_link, amodel, sizeof amodel, afw, sizeof afw);
          int id = sensor_mint(cgm_type, s.mac, "", amodel, afw, activation);
          idx    = (id < 0) ? -1 : sensor_claim_slot(id, cgm_type, s.mac);
+         /* THE ID, NOT THE ADDRESS. The registry id is this app's own name
+          * for the device: it identifies no hardware, it means something to
+          * anybody reading the logs beside the registry, and it is what every
+          * other line about this sensor already carries. The per-run tag is
+          * there so a line here can be matched with the transport's, which
+          * only ever knows the address. See devtag.h. */
+         char dt[DEVTAG_LEN];
          if (idx >= 0)
-            LOGI("registered sensor id=%d type=%s mac=%s fw=%s", id,
-                 sensor_type_name(cgm_type), s.mac, afw);
+            LOGI("registered sensor id=%d type=%s dev %s fw=%s", id,
+                 sensor_type_name(cgm_type), devtag(s.mac, dt), afw);
          else if (id >= 0)
-            LOGI("sensor slots full (%d); %s not listed", MAX_SLOTS, s.mac);
+            LOGI("sensor slots full (%d); dev %s not listed", MAX_SLOTS,
+                 devtag(s.mac, dt));
       }
-      /* THE ID ON THIS LINK, not the position it landed in: this is the
-       * fallback provenance stamped onto every reading until the next
-       * reconcile, in a log that is never rewritten. Resolved from the
-       * ADDRESS, which is the one identity a registry shift cannot move --
-       * and which is right whether the device was just minted here or was
-       * already registered. */
-      struct sensor_view sv;
-      sensors_view_get(&sv);
-      for (int i = 0; i < sv.n; i++)
-         if (sv.have_rec[i] && !strcmp(sv.rec[i].identity, s.mac)) {
-            reading_set_src(sv.slot[i].id);
-            break;
-         }
+      /* (NO AMBIENT PROVENANCE IS PUBLISHED HERE. A reading is stamped with
+       * the sensor whose LINK it arrived on, resolved per reading, and a link
+       * no slot claims yet defers rather than borrowing somebody's id. The
+       * registration above is what makes that resolution possible, and it is
+       * the whole of this block's job.) */
    }
 
    /* SECOND PASS: complete provenance for an ALREADY-registered CGM whose
@@ -315,9 +341,9 @@ void sensor_reconcile(void)
     * moment it becomes true, via sensor_complete, which fills ONLY missing
     * fields and appends the corrected row (the file is never rewritten).
     *
-    * This used to mint a second id and rebind the slot to it. Since identity
-    * became MAC-only that mint always returned the SAME id and the rebind was
-    * a no-op -- the pass was dead code and rows stayed bare forever. */
+    * It does NOT mint a second id and rebind the slot to it: with MAC-only
+    * identity such a mint returns the SAME id and the rebind is a no-op, so
+    * the pass would be dead code and rows would stay bare forever. */
    /* Collect from ONE snapshot, ACT afterwards. sensor_complete does
     * synchronous file I/O (sensors.csv), and the driver's lock is a spin
     * lock every GATT binder callback waits on -- holding it across a file
@@ -349,7 +375,7 @@ void sensor_reconcile(void)
        * corrected -- in an append-only file. */
       char lmodel[24] = {0};
       char lfw[24]    = {0};
-      reading_dis(l, lmodel, sizeof lmodel, lfw, sizeof lfw);
+      linkinfo_dis(l, lmodel, sizeof lmodel, lfw, sizeof lfw);
       /* Slot and provenance from ONE snapshot: read separately, a mint on a
        * binder thread between them gives an index into a shifted array. */
       struct sensor_view cv;
@@ -397,13 +423,11 @@ void sensor_reconcile(void)
               todo[i].id, todo[i].model, todo[i].fw, todo[i].act);
    }
 
-   /* NOTHING TO PUT BACK ANY MORE. This used to end with
-    * a call selecting LINK_CGM and the note "leave the driver on a link that
-    * actually exists: the caller's stall watchdog and build_model() both read
-    * the session straight after this, and an unused link reports an empty
-    * one". That was a workaround for the walk above moving the ambient
-    * selection and leaving it on whatever link it stopped at. It reads each
-    * link by name now, so it never moves the selection and there is no
+   /* NOTHING TO PUT BACK. A walk that moved an ambient selection would have
+    * to end by "leaving the driver on a link that actually exists", because
+    * the caller's stall watchdog and build_model() both read the session
+    * straight after this and an unused link reports an empty one. This reads
+    * each link by name, so it never moves a selection and there is no
     * "leave it somewhere sensible" to get right. */
    flight_leave(&g_reconcile_flight);
 }

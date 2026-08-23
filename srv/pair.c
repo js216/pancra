@@ -3,7 +3,7 @@
  * Copyright 2026 Jakob Kastelic
  *
  * EC-J-PAKE over P-256: the same construction and the same 160-byte round
- * packets a Dexcom G7 pairs with, with a 6-digit code instead of 4. The code
+ * packets a Dexcom G7 pairs with, with a 6-digit code rather than 4. The code
  * never goes on the wire, and the protocol's whole point is that a wrong
  * guess yields nothing an attacker can test offline -- so the ONLY way to
  * search the code space is to keep asking this server, and this server allows
@@ -29,7 +29,7 @@
  * purpose.
  */
 #include "pair.h"
-#include "auth.h"
+#include "authuser.h"
 #include "ct.h"
 #include "db.h"
 #include "hmac.h"
@@ -47,7 +47,7 @@
 
 static struct {
    char sess[33];
-   long uid;
+   int64_t uid;
    struct jpake *p;
    double started;
    int round;       /* rounds completed so far */
@@ -65,12 +65,27 @@ static struct {
  * but an email address. Round 1 refuses instead; see pair_in_flight. */
 static pthread_mutex_t pair_mu = PTHREAD_MUTEX_INITIALIZER;
 
-void pair_lock(void)
+/* ---- THE SERIALISATION IS THIS MODULE'S, NOT ITS CALLERS' ----
+ *
+ * These were a lock/unlock PAIR exported from pair.h, and every caller had
+ * to bracket its own call. That is a rule written in a header and
+ * enforced nowhere, and it had already been broken once: the settings page's
+ * Unpair handler called pair_unpair() without the lock, and pair_unpair
+ * reaches pair_reset(), which jpake_free()s the in-flight exchange -- a
+ * use-after-free on a live crypto context while another worker was mid-round.
+ * Clicking Unpair on the website while a phone was pairing was the whole
+ * reproduction.
+ *
+ * A shared object whose lock is the CALLER's responsibility has one failure
+ * mode and it is that one. So the lock is private now: every entry point in
+ * this file that touches `cur` takes it itself, and there is nothing in
+ * pair.h to forget. */
+static void pair_hold(void)
 {
    pthread_mutex_lock(&pair_mu);
 }
 
-void pair_unlock(void)
+static void pair_release(void)
 {
    pthread_mutex_unlock(&pair_mu);
 }
@@ -144,17 +159,17 @@ static int pair_in_flight(void)
  *
  * "Established" is a precise point and the round-1 handler states it in full:
  * after the peer's packet has passed its zero-knowledge proof, and never
- * before. It used to be "on arrival", which charged the owner for a stranger's
- * 320 zeros -- see the rule written out in h_pair. */
+ * before. Charged "on arrival" instead, the owner pays for a stranger's 320
+ * zeros -- see the rule written out in h_pair. */
 /* 1 when the try was CHARGED and the budget enforced; 0 when the database
  * would not do it.
  *
  * This is the only thing standing between a 6-digit secret and an exhaustive
- * search, and it used to be `void`: both statements had their results
- * dropped, so a database that could not prepare or step simply did not count
- * the attempt -- and the exchange went ahead anyway. A guesser who could keep
- * the database busy, or who found it wedged, had an unlimited budget against
- * a million-value code. The caller refuses the round instead. */
+ * search, and it is not `void`: with both statements' results dropped, a
+ * database that cannot prepare or step simply does not count the attempt --
+ * and the exchange goes ahead anyway. A guesser who can keep the database
+ * busy, or who finds it wedged, has an unlimited budget against a
+ * million-value code. The caller refuses the round instead. */
 /* THE INCREMENT AND THE BURN ARE ONE TRANSACTION.
  *
  * They were two statements with two results, and the failure between them is
@@ -168,7 +183,7 @@ static int pair_in_flight(void)
  * Inside BEGIN IMMEDIATE both land or neither does. IMMEDIATE, not deferred:
  * the write lock is taken up front, so two rounds for one user cannot both
  * read `tries` and both write it. */
-static int pair_charge(struct db *d, long uid)
+static int pair_charge(struct db *d, int64_t uid)
 {
    if (!db_exec(d, "BEGIN IMMEDIATE;"))
       return 0;
@@ -215,7 +230,7 @@ static int pair_charge(struct db *d, long uid)
    return 1;
 }
 
-int pair_code_new(struct db *d, long uid, char *out, size_t cap)
+int pair_code_new(struct db *d, int64_t uid, char *out, size_t cap)
 {
    /* Uniform over 000000..999999. Rejection sampling rather than a modulo of
     * a random byte string, which would make the low codes fractionally more
@@ -237,7 +252,7 @@ int pair_code_new(struct db *d, long uid, char *out, size_t cap)
       return 0;
    sqlite3_bind_int64(st, 1, uid);
    sqlite3_bind_text(st, 2, out, -1, SQLITE_STATIC);
-   sqlite3_bind_int64(st, 3, (long)time(NULL) + PAIR_CODE_TTL);
+   sqlite3_bind_int64(st, 3, (int64_t)time(NULL) + PAIR_CODE_TTL);
    int ok = sqlite3_step(st) == SQLITE_DONE;
    sqlite3_finalize(st);
    return ok;
@@ -246,13 +261,19 @@ int pair_code_new(struct db *d, long uid, char *out, size_t cap)
 /* 1 when the app key is GONE from the database.
  *
  * "Unpair" is a revocation: the phone's key stops being accepted. Reported
- * as done while the DELETE failed, the settings page said the app was
- * unpaired and the old key went on signing requests -- which is the whole
+ * as done while the DELETE failed, the settings page says the app is
+ * unpaired and the stored key goes on signing requests -- which is the whole
  * of what unpairing is for. The in-memory exchange is still reset either
  * way; that part cannot fail, and leaving a half-finished pairing running
  * after the user asked to stop would be worse. */
-int pair_unpair(struct db *d, long uid)
+int pair_unpair(struct db *d, int64_t uid)
 {
+   /* THE LOCK IS TAKEN HERE, not by the caller: a handler that forgets it
+    * leaves this function's pair_reset() jpake_free()ing an exchange another
+    * worker is in the middle of. The delete itself needs no lock; what does
+    * is the reset below,
+    * which is why it cannot be left to whoever calls this next. */
+   pair_hold();
    sqlite3_stmt *st = db_prep(d, "DELETE FROM app WHERE user_id=?");
    int ok           = 0;
    if (st) {
@@ -262,10 +283,11 @@ int pair_unpair(struct db *d, long uid)
    }
    if (cur.uid == uid)
       pair_reset();
+   pair_release();
    return ok;
 }
 
-int pair_is_paired(struct db *d, long uid)
+int pair_is_paired(struct db *d, int64_t uid)
 {
    switch (db_get_long(d, "SELECT 1 FROM app WHERE user_id=?", uid, NULL)) {
       case DB_GET_VALUE: return 1;
@@ -277,7 +299,7 @@ int pair_is_paired(struct db *d, long uid)
 
 /* The live code for a user, or 0 if there is none, it expired, or its try
  * budget is spent. */
-static int pair_code_for(struct db *d, long uid, char *code, size_t cap)
+static int pair_code_for(struct db *d, int64_t uid, char *code, size_t cap)
 {
    sqlite3_stmt *st =
        db_prep(d, "SELECT code,expires_at,tries FROM pairing WHERE user_id=?");
@@ -287,9 +309,9 @@ static int pair_code_for(struct db *d, long uid, char *code, size_t cap)
    int ok = 0;
    if (sqlite3_step(st) == SQLITE_ROW) {
       const char *c = (const char *)sqlite3_column_text(st, 0);
-      long exp      = (long)sqlite3_column_int64(st, 1);
+      int64_t exp   = (int64_t)sqlite3_column_int64(st, 1);
       int tries     = sqlite3_column_int(st, 2);
-      if (c && exp > (long)time(NULL) && tries < PAIR_TRIES) {
+      if (c && exp > (int64_t)time(NULL) && tries < PAIR_TRIES) {
          snprintf(code, cap, "%s", c);
          ok = 1;
       }
@@ -298,13 +320,13 @@ static int pair_code_for(struct db *d, long uid, char *code, size_t cap)
    return ok;
 }
 
+/* THE CONSTRUCTION IS lib/pairtag.h's. This wrapper is what is
+ * left of confirm_mac: the key length this protocol uses, and a refusal that
+ * leaves `out` empty -- which no tag equals, so a failure to build one cannot
+ * become an accidental match. */
 static void confirm_mac(const uint8_t key[16], const char *label, char *out)
 {
-   uint8_t mac[32];
-   hmac_sha256(key, 16, (const uint8_t *)label, strlen(label), mac);
-   char hex[65];
-   hex_of(mac, 32, hex);
-   snprintf(out, CONFIRM_HEX + 1, "%.*s", CONFIRM_HEX, hex);
+   (void)pair_tag(key, 16, label, out, CONFIRM_HEX + 1);
 }
 
 /* Split "<first line>\n<hex packet>[\n<confirm>]". */
@@ -348,6 +370,8 @@ static int split_body(const struct req *r, char *first, size_t fcap,
 
 static void h_pair_confirm(struct req *r, const char *sent);
 
+static void h_pair_locked(struct req *r, int round);
+
 void h_pair(struct req *r, int round)
 {
    /* POST ONLY, and route_api has already refused everything else before it
@@ -355,13 +379,25 @@ void h_pair(struct req *r, int round)
     * trusted: this is the one handler that runs with no authentication at all,
     * and a route_allow mask is a declaration a future caller could forget to
     * enforce. The set comes from route_allow so the two cannot disagree, and
-    * the refusal carries the `Allow` header a 405 owes (RFC 9110 9.5.5) --
-    * this used to answer with the word "POST" in the BODY, which no client
-    * parses. */
+    * the refusal carries the `Allow` header a 405 owes (RFC 9110 9.5.5),
+    * rather than the word "POST" in the BODY, which no client parses. */
    if (!(http_method_bit(r->method) & route_allow(RT_PAIR))) {
       http_method_not_allowed(r->c, route_allow(RT_PAIR));
       return;
    }
+   /* ONE EXCHANGE AT A TIME, AND THIS FUNCTION IS WHERE THAT IS ENFORCED
+    *. The lock is private to this function, so there is nothing for a route
+    * to forget. Taken AFTER the
+    * method check, deliberately: a stranger sending GET /v1/pair/1 in a loop
+    * must not serialise every real pairing round behind requests that are
+    * going to be refused. */
+   pair_hold();
+   h_pair_locked(r, round);
+   pair_release();
+}
+
+static void h_pair_locked(struct req *r, int round)
+{
    char first[128], confirm[CONFIRM_HEX + 1];
    uint8_t pkt[PAIR_PKT], out[PAIR_PKT];
    if (round == 4) {
@@ -408,25 +444,25 @@ void h_pair(struct req *r, int round)
        * holder's business card. So nothing this request says about itself may
        * be allowed to interfere with an exchange that is already running.
        *
-       * WHAT THIS USED TO DO. The test was `pair_live() && cur.uid != uid` --
-       * a live exchange belonging to ANOTHER user was protected, and a live
-       * exchange belonging to the named user was then destroyed by the
+       * WHAT A NARROWER TEST COSTS. Under `pair_live() && cur.uid != uid`
+       * only an exchange belonging to ANOTHER user is protected; a live
+       * exchange belonging to the named user is destroyed by the
        * unconditional `pair_reset()` on the next line, before one byte of the
-       * request had been checked against anything. Worse, the try was charged
-       * a few lines further down, still before the peer's packet was
-       * validated. Both together handed a stranger who knew nothing but the
-       * address this:
+       * request has been checked against anything. Charge the try a few lines
+       * further down, still before the peer's packet is validated, and the
+       * two together hand a stranger who knows nothing but the address
+       * this:
        *
        *   POST /v1/pair/1   "jk@example.com\n" + 320 zeros
        *
-       * which aborted whatever the owner's phone was in the middle of AND
-       * spent one of the three tries the six-digit code is protected by.
-       * Three of those -- three requests, no secrets, no crypto -- burned the
-       * code. The owner saw their phone fail to pair, minted a new code, and
-       * had it burned again. There is no number of retries that wins that,
+       * which aborts whatever the owner's phone is in the middle of AND
+       * spends one of the three tries the six-digit code is protected by.
+       * Three of those -- three requests, no secrets, no crypto -- burn the
+       * code. The owner sees their phone fail to pair, mints a new code, and
+       * has it burned again. There is no number of retries that wins that,
        * because the attacker's cost per code is three HTTP requests.
        *
-       * THE RULE NOW: an exchange the peer is still mid-conversation with is
+       * THE RULE: an exchange the peer is still mid-conversation with is
        * refused a replacement, whoever asks, until it expires. See
        * pair_in_flight for where "still mid-conversation" ends and for the
        * one race that remains.
@@ -486,7 +522,7 @@ void h_pair(struct req *r, int round)
        * alone. Discarding it was the only way the two could not be told
        * apart. */
       int pfailed = 0;
-      long uid    = email_canon(first, cemail, sizeof cemail)
+      int64_t uid = email_canon(first, cemail, sizeof cemail)
                         ? user_by_email(r->db, cemail, &pfailed)
                         : 0;
       if (pfailed)
@@ -544,7 +580,11 @@ void h_pair(struct req *r, int round)
       cur.uid     = uid;
       cur.started = http_mono_s();
       cur.round   = 0;
-      rnd_hex(cur.sess, 32);
+      if (!rnd_hex(cur.sess, sizeof cur.sess, 32)) {
+         pair_reset();
+         oops(r);
+         return;
+      }
       if (!pair_charge(r->db, uid)) {
          pair_reset();
          oops(r);
@@ -611,7 +651,7 @@ void h_pair(struct req *r, int round)
  * wrong code and fail later as unexplained signature errors. */
 static void h_pair_confirm(struct req *r, const char *sent)
 {
-   long uid = cur.uid;
+   int64_t uid = cur.uid;
    char want[CONFIRM_HEX + 1];
    confirm_mac(cur.key, CONFIRM_LABEL_CLIENT, want);
    if (strlen(sent) != CONFIRM_HEX || !ct_eq(want, sent, CONFIRM_HEX)) {
@@ -634,7 +674,7 @@ static void h_pair_confirm(struct req *r, const char *sent)
       oops(r);
       return;
    }
-   long now = (long)time(NULL);
+   int64_t now = (int64_t)time(NULL);
    sqlite3_bind_int64(st, 1, uid);
    sqlite3_bind_blob(st, 2, cur.key, 16, SQLITE_STATIC);
    sqlite3_bind_int64(st, 3, now);
@@ -669,7 +709,7 @@ static void h_pair_confirm(struct req *r, const char *sent)
       return;
    }
    char msg[32];
-   snprintf(msg, sizeof msg, "%ld\n", uid);
+   snprintf(msg, sizeof msg, "%" PRIwire "\n", uid);
    http_text(r->c, 200, "OK", msg);
    pair_reset();
 }

@@ -28,22 +28,11 @@
  * an empty plot from an intact log. */
 #define STORE_TAIL 262144
 
-/* One reading in the display history.
- *
- * glu/trend are narrowed to 16 bits so `src` and `kind` fit in what was
- * padding: the struct stays 16 bytes, so g_hist costs exactly what it always
- * did (2100 x 16 B) despite carrying full attribution. Glucose fits in mg/dL
- * and trend10 in tenths-per-minute with room to spare. */
-struct reading {
-   short glu, trend;
-   /* Sensor id (see sensors.h); 0 = pre-registry legacy. 16 bits, NOT 8: ids
-    * are minted for every session and firmware change and never reused, so an
-    * 8-bit field wraps after 255 -- and a wrapped id aliases a real one, which
-    * would silently reattribute readings to the wrong physical device. */
-   unsigned short src;
-   unsigned char kind; /* KIND_CGM / KIND_BGM -- decides how it is plotted */
-   long t;             /* canonical UTC epoch seconds */
-};
+/* `struct reading` -- the record this history is made of. Its own header so
+ * that a caller wanting only the LAYOUT does not take a dependency on the
+ * whole store; see readingrec.h for what that cost. */
+#include "readingrec.h"
+#include "sensors.h" /* enum sensor_kind: a reading is a CGM sample or a stick */
 
 /* THE HISTORY IS PRIVATE. It was `extern struct reading g_hist[NHIST]` and a
  * count, which made every reader depend on the representation (an array, this
@@ -60,16 +49,52 @@ struct reading {
  * that. hist_copy is the exception -- it takes the lock itself, because one
  * call IS the whole walk. */
 
-/* How many readings the in-memory tail holds. Caller holds hist_lock for a
- * value it is about to walk with. */
+/* ---- ASK A QUESTION; DO NOT WALK THE TABLE ----------------
+ *
+ * hist_count() and hist_at() are a COUNT and an INDEXED READ: two calls about
+ * a table another thread can change between them, and their coherence was
+ * every caller's problem, solved by exporting the lock and asking each of
+ * them to hold it. Four modules then open-coded the same three walks -- "the
+ * newest reading from this sensor", "the oldest one", "this sensor's samples"
+ * -- each with its own copy of the `kind != KIND_BGM` rule, and one of them
+ * (model.c) deliberately holds no lock at all because the frame path already
+ * has it. That is four chances to forget the lock and four copies of one
+ * semantic rule.
+ *
+ * These are the questions the callers were really asking. Each takes the lock
+ * ITSELF and answers from ONE instant, and none of them can be got wrong by
+ * forgetting to hold something.
+ *
+ * CGM READINGS ONLY, in all three: a fingerstick (KIND_BGM) is a different
+ * measurement with a different provenance, and every one of the open-coded
+ * walks excluded it -- separately, in four places. */
+
+/* The instant of the newest CGM reading from `src`, or 0 if it has none. */
+long hist_newest_t(int src);
+/* ...and of the oldest one held in the tail, or 0. NOT the oldest in the LOG:
+ * this is the in-memory tail, which is a display window. */
+long hist_oldest_t(int src);
+/* Copy up to `cap` of `src`'s CGM readings, NEWEST FIRST; returns how many. */
+int hist_copy_src(int src, struct reading *out, int cap);
+
+/* HOW MANY THE TAIL HOLDS, as a number to SAY rather than to walk with: the
+ * startup log line reports it, and nothing indexes anything with it. Takes
+ * the lock itself, so it is not the count half of a count/index pair. */
+int hist_in_memory(void);
+
+/* How many readings the in-memory tail holds.
+ *
+ * ALREADY-LOCKED TRAVERSAL, and the only caller that may use it is one that
+ * already holds the lock for another reason -- the frame builder, which runs
+ * inside draw()'s hold (see the note in model.c's build_model). Everything
+ * else asks one of the questions above; `make -f test/Makefile lockcheck`
+ * refuses this pair anywhere else. */
 int hist_count(void);
-/* The i-th, NEWEST first; out of range yields a zeroed reading. */
+/* The i-th, NEWEST first; out of range yields a zeroed reading. Same rule as
+ * hist_count. */
 struct reading hist_at(int i);
 /* Copy up to `cap`, newest first, under the lock; returns how many. */
 int hist_copy(struct reading *out, int cap);
-/* Forget the in-memory tail (a reload rebuilds it from the file). Does not
- * touch the log. */
-void hist_clear(void);
 
 /* How many readings have been APPENDED this run (what the settings screen
  * reports as "stored"). Distinct from store_count(), which counts the rows in
@@ -79,9 +104,15 @@ int store_appended(void);
 /* THE CRASH HANDLER'S TWO POINTERS, and nothing else's. It runs on a signal
  * stack: it may not lock, allocate, or call into the modules it is
  * describing, so it holds these addresses from startup and reads them
- * directly. A torn read in a crash report is better than no context. */
-const int *store_glu_ptr(void);
-const int *hist_count_ptr(void);
+ * directly.
+ *
+ * ATOMIC, so that reading them there is defined rather than merely likely to
+ * work: they are written by the binder thread that ingests a reading and read
+ * from a handler that can interrupt it mid-instruction. Both are dedicated
+ * MIRRORS published at each mutation -- the live values stay plain ints, so
+ * the ingest path pays nothing for a diagnostic. See crashlog.h. */
+const _Atomic int *store_glu_ptr(void);
+const _Atomic int *hist_count_ptr(void);
 /* The reading log's path, for the code that must NAME the file: the sync
  * client registers it, the long-span plot re-reads it, and the log line at
  * startup says where it is. Read-only -- it is set once, by store_paths. */
@@ -105,7 +136,38 @@ int store_paths(const char *dir);
  * path had skipped. The stats ring spans ~91 days against g_hist's ~7, so a
  * reading off the end of the DISPLAY window is still inside the STATISTICS
  * window and belongs in them. */
-enum { HIST_DUP = 0, HIST_NEW = 1, HIST_OLD = 2 };
+/* ---- AND IT IS A TYPE, NOT AN INT --------------------------
+ *
+ * Three outcomes, and the two that are NOT "duplicate" mean different things
+ * to different callers: one wants "did this reach the record" (both), another
+ * wants "is this the newest thing on the screen" (only HIST_NEW). As a bare
+ * int, callers wrote `int isnew = r.inserted;` and then used it as a boolean
+ * -- which reads as "new" and answers "not duplicate", so HIST_OLD (a
+ * backfilled reading older than the display window) took every path meant for
+ * a fresh sample: the big number, the alarm, the new-datapoint chirp.
+ *
+ * So the enum is named, the field carries the type, and the two questions
+ * have their own predicates. `hist_kept` is "it reached the record";
+ * `hist_is_tail` is "it is the newest sample on this screen". Neither is
+ * spelled as a truth value, because the two are not the same truth. */
+enum hist_insert_result { HIST_DUP = 0, HIST_NEW = 1, HIST_OLD = 2 };
+
+/* DID IT REACH THE RECORD? True for HIST_NEW and HIST_OLD alike: the log and
+ * the statistics take both, and gating them on HIST_NEW is what once made the
+ * live numbers and the post-restart numbers disagree about one file. */
+static inline int hist_kept(enum hist_insert_result r)
+{
+   return r != HIST_DUP;
+}
+
+/* IS IT THE NEWEST SAMPLE THE SCREEN HOLDS? Only HIST_NEW. Everything that
+ * describes "now" -- the big number, the trend, the alarm evaluation, the
+ * new-datapoint sound -- asks THIS, because a backfilled reading from last
+ * Tuesday is a fact worth keeping and not a thing that just happened. */
+static inline int hist_is_tail(enum hist_insert_result r)
+{
+   return r == HIST_NEW;
+}
 
 /* Insert a reading (out-of-order safe for backfill); see the enum above.
  *
@@ -113,7 +175,8 @@ enum { HIST_DUP = 0, HIST_NEW = 1, HIST_OLD = 2 };
  * and a global time window would let one silently overwrite the other. A BGM
  * fingerstick never dedups against a CGM sample either -- a meter reading in
  * the same minute is precisely the divergence worth seeing. */
-int hist_insert(long t, int glu, int trend, int src, int kind);
+enum hist_insert_result hist_insert(long t, int glu, int trend, int src,
+                                    int kind);
 /* Glucose of the newest CGM sample from `src` in [not_before, t) -- strictly
  * older than `t`, and no older than `not_before` -- or -1 if that source has
  * none in the window.
@@ -137,7 +200,8 @@ int hist_prev_glu(long t, int src, long not_before);
  * restart, and then gone -- which is the one failure the log exists to
  * prevent. app/insulin.c's ins_write_row has always been checked this way. */
 int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
-                 long raw, long tz, int kind, int rescale_pm);
+                 long raw, long tz, int kind, int rescale_pm,
+                 enum warm_state warm);
 /* Recompute g_cur_* from the newest CGM sample in g_hist. With a primary
  * configured (`prime` >= 0), ONLY the primary's samples qualify: a primary
  * with no data yet clears the current reading (glu -1 = none) rather than
@@ -190,7 +254,6 @@ struct reading_rssi {
    int dbm;
    int ok;
 };
-struct reading_rssi store_rssi(void);
 /* ...for a caller already holding the store lock. */
 struct reading_rssi store_rssi_locked(void);
 /* Record one, from the reading path. */
@@ -224,8 +287,12 @@ struct reading_event {
    int glu;   /* mg/dL, ALREADY rescaled */
    int trend; /* tenths of mg/dL per minute; 127 = unknown */
    int src;   /* provenance id of the device that made it */
-   int kind;  /* KIND_CGM / KIND_BGM */
-   int rssi;  /* link RSSI, meaningful only when has_rssi */
+   /* THE ENUM. A reading's kind decides whether it dedups
+    * against a CGM sample, whether it ends a streak, and how it is drawn --
+    * three rules that all read this field, and none of which wants an
+    * arbitrary integer. */
+   enum sensor_kind kind;
+   int rssi; /* link RSSI, meaningful only when has_rssi */
    int has_rssi;
    long raw;       /* the sensor's own uncorrected time */
    long tz;        /* the offset assumed when converting it */
@@ -235,6 +302,16 @@ struct reading_event {
     * counted in the statistics when they were first seen -- feeding them
     * again double-counts a day of a person's time in range. */
    int warm;
+   /* WHAT THE SENSOR SAID ABOUT ITS OWN WARM-UP, stored with the
+    * row so a replay is not left inferring it from an activation that may
+    * never have been learned. `warm` above is the DECISION -- whether this
+    * reading feeds the statistics -- and it is made from this by warm_decide;
+    * this is the EVIDENCE, and it is what goes in the log. */
+   enum warm_state wstate;
+   /* Whether that decision rests on the inference rather than on a
+    * measurement, so the coverage figures can say how much of a window does
+    * (see struct stat_cov). */
+   int warm_unsure;
    /* The primary source id, resolved by the caller UNDER THE REGISTRY LOCK
     * before calling. -1 when no CGM is registered. It is a parameter and not
     * a lookup for the lock-order reason in hist_refresh_current's comment. */
@@ -243,7 +320,10 @@ struct reading_event {
 
 /* What recording it did. */
 struct reading_result {
-   int inserted;  /* HIST_DUP / HIST_NEW / HIST_OLD */
+   /* WHAT HAPPENED TO IT. Ask hist_kept() for "did it reach the
+    * record" and hist_is_tail() for "is it the newest on screen"; the two
+    * are different questions and were the same `int` until they were not. */
+   enum hist_insert_result inserted;
    int persisted; /* 1 = the row reached the disk. CHECK IT. */
    /* This source's previous glucose within CHIRP_MAX_GAP_S, captured before
     * the insert (afterwards the newest sample from src IS this one), or -1.
@@ -260,9 +340,9 @@ struct reading_result store_record(const struct reading_event *ev, long gap);
 
 /* THE HISTORY LOCK, which lives here because the history does.
  *
- * It used to be a flag in the shell called g_draw_busy, taken by name at fifty
- * call sites in a different translation unit from the array it protects. A
- * lock that lives away from its data is a lock somebody forgets to take. */
+ * NOT a flag in the shell taken by name at fifty call sites in a different
+ * translation unit from the array it protects: a lock that lives away from
+ * its data is a lock somebody forgets to take. */
 void store_lock(void);
 void store_unlock(void);
 int store_trylock(void);
@@ -286,10 +366,10 @@ int store_drain(int ms);
  * complete one.
  *
  * `prime` is the PRIMARY SENSOR'S ID, resolved by the caller BEFORE it takes
- * the history lock. This function used to call sensor_primary_id() itself, at
- * the end, with the history lock held -- registry inside history, the inverse
- * of the documented registry -> history order, and one binder thread away
- * from a freeze. The lock order is a property of the CALL SITE, so the id is
+ * the history lock. Calling sensor_primary_id() here, at the end, with the
+ * history lock held would be registry inside history -- the inverse of the
+ * documented registry -> history order, and one binder thread away from a
+ * freeze. The lock order is a property of the CALL SITE, so the id is
  * an argument. -1 means "no primary". */
 int store_load(int prime);
 /* Count the rows currently in the log (one pass). */

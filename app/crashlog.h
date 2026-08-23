@@ -46,37 +46,76 @@ struct crash_ctx {
     * every target this builds for, and is async-signal-safe. */
    const char *_Atomic *where; /* -> the last checkpoint label */
 
-   /* THE REST STAY VOLATILE, deliberately, and this is the argument.
+   /* AND SO ARE THE SCALARS, for the same reason and not a weaker one.
     *
-    * They are pointers into ordinary storage the app already owns -- a char
-    * array and three plain ints -- and what the handler needs from them is
-    * that the compiler re-read them at the moment of the crash instead of
-    * using a value it cached earlier. That is exactly what volatile is for,
-    * and it is what the rest of the world calls this idiom.
+    * Every one of these is written by a thread other than the one that
+    * crashes -- glucose and the sample count by a binder thread under the
+    * history lock, the screen by the main looper -- and read HERE, from a
+    * handler that can interrupt any of them mid-instruction and may not take
+    * a lock to do it. `volatile` says only that the compiler must re-read the
+    * object; it makes no promise about indivisibility, it is not a
+    * synchronisation primitive in C11's memory model, and a program whose
+    * threads share a plain `int` has undefined behaviour whatever the
+    * hardware would have done with it.
     *
-    * The checkpoint is different in kind, not degree: it is a pointer that is
-    * REPOINTED, so a stale or torn read there is a wild pointer the handler
-    * then walks. An int read one microsecond out of date is a slightly wrong
-    * number in a diagnostic line, which is the worst these can do.
+    * "An aligned int cannot tear on this target" is an argument about a
+    * machine, made in a file whose whole subject is what to trust when the
+    * program has already gone wrong. A relaxed atomic load costs exactly the
+    * same instruction on every target this builds for, is async-signal-safe
+    * (C11 7.14.1.1: a handler may access a lock-free atomic), and needs no
+    * such argument -- so the values are published as atomics by their owners
+    * and read as atomics here.
     *
-    * (`glu` and `nhist` are written by binder threads under the history lock,
-    * so they are cross-thread state -- but an aligned int on this target
-    * cannot tear, the handler cannot take a lock, and a crash report is not
-    * somewhere to trade a guaranteed line for a stricter one.) */
-   const volatile char *status; /* the status line on screen */
-   const volatile int *glu;     /* current glucose, or -1 */
-   const volatile int *menu;    /* which screen was up */
-   const volatile int *nhist;   /* how many samples were held */
+    * RELAXED IS THE RIGHT ORDER. Nothing is being ordered against these: the
+    * handler wants each number as a number, not as a signal that something
+    * else has happened. What it must not get is a value the compiler cached
+    * three functions ago, or half of one. */
+   const _Atomic char *status; /* the status line on screen */
+   const _Atomic int *glu;     /* current glucose, or -1 */
+   const _Atomic int *menu;    /* which screen was up */
+   const _Atomic int *nhist;   /* how many samples were held */
 };
 
+/* ---- WHAT WAS ACTUALLY INSTALLED ---------------------------
+ *
+ * crash_install was void and dropped every signal() result, so startup could
+ * announce crash reporting with none of it in place -- and the failure that
+ * produces is invisible by construction: the app dies, there is no
+ * crash.log, and nothing says the handler was never there.
+ *
+ * One bit per signal, in the order crash_sig_of names them. `installed` and
+ * `failed` are separate rather than one mask and its complement so that a
+ * caller can tell "not asked for" from "asked for and refused" if the list
+ * ever grows.
+ *
+ * A PARTIAL INSTALL IS KEPT. A handler that is in place writes a report for
+ * its own signal; removing it because another could not be installed trades
+ * a partial diagnostic for none. The caller reports what is missing. */
+struct crash_install_result {
+   unsigned installed; /* bit k set: CRASH signal k is covered */
+   unsigned failed;    /* bit k set: the kernel refused it */
+};
+
+/* The signal number bit `k` stands for, or 0 past the end -- so a caller can
+ * name what is missing without keeping its own copy of the list. */
+int crash_sig_of(unsigned bit);
+
 /* Point the handler at `dir`/crash.log and install it for the fatal signals.
- * `ctx` must outlive the process -- pass the address of file-scope state. */
-void crash_install(const char *dir, const struct crash_ctx *ctx);
+ * `ctx` must outlive the process -- pass the address of file-scope state.
+ * The context and the path are published BEFORE the first registration: a
+ * signal arriving between two of them must find both. */
+struct crash_install_result crash_install(const char *dir,
+                                          const struct crash_ctx *ctx);
 
 /* The two pure formatters, exposed so they can be tested. Append to b[*pos],
  * never past cap. crash_puts stops at max characters of s. */
 void crash_putn(char *b, int cap, int *pos, long v);
 void crash_puts(char *b, int cap, int *pos, const volatile char *s, int max);
+/* The same, for a string whose BYTES are atomic -- the status line, which is
+ * written by one thread and read by the handler (see struct crash_ctx). Each
+ * character is one relaxed load. */
+void crash_puts_atomic(char *b, int cap, int *pos, const _Atomic char *s,
+                       int max);
 
 /* Build the whole line the handler writes, into b (never past cap); returns
  * its length. Split out of the handler so a test can hold a crash_ctx, move

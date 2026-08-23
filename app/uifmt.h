@@ -56,13 +56,13 @@
  * draws all three at once. The count must be the WORST case the renderer can
  * produce, not the common one -- being pessimistic costs a little font size on
  * a crowded screen, while being optimistic costs the ADD button entirely, with
- * no scrolling to recover it. (This budget used to cover render_settings, which
- * carried the list inline; the list now has its own screen, so the four
- * submenu rows and EXPORT DATA are no longer part of it.)
+ * no scrolling to recover it. (It covers render_devices alone: the device
+ * list has its own screen, so render_settings' four submenu rows and EXPORT
+ * DATA are no part of it.)
  *
- * Exported deliberately. It used to be private to the renderer while
- * test/uitest.c carried its own literal for the same quantity, so the two could
- * drift apart silently -- and adding rows to render_devices without bumping
+ * Exported deliberately. Private to the renderer, with test/uitest.c carrying
+ * its own literal for the same quantity, the two drift apart silently -- and
+ * adding rows to render_devices without bumping
  * this is exactly the mistake that leaves device rows and their tap targets
  * below the bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
@@ -117,7 +117,7 @@ extern const char ui_label_chars[];
  * cells and the input path accepts exactly this many digits, so the two
  * cannot drift into disagreeing about how long an entry may be. */
 /* (Keypad modes moved to keypad.h, where each one is described ONCE -- title,
- * digit slots, unit suffix, decimal point, threshold -- instead of being a
+ * digit slots, unit suffix, decimal point, threshold -- rather than being a
  * bare integer with a table in the renderer and a range in the shell. The two
  * tables this bound have become one, and the ranges have become names.) */
 

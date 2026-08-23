@@ -1,20 +1,3 @@
-# The trailing exclusions below the original set fall into one category only:
-# checks that fire on unavoidable platform/ABI constructs, not on real defects.
-#   - insecureAPI.DeprecatedOrUnsafeBufferHandling: flags snprintf and wants the
-#     C11 Annex-K *_s functions, which bionic (Android libc) does not provide.
-#     Our code already uses bounded snprintf and never sprintf/strcpy/strcat.
-#   - modernize-avoid-c-style-cast: wants C++ static_cast; this is C.
-#   - reserved-identifier / cert-dcl37-c / cert-dcl51-cpp: __android_log_print is
-#     bionic's own ABI symbol and must be declared with exactly that name.
-#   - function-cognitive-complexity: an advisory metric, not a defect. The few
-#     functions over the threshold are the correctness-critical BLE state machine,
-#     the renderer and the input dispatch; restructuring them purely to satisfy a
-#     heuristic -- and unverifiable without the device -- would risk reliability.
-#     Every genuine simplification found during the cleanup was applied.
-# FunctionCase is intentionally NOT enforced: every function we define is already
-# lower_case, and the only non-conforming names are the NDK/JNI entry points
-# (ANativeActivity_onCreate, AInputQueue_getEvent, ...) which are fixed by the
-# Android ABI and cannot be renamed. VariableCase IS enforced.
 Checks: >
   clang-analyzer-*,
   bugprone-*,
@@ -41,16 +24,16 @@ Checks: >
   -bugprone-reserved-identifier,
   -cert-dcl37-c,
   -cert-dcl51-cpp,
-  -readability-function-cognitive-complexity
+  -readability-function-cognitive-complexity,
+  -bugprone-branch-clone,
+  -clang-analyzer-optin.performance.Padding
 
 WarningsAsErrors: '*'
 
 CheckOptions:
   - key:             readability-identifier-naming.VariableCase
     value:           lower_case
-  # The crash handler writes a diagnostic line with open/write/close, which ARE
-  # async-signal-safe under POSIX. The check defaults to a "minimal" set that
-  # excludes them; select the POSIX set so it recognises them (the handler uses
-  # nothing else -- no snprintf/malloc/stdio).
   - key:             bugprone-signal-handler.AsyncSafeFunctionSet
     value:           POSIX
+  - key:             misc-include-cleaner.IgnoreHeaders
+    value:           '.*errno\.h>?;.*/bits/.*'

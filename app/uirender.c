@@ -42,7 +42,7 @@
  * drawing decision ever reads.
  *
  * It is not logic, it is an instrument: written by the primitives, read only
- * by app/test/uitest.c, reset per screen. Nothing branches on it, so it cannot
+ * by test/app/uitest.c, reset per screen. Nothing branches on it, so it cannot
  * make one render depend on a previous one -- which is the property the purity
  * argument is actually there to protect. */
 static long g_clipped;
@@ -50,16 +50,6 @@ static long g_clipped;
 void ui_clip_bump(long n)
 {
    g_clipped += n;
-}
-
-void ui_clip_reset(void)
-{
-   g_clipped = 0;
-}
-
-long ui_clipped(void)
-{
-   return g_clipped;
 }
 
 /* 720h = 30D on the right. 6H went: it sat between 3H and 12H without showing
@@ -71,7 +61,7 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    h->n        = 0;
    h->overflow = 0;
-   /* TRUE black, zero photons on an OLED -- not the old 0xFF181818 wash. */
+   /* TRUE black: zero photons on an OLED, rather than a near-black wash. */
    clear_fb(fb, 0xFF000000);
    switch (m->scr) {
       case SCR_SETTINGS: render_settings(fb, m, h); break;
@@ -87,6 +77,7 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_METERHELP: render_meterhelp(fb, m, h); break;
       case SCR_FORGET: render_forget(fb, m, h); break;
       case SCR_RECONF: render_reconf(fb, m, h); break;
+      case SCR_PENDCANCEL: render_pendcancel(fb, m, h); break;
       case SCR_PAIRCONF: render_pairconf(fb, m, h); break;
       case SCR_SYNCRESTORE: render_syncrestore(fb, m, h); break;
       case SCR_ADDMENU: render_addmenu(fb, m, h); break;
@@ -109,7 +100,11 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_OLDDEV: render_olddev(fb, m, h); break;
       case SCR_LABEL: render_label(fb, m, h); break;
       case SCR_FOODTYPE: render_foodtype(fb, m, h); break;
+      case SCR_EXLOG: render_exlog(fb, m, h); break;
+      case SCR_EXEDIT: render_exedit(fb, m, h); break;
+      case SCR_EXDEL: render_exdel(fb, m, h); break;
       case SCR_FOODLOG: render_foodlog(fb, m, h); break;
+      case SCR_FOODDEL: render_fooddel(fb, m, h); break;
       case SCR_FOOD: render_food(fb, m, h); break;
       case SCR_MARKPICK:
       case SCR_COLORPICK: render_markpick(fb, m, h); break; /* combined menu */

@@ -5,11 +5,16 @@
 #ifndef PANCRA_SYNCJNI_H
 #define PANCRA_SYNCJNI_H
 
+#include "wireint.h" /* int64_t: a state stamp is a persisted quantity */
 #include <jni.h>
 
 /* Wire the transport to Ble.syncHttp and register which files sync. Called
  * once, from dexble_register, with the same Ble class. */
-void syncjni_wire(JNIEnv *e, jclass ble);
+/* Wire the sync transport: resolve com.jk.pancra.PancraNet through the
+ * activity's own classloader and bind the six methods native calls on it.
+ * `activity` is the NativeActivity object, which is what the classloader walk
+ * starts from (see jb_app_class). */
+void syncjni_wire(JNIEnv *e, jobject activity);
 /* Re-read the log paths (they are filled in after the data directory is
  * known, which is later than wiring). */
 void syncjni_register_logs(void);
@@ -22,7 +27,7 @@ void syncjni_register_logs(void);
 /* A number that changes when any synced file changes: the sum of their sizes.
  * The cheap answer to "is there anything to sync", asked before deciding to
  * ask the server the expensive version of the same question. */
-long syncjni_state_stamp(void);
+int64_t syncjni_state_stamp(void);
 
 /* Ask Java's worker to run a sync. Returns at once, and says whether the
  * request was ACCEPTED: 1 if Java has it, 0 if it was dropped.

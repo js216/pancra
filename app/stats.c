@@ -10,14 +10,16 @@
 #include "clock.h"
 #include "csvcur.h" /* the shared bounded CSV cursor; the schema stays here */
 #include "dexlibc.h"
-#include "ingest.h"  /* STORE_GLU_MIN/MAX: what a stored reading may be */
-#include "sensors.h" /* KIND_BGM / KIND_CGM: fingersticks are excluded */
-#include <stdio.h>   /* SEEK_SET / SEEK_END */
+#include "ingest.h"     /* STORE_GLU_MIN/MAX: what a stored reading may be */
+#include "loadresult.h" /* what a load actually found; see stat_load */
+#include "sensors.h"    /* KIND_BGM / KIND_CGM: fingersticks are excluded */
+#include <stdio.h>      /* SEEK_SET / SEEK_END */
 #include <stdlib.h>
 #include <string.h> /* memcpy: the chunked replay carries partial lines */
 
 struct hourbucket {
    int hour, count, in_range, sum;
+   int unsure; /* of `count`, how many were counted on an inference: item 309 */
 };
 static struct hourbucket
     g_hours[STAT_HOURS];   /* ring keyed by hour % STAT_HOURS */
@@ -33,7 +35,7 @@ static long g_stat_oldest; /* oldest reading time fed in */
  *
  * `oldest` travels with the ring because it is part of the same answer:
  * stat_window_at measures REPORTABILITY from it, so publishing a rebuilt ring
- * while keeping the old oldest would let a 90-day figure be reported off a
+ * while keeping a stale `oldest` would let a 90-day figure be reported off a
  * week of restored data. */
 struct stat_fill {
    struct hourbucket *ring;
@@ -47,7 +49,8 @@ struct stat_fill {
  * the boundaries -- and the boundaries are where the bug was: a reading older
  * than the ring ALIASES onto a live bucket and erases it. The public wrappers
  * below supply realtime_s(); the tests supply their own. */
-static void bucket_add(struct stat_fill *d, long t, int glu, long now)
+static void bucket_add(struct stat_fill *d, long t, int glu, int unsure,
+                       long now)
 {
    int hour = (int)(t / 3600);
    int nowh = (int)(now / 3600);
@@ -76,13 +79,12 @@ static void bucket_add(struct stat_fill *d, long t, int glu, long now)
     * The test is on t, NOT on hour: C truncates division toward zero, so every
     * t in (-3600, 0) gives hour == 0 and would slip past an `hour < 0` check
     * while still dragging g_stat_oldest negative -- which makes every rolling
-    * window claim to be covered, since reportability is measured from it. That
-    * was the first version of this guard, and the tests caught it. */
+    * window claim to be covered, since reportability is measured from it. */
    /* COMPARE IN long, AND REJECT A NEGATIVE HOUR EXPLICITLY.
     *
     * `hour` is an int narrowed from t/3600, so a large timestamp -- one the
     * 18-digit parser cap happily admits -- overflows it to a large NEGATIVE
-    * value. The old guard then computed `nowh - hour` in int, which overflows
+    * value. Computing `nowh - hour` in int overflows
     * a second time and wraps NEGATIVE, so `>= STAT_HOURS` silently passed and
     * `hour % STAT_HOURS` indexed BEFORE g_hours: an out-of-bounds write.
     * Demonstrated at t = 7730941136400 (hour = -2147483647, index -2047).
@@ -102,16 +104,19 @@ static void bucket_add(struct stat_fill *d, long t, int glu, long now)
       ring[idx].count    = 0;
       ring[idx].in_range = 0;
       ring[idx].sum      = 0;
+      ring[idx].unsure   = 0;
    }
    ring[idx].count++;
    ring[idx].sum += glu;
+   if (unsure)
+      ring[idx].unsure++;
    /* 70-180 mg/dL is the international consensus "time in range" band (ADA /
     * ATTD, 2019), which is why it is these numbers and not the user's own
     * alarm thresholds -- a TIR figure is only comparable to a published one
     * if it uses the published band. It is deliberately NOT settable for the
     * same reason. The house style is to say where a clinical number came
     * from; this one had no comment at all. */
-   if (glu >= TIR_LOW_MGDL && glu <= TIR_HIGH_MGDL)
+   if (stat_in_range(glu))
       ring[idx].in_range++;
    if (!d->oldest || t < d->oldest)
       d->oldest = t;
@@ -125,27 +130,51 @@ static struct stat_fill live_fill(void)
    return d;
 }
 
-void stat_add_at(long t, int glu, long now)
+/* THE INTERNATIONAL CONSENSUS BAND, 70-180 mg/dL (ADA / ATTD 2019). It is
+ * these numbers and not the user's own alarm thresholds because a
+ * time-in-range figure is only comparable to a published one if it uses the
+ * published band -- which is also why it is not settable. */
+bool stat_in_range(int glu)
 {
-   struct stat_fill d = live_fill();
-   bucket_add(&d, t, glu, now);
-   g_stat_oldest = d.oldest;
+   return (bool)(glu >= STAT_TIR_LO && glu <= STAT_TIR_HI);
 }
 
-void stat_add(long t, int glu)
+void stat_add(long t, int glu, int unsure)
 {
-   stat_add_at(t, glu, realtime_s());
+   stat_add_at(t, glu, unsure, realtime_s());
 }
 
-int stat_window_at(int days, int *tir, int *avg, long now)
+int stat_window_cov_at(int days, int *tir, int *avg, struct stat_cov *cov,
+                       long now)
 {
+   /* A DEGRADED LOAD ANSWERS NO WINDOW. The buckets hold whatever was
+    * readable before the log stopped being readable, and there is no way to
+    * tell 62% of a month from 62% of the eleven days that happened to come
+    * back. The screen shows "--", which is true; a number here would not be.
+    * See stat_load. */
+   int hours = days * 24;
+   if (cov) {
+      cov->hours     = 0;
+      cov->of_hours  = hours;
+      cov->gap_hours = 0;
+      cov->unsure    = 0;
+      cov->counted   = 0;
+   }
+   if (stat_degraded())
+      return 0;
    if (!g_stat_oldest || now - g_stat_oldest < ((long)days * 86400) - 3600)
       return 0;
-   int nowh  = (int)(now / 3600);
-   int hours = days * 24;
-   long cnt  = 0;
-   long inr  = 0;
-   long sum  = 0;
+   int nowh = (int)(now / 3600);
+   long cnt = 0;
+   long inr = 0;
+   long sum = 0;
+   /* COVERAGE, COUNTED WHILE THE WINDOW IS WALKED. The walk was
+    * already visiting every hour; what it did not do was notice how many of
+    * them held anything. */
+   int covered = 0;
+   int gap     = 0;
+   int worst   = 0;
+   long unsure = 0;
    for (int h = 0; h < hours; h++) {
       int hour = nowh - h;
       /* Same signed-modulo hazard as stat_add_at. The early return above makes
@@ -156,14 +185,53 @@ int stat_window_at(int days, int *tir, int *avg, long now)
       if (hour < 0)
          break;
       int idx = hour % STAT_HOURS;
-      if (g_hours[idx].hour == hour) {
+      int has = g_hours[idx].hour == hour && g_hours[idx].count > 0;
+      if (has) {
          cnt += g_hours[idx].count;
          inr += g_hours[idx].in_range;
          sum += g_hours[idx].sum;
+         unsure += g_hours[idx].unsure;
+         covered++;
+         gap = 0;
+      } else {
+         gap++;
+         if (gap > worst)
+            worst = gap;
       }
+   }
+   if (cov) {
+      cov->hours     = covered;
+      cov->gap_hours = worst;
+      cov->unsure    = (int)unsure;
+      cov->counted   = (int)cnt;
    }
    if (cnt == 0)
       return 0;
+   /* ONE COVERED HOUR PER DAY OF THE WINDOW, and no empty run longer than
+    * half of it. Without the rule, two readings ninety days apart print a
+    * ninety-day time-in-range: the oldest timestamp says the window is
+    * reachable and nothing asks what is in it.
+    *
+    * WHY THE BAR IS THIS LOW, and not the clinical 70% of 14 days: this
+    * figure sits on a phone screen beside the live number, not in a clinic
+    * letter, and blanking it because somebody's phone was off for a night --
+    * or because they were away from a sensor for a week of a 90-day window
+    * -- would be a worse answer than showing it with the coverage available
+    * to the caller. What it refuses is the case where there is essentially
+    * nothing: 2 covered hours in 2160 says nothing about three months.
+    *
+    * THE GAP RULE catches the other shape: a window whose data all sits at
+    * one end. Half the window empty in one stretch means the "rolling last
+    * N days" it claims to describe is not what was measured. */
+   if (covered < days)
+      return 0;
+   /* THE GAP IS REPORTED, NOT GATED ON, and that is a decision rather than an
+    * omission. A 1-day window whose data is the last hour has a 23-hour gap
+    * and is still today's data; a 90-day window with a fortnight's hole in it
+    * is still ninety days of wear with a holiday in the middle. Refusing
+    * either would blank a figure the reader can see the basis for -- so the
+    * basis travels instead (struct stat_cov) and the caller decides what to
+    * say about it. */
    *tir = (int)(100 * inr / cnt);
    *avg = (int)(sum / cnt);
    return 1;
@@ -171,7 +239,7 @@ int stat_window_at(int days, int *tir, int *avg, long now)
 
 int stat_window(int days, int *tir, int *avg)
 {
-   return stat_window_at(days, tir, avg, realtime_s());
+   return stat_window_cov_at(days, tir, avg, NULL, realtime_s());
 }
 
 /* Seed the stats from the last ~90 days of the log -- a bounded tail read, so
@@ -186,16 +254,26 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now);
  * never be called with the history lock held. That is the whole reason the
  * rebuild is two calls; see stats.h.
  *
- * Returns 1 when the source was seen WHOLE and 0 when a read failed partway.
- * A log that does not exist is 1: "there are no readings" is a complete
- * answer, and it is the same one store_load gives for a missing file. A read
- * that failed is not -- what the rest of the file said is unknown, so the
- * buckets are a prefix and not a summary. */
-static int load_into(struct stat_fill *d, const char *readings_path)
+ * LOAD_ABSENT there is no log; LOAD_OK it was seen whole; LOAD_ERROR a read
+ * failed partway or the buffer could not be allocated -- what the rest of the
+ * file said is then unknown, so the buckets are a PREFIX and not a summary,
+ * and the caller must not present them as one. */
+static enum load_result load_into(struct stat_fill *d,
+                                  const char *readings_path)
 {
    int fd = open(readings_path, O_RDONLY, 0);
-   if (fd < 0)
-      return 1; /* no log is not a failure; see store_load's ENOENT */
+   if (fd < 0) {
+      /* ENOENT IS AN ANSWER; ANYTHING ELSE IS A REFUSAL.
+       *
+       * "There are no readings" is complete and ordinary -- it is a first
+       * run, and store_load says the same about the same file. "I could not
+       * open the log" is not: a permission change, a filesystem gone
+       * read-only, a card that has begun to fail. Treating the second as the
+       * first publishes a TIR and an average computed from nothing, on a
+       * phone whose record is intact and merely unreadable -- the one shape
+       * of wrong number that looks exactly like a new install. */
+      return errno == ENOENT ? LOAD_ABSENT : LOAD_ERROR;
+   }
    /* THE WHOLE FILE, streamed. Reading only a tail assumed the newest rows
     * sit at the end -- true of a pure arrival log, FALSE once months of
     * older history are imported and appended. When that happened the last
@@ -205,8 +283,10 @@ static int load_into(struct stat_fill *d, const char *readings_path)
    long want = 256L * 1024; /* read buffer, not a limit */
    char *buf = malloc((unsigned long)want + 1);
    if (!buf) {
+      /* The log is there and this run cannot say what is in it -- the same
+       * position a failed read leaves us in, and reported the same way. */
       close(fd);
-      return 0;
+      return LOAD_ERROR;
    }
    /* ONE `now` for the whole replay, read once here rather than per row.
     * Every guard in bucket_add compares a row's hour against the current
@@ -223,10 +303,11 @@ static int load_into(struct stat_fill *d, const char *readings_path)
          /* THE LAST BYTES OF THE FILE WITH NO NEWLINE AFTER THEM: an append
           * that did not finish -- power loss, or a full disk. The bytes may
           * parse perfectly and still be half a reading, a plausible glucose
-          * at a plausible time that nobody measured, and this replay used to
-          * count exactly that into TIR and the average. store_load refuses to
-          * publish such a row for the same reason (see its `unterm`), so
-          * counting it here put the statistics over a reading the history
+          * at a plausible time that nobody measured, and counting it into
+          * TIR and the average is counting something that did not happen.
+          * store_load refuses to publish such a row for the same reason (see
+          * its `unterm`), so counting it here would put the statistics over a
+          * reading the history
           * does not hold -- the two disagreeing about one file, which every
           * other bound in this parser exists to prevent. */
          break;
@@ -263,18 +344,40 @@ static int load_into(struct stat_fill *d, const char *readings_path)
    }
    close(fd);
    free(buf);
-   return n >= 0;
+   return n >= 0 ? LOAD_OK : LOAD_ERROR;
 }
 
-void stat_load(const char *readings_path)
+/* WHETHER THE FIGURES DESCRIBE THE WHOLE LOG. Published by stat_load and read
+ * by stat_window (see stats.h): a degraded load answers no window at all,
+ * rather than a plausible number over a prefix. */
+static int g_stat_partial;
+
+/* 1 when the load could not read the whole history, so every window is
+ * refused rather than answered from part of it: a figure computed over an
+ * unknown fraction of the record is a wrong figure, not a partial one. */
+bool stat_degraded(void)
+{
+   return (bool)g_stat_partial;
+}
+
+enum load_result stat_load(const char *readings_path)
 {
    /* STARTUP'S SEED, into the live ring. Correct only because it runs once,
     * before any other thread exists and into a ring BSS has already zeroed:
     * this call is additive, so a second one over live data would double-count
-    * everything it read. A rebuild goes through the two calls below. */
-   struct stat_fill d = live_fill();
-   (void)load_into(&d, readings_path);
-   g_stat_oldest = d.oldest;
+    * everything it read. A rebuild goes through the two calls below.
+    *
+    * WHAT A FAILED READ LEAVES BEHIND is a PREFIX of the record, and the
+    * caller has to be told: TIR and the average are a summary of the whole
+    * log or they are nothing, because there is no way to tell 62% of a month
+    * from 62% of the eleven days that happened to be readable. So the buckets
+    * that were filled stay (they are the only thing this run knows) and the
+    * degraded flag stops them being SHOWN as a figure. */
+   struct stat_fill d   = live_fill();
+   enum load_result res = load_into(&d, readings_path);
+   g_stat_oldest        = d.oldest;
+   g_stat_partial       = res == LOAD_ERROR;
+   return res;
 }
 
 /* THE PRIVATE RING A REBUILD IS BUILDING, between prepare and publish.
@@ -317,12 +420,12 @@ int stat_reload_prepare(const char *readings_path)
     * No lock is held here, and none may be: this reads the registry for the
     * per-sensor warm-up rule. See stats.h. */
    struct stat_fill d = {fresh, 0};
-   if (!load_into(&d, readings_path)) {
+   if (load_into(&d, readings_path) == LOAD_ERROR) {
       /* THE SOURCE WAS NOT SEEN WHOLE, so these buckets are a prefix of the
        * record rather than a summary of it. Publishing them would put a TIR
        * and an average on screen that describe part of a file, beside a
        * history store_load has (for the same reason) refused to replace --
-       * the two numbers disagreeing again, which is the whole defect this
+       * the two numbers disagreeing, which is the whole defect this
        * rebuild exists to remove. Nothing prepared; the caller keeps what it
        * has and says so. */
       free(fresh);
@@ -340,10 +443,16 @@ void stat_reload_publish(void)
    /* ONE COPY AND ONE STORE, under the caller's store lock. The oldest goes
     * with the ring because it is part of the same answer -- stat_window_at
     * measures REPORTABILITY from it, so publishing rebuilt buckets while
-    * keeping the old value would let a 90-day figure be reported off a week
-    * of restored data. */
+    * keeping a stale one would let a 90-day figure be reported off a week of
+    * restored data. */
    memcpy(g_hours, g_rebuild, sizeof g_hours);
    g_stat_oldest = g_rebuild_oldest;
+   /* THE LOG READ WHOLE THIS TIME. stat_reload_prepare refuses to prepare
+    * anything else, so reaching here means these buckets summarise the entire
+    * file, so a degradation recorded at startup describes a state that has
+    * passed. Leaving it set would blank the windows for the rest of the
+    * run over a file that has just been read end to end. */
+   g_stat_partial = 0;
    free(g_rebuild);
    g_rebuild        = 0;
    g_rebuild_oldest = 0;
@@ -361,12 +470,12 @@ void stat_reload_publish(void)
 /* ONE ROW OF readings.csv -> (t, glu, src, kind), or 0 if the line is not a
  * complete reading.
  *
- * THROUGH csvcur.h, NOT FOUR MORE DIGIT LOOPS. This function used to be four
- * hand-rolled accumulators and a field-skipper that treated a missing
- * separator as end-of-row, and what it produced was a statistic computed from
- * a row the app does not have. `<epoch>,100junk` was read as a glucose of 100
- * -- the leading digits of a field that says something else entirely -- and
- * folded into TIR and the average; the same walk lost the source and kind
+ * THROUGH csvcur.h, NOT FOUR MORE DIGIT LOOPS. Four hand-rolled accumulators
+ * and a field-skipper that treats a missing separator as end-of-row produce a
+ * statistic computed from a row the app does not have. `<epoch>,100junk`
+ * reads as a glucose of 100 -- the leading digits of a field that says
+ * something else entirely -- and folds into TIR and the average; the same
+ * walk loses the source and kind
  * columns of any row with a contaminated field, so the warm-up and fingerstick
  * exclusions silently stopped applying to it. Statistics are the one display
  * with no per-row detail behind it: a wrong TIR looks exactly like a right
@@ -386,8 +495,8 @@ void stat_reload_publish(void)
  * with an explicit CSV_FIELD_OK test. Note the sense: CSV_FIELD_OK is 0, so
  * `if (!why)` reads as failure and means success -- every test here names the
  * enumerator. */
-static int stat_row(const char *ln, const char *e, long *t, long *glu,
-                    int *src, long *kind)
+static int stat_row(const char *ln, const char *e, long *t, long *glu, int *src,
+                    long *kind, enum warm_state *warm)
 {
    struct csv_cur c;
    csv_open(&c, ln, e);
@@ -398,8 +507,8 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu,
    if (c.p >= c.e || *c.p < '0' || *c.p > '9')
       return 0;
 
-   enum csv_field why;
-   long tv = csv_num(&c, &why);
+   enum csv_field why = CSV_FIELD_OK;
+   long tv            = csv_num(&c, &why);
    if (why != CSV_FIELD_OK)
       return 0;
    if (!csv_sep(&c))
@@ -412,13 +521,17 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu,
     * whole row has been read and passed. */
    long srcv  = 0;
    long kindv = KIND_CGM;
+   /* ABSENT MEANS UNKNOWN, and that is the whole reason this column can be
+    * added to a log that is never rewritten: every row written before it
+    * existed says nothing, which is exactly true. */
+   long warmv = WARM_UNKNOWN;
 
-   /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale
+   /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale,warm
     *
-    * THE LAST COLUMN IS A DECIMAL, and this loop used to reject the whole row
-    * because of it. `rescale` is written as "0.830"; csv_num reads the 0 and
-    * stops AT the '.', so the next csv_sep found a '.' where it wanted a ','
-    * and returned 0 -- discarding a perfectly good reading.
+    * A TRAILING COLUMN IS A DECIMAL, and a walk that does not expect one
+    * rejects the whole row. `rescale` is written as "0.830"; csv_num reads
+    * the 0 and stops AT the '.', so the next csv_sep finds a '.' where it
+    * wants a ',' and returns 0 -- discarding a perfectly good reading.
     *
     * What that cost: every row written since a rescale factor was first
     * stored was dropped from the statistics. The plot was unaffected (it
@@ -427,7 +540,7 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu,
     * path had added since launch -- an hour of data reported as "1D", which
     * read as 100% on a day that was really 90%. Measured on a real log:
     * 42,000 rows, 4,189 of them with a fractional rescale, and the 1D/3D/7D
-    * columns wrong for as long as the app had been running.
+    * columns wrong for as long as the app stayed up.
     *
     * A fraction is SKIPPED, not parsed: no column this function reads is
     * fractional, and the integer part is the answer for any that ever were.
@@ -453,6 +566,8 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu,
          srcv = n;
       else if (f == 9)
          kindv = n;
+      else if (f == 11)
+         warmv = n;
    }
 
    /* Both bounds are applied on the WIDE side, before anything narrows: an
@@ -465,6 +580,12 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu,
    *glu  = gv;
    *src  = (srcv >= 0 && srcv <= STAT_SRC_MAX) ? (int)srcv : 0;
    *kind = kindv;
+   /* A value this build does not know is not a measurement. The column is
+    * written by this app and read by this app, so the only way to see one is
+    * a newer writer or a damaged row -- and both are cases where claiming a
+    * measured state would be inventing one. */
+   *warm = (warmv == WARM_NO || warmv == WARM_YES) ? (enum warm_state)warmv
+                                                   : WARM_UNKNOWN;
    return 1;
 }
 
@@ -482,12 +603,13 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now)
        * parser rather than of its one caller. */
       if (*e != '\n')
          return;
-      long t    = 0;
-      long glu  = 0;
-      long kind = 0;
-      int src   = 0;
+      long t               = 0;
+      long glu             = 0;
+      long kind            = 0;
+      int src              = 0;
+      enum warm_state warm = WARM_UNKNOWN;
       /* '#' is the header / a comment, and it is not damage. */
-      if (*p != '#' && stat_row(p, e, &t, &glu, &src, &kind)) {
+      if (*p != '#' && stat_row(p, e, &t, &glu, &src, &kind, &warm)) {
          /* This predicate MUST match the live path's exactly (see
           * glucose_plausible in reading.c). When replay used `glu > 0` while
           * the live path had no bound at all, an implausible sample was
@@ -508,12 +630,24 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now)
           *
           * WARMUP is excluded for the same reason and by the same both-paths
           * rule: the value is uncalibrated, so counting it skews TIR and the
-          * average. sensors_load() runs before stat_load (main.c), so the
-          * activation this resolves against is already on hand. */
+          * average. What decides is warm_decide (sensors.h) -- the row's own
+          * measured state where it has one, and the activation inference
+          * where it does not. sensors_load() runs before stat_load (main.c),
+          * so the activation that inference resolves against is already on
+          * hand. A row counted on the inference alone is marked, and the
+          * coverage figures carry the total. */
+         enum warm_verdict v = warm_decide(warm, src, t);
          if (t > 0 && glu >= STORE_GLU_MIN && glu <= STORE_GLU_MAX &&
-             kind != KIND_BGM && !sensor_in_warmup(src, t))
-            bucket_add(d, t, (int)glu, now);
+             kind != KIND_BGM && v != WARM_SKIP)
+            bucket_add(d, t, (int)glu, v == WARM_COUNT_UNSURE, now);
       }
       p = e + 1;
    }
+}
+
+void stat_add_at(long t, int glu, int unsure, long now)
+{
+   struct stat_fill d = live_fill();
+   bucket_add(&d, t, glu, unsure, now);
+   g_stat_oldest = d.oldest;
 }

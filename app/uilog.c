@@ -3,8 +3,10 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "font.h"
+#include "insrow.h"  /* INS_*: what a dose row can say */
 #include "insulin.h" /* struct ins_rec + INS_* for the INSULIN LOG table */
 #include "ndk.h"
+#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "ui.h"
 #include "uiact.h"
 #include "uidraw.h"
@@ -28,14 +30,14 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y        = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, m->ins.ins_edit ? "EDIT INSULIN" : "LOG INSULIN",
-            0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+            UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* X discards -- nothing is written before an explicit CONFIRM. */
    /* 2*lh - 2*sc, not 2*lh: value_row's target starts at its y - 4*sc, so a
     * full close band reaches 4*sc into the TYPE row below it -- the same
     * overlap render_weight was already fixed for, and this form is the one
     * where the row underneath changes a logged dose. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc),
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc)),
               MA_INS_DISCARD, 0);
    y += 2 * lh;
 
@@ -43,8 +45,7 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * pre-populate it); FAST shows in the log table's blue, at the same
     * large value size as the other editable fields. */
    y = value_row(fb, h, y, sc, "TYPE", m->ins.ins_type == 1 ? "FAST" : "SLOW",
-                 m->ins.ins_type == 1 ? 0xFFFFAA66 : 0xFFFFFFFF, MA_INS_TYPE,
-                 0);
+                 m->ins.ins_type == 1 ? 0xFFFFAA66 : UI_TEXT, MA_INS_TYPE, 0);
    y += lh;
 
    /* fmt_date renders "YYYY-MM-DD HH:MM"; the form splits it into YEAR,
@@ -65,28 +66,27 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
    str_snapshot(timep, sizeof timep, (str_len(dt) > 11) ? dt + 11 : "");
    char val[20];
    (void)snprintf(val, sizeof val, "%d U", m->ins.ins_units);
-   y = value_row(fb, h, y, sc, "UNITS", val, 0xFFFFFFFF, MA_INS_EDIT, 0);
+   y = value_row(fb, h, y, sc, "UNITS", val, UI_TEXT, MA_INS_EDIT, 0);
    y += lh;
-   y = value_row(fb, h, y, sc, "TIME", timep, 0xFFFFFFFF, MA_INS_EDIT, 2);
+   y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_INS_EDIT, 2);
    y += lh;
-   y = value_row(fb, h, y, sc, "DATE", datep, 0xFFFFFFFF, MA_INS_EDIT, 1);
+   y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_INS_EDIT, 1);
    y += lh;
-   y = value_row(fb, h, y, sc, "YEAR", yearp, 0xFFFFFFFF, MA_INS_EDIT, 3);
+   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_INS_EDIT, 3);
    y += 2 * lh;
 
    /* Cancel on TOP, the committing button on the BOTTOM -- the app-wide
     * rule, so reach-and-tap muscle memory can never commit by accident.
     * Editing adds DELETE (red) between the two. */
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_INS_DISCARD,
-                   0);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_INS_DISCARD, 0);
    y += 2 * lh;
    if (m->ins.ins_edit) {
-      y = menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF0000FF, MA_INS_DELETE,
+      y = menu_button(fb, h, x, y, bw, sc, "DELETE", UI_ALERT, MA_INS_DELETE,
                       0);
       y += 2 * lh;
    }
-   menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF00FF00, MA_INS_CONFIRM, 0);
+   menu_button(fb, h, x, y, bw, sc, "CONFIRM", UI_GO, MA_INS_CONFIRM, 0);
 }
 
 /* ---- delete-dose confirmation ----
@@ -103,10 +103,9 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "DELETE DOSE?", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X",
-            0xFFFFFFFF); /* close = cancel */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_INSDEL_NO, 0);
+   draw_str(px, fb, x, y, tsc, "DELETE DOSE?", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT); /* close = cancel */
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_INSDEL_NO, 0);
    y += 2 * lh;
 
    /* the dose about to be deleted, so a mis-tap from the log is caught */
@@ -115,9 +114,9 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    char line[40];
    (void)snprintf(line, sizeof line, "%d U %s", m->ins.ins_units,
                   m->ins.ins_type == 1 ? "FAST" : "SLOW");
-   draw_str(px, fb, x, y, sc, line, 0xFFFFFFFF);
+   draw_str(px, fb, x, y, sc, line, UI_TEXT);
    y += lh;
-   draw_str(px, fb, x, y, sc, dt, 0xFFFFFFFF);
+   draw_str(px, fb, x, y, sc, dt, UI_TEXT);
    y += 2 * lh;
    static const char *const note[] = {
        "REMOVES THIS DOSE FROM THE",
@@ -125,7 +124,7 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
        "BE UNDONE.",
    };
    for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
-      draw_str(px, fb, x, y, sc, note[i], 0xFF888888);
+      draw_str(px, fb, x, y, sc, note[i], UI_MUTED);
       y += lh;
    }
    y += 2 * lh;
@@ -134,9 +133,9 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * discipline as SCR_FORGET, so reach-and-tap muscle memory can never
     * delete by accident. */
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_INSDEL_NO, 0);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_INSDEL_NO, 0);
    y += 3 * lh; /* wide gap so DELETE is not tapped by accident */
-   menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF0000FF, MA_INSDEL_YES, 0);
+   menu_button(fb, h, x, y, bw, sc, "DELETE", UI_ALERT, MA_INSDEL_YES, 0);
 }
 
 /* ---- INSULIN LOG: the dose tail as a when/type/units table, newest
@@ -153,16 +152,17 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "INSULIN LOG", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_INSLOG_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "INSULIN LOG", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_INSLOG_BACK,
+              0);
    y += 3 * lh;
 
    if (m->ins.ins_nlog <= 0) {
-      draw_str(px, fb, x, y, sc, "No doses logged yet.", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "No doses logged yet.", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "TIME              TYPE  UNITS", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "TIME              TYPE  UNITS", UI_MUTED);
    y += lh;
 
    /* Rows that fit between the header and a reserved bottom nav line. */
@@ -200,7 +200,7 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       /* FAST doses in a soft blue, so the two types separate at a glance
        * (0xAABBGGRR: R=0x66 G=0xAA B=0xFF). */
       draw_str(px, fb, x, y, sc, row,
-               d->type == INS_FAST ? 0xFFFFAA66 : 0xFFCCCCCC);
+               d->type == INS_FAST ? 0xFFFFAA66 : UI_TEXT_DIM);
       /* The pencil is the affordance; the WHOLE row is the target (it
        * opens this dose in the EDIT INSULIN form). Centre the pencil in
        * the free column right of UNITS -- glued to the screen edge it
@@ -210,9 +210,10 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
          int ix = te + (((rx - te) - (5 * sc)) / 2);
          if (ix < te)
             ix = rx - (6 * sc); /* narrow screen: fall back to the edge */
-         draw_icon(px, fb, ix, y, sc, icon_pencil, 0xFF888888);
+         draw_icon(px, fb, ix, y, sc, icon_pencil, UI_MUTED);
       }
-      add_hit_ix(h, 0, y - (3 * sc), fb->width, lh, MA_INSLOG_EDIT, ti);
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_INSLOG_EDIT,
+                 ti);
       y += lh;
    }
 
@@ -225,18 +226,21 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * gate forbids everywhere else, and the bottom strip of the finger
        * target simply did not exist. This ends flush with the bottom edge. */
       if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, navy - (3 * sc), fb->width / 3, lh + (7 * sc),
+         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
                     MA_INSLOG_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, fb->width - (fb->width / 3), navy - (3 * sc),
-                    fb->width / 3, lh + (7 * sc), MA_INSLOG_NEXT, 0);
+         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(fb->width - (fb->width / 3), navy - (3 * sc),
+                            fb->width / 3, lh + (7 * sc)),
+                    MA_INSLOG_NEXT, 0);
       }
    }
 }
@@ -256,11 +260,11 @@ static void fmt_weight(long g, int units, char *out, int n)
    (void)snprintf(out, n, "%d.%d %s", t / 10, t % 10, wt_unit_name(units));
 }
 
-/* NARROWED ON PURPOSE. This used to take the whole `struct screen`, which
- * meant nothing in its signature said that the weight form reads the weight
- * model, the display unit and the zone -- and nothing stopped it quietly
- * growing a dependency on the sensor registry or the alarm thresholds. The
- * parameters ARE the contract now. */
+/* NARROWED ON PURPOSE. Taking the whole `struct screen`, nothing in the
+ * signature says that the weight form reads the weight model, the display
+ * unit and the zone -- and nothing stops it quietly growing a dependency on
+ * the sensor registry or the alarm thresholds. The parameters ARE the
+ * contract. */
 void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                    const struct ui_prefs *prefs, long tz_off, struct hits *h)
 {
@@ -273,13 +277,13 @@ void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    int y        = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, wt->wt_edit ? "EDIT WEIGHT" : "LOG WEIGHT",
-            0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+            UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    /* X discards -- nothing is written before an explicit CONFIRM. */
    /* 2*lh - 2*sc, not 2*lh: value_row's target starts at its y - 4*sc, so a
     * full 2*lh close band reached 4*sc into the WEIGHT row below it. */
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc), MA_WT_DISCARD,
-              0);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, (2 * lh) - (2 * sc)),
+              MA_WT_DISCARD, 0);
    y += 2 * lh;
 
    /* fmt_date renders "YYYY-MM-DD HH:MM"; split it the way the insulin form
@@ -300,13 +304,13 @@ void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    char val[20];
    (void)snprintf(val, sizeof val, "%d.%d %s", wt->wt_tenths / 10,
                   wt->wt_tenths % 10, wt_unit_name(prefs->wunits));
-   y = value_row(fb, h, y, sc, "WEIGHT", val, 0xFFFFFFFF, MA_WT_EDIT, 0);
+   y = value_row(fb, h, y, sc, "WEIGHT", val, UI_TEXT, MA_WT_EDIT, 0);
    y += lh;
-   y = value_row(fb, h, y, sc, "TIME", timep, 0xFFFFFFFF, MA_WT_EDIT, 2);
+   y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_WT_EDIT, 2);
    y += lh;
-   y = value_row(fb, h, y, sc, "DATE", datep, 0xFFFFFFFF, MA_WT_EDIT, 1);
+   y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_WT_EDIT, 1);
    y += lh;
-   y = value_row(fb, h, y, sc, "YEAR", yearp, 0xFFFFFFFF, MA_WT_EDIT, 3);
+   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_WT_EDIT, 3);
    y += 2 * lh;
 
    /* Cancel on TOP, the committing button on the BOTTOM -- the app-wide
@@ -314,15 +318,14 @@ void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
     * two, mirroring EDIT INSULIN; it only opens a confirmation, it never
     * deletes on the tap itself. */
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_WT_DISCARD, 0);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_WT_DISCARD, 0);
    y += (3 * lh) / 2;
    if (wt->wt_edit) {
-      y = menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF4466FF, MA_WT_DELETE,
+      y = menu_button(fb, h, x, y, bw, sc, "DELETE", UI_DANGER, MA_WT_DELETE,
                       0);
       y += (3 * lh) / 2;
    }
-   (void)menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88, MA_WT_CONFIRM,
-                     0);
+   (void)menu_button(fb, h, x, y, bw, sc, "CONFIRM", UI_OK, MA_WT_CONFIRM, 0);
 }
 
 /* Confirm deleting one weight entry. Mirrors the insulin one: the value being
@@ -337,7 +340,7 @@ void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "DELETE?", 0xFF4466FF);
+   draw_str(px, fb, x, y, tsc, "DELETE?", UI_DANGER);
    y += 3 * lh;
    char wv[16];
    char when[20];
@@ -347,17 +350,16 @@ void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
     * a different record than the one it destroys is worse than none. */
    fmt_weight(wt->wt_orig_g, prefs->wunits, wv, sizeof wv);
    fmt_date(wt->wt_orig_t, tz_off, when, sizeof when);
-   draw_str(px, fb, x, y, sc, wv, 0xFFFFFFFF);
+   draw_str(px, fb, x, y, sc, wv, UI_TEXT);
    y += lh;
-   draw_str(px, fb, x, y, sc, when, 0xFFCCCCCC);
+   draw_str(px, fb, x, y, sc, when, UI_TEXT_DIM);
    y += 2 * lh;
-   draw_str(px, fb, x, y, sc, "This cannot be undone.", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "This cannot be undone.", UI_MUTED);
    y += 2 * lh;
    int bw = fb->width - (2 * x);
-   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_WTDEL_NO, 0);
+   y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_WTDEL_NO, 0);
    y += (3 * lh) / 2;
-   (void)menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF4466FF, MA_WTDEL_YES,
-                     0);
+   (void)menu_button(fb, h, x, y, bw, sc, "DELETE", UI_DANGER, MA_WTDEL_YES, 0);
 }
 
 const int ui_wt_days[UI_WT_TABS] = {30, 90, 180, 365, 0}; /* 0 = everything */
@@ -409,7 +411,7 @@ static void wt_window(const struct ui_wtview *wt, long now, long from,
       w->tmin = from;
    w->tmax = now;
    /* A flat or single-point window has no range to scale to; pad it so the
-    * trace lands mid-plot instead of dividing by zero. */
+    * trace lands mid-plot rather than dividing by zero. */
    if (w->hi - w->lo < 200) {
       long mid = (w->hi + w->lo) / 2;
       w->lo    = mid - 100;
@@ -449,11 +451,6 @@ static long wt_from_of(const struct ui_wtview *wt, long now)
    if (tab < 0 || tab >= UI_WT_TABS)
       tab = 0;
    return ui_wt_days[tab] > 0 ? now - ((long)ui_wt_days[tab] * 86400L) : 0;
-}
-
-long ui_wt_from(const struct screen *m)
-{
-   return wt_from_of(&m->wt, m->now);
 }
 
 int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x)
@@ -500,14 +497,14 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    wt_window(wt, now, from, &w);
    if (!w.n) {
       draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "no data in range",
-               0xFF888888);
+               UI_MUTED);
       return;
    }
    int pad = WT_PAD * sc;
    /* Reserved strips: the upper bound's line at the top, and the lower
     * bound's line PLUS the date-tick line at the bottom. */
    /* + half a text height of breathing room, so the extreme datapoint clears
-    * the bound that names it instead of just touching it. */
+    * the bound that names it rather than just touching it. */
    int half  = (7 * sc) / 2;
    int pad_t = (13 * sc) + half;
    int pad_b = (22 * sc) + half;
@@ -532,18 +529,17 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    }
 
    /* THE Y BOUNDS, upper at the top-left and lower at the bottom-left, each
-    * against the axis end it names. They used to be one "lo-hi" string in the
-    * top-right corner, which states the range but not which end is which way
-    * up. Always drawn: the reserved strips above keep the trace off them, so
-    * unlike the old corner label there is nothing to suppress while
-    * scrubbing. */
+    * against the axis end it names -- not one "lo-hi" string in the top-right
+    * corner, which states the range but not which end is which way up. Always
+    * drawn: the reserved strips above keep the trace off them, so unlike a
+    * corner label there is nothing to suppress while scrubbing. */
    {
       char slab[16];
       fmt_weight(w.hi, prefs->wunits, slab, sizeof slab);
-      draw_str(px, fb, px0 + (4 * sc), py0 + (3 * sc), sc, slab, 0xFF888888);
+      draw_str(px, fb, px0 + (4 * sc), py0 + (3 * sc), sc, slab, UI_MUTED);
       fmt_weight(w.lo, prefs->wunits, slab, sizeof slab);
       draw_str(px, fb, px0 + (4 * sc), py0 + ph - (19 * sc), sc, slab,
-               0xFF888888);
+               UI_MUTED);
    }
 
    /* DATE TICKS on the vertical grid lines. Without them the x axis is
@@ -590,8 +586,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       /* White, like the glucose trace. The SCRUBBED point is redrawn below in
        * UI_HILITE grey -- the same "white normally, grey when picked" pair
        * plot_render uses, so both plots read the same way. */
-      fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc,
-                0xFFFFFFFF);
+      fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc, UI_TEXT);
       prevx = cx;
       prevy = cy;
       have  = 1;
@@ -628,13 +623,13 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "WEIGHT LOG", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
-   add_hit_ix(h, 0, y - (3 * sc), fb->width, 2 * lh, MA_WTLOG_BACK, 0);
+   draw_str(px, fb, x, y, tsc, "WEIGHT LOG", UI_TEXT);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_WTLOG_BACK, 0);
    y += 3 * lh;
 
    if (wt->nwt <= 0) {
-      draw_str(px, fb, x, y, sc, "No weights logged yet.", 0xFF888888);
+      draw_str(px, fb, x, y, sc, "No weights logged yet.", UI_MUTED);
       return;
    }
 
@@ -663,7 +658,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    /* A blank line between the table and the pagination row, so the two halves
     * of this screen read as two things rather than one crowded column. */
 
-   draw_str(px, fb, x, y, sc, "TIME              WEIGHT", 0xFF888888);
+   draw_str(px, fb, x, y, sc, "TIME              WEIGHT", UI_MUTED);
    y += lh;
 
    /* CAP THE ROWS BY THE HIT BUDGET, not just by height.
@@ -697,7 +692,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
       fmt_date(w->t, tz_off, when, sizeof when);
       fmt_weight(w->g, prefs->wunits, wv, sizeof wv);
       (void)snprintf(row, sizeof row, "%s  %s", when, wv);
-      draw_str(px, fb, x, y, sc, row, 0xFFCCCCCC);
+      draw_str(px, fb, x, y, sc, row, UI_TEXT_DIM);
       /* The pencil is the affordance; the WHOLE row is the target, opening
        * this entry in the EDIT WEIGHT form (the insulin log's pattern). */
       {
@@ -705,26 +700,29 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
          int ix = te + (((rx - te) - (5 * sc)) / 2);
          if (ix < te)
             ix = rx - (6 * sc);
-         draw_icon(px, fb, ix, y, sc, icon_pencil, 0xFF888888);
+         draw_icon(px, fb, ix, y, sc, icon_pencil, UI_MUTED);
       }
-      add_hit_ix(h, 0, y - (3 * sc), fb->width, lh, MA_WTLOG_EDIT, ti);
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_WTLOG_EDIT, ti);
       y += lh;
    }
 
    if (npages > 1) {
       if (page > 0) {
-         draw_str(px, fb, x, nav_y, tsc, "<", 0xFFFFFFFF);
-         add_hit_ix(h, 0, nav_y - (3 * sc), fb->width / 3, lh + (7 * sc),
+         draw_str(px, fb, x, nav_y, tsc, "<", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(0, nav_y - (3 * sc), fb->width / 3, lh + (7 * sc)),
                     MA_WTLOG_PREV, 0);
       }
       char pg[24];
       (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
       draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, nav_y, sc, pg,
-               0xFF888888);
+               UI_MUTED);
       if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), nav_y, tsc, ">", 0xFFFFFFFF);
-         add_hit_ix(h, fb->width - (fb->width / 3), nav_y - (3 * sc),
-                    fb->width / 3, lh + (7 * sc), MA_WTLOG_NEXT, 0);
+         draw_str(px, fb, rx - (6 * tsc), nav_y, tsc, ">", UI_TEXT);
+         add_hit_ix(h,
+                    ui_rect(fb->width - (fb->width / 3), nav_y - (3 * sc),
+                            fb->width / 3, lh + (7 * sc)),
+                    MA_WTLOG_NEXT, 0);
       }
    }
 
@@ -755,7 +753,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
        * glucose plot uses. Green means "on / enabled" everywhere else in this
        * app; a readout is neither. Top-aligned in the tab row, as there. */
       draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
-               0xFFFFFFFF);
+               UI_TEXT);
       /* No tab targets while scrubbing: the row is not showing tabs, and a
        * target that does not match what is drawn is how a drag ends up
        * changing the span it was only trying to read. */
@@ -768,8 +766,8 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
           * gap between a tab and the plot is identical on both screens. The
           * TARGET still spans the whole band above, which is empty. */
          draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, ui_wt_tab_lbl[i],
-                  i == tab ? 0xFFFFFFFF : 0xFF888888);
-         add_hit_ix(h, tabx, tabs_y, colw, tabs_h, MA_WTTAB, i);
+                  i == tab ? UI_TEXT : UI_MUTED);
+         add_hit_ix(h, ui_rect(tabx, tabs_y, colw, tabs_h), MA_WTTAB, i);
       }
    }
 
@@ -780,10 +778,15 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    /* arg carries sc: the shell needs the SAME scale the plot was drawn at to
     * map a finger x back to a point, and re-deriving it there would be a
     * second copy of the layout that can drift. */
-   add_hit(h, x, plot_top, pw, plot_h, ACT_SCRUB, sc);
+   add_hit(h, ui_rect(x, plot_top, pw, plot_h), ACT_SCRUB, sc);
 }
 
 /* ---- OLD DEVICES: DISCONNECTED devices. Each keeps its whole slot, so a row
  * opens the SAME per-device menu as a live one (MA_SENSOR + slot index). The
  * list PAGINATES: if there are more than fit, a "< PAGE i/n >" row at the
  * bottom navigates, so any number of old devices is usable. ---- */
+
+long ui_wt_from(const struct screen *m)
+{
+   return wt_from_of(&m->wt, m->now);
+}

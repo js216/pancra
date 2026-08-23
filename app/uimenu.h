@@ -13,25 +13,18 @@
 #include "uimodel.h" /* struct ui_sensor: what these two ask about */
 
 int ui_shortcut_code(int slot);
-/* THE PINNABLE-ACTION TABLE: which ADD-menu actions the PIN column may pin to
- * the main screen, in ADD-menu order. Exported because the shell has to turn a
- * tapped
- * checkbox (MA_SCTOGGLE + slot) into the MA_* code it persists, and deriving
- * that mapping twice is how the stored code and the drawn row drift apart.
- * `abbrev` gives the short label the main screen falls back to when two or
- * three buttons share the row -- the font never shrinks, the words do. */
-int ui_shortcut_count(void);
 /* MA_* action, or 0 if slot is out of range */
 const char *ui_shortcut_label(int slot, int abbrev);
-/* The slot holding `code`, or -1. The inverse of ui_shortcut_code, for
- * rendering what the persisted codes point at. */
-int ui_shortcut_slot(int code);
 /* The STABLE id a slot is stored as, and the inverse. The id belongs to the
  * domain (settings.h, enum shortcut_id); the code above belongs to this
  * renderer. Keeping them apart is what lets the touch codes be renumbered
  * without repointing somebody's pinned buttons. */
 int ui_shortcut_id(int slot);
 int ui_shortcut_slot_by_id(int id);
+int ui_shortcut_sect(int slot);
+/* How many slots there are to ask about. */
+int ui_shortcut_count(void);
+
 
 /* ---- two questions the menus answer about a device -------------------
  *

@@ -60,11 +60,10 @@ int jpake_init(void)
  * from. Silently continuing with stack garbage is strictly worse than refusing
  * to connect: the connection retries, a leaked private key does not un-leak.
  *
- * THE RANGE IS NOT THIS FILE'S BUSINESS ANY MORE. This used to be
- * `rand_bytes(b, 32)` and then p256_sc_from_be, which is the biased reduction
- * item 65 is about, and which accepted ZERO. A zero vA/vB/v3 is the sharp case
- * and it is specific to Schnorr: the proof getproof() emits is
- * `ran - H*priv`, so with ran == 0 the published proof scalar is exactly
+ * THE RANGE IS NOT THIS FILE'S BUSINESS. `rand_bytes(b, 32)` and then
+ * p256_sc_from_be is a biased reduction, and it accepts ZERO. A zero vA/vB/v3
+ * is the sharp case and it is specific to Schnorr: the proof getproof() emits
+ * is `ran - H*priv`, so with ran == 0 the published proof scalar is exactly
  * -H*priv, and H is a hash the verifier recomputes itself -- one packet and
  * anybody watching has the private scalar the proof existed to hide. A zero
  * xA/xB is milder but still fatal to the exchange.
@@ -91,15 +90,6 @@ static void be32(uint8_t *b, uint32_t v)
    b[1] = v >> 16U;
    b[2] = v >> 8U;
    b[3] = v;
-}
-
-static void sc_to_be(const struct u256 *a, uint8_t out[32])
-{
-   for (int i = 0; i < 4; i++) {
-      uint64_t w = a->v[3 - i];
-      for (int j = 0; j < 8; j++)
-         out[(i * 8) + j] = (uint8_t)(w >> (unsigned)(56 - (8 * j)));
-   }
 }
 
 /* ZKP hash = SHA256( L|G  L|V(gv)  L|X(pub)  L|party ), points uncompressed
@@ -169,12 +159,12 @@ static void cert_fill(struct PCert *c, const struct jpoint *p1,
 /* Returns 0 if either point is the point at infinity, which has no affine
  * encoding.
  *
- * This used to be void. Both p256_to_xy returns were dropped and `out` -- an
- * uninitialised stack buffer in the driver -- was transmitted regardless. A
- * PEER can force it: round 3's base is (pubA + peer_pub1 + peer_pub2), so a
- * peer choosing pub2 = -(pubA + pub1) makes the base infinity, and then both
- * emitted points are too. That published 128 bytes of our stack over the air,
- * chosen by the attacker. p256_to_xy now zeroes on failure so the bytes are at
+ * NOT void. Drop the two p256_to_xy returns and `out` -- an uninitialised
+ * stack buffer in the driver -- is transmitted regardless. A PEER can force
+ * it: round 3's base is (pubA + peer_pub1 + peer_pub2), so a peer choosing
+ * pub2 = -(pubA + pub1) makes the base infinity, and then both emitted points
+ * are too. That publishes 128 bytes of our stack over the air, chosen by the
+ * attacker. p256_to_xy zeroes on failure so the bytes are at
  * least deterministic; this return is what stops them being sent at all. */
 static int cert_byteify(const struct PCert *c, uint8_t out[160])
 {
@@ -182,7 +172,10 @@ static int cert_byteify(const struct PCert *c, uint8_t out[160])
     * `out` is written (zeroed on failure) whatever the other does. */
    int ok1 = p256_to_xy(&c->pubkey1, out, out + 32);
    int ok2 = p256_to_xy(&c->pubkey2, out + 64, out + 96);
-   sc_to_be(&c->hash, out + 128);
+   /* p256_sc_to_be: one encoder for the whole program (see p256.h). The
+    * proof scalar goes out over the air and the peer decodes it with
+    * p256_sc_from_be, so this side must be that side's exact inverse. */
+   p256_sc_to_be(&c->hash, out + 128);
    return ok1 && ok2;
 }
 
@@ -271,13 +264,12 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  * only record that the peer's Schnorr proof was ever checked. So it must mean
  * "verified", and nothing weaker.
  *
- * IT USED TO BE THREE FLAGS, AND THEY USED TO MEAN "ARRIVED".
- * jpake_peer_round1 decoded the 160 wire bytes straight into p->r1, raised
- * its flag, and only THEN returned validate_zkp(). Rounds 2 and 3 were
- * written the same way, so all three had it. After a rejected packet the
- * object therefore looked, to any later call, exactly like one holding an
- * accepted round -- except the two ephemeral public keys and the proof scalar
- * in it were whatever the peer sent, chosen freely, having passed nothing.
+ * WHY IT IS NOT THREE FLAGS MEANING "ARRIVED". Decode the 160 wire bytes
+ * straight into p->r1, raise a flag, and only THEN return validate_zkp() --
+ * and after a rejected packet the object looks, to any later call, exactly
+ * like one holding an accepted round, except that the two ephemeral public
+ * keys and the proof scalar in it are whatever the peer sent, chosen freely,
+ * having passed nothing.
  * WHAT AN ATTACKER GOT FOR IT: peer round 1's pubkey1 is a base point of
  * round 3 (make_round3 adds it in) and peer round 2's pubkey1 and peer round
  * 3's pubkey1 are the two inputs shared_key combines, so an accepted-looking
@@ -286,13 +278,12 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  * man in the middle; a flag that says they passed when they did not is that
  * defence turned off.
  *
- * It was never a return-code bug. The return code was right every time. That
- * is the whole shape of it: whether the wrong state could be USED depended
- * only on whether some caller went on touching the object after a failure --
- * a property of every present and future caller, checked nowhere, rather than
- * a property of this file. Today no caller does (see the survey below), so
- * this was latent; the point of fixing it here is that it stops being any
- * caller's problem to get right.
+ * IT IS NOT A RETURN-CODE QUESTION: the return code is right every time.
+ * Whether the wrong state can be USED would depend on whether some caller
+ * goes on touching the object after a failure -- a property of every present
+ * and future caller, checked nowhere, rather than a property of this file.
+ * Holding the state back is what stops it being any caller's problem to get
+ * right.
  *
  * THREE MECHANISMS, DELIBERATELY, because they fail independently:
  *
@@ -317,15 +308,14 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  *      trusted to interpret.
  *
  *   3. THE TRANSCRIPT HAS A PHASE, and it covers the case the other two do
- *      not. This paragraph used to read "NOT CHANGED, and flagged here on
- *      purpose: a SECOND valid round-N packet still replaces the first", on
- *      the grounds that no caller could send one and that refusing it would
- *      refuse a sensor's retransmit. Both halves were wrong to rest on. THE
- *      PEER IS NOT THE CALLER: a second round-1 packet arrives over the air,
- *      from whoever is transmitting, and mechanisms (1) and (2) do not touch
- *      it -- a DIFFERENT round-1 packet carrying a VALID proof (anyone can
- *      compute one; it proves knowledge of a scalar the sender chose, not of
- *      the password) published its pubkey1 straight over the accepted one.
+ *      not. It is tempting to leave a SECOND valid round-N packet replacing
+ *      the first, on the grounds that no caller sends one and that refusing
+ *      it would refuse a sensor's retransmit. Neither half holds. THE PEER IS
+ *      NOT THE CALLER: a second round-1 packet arrives over the air, from
+ *      whoever is transmitting, and mechanisms (1) and (2) do not touch it --
+ *      a DIFFERENT round-1 packet carrying a VALID proof (anyone can compute
+ *      one; it proves knowledge of a scalar the sender chose, not of the
+ *      password) would publish its pubkey1 straight over the accepted one.
  *      That value is a base point of make_round3 and a term in shared_key, so
  *      a peer could replace a proven term of the derived key at any moment
  *      before derivation. And "a genuine retransmit" is precisely what must be
@@ -358,7 +348,7 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  * restart from round 1 -- and in EC-J-PAKE that is not a cheap retry, it is a
  * new set of ephemerals and a new set of round packets. No caller wants that
  * today: srv/pair.c calls pair_reset(), app/sync.c breaks out to
- * jpake_free(), srv/synccli.c exits, and app/dexdriver.c goes to P_FAIL. The
+ * jpake_free(), srv/synccli.c exits, and app/dexproto.c goes to P_FAIL. The
  * cost is paid entirely by a hypothetical future caller, and it buys the
  * guarantee that such a caller cannot reintroduce this bug by accident. */
 struct jpake {
@@ -385,7 +375,7 @@ struct jpake {
  * public values, which went over the air in the clear and are secret from
  * nobody. The secrets in this object -- pass, xA, xB, vA, vB, v3 -- are left
  * alone here and wiped by jpake_free, which is where the non-elidable-wipe
- * question belongs (TODO item 62) and not here. */
+ * question belongs and not here. */
 static int jpake_fail(struct jpake *p)
 {
    if (!p)
@@ -403,40 +393,18 @@ int jpake_poisoned(const struct jpake *p)
    return !p || p->poisoned;
 }
 
-enum jpake_phase jpake_phase(const struct jpake *p)
-{
-   /* A poisoned exchange holds nothing, and answering with the phase it had
-    * reached would say otherwise. Same rule as jpake_accepted below, in one
-    * place, so the two can never disagree. */
-   if (jpake_poisoned(p))
-      return JPAKE_PHASE_R1;
-   return p->phase;
-}
-
-/* `phase` counts accepted peer rounds, so "round N is accepted" is exactly
- * "the count reached N" -- JPAKE_PHASE_R2 is 1, JPAKE_PHASE_R3 is 2,
- * JPAKE_PHASE_DONE is 3. That identity is why the three flags could go: with
- * a counter there is no representable state in which round 3 is accepted and
- * round 1 is not. */
-int jpake_accepted(const struct jpake *p, int round)
-{
-   if (round < 1 || round > 3)
-      return 0;
-   return (int)jpake_phase(p) >= round;
-}
-
 /* The password is validated and converted BEFORE the allocation, so a refused
  * password costs nothing and there is no half-built object to release. See
  * jpake.h for the encoding and the exact domain; what belongs here is why each
  * refusal is a refusal and not a repair.
  *
- * `if (passlen > 32) passlen = 32;` is what stood here. It silently kept the
- * FIRST 32 bytes, so every password sharing its first 32 bytes was one
- * password -- and the two sides never compare passwords, they compare a
- * derived key, so the only symptom of two users pairing on a truncated secret
- * is that it WORKS. There is no length this could be rounded to that a caller
- * would want; a passphrase this construction cannot hold has to come back as
- * a failure the caller can act on.
+ * `if (passlen > 32) passlen = 32;` would silently keep the FIRST 32 bytes,
+ * making every password that shares its first 32 bytes one password -- and
+ * the two sides never compare passwords, they compare a derived key, so the
+ * only symptom of two users pairing on a truncated secret is that it WORKS.
+ * There is no length this could be rounded to that a caller would want; a
+ * passphrase this construction cannot hold has to come back as a failure the
+ * caller can act on.
  *
  * The zero test is on the SCALAR, after reduction, not on the bytes: the
  * all-zero password and the 32 bytes of n are different inputs that reduce to
@@ -483,7 +451,14 @@ static int emit_round(const struct jpoint *pub, const struct u256 *priv,
                       uint8_t out[160])
 {
    struct PCert c;
-   cert_fill(&c, &p256_g, pub, priv, ran, party);
+   /* A COPY OF THE GENERATOR, ASKED FOR. Refusing here rather
+    * than proving over an empty curve: emit_round's 0 is fatal to the link,
+    * which is the right answer for "there is no curve yet" -- the alternative
+    * was a proof over the point at infinity that the peer would accept. */
+   struct jpoint g;
+   if (!p256_gen(&g))
+      return 0;
+   cert_fill(&c, &g, pub, priv, ran, party);
    if (!cert_byteify(&c, out))
       return 0; /* send_our_round treats 0 as fatal and fails the link */
    return 160;
@@ -531,26 +506,29 @@ int jpake_round3(struct jpake *p, uint8_t out[160])
    return 160;
 }
 
-/* The three peer rounds share one shape, and it is the fix: the PHASE TEST
- * COMES FIRST and refuses without reading the bytes, then `t` on the stack
+/* The three peer rounds share one shape, and the shape is the defence: the
+ * PHASE TEST COMES FIRST and refuses without reading the bytes, then `t` on
+ * the stack
  * absorbs the attacker-controlled bytes, verification runs against `t`, and
  * p->r* and the phase are touched only after the proof holds. Note also that
  * cert_from_bytes writes pubkey1 before it can discover pubkey2 is not on the
- * curve -- so even a packet rejected at DECODE used to leave half of an
+ * curve -- so without `t` even a packet rejected at DECODE leaves half of an
  * already-accepted round replaced by peer bytes and its flag still raised.
- * `t` fixes that case too, and it is the reason the temporary is a whole
- * PCert rather than a flag reordering. */
+ * That case is why the temporary is a whole PCert rather than a flag
+ * reordering. */
 int jpake_peer_round1(struct jpake *p, const uint8_t in[160])
 {
    if (jpake_poisoned(p))
       return 0;
    /* BEFORE cert_from_bytes, which is the point: a second round-1 packet is
     * not decoded, not verified and not published, so the accepted round it
-    * would have replaced is still exactly where it was. */
+    * would have replaced stands untouched. */
    if (p->phase != JPAKE_PHASE_R1)
       return 0;
    struct PCert t;
-   if (!cert_from_bytes(&t, in) || !validate_zkp(&p256_g, &t, p->peer))
+   struct jpoint g;
+   if (!p256_gen(&g) || !cert_from_bytes(&t, in) ||
+       !validate_zkp(&g, &t, p->peer))
       return jpake_fail(p);
    p->r1    = t;
    p->phase = JPAKE_PHASE_R2;
@@ -565,7 +543,9 @@ int jpake_peer_round2(struct jpake *p, const uint8_t in[160])
    if (p->phase != JPAKE_PHASE_R2)
       return 0;
    struct PCert t;
-   if (!cert_from_bytes(&t, in) || !validate_zkp(&p256_g, &t, p->peer))
+   struct jpoint g;
+   if (!p256_gen(&g) || !cert_from_bytes(&t, in) ||
+       !validate_zkp(&g, &t, p->peer))
       return jpake_fail(p);
    p->r2    = t;
    p->phase = JPAKE_PHASE_R3;
@@ -581,8 +561,8 @@ int jpake_peer_round3(struct jpake *p, const uint8_t in[160])
     * base would be built from the zero point calloc left behind, i.e. this
     * would be "verifying" against state no peer ever proved. Every caller does
     * feed rounds 1 and 2 first; this is what makes that ordering a rule of the
-    * object instead of a convention of four call sites -- and it now also
-    * refuses the SECOND round 3, which used to overwrite the first. */
+    * object rather than a convention of four call sites -- and it also
+    * refuses a SECOND round 3, which would otherwise overwrite the first. */
    if (p->phase != JPAKE_PHASE_R3)
       return 0;
    struct PCert t;
@@ -599,10 +579,9 @@ int jpake_shared_key(struct jpake *p, uint8_t out16[16])
    if (jpake_poisoned(p))
       return 0;
    /* EXACTLY ONE ACCEPTED PACKET OF EVERY REQUIRED ROUND, which is what
-    * JPAKE_PHASE_DONE means and what the old test did not: it read two of the
-    * three flags, so an object that had never accepted a round 1 -- or that
-    * had accepted round 2 twice and round 3 once -- satisfied it. The counter
-    * cannot represent either. */
+    * JPAKE_PHASE_DONE means. A test that reads two of three flags is
+    * satisfied by an object that never accepted a round 1 -- or that accepted
+    * round 2 twice and round 3 once. The counter cannot represent either. */
    if (p->phase != JPAKE_PHASE_DONE)
       return 0;
    /* shared_key returns 0 only when the combined point is infinity, which a

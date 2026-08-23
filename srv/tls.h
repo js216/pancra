@@ -3,7 +3,7 @@
  * Copyright 2026 Jakob Kastelic
  *
  * The whole TLS implementation is on the other side of these functions, and
- * nothing outside srv/tls.c knows how it works -- so replacing it is a
+ * nothing outside the tls module knows how it works -- so replacing it is a
  * rewrite of one file rather than a search across the server.
  *
  * A session belongs to ONE connection and one thread. The configuration --
@@ -33,12 +33,12 @@ typedef int (*tls_giveup_fn)(void);
  * is printed. */
 int tls_init(const char *cert_pem, const char *key_pem, const char *name);
 
-/* ONE TLS CONNECTION. Opaque: everything inside it is tls.c's business.
+/* ONE TLS CONNECTION. Opaque: everything inside it is the module's business
+ * (srv/tlsint.h, shared by its five files and nobody else).
  *
- * These five used to take no connection at all -- the header said they acted
- * on "the connection this thread last handshook", which is a sentence doing
- * the job a parameter should. A caller could not say which connection it
- * meant, and nothing stopped a hook that had forgotten to handshake from
+ * These five TAKE one. Acting on "the connection this thread last handshook"
+ * is a sentence doing the job a parameter should: a caller cannot say which
+ * connection it means, and nothing stops a hook that forgot to handshake from
  * reading a previous connection's keys. */
 struct tls_conn;
 
@@ -89,9 +89,9 @@ int derive_secret(const uint8_t secret[32], const char *label,
 #ifdef TLS_FAULTS
 /* ---- THE TEST BUILD'S DOOR ONTO SESSION TICKETS ------------------------
  *
- * Present only under -DTLS_FAULTS, which only srv/test/cryptotest.c's recipe
- * sets, alongside the injected monotonic clock (TLS_FAIL_MONOTONIC,
- * TLS_MONOTONIC_FIXED -- see srv/tls.c). A shipping binary has none of this,
+ * Present only under -DTLS_FAULTS, alongside the injected monotonic clock
+ * (TLS_FAIL_MONOTONIC, TLS_MONOTONIC_FIXED -- see srv/tls.c). A shipping
+ * binary has none of this,
  * the same way nothing that ships carries srv/db.c's DB_FAULTS hooks.
  *
  * WHY A DOOR AND NOT AN END-TO-END TEST. "No monotonic clock, no ticket"
@@ -111,6 +111,11 @@ int tls_fault_send_ticket(int fd);
 /* Fill the transcript to `pre`, offer `n` more: 1 = counted, 0 = refused.
  * Writes whether the connection was marked fatal through `fatal`. */
 int tls_fault_transcript(size_t pre, size_t n, int *fatal);
+/* How much the transcript holds. The size is a consequence of the largest
+ * certificate chain this server will send (see TRANS_MAX in srv/tlsint.h), so
+ * a suite that wants to stand one byte either side of the limit asks for it
+ * rather than repeating a number that moves when the chain bound does. */
+size_t tls_fault_transcript_cap(void);
 #endif
 
 #endif

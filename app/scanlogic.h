@@ -43,7 +43,8 @@ int scan_should_start(const struct scan_state *s);
  *
  * The rule: pair automatically only when ONE candidate is unambiguously the
  * nearest -- at least SCAN_AMBIG_DB stronger than every other. Below that the
- * user must choose, because commit_pair drops the old bond and pairs the MAC
+ * user must choose, because commit_pair drops the existing bond and pairs
+ * the MAC
  * it is given, so guessing wrong is destructive and silent.
  *
  * Lifted out of main.c because nothing there is reachable by any test: an
@@ -80,7 +81,8 @@ int scan_pick_candidate(const int *rssi, int n);
  * does the DEVICES refresh (scan_restart), and pairing takes the radio and
  * gives it back. A failure that reset whatever scan happened to be live would
  * then tear down a HEALTHY one -- the same outage, reached by a different
- * route, and this time caused by the fix. So every start is handed the
+ * route, and this time caused by the recovery. So every start is handed
+ * the
  * generation it owns and a failure is acted on only when it names the
  * generation still believed live. This is the same rule, for the same reason,
  * as the per-link GATT generations in Ble.java.
@@ -178,8 +180,8 @@ const char *scan_fail_text(int err);
  * (a separate armed flag beside every stamp) buys nothing for it. */
 #define MONO_NEVER 0L
 
-/* The intervals, in one place, because three of the four used to be bare
- * numbers at their call sites in reading.c. */
+/* The intervals, in one place, rather than bare numbers at their call sites
+ * in reading.c. */
 #define LIVE_SILENCE_S    420 /* CGM quiet this long -> force a reconnect */
 #define LIVE_KICK_MIN_S   300 /* ...and no more often than this per link */
 #define LIVE_RSSI_FRESH_S 120 /* an RSSI this recent is "this connection" */

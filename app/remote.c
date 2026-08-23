@@ -4,6 +4,7 @@
 
 #include "remote.h"
 #include "clock.h"
+#include "remotecfg.h"
 #include "settings.h"
 #include "shell.h"
 #include "sync.h"
@@ -15,11 +16,11 @@
 
 /* WHEN TO SYNC AT ALL.
  *
- * Only when something changed. This used to fire every ten seconds forever:
- * with nothing to send it still cost a TLS handshake, a request to the
- * server, and a full local pass over every log to hash it -- several times a
- * minute, on a phone battery, against a single-core board. That is not a
- * sync, it is a slow denial of service against your own server.
+ * Only when something changed. Firing every ten seconds forever costs a TLS
+ * handshake, a request to the server, and a full local pass over every log to
+ * hash it even with nothing to send -- several times a minute, on a phone
+ * battery, against a single-core board. That is not a sync, it is a slow
+ * denial of service against your own server.
  *
  * So: the sizes of the synced files are the trigger. A reading, a dose, an
  * edit or a deletion changes one of them; nothing else does. On top of that
@@ -35,12 +36,12 @@
  * resolve, a refused certificate, a rejected key. A fixed five minutes, and
  * deliberately NOT the climbing backoff above.
  *
- * It used to go straight to REMOTE_FAIL_MAX, the slowest schedule there is,
- * on the reasoning that retrying "cannot help". Two things were wrong with
- * that. The repair is often at the OTHER end -- a certificate renewed on the
- * server is exactly this case, and srv/deploy/README.md tells the operator
- * the phone "does not back off on it, because backing off would not help",
- * which is the opposite of what the code did. And half an hour is long
+ * Going straight to REMOTE_FAIL_MAX, the slowest schedule there is, on the
+ * reasoning that retrying "cannot help", is wrong twice over. The repair is
+ * often at the OTHER end -- a certificate renewed on the server is exactly
+ * this case, and srv/deploy/README.md tells the operator the phone "does not
+ * back off on it, because backing off would not help". And half an hour is
+ * long
  * enough that a botched rotation looks, from the phone, indistinguishable
  * from a phone that has given up.
  *
@@ -114,12 +115,12 @@ static void remote_sync_locked(void)
 {
    /* Ask JAVA to run a sync on its worker; the protocol itself is in sync.c.
     *
-    * This used to BE the protocol -- cursors, outbox positions, per-set
-    * batches, acknowledgement tags. All of that existed to make a
-    * fire-and-forget push lossless. The replica protocol does not need any of
-    * it: the phone and the server compare hashes and the phone pushes whole
+    * NOTHING OF THE PROTOCOL LIVES HERE -- no cursors, outbox positions,
+    * per-set batches or acknowledgement tags. All of that exists to make a
+    * fire-and-forget push lossless. The replica protocol needs none of it:
+    * the phone and the server compare hashes and the phone pushes whole
     * buckets, so "what has the server already got" is answered by the server,
-    * exactly, every time, instead of being tracked here and hoped for. */
+    * exactly, every time, rather than being tracked here and hoped for. */
    /* ONE reading of the three facts that decide whether to push at all: the
     * switch, the server and the identity are written by the settings screen
     * and the pairing worker, and this runs on the tick. Read one at a time
@@ -162,7 +163,7 @@ static void remote_sync_locked(void)
    if (syncjni_sync_request())
       return;
    /* JAVA NEVER TOOK IT, so no sync is running and no sync_report() is
-    * coming. The schedule must go back to what it was, or the next attempt
+    * coming. The schedule must be put back, or the next attempt
     * waits out REMOTE_SAFETY -- six hours in which the phone believes a sync
     * is in flight and nothing is. This is the ordinary prompt retry: the
     * floor (REMOTE_MIN_GAP) still applies, because a request Java keeps
@@ -177,9 +178,9 @@ static void remote_sync_locked(void)
       g_rem_seen = was_seen;
    if (g_rem_safety == now + REMOTE_SAFETY)
       g_rem_safety = was_safety;
-   /* g_rem_next is NOT restored to what it was: `go` required
-    * now >= g_rem_next, so the old value is already in the past and putting
-    * it back would let the very next tick fire, one second later. The floor
+   /* g_rem_next is NOT put back: `go` required now >= g_rem_next, so the
+    * value it held is already in the past and restoring it would let the very
+    * next tick fire, one second later. The floor
     * is what a refused request deserves -- retry promptly, but a Java that
     * keeps refusing must not become a spin. It is left in place. */
    mutex_unlock(&g_sched_lk);
@@ -187,7 +188,7 @@ static void remote_sync_locked(void)
 
 /* Called from the sync worker thread (see syncjni.h). Only touches values the
  * renderer reads whole, and sets the dirty flag last. */
-void sync_report(int outcome)
+void sync_report(enum sync_outcome outcome)
 {
    int ok = sync_outcome_severity(outcome) == SYNC_SEV_GOOD;
    /* Two clocks, deliberately: the UI shows WHEN the server last accepted
@@ -197,7 +198,7 @@ void sync_report(int outcome)
       remote_note_ok(realtime_s());
    long now = mono_s();
    /* THE WHOLE RESULT UNDER ONE LOCK, so a tick cannot observe the new
-    * deadline with the old freshness stamp (see g_sched_lk). */
+    * deadline against a stale freshness stamp (see g_sched_lk). */
    mutex_lock(&g_sched_lk);
    if (ok) {
       g_rem_backoff = 0;
@@ -236,9 +237,9 @@ void sync_report(int outcome)
 }
 
 /* THE USER CHANGED SOMETHING THE FAILURE WAS ABOUT. Clear the schedule so
- * the fix is tried at once instead of waiting out a backoff that was earned
- * by the old settings: a corrected server name that takes half an hour to be
- * tried looks exactly like a name that is still wrong. */
+ * the correction is tried at once rather than waiting out a backoff earned
+ * by the settings the user has just corrected: a fixed server name that takes
+ * half an hour to be tried looks exactly like a name that is still wrong. */
 void remote_retry_now(void)
 {
    mutex_lock(&g_sched_lk);
@@ -248,22 +249,20 @@ void remote_retry_now(void)
    mutex_unlock(&g_sched_lk);
 }
 
-/* The configured server changed. There is no cursor to forget any more --
- * the next sync asks the NEW server what it has and finds out exactly -- but
- * the paired identity belongs to the old one and must not be offered to
- * another server. */
-void remote_forget_cursor(void)
+/* See remote.h for what this deletes and what a refusal leaves behind. */
+enum identity_drop remote_drop_identity(void)
 {
    struct sync_creds sc;
-   sync_creds_get(&sc);
+   remote_creds_get(&sc);
    /* BOTH OR NEITHER. The stored identity is rolled back whole when the
     * write fails, so dropping the RUNTIME key regardless is what made it
     * half gone: the phone stops signing requests while the file still names
     * the account, and the next launch loads it back. */
-   if (settings_forget_identity() != SETTINGS_OK)
-      return;
+   if (remote_forget_identity() != SETTINGS_OK)
+      return IDENTITY_KEPT;
    sync_set_key(0, sc.key);
    remote_retry_now();
+   return IDENTITY_DROPPED;
 }
 
 /* Wall-clock of the last REMOTE push the server ACKNOWLEDGED (HTTP 2xx),
@@ -292,21 +291,21 @@ static _Atomic long g_remote_last_ok;
  * recognising the words, which is what let two outcomes render as "nothing
  * has happened" for as long as they existed. */
 static struct mutex g_rstat_lk = MUTEX_INIT;
-static int g_remote_outcome; /* enum sync_outcome, written by the worker */
+/* THE TYPE IS THE TYPE: an int with the enum named in a comment beside it is
+ * a promise the compiler cannot keep. */
+static enum sync_outcome g_remote_outcome;
 
-void remote_note_outcome(int outcome)
+enum sync_outcome remote_outcome(void)
 {
    mutex_lock(&g_rstat_lk);
-   g_remote_outcome = outcome;
-   mutex_unlock(&g_rstat_lk);
-}
-
-int remote_outcome(void)
-{
-   mutex_lock(&g_rstat_lk);
-   int o = g_remote_outcome;
+   enum sync_outcome o = g_remote_outcome;
    mutex_unlock(&g_rstat_lk);
    return o;
+}
+
+long remote_ok_time(void)
+{
+   return atomic_load_explicit(&g_remote_last_ok, memory_order_relaxed);
 }
 
 void remote_note_ok(long when)
@@ -314,7 +313,9 @@ void remote_note_ok(long when)
    atomic_store_explicit(&g_remote_last_ok, when, memory_order_relaxed);
 }
 
-long remote_ok_time(void)
+void remote_note_outcome(int outcome)
 {
-   return atomic_load_explicit(&g_remote_last_ok, memory_order_relaxed);
+   mutex_lock(&g_rstat_lk);
+   g_remote_outcome = outcome;
+   mutex_unlock(&g_rstat_lk);
 }

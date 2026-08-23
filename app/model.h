@@ -33,6 +33,27 @@
  * history lock -- see the header comment. */
 void model_snapshot(void);
 
+/* ---- THE ONLY WAY TO GET A FRAME ------------------------------------
+ *
+ * A frame is not just build_model(): it is model_snapshot() FIRST (which
+ * takes the driver and registry locks, and must not be called with the
+ * history lock held), then the history lock, then build_model, then the
+ * unlock. Three steps in one order, and getting any of them wrong produces
+ * a frame that LOOKS right -- the failure is a plot drawn from two different
+ * histories, or a deadlock between the binder thread and the compositor.
+ *
+ * It was written out at the one call site that draws, and the OTHER caller
+ * -- the weight-scrub drag in input.c -- called build_model alone: no
+ * snapshot, no history lock, on the main thread while a BLE reading could be
+ * inserting into the very history it walks. So the sequence is one function
+ * now, and there is nothing left to write out wrongly.
+ *
+ * Returns 0 when the history lock was not free, and then there is no frame
+ * and the caller must use none: both callers are repeated (the 1 Hz timer,
+ * and a drag's next MOVE event), so the answer costs one skipped frame
+ * rather than a main thread queued behind a binder thread. */
+int model_frame(struct screen *m);
+
 /* The id of the device drawn at row `row` of the last frame, or -1. A tap
  * names a row; this is what turns it into a device, against the picture the
  * user actually touched rather than the registry as it now stands. */

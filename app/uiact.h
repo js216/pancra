@@ -19,13 +19,13 @@
 
 /* One touch target and the action the shell acts on.
  *
- * THREE FIELDS, AND THE THIRD IS THE POINT. `code` used to carry base+index
- * arithmetic: "sensor 3" was MA_SENSOR + 3, "digit 7" was MA_DIGIT + 7, and
- * seventeen such bases were packed into one integer namespace with gaps
- * chosen by hand. Nothing checked the gaps were big enough, so raising
- * MAX_SLOTS turned "open sensor 8" into "close the sensor screen" -- a wrong
- * branch that reaches sensor_forget and the calibration write. Ten
- * _Static_asserts existed solely to make those collisions build errors.
+ * THREE FIELDS, AND THE THIRD IS THE POINT. `code` carries NO base+index
+ * arithmetic: with "sensor 3" as MA_SENSOR + 3 and "digit 7" as MA_DIGIT + 7,
+ * seventeen such bases pack into one integer namespace with gaps chosen by
+ * hand. Nothing checks the gaps are big enough, so raising MAX_SLOTS turns
+ * "open sensor 8" into "close the sensor screen" -- a wrong branch that
+ * reaches sensor_forget and the calibration write. Ten _Static_asserts would
+ * exist solely to make those collisions build errors.
  *
  * With the index in its own field there are no ranges to collide: every code
  * is a plain tag, and "which one" is a separate number that cannot run into
@@ -152,8 +152,8 @@ enum ui_menu {
    MA_FOODTYPE_BACK, /* picker: leave without choosing */
    MA_FOODPAGE_PREV, /* picker: previous page of the vocabulary */
    MA_FOODPAGE_NEXT,
-   MA_FOOD_CONFIRM,  /* LOG FOOD: append the entry */
-   MA_FOOD_DISCARD,  /* LOG FOOD: leave without logging */
+   MA_FOOD_CONFIRM, /* LOG FOOD: append the entry */
+   MA_FOOD_DISCARD, /* LOG FOOD: leave without logging */
    /* LOG FOOD fields, mirroring MA_WT_EDIT; ix picks one: 0 type, 1 grams,
     * 2 time, 3 date, 4 year. */
    MA_FOOD_EDIT,
@@ -161,10 +161,35 @@ enum ui_menu {
    MA_FOODLOG_BACK,
    MA_FOODLOG_PREV,
    MA_FOODLOG_NEXT,
+   MA_FOODLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
+   MA_FOOD_DELETE,  /* EDIT FOOD: delete this entry (red) */
+   MA_FOODDEL_YES,
+   MA_FOODDEL_NO,
    /* EXERCISE: one button on the ADD menu that cycles 0-1-2-3 and opens
     * nothing. It has no screen of its own, which is why it has exactly one
     * code here. */
    MA_EXERCISE,
+   /* ...and its LOG, which does have screens: the same paginated, editable
+    * table the insulin, weight and food logs have. The button that records
+    * needs one code; correcting what it recorded needs the same eleven every
+    * other log has. */
+   MA_EXLOG_OPEN, /* ADD menu: open the exercise table */
+   MA_EXLOG_BACK,
+   MA_EXLOG_PREV,
+   MA_EXLOG_NEXT,
+   MA_EXLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
+   MA_EX_CONFIRM, /* EDIT EXERCISE: rewrite the entry */
+   MA_EX_DISCARD, /* EDIT EXERCISE: leave it as it was */
+   /* EDIT EXERCISE fields; ix picks one: 0 level, 1 time, 2 date, 3 year.
+    * LEVEL is not a keypad -- it cycles 1-2-3, the same three values the ADD
+    * button offers, so there is one way to say "moderate" rather than two. */
+   MA_EX_EDIT,
+   MA_EX_DELETE, /* EDIT EXERCISE: delete this entry (red) */
+   MA_EXDEL_YES,
+   MA_EXDEL_NO,
+   /* THE MODEL'S OWN SCREEN. Two ways in, deliberately: the stats table on the
+    * main screen is where a number about the near future belongs, and
+    * SETTINGS is where somebody goes looking for it by name. */
    MA_PERM, /* ix = permission index */
    MA_BATTERY,
    MA_BGEXEC,
@@ -213,29 +238,29 @@ enum ui_menu {
    MA_ADD_OPEN,       /* main-screen '+': open the ADD menu */
    MA_INS_OPEN,       /* ADD menu: open the LOG INSULIN form */
    MA_INS_TYPE,       /* LOG INSULIN: toggle SLOW / FAST */
-   MA_INS_UMINUS,     /* LOG INSULIN: units - 1 */
-   MA_INS_UPLUS,      /* LOG INSULIN: units + 1 */
-   MA_INS_DMINUS,     /* LOG INSULIN: date - 1 day */
-   MA_INS_DPLUS,      /* LOG INSULIN: date + 1 day */
-   MA_INS_TMINUS,     /* LOG INSULIN: time - 5 min */
-   MA_INS_TPLUS,      /* LOG INSULIN: time + 5 min */
-   MA_INS_CONFIRM,    /* LOG INSULIN: append the dose */
-   MA_INS_DISCARD,    /* LOG INSULIN: leave without logging */
-   MA_WEAR,           /* device screen: toggle wear length 10 D / 15 D */
-   MA_PEND_CANCEL,    /* DEVICES: cancel the armed (pending) pairing */
-   MA_PERMS_OPEN,     /* settings: open the PERMISSIONS submenu */
-   MA_PERMS_BACK,     /* permissions submenu: back to settings */
-   MA_DEVICES_OPEN,   /* open the DEVICES screen: the main screen's big
-                              number, or the SETTINGS row */
-   MA_OLDDEV_OPEN,    /* DEVICES: open the OLD DEVICES list */
-   MA_OLDDEV_BACK,    /* OLD DEVICES list: back to DEVICES */
-   MA_OLDPAGE_PREV,   /* OLD DEVICES: previous page */
-   MA_OLDPAGE_NEXT,   /* OLD DEVICES: next page */
-   MA_DEVPAGE_PREV,   /* DEVICES: previous page of the live list */
-   MA_DEVPAGE_NEXT,   /* DEVICES: next page of the live list */
+   /* (LOG INSULIN takes its number through the keypad, so it has no +/-
+    * steppers and no codes for them. A code in this enum with no handler and
+    * no button is one a tap can carry that nothing will act on;
+    * `make -f test/Makefile actioncheck` refuses that shape.) */
+   MA_INS_CONFIRM,  /* LOG INSULIN: append the dose */
+   MA_INS_DISCARD,  /* LOG INSULIN: leave without logging */
+   MA_WEAR,         /* device screen: toggle wear length 10 D / 15 D */
+   MA_PEND_CANCEL,  /* DEVICES: the armed (pending) pairing row: ask */
+   MA_PEND_STOP,    /* pending-pairing confirm: stop waiting */
+   MA_PEND_KEEP,    /* pending-pairing confirm: leave it armed */
+   MA_PERMS_OPEN,   /* settings: open the PERMISSIONS submenu */
+   MA_PERMS_BACK,   /* permissions submenu: back to settings */
+   MA_DEVICES_OPEN, /* open the DEVICES screen: the main screen's big
+                            number, or the SETTINGS row */
+   MA_OLDDEV_OPEN,  /* DEVICES: open the OLD DEVICES list */
+   MA_OLDDEV_BACK,  /* OLD DEVICES list: back to DEVICES */
+   MA_OLDPAGE_PREV, /* OLD DEVICES: previous page */
+   MA_OLDPAGE_NEXT, /* OLD DEVICES: next page */
+   MA_DEVPAGE_PREV, /* DEVICES: previous page of the live list */
+   MA_DEVPAGE_NEXT, /* DEVICES: next page of the live list */
    /* The PIN checkbox on the ADD menu; ix is a slot in the ui_shortcut_*
-    * table. Nothing bounds that table any more -- it used to be capped at 11
-    * entries by the reserved range this code sat in. */
+    * table. Nothing bounds that table -- a reserved code range would cap it
+    * at 11 entries. */
    MA_SCTOGGLE,
    MA_RECONNECT, /* old device: revive it (direct if not yet expired,
                   * else via a confirmation screen) */
@@ -265,14 +290,14 @@ enum ui_menu {
    MA_INSLOG_EDIT,
 };
 
-/* THE RANGES ARE GONE, AND SO ARE THE ASSERTS THAT GUARDED THEM.
+/* WHY THERE ARE NO BASE-PLUS-INDEX RANGES HERE, AND NO ASSERTS GUARDING THEM.
  *
- * Ten _Static_asserts stood here. Every one of them said the same thing: that
- * one code's base-plus-index run had not yet grown into its neighbour's. They
- * existed because seventeen of these codes were a BASE with a runtime index
- * added -- MA_SENSOR + slot, MA_DIGIT + digit, MA_CHAR + letter -- packed into
- * one integer namespace whose gaps were picked by hand. MA_DIGIT + 9 landed
- * exactly on MA_BACKSPACE with nothing to spare, and MA_SENSOR + slot had
+ * A code built as a BASE with a runtime index added -- MA_SENSOR + slot,
+ * MA_DIGIT + digit, MA_CHAR + letter -- packs several codes into one integer
+ * namespace whose gaps have to be picked by hand, and each run then needs a
+ * _Static_assert saying it has not grown into its neighbour's. The margins are
+ * nothing: MA_DIGIT + 9 lands exactly on MA_BACKSPACE with nothing to spare,
+ * and MA_SENSOR + slot had
  * three. A collision does not crash or warn: the dispatcher simply runs the
  * wrong branch, so raising MAX_SLOTS turned "open sensor 8" into "close the
  * sensor screen" -- and a wrong branch here reaches sensor_forget and the
@@ -308,10 +333,10 @@ enum ui_menu {
  *
  * The touch path has to reproduce the render's mapping exactly to resolve a
  * tap to the right datapoint, and both inputs to that mapping -- the vertical
- * scale and the marker radius -- used to live in process globals that
- * plot_render wrote and plot_hit read back. Two plots with different settings
- * therefore could not exist at once, and the first touch after a scale change
- * answered against the previous one.
+ * scale and the marker radius -- are NOT process globals that plot_render
+ * writes and plot_hit reads back. As globals, two plots with different
+ * settings cannot exist at once, and the first touch after a scale change
+ * answers against the previous one.
  *
  * It belongs HERE because this is already the per-frame record of what was
  * drawn where: the scrub rectangle is read out of it the same way (see

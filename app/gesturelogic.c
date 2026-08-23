@@ -5,6 +5,7 @@
 /* See gesturelogic.h. Pure by design: no globals, no clock, no event, no
  * locks, no JNI. */
 #include "gesturelogic.h"
+#include "ndk.h"
 
 /* Where the latched pointer sits in THIS event, or -1 if it is not in it.
  *
@@ -33,7 +34,7 @@ struct gesture_out gesture_resolve(const struct gesture_in *in)
     * second byte. Only POINTER_DOWN and POINTER_UP carry it; for every other
     * action those bits are zero. */
    int pidx = (int)((raw & (unsigned)AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >>
-                    AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+                    (unsigned)AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
 
    /* A NEW GESTURE. ACTION_DOWN is by definition the FIRST finger, so the
     * action word's index bits are zero and slot 0 really is the new pointer --

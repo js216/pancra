@@ -4,6 +4,8 @@
  */
 #ifndef PBKDF2_H
 #define PBKDF2_H
+
+#include "compiler.h" /* PANCRA_MUST_USE: the annotation, portably */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -15,11 +17,11 @@
  * to the one-shot hmac_sha256(). 252 + 4 keeps that block at the 256 bytes it
  * has always been. What changes is the answer to a longer salt.
  *
- * WHAT THE OLD CODE DID: `size_t k = saltn > sizeof si - 4 ? sizeof si - 4 :
- * saltn;` -- it TRUNCATED, and the API returned void, so nobody could be
- * told. Two accounts salted with 300-byte values that shared their first 252
- * bytes hashed identically; a salt lengthened from 252 to 260 kept deriving
- * the old key while the stored salt said otherwise. Both are unreproducible
+ * WHY A LONGER SALT IS REFUSED. `size_t k = saltn > sizeof si - 4 ? sizeof
+ * si - 4 : saltn;` TRUNCATES, and with a void API nobody can be told: two
+ * accounts salted with 300-byte values that share their first 252 bytes hash
+ * identically, and a salt lengthened from 252 to 260 goes on deriving the
+ * same key while the stored salt says otherwise. Both are unreproducible
  * from the arguments at the call site, which is the whole problem with a KDF
  * that edits its inputs. */
 #define PBKDF2_SALT_MAX 252
@@ -46,22 +48,22 @@ enum pbkdf2_status {
    PBKDF2_ERR_DKLEN  /* n == 0, or above the block ceiling above */
 };
 
-/* PBKDF2_OK, or a status with `out` LEFT EXACTLY AS IT WAS.
+/* PBKDF2_OK, or a status with `out` LEFT UNTOUCHED.
  *
  * `iters` is the caller's cost parameter and must be stored beside the hash,
  * so it can be raised later without invalidating existing passwords -- which
- * is also why zero is REFUSED rather than rounded up. The old code ran
- * `for (i = 1; i < iters; i++)`, so a stored count of 0 silently became a
- * count of 1: a password hash with no work factor at all, indistinguishable
+ * is also why zero is REFUSED rather than rounded up. Under
+ * `for (i = 1; i < iters; i++)` a stored count of 0 silently becomes a count
+ * of 1: a password hash with no work factor at all, indistinguishable
  * on the wire and in the database from one deliberately created with c = 1,
  * and still verifying successfully for the account holder. A cost parameter
  * that can quietly become the weakest legal value is not a cost parameter.
  *
  * warn_unused_result because a KDF that reports a refusal nobody reads still
  * leaves the caller holding whatever was in the buffer. */
-enum pbkdf2_status pbkdf2_sha256(const uint8_t *pw, size_t pwn,
-                                 const uint8_t *salt, size_t saltn,
-                                 unsigned iters, uint8_t *out, size_t n)
-    __attribute__((warn_unused_result));
+PANCRA_MUST_USE enum pbkdf2_status pbkdf2_sha256(const uint8_t *pw, size_t pwn,
+                                                 const uint8_t *salt,
+                                                 size_t saltn, unsigned iters,
+                                                 uint8_t *out, size_t n);
 
 #endif

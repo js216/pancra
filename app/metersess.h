@@ -10,7 +10,7 @@
  * connect has to be refused until it does not. That fact -- busy, the link it
  * is running on, the registry id behind it, when it started, and which links
  * are waiting for a teardown -- was five file-scope variables in meter.c
- * written from three threads with no lock at all (NOTES.md):
+ * written from three threads with no lock at all:
  *
  *   BINDER   the connect/disconnect/notify callbacks (meter_hook_connected,
  *            meter_hook_disconnected, ot_drv_*), which both TEST busy and
@@ -49,7 +49,7 @@
  * The module has no clock of its own precisely so that a wall-clock stamp
  * cannot be smuggled in by including the wrong header; see clockcheck.
  *
- * Pure otherwise: no globals but its own, no JNI, no files. app/test/
+ * Pure otherwise: no globals but its own, no JNI, no files. test/app/
  * metersesstest.c runs the callback and watchdog paths against it on real
  * threads.
  */
@@ -111,7 +111,6 @@ int msess_drop(void);
 
 /* Which meter the app is bound to, and its address. `src` is 0 when none. */
 int msess_src(void);
-void msess_mac(char *out, int cap);
 int msess_busy(void);
 /* Bind to a meter without claiming an exchange (the reconcile path, which
  * decides WHICH registered meter the runtime speaks for). */
@@ -123,8 +122,5 @@ void msess_bind(int src, const char *mac);
 void msess_idle_set(int link, long when);
 void msess_idle_copy(long *out, int n);
 
-/* Forget everything. For tests: the app has one session for the life of the
- * process. */
-void msess_reset(void);
 
 #endif
