@@ -79,7 +79,9 @@ long *form_ex_duration(void);
  * refusal says); each of these is the one line that follows a number the
  * keypad has already judged. */
 void form_wt_set_tenths(int tenths);
-void form_ins_set_units(int units);
+/* THOUSANDTHS of a unit -- the keypad has already bounded it; this is the
+ * assignment that follows. */
+void form_ins_set_units(int milli);
 void form_food_set_grams(int grams);
 
 /* This workflow's part of the frame's snapshot. Each fills only its own

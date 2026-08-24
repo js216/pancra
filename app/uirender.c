@@ -62,7 +62,7 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
    h->n        = 0;
    h->overflow = 0;
    /* TRUE black: zero photons on an OLED, rather than a near-black wash. */
-   clear_fb(fb, 0xFF000000);
+   clear_fb(fb, UI_BLACK);
    switch (m->scr) {
       case SCR_SETTINGS: render_settings(fb, m, h); break;
       case SCR_KEYPAD: render_keypad(fb, m, h); break;
@@ -91,7 +91,8 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
          render_weight(fb, &m->wt, &m->prefs, m->tz_off, h);
          break;
       case SCR_WTLOG:
-         render_wtlog(fb, &m->wt, &m->prefs, m->now, m->tz_off, h);
+         render_wtlog(fb, &m->wt, &m->prefs, m->now, m->tz_off, m->log_scrub,
+                      h);
          break;
       case SCR_WTDEL: render_wtdel(fb, &m->wt, &m->prefs, m->tz_off, h); break;
       case SCR_ALARM: render_alarm(fb, m, h); break;

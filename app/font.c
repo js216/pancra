@@ -78,45 +78,180 @@ static const uint8_t font_at[7] = {0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0F};
 static const uint8_t font_comma[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08};
 static const uint8_t font_quest[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
 
+static const uint8_t font_lower[26][7] = {
+    {0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F}, /* a */
+    {0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E}, /* b */
+    {0x00, 0x00, 0x0F, 0x10, 0x10, 0x10, 0x0F}, /* c */
+    {0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F}, /* d */
+    {0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E}, /* e */
+    {0x06, 0x09, 0x08, 0x1E, 0x08, 0x08, 0x08}, /* f */
+    {0x00, 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x0E}, /* g */
+    {0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x11}, /* h */
+    {0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E}, /* i */
+    {0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0C}, /* j */
+    {0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12}, /* k */
+    {0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, /* l */
+    {0x00, 0x00, 0x1A, 0x15, 0x15, 0x15, 0x15}, /* m */
+    {0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11}, /* n */
+    {0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E}, /* o */
+    {0x00, 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10}, /* p */
+    {0x00, 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x01}, /* q */
+    {0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10}, /* r */
+    {0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E}, /* s */
+    {0x08, 0x08, 0x1E, 0x08, 0x08, 0x09, 0x06}, /* t */
+    {0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F}, /* u */
+    {0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04}, /* v */
+    {0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A}, /* w */
+    {0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11}, /* x */
+    {0x00, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E}, /* y */
+    {0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F}, /* z */
+};
+/* THE PUNCTUATION THAT HAD NO GLYPH. Every one of these drew as a blank
+ * cell, so a string containing it silently lost a character. */
+static const uint8_t font_quote[7] = {0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '"' */
+static const uint8_t font_hash[7] = {0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A}; /* '#' */
+static const uint8_t font_dollar[7] = {0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04}; /* '$' */
+static const uint8_t font_amp[7] = {0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D}; /* '&' */
+static const uint8_t font_tick[7] = {0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '\'' */
+static const uint8_t font_star[7] = {0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00}; /* '*' */
+static const uint8_t font_semi[7] = {0x00, 0x04, 0x00, 0x00, 0x04, 0x04, 0x08}; /* ';' */
+static const uint8_t font_equals[7] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}; /* '=' */
+static const uint8_t font_lbrack[7] = {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}; /* '[' */
+static const uint8_t font_bslash[7] = {0x10, 0x10, 0x08, 0x04, 0x04, 0x02, 0x01}; /* '\\' */
+static const uint8_t font_rbrack[7] = {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}; /* ']' */
+static const uint8_t font_caret[7] = {0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00}; /* '^' */
+static const uint8_t font_grave[7] = {0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '`' */
+static const uint8_t font_lbrace[7] = {0x06, 0x04, 0x04, 0x08, 0x04, 0x04, 0x06}; /* '{' */
+static const uint8_t font_pipe[7] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}; /* '|' */
+static const uint8_t font_rbrace[7] = {0x0C, 0x04, 0x04, 0x02, 0x04, 0x04, 0x0C}; /* '}' */
+static const uint8_t font_tilde[7] = {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00}; /* '~' */
+
+/* EVERY VISIBLE ASCII CHARACTER, indexed by `c - ' '`.
+ *
+ * A TABLE, NOT A CHAIN OF ifs. The chain this replaces answered for about a
+ * third of the printable range and returned NULL for the rest -- and a NULL
+ * is a blank cell, so a string containing an unlisted character lost it
+ * silently, which is how '?' and ',' were once missing from a confirmation
+ * and a disclaimer without anybody noticing. Laid out by character, the
+ * question "is every visible character here" is answered by reading the
+ * table, and a gap is a hole you can see.
+ *
+ * SPACE IS THE ONE DELIBERATE NULL: a blank cell is what a space IS.
+ *
+ * LOWERCASE IS ITS OWN SET now, rather than being folded onto the capitals.
+ * The prose this app draws -- the gate's disclaimer, the device list's
+ * instructions -- was written in mixed case and rendered in shouting
+ * capitals; a sentence that looks like a warning when it is an explanation
+ * is a small lie the font was telling. Callers that WANT capitals uppercase
+ * their own text (the label editor does), which is a decision about the
+ * text rather than about the alphabet. */
+static const uint8_t *const font_ascii['~' - ' ' + 1] = {
+    [' ' - ' '] = 0,  /* a blank cell, and the only one that is deliberate */
+    ['0' - ' '] = font_digit[0],
+    ['1' - ' '] = font_digit[1],
+    ['2' - ' '] = font_digit[2],
+    ['3' - ' '] = font_digit[3],
+    ['4' - ' '] = font_digit[4],
+    ['5' - ' '] = font_digit[5],
+    ['6' - ' '] = font_digit[6],
+    ['7' - ' '] = font_digit[7],
+    ['8' - ' '] = font_digit[8],
+    ['9' - ' '] = font_digit[9],
+    ['A' - ' '] = font_upper[0],
+    ['B' - ' '] = font_upper[1],
+    ['C' - ' '] = font_upper[2],
+    ['D' - ' '] = font_upper[3],
+    ['E' - ' '] = font_upper[4],
+    ['F' - ' '] = font_upper[5],
+    ['G' - ' '] = font_upper[6],
+    ['H' - ' '] = font_upper[7],
+    ['I' - ' '] = font_upper[8],
+    ['J' - ' '] = font_upper[9],
+    ['K' - ' '] = font_upper[10],
+    ['L' - ' '] = font_upper[11],
+    ['M' - ' '] = font_upper[12],
+    ['N' - ' '] = font_upper[13],
+    ['O' - ' '] = font_upper[14],
+    ['P' - ' '] = font_upper[15],
+    ['Q' - ' '] = font_upper[16],
+    ['R' - ' '] = font_upper[17],
+    ['S' - ' '] = font_upper[18],
+    ['T' - ' '] = font_upper[19],
+    ['U' - ' '] = font_upper[20],
+    ['V' - ' '] = font_upper[21],
+    ['W' - ' '] = font_upper[22],
+    ['X' - ' '] = font_upper[23],
+    ['Y' - ' '] = font_upper[24],
+    ['Z' - ' '] = font_upper[25],
+    ['a' - ' '] = font_lower[0],
+    ['b' - ' '] = font_lower[1],
+    ['c' - ' '] = font_lower[2],
+    ['d' - ' '] = font_lower[3],
+    ['e' - ' '] = font_lower[4],
+    ['f' - ' '] = font_lower[5],
+    ['g' - ' '] = font_lower[6],
+    ['h' - ' '] = font_lower[7],
+    ['i' - ' '] = font_lower[8],
+    ['j' - ' '] = font_lower[9],
+    ['k' - ' '] = font_lower[10],
+    ['l' - ' '] = font_lower[11],
+    ['m' - ' '] = font_lower[12],
+    ['n' - ' '] = font_lower[13],
+    ['o' - ' '] = font_lower[14],
+    ['p' - ' '] = font_lower[15],
+    ['q' - ' '] = font_lower[16],
+    ['r' - ' '] = font_lower[17],
+    ['s' - ' '] = font_lower[18],
+    ['t' - ' '] = font_lower[19],
+    ['u' - ' '] = font_lower[20],
+    ['v' - ' '] = font_lower[21],
+    ['w' - ' '] = font_lower[22],
+    ['x' - ' '] = font_lower[23],
+    ['y' - ' '] = font_lower[24],
+    ['z' - ' '] = font_lower[25],
+    ['!' - ' '] = font_bang,
+    ['"' - ' '] = font_quote,
+    ['#' - ' '] = font_hash,
+    ['$' - ' '] = font_dollar,
+    ['%' - ' '] = font_pct,
+    ['&' - ' '] = font_amp,
+    ['\'' - ' '] = font_tick,
+    ['(' - ' '] = font_lpar,
+    [')' - ' '] = font_rpar,
+    ['*' - ' '] = font_star,
+    ['+' - ' '] = font_plus,
+    [',' - ' '] = font_comma,
+    ['-' - ' '] = font_minus,
+    ['.' - ' '] = font_dot,
+    ['/' - ' '] = font_slash,
+    [':' - ' '] = font_colon,
+    [';' - ' '] = font_semi,
+    ['<' - ' '] = font_larrow,
+    ['=' - ' '] = font_equals,
+    ['>' - ' '] = font_rarrow,
+    ['?' - ' '] = font_quest,
+    ['@' - ' '] = font_at,
+    ['[' - ' '] = font_lbrack,
+    ['\\' - ' '] = font_bslash,
+    [']' - ' '] = font_rbrack,
+    ['^' - ' '] = font_caret,
+    ['_' - ' '] = font_uscore,
+    ['`' - ' '] = font_grave,
+    ['{' - ' '] = font_lbrace,
+    ['|' - ' '] = font_pipe,
+    ['}' - ' '] = font_rbrace,
+    ['~' - ' '] = font_tilde,
+};
+
 const uint8_t *glyph_for(char c)
 {
-   if (c >= 'a' && c <= 'z')
-      c -= 'a' - 'A';
-   if (c >= 'A' && c <= 'Z')
-      return font_upper[c - 'A'];
-   if (c >= '0' && c <= '9')
-      return font_digit[c - '0'];
-   if (c == '-')
-      return font_minus;
-   if (c == ':')
-      return font_colon;
-   if (c == '.')
-      return font_dot;
-   if (c == '!')
-      return font_bang;
-   if (c == '/')
-      return font_slash;
-   if (c == '+')
-      return font_plus;
-   if (c == '(')
-      return font_lpar;
-   if (c == ')')
-      return font_rpar;
-   if (c == '%')
-      return font_pct;
-   if (c == '<')
-      return font_larrow; /* backspace key label */
-   if (c == '_')
-      return font_uscore; /* keypad entry placeholder */
-   if (c == '>')
-      return font_rarrow; /* primary-sensor marker */
-   if (c == ',')
-      return font_comma;
-   if (c == '@')
-      return font_at;
-   if (c == '?')
-      return font_quest;
-   return 0; /* space / unknown: blank cell */
+   /* UNSIGNED, because `char` is signed on this target: a byte above 0x7F
+    * arrives negative, and a signed compare would let it past the range test
+    * and index the table from before its start. */
+   const unsigned char u = (unsigned char)c;
+   if (u < ' ' || u > '~')
+      return 0; /* control byte or high bit set: not something we draw */
+   return font_ascii[u - ' '];
 }
 
 int str_len(const char *s)
@@ -139,6 +274,32 @@ const uint8_t icon_vibrate[7] = {0x0E, 0x0A, 0x1B, 0x1B, 0x1B, 0x0A, 0x0E};
 const uint8_t icon_pencil[7] = {0x03, 0x07, 0x0E, 0x1C, 0x18, 0x10, 0x00};
 /* A small filled disc: the NEW DATAPOINT beep indicator. */
 const uint8_t icon_dot[7] = {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00};
+/* UP AND DOWN ARROWS. Symbols, not letters: the alarm row marks its four
+ * thresholds with them -- two down for the low alarm, one down for the low
+ * nudge, one up for the high nudge, two up for the high alarm -- so which
+ * band a number belongs to is readable without a word for it. They sit here
+ * with the speaker and the dot because that is what they are; the font is for
+ * text, and an arrow is not a character anybody types. */
+const uint8_t icon_arrow_up[7] = {0x04, 0x0E, 0x1F, 0x04, 0x04, 0x04, 0x00};
+const uint8_t icon_arrow_dn[7] = {0x00, 0x04, 0x04, 0x04, 0x1F, 0x0E, 0x04};
+
+/* THE PAGER'S FOUR BUTTONS, as SOLID TRIANGLES rather than the font's '<'
+ * and '>'.
+ *
+ * The end-stop pair were drawn as two characters, ">|", and that is what they
+ * looked like: an arrow standing next to a bar, which reads as two controls
+ * crowded together rather than one that means "the last page". Joined into a
+ * single glyph -- the apex meeting the wall it stops against -- the pair say
+ * what they do without being read twice.
+ *
+ * The plain pair are triangles too, so all four are one family. The font's
+ * thin '<' keeps its own job as the keypad's backspace, where it is a
+ * character in a label rather than a button. */
+const uint8_t icon_pg_prev[7]  = {0x01, 0x03, 0x07, 0x0F, 0x07, 0x03, 0x01};
+const uint8_t icon_pg_next[7]  = {0x10, 0x18, 0x1C, 0x1E, 0x1C, 0x18, 0x10};
+const uint8_t icon_pg_first[7] = {0x11, 0x13, 0x17, 0x1F, 0x17, 0x13, 0x11};
+const uint8_t icon_pg_last[7]  = {0x11, 0x19, 0x1D, 0x1F, 0x1D, 0x19, 0x11};
+
 /* A slashed circle -- "no data": the DISCONNECT (stale-data) alarm. */
 const uint8_t icon_nolink[7] = {0x00, 0x0E, 0x13, 0x15, 0x19, 0x0E, 0x00};
 /* Checkbox, empty and checked (an X filling the interior). */

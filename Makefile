@@ -1,24 +1,24 @@
-APP_CC = ccache clang-19 --target=aarch64-linux-android29
-SRV_CC = ccache tools/riscv64-linux-musl-cross/bin/riscv64-linux-musl-cc
+export APP_CC = ccache clang-19 --target=aarch64-linux-android29
+export SRV_CC = ccache tools/riscv64-linux-musl-cross/bin/riscv64-linux-musl-cc
 
 CFLAGS := -Werror -Wall -Wextra -Wshadow -Wpointer-arith -Wstrict-prototypes \
   -Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Wundef -Wcast-qual \
   -Wdouble-promotion -Wswitch-enum -Wredundant-decls -Os -MMD -MP -std=c11 \
   -pedantic-errors -ffunction-sections -fdata-sections
 
-CFLAGS_APP := $(CFLAGS) -D_XOPEN_SOURCE=700 -ffreestanding \
+export CFLAGS_APP := $(CFLAGS) -D_XOPEN_SOURCE=700 -ffreestanding \
   -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables \
   -fvisibility=hidden -Iapp -Ilib \
   -I/usr/lib/jvm/java-21-openjdk-amd64/include \
   -I/usr/lib/jvm/java-21-openjdk-amd64/include/linux
 
-CFLAGS_SRV := $(CFLAGS) -D_XOPEN_SOURCE=700 -iquote srv -iquote lib \
+export CFLAGS_SRV := $(CFLAGS) -D_XOPEN_SOURCE=700 -iquote srv -iquote lib \
   -Itools/sqlite-amalgamation-3460100 -DSQLITE_THREADSAFE=1
 
-APP_OBJ := $(patsubst %.c,build/app/obj/%.o,$(wildcard app/*.c lib/*.c)) \
+export APP_OBJ := $(patsubst %.c,build/app/obj/%.o,$(wildcard app/*.c lib/*.c)) \
            $(patsubst stub/%.c,build/stub/lib%.so,$(wildcard stub/*.c))
 
-SRV_OBJ = $(patsubst %.c,build/srv/%.o,$(wildcard lib/*.c srv/*.c)) \
+export SRV_OBJ = $(patsubst %.c,build/srv/%.o,$(wildcard lib/*.c srv/*.c)) \
           build/srv/sqlite3.o
 
 .PHONY: all clean install deploy
@@ -36,7 +36,7 @@ build:
 # app
 
 build/app/obj/%.o: %.c | build
-	$(APP_CC) $(CFLAGS_APP) -c -o $@ $<
+	$$APP_CC $$CFLAGS_APP -c -o $@ $<
 
 build/app/apk/classes.dex: $(wildcard app/*.java) | build
 	javac -Xlint:-options -source 8 -target 8 \
@@ -46,11 +46,11 @@ build/app/apk/classes.dex: $(wildcard app/*.java) | build
 	    $$(find build/app/classes -name '*.class')
 
 build/stub/lib%.so: build/app/obj/stub/%.o | build
-	$(APP_CC) -shared -nostdlib -fuse-ld=lld -Wl,-soname,lib$*.so -o $@ $<
+	$$APP_CC -shared -nostdlib -fuse-ld=lld -Wl,-soname,lib$*.so -o $@ $<
 
 build/app/apk/lib/arm64-v8a/libpancra.so: $(APP_OBJ) | build
-	$(APP_CC) -shared -nostdlib -fuse-ld=lld -Wl,--no-undefined \
-	    -Wl,--gc-sections -o $@ $^
+	$$APP_CC -shared -nostdlib -fuse-ld=lld -Wl,--no-undefined \
+	    -Wl,--gc-sections -o $@ $$APP_OBJ
 	llvm-strip-19 $@
 
 build/app/pancra.apk: app/AndroidManifest.xml Makefile \
@@ -73,16 +73,16 @@ install: build/app/pancra.apk
 # server
 
 build/srv/sqlite3.o: tools/sqlite-amalgamation-3460100/sqlite3.c | build
-	$(SRV_CC) $(CFLAGS_SRV) -w -c -o $@ $<
+	$$SRV_CC $$CFLAGS_SRV -w -c -o $@ $<
 
 build/srv/%.o: %.c | build
-	$(SRV_CC) $(CFLAGS_SRV) -c -o $@ $<
+	$$SRV_CC $$CFLAGS_SRV -c -o $@ $<
 
 build/srv/pancra_srv: $(SRV_OBJ) | build
-	$(SRV_CC) -o $@ $^ -static -no-pie -s -pthread -Wl,--gc-sections
+	$$SRV_CC -o $@ $$SRV_OBJ -static -no-pie -s -pthread -Wl,--gc-sections
 
 deploy: build/srv/pancra_srv
-	ssh duo killall sync pancra_srv || echo "Server not yet running."
+	ssh duo killall pancra_srv || echo "Server not yet running."
 	scp -O build/srv/pancra_srv duo:projects/glucoserve/
 	ssh duo projects/glucoserve/sync-tls.sh
 

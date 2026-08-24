@@ -112,6 +112,77 @@ static inline long csv_num(struct csv_cur *c, enum csv_field *why)
    return neg ? -v : v;
 }
 
+/* Read a decimal written the way people write one -- "20", "0.5", "16.5" --
+ * and return it scaled by 10^`dp`, so nothing downstream has to hold a
+ * fraction in a float. With dp 3, "0.5" comes back 500 and "20" comes back
+ * 20000.
+ *
+ * WHY SCALED RATHER THAN FLOATING. This app has no floating point in it by
+ * construction (the build is -ffreestanding and warns on double promotion),
+ * and a dose is a quantity that must round-trip through a text file exactly:
+ * 0.1 is not representable in binary floating point, so a log written from a
+ * double and read back can disagree with itself in the last digit. Fixed
+ * point in an int cannot.
+ *
+ * DIGITS PAST `dp` ARE DISCARDED, not rounded: they are precision the format
+ * does not carry, and rounding them would make the value written differ from
+ * the value read for no benefit.
+ *
+ * `why` is CSV_FIELD_EMPTY when there was no number at all -- a bare "." or
+ * an empty field -- which is what separates "nothing was written here" from
+ * "a zero was". */
+static inline long csv_fixed(struct csv_cur *c, int dp, enum csv_field *why)
+{
+   long v        = 0;
+   int nd        = 0;
+   int neg       = 0;
+   const char *q = c->p;
+   if (q < c->e && *q == '-') {
+      neg = 1;
+      q++;
+   }
+   int seen  = 0; /* digits anywhere in the number, either side of the point */
+   int scale = dp;
+   while (q < c->e && *q >= '0' && *q <= '9') {
+      if (nd < CSV_MAX_DIGITS) {
+         v = (v * 10) + (*q - '0');
+         nd++;
+      }
+      seen++;
+      q++;
+   }
+   if (q < c->e && *q == '.') {
+      q++;
+      while (q < c->e && *q >= '0' && *q <= '9') {
+         if (scale > 0) {
+            if (nd < CSV_MAX_DIGITS) {
+               v = (v * 10) + (*q - '0');
+               nd++;
+            }
+            scale--;
+         }
+         seen++;
+         q++; /* past `dp` places: consumed, not kept */
+      }
+   }
+   while (scale-- > 0)
+      v *= 10;
+   if (why) {
+      /* COUNTED ACROSS BOTH HALVES: ".5" is a number and "5." is a number,
+       * and only a field with no digit anywhere in it is empty -- a bare "."
+       * included, which is why this is a digit count and not a comparison of
+       * where the integer part ended. */
+      if (!seen)
+         *why = CSV_FIELD_EMPTY;
+      else if (nd >= CSV_MAX_DIGITS)
+         *why = CSV_FIELD_OVERFLOW;
+      else
+         *why = CSV_FIELD_OK;
+   }
+   c->p = q;
+   return neg ? -v : v;
+}
+
 /* Step over one field separator. 1 when there WAS one.
  *
  * A missing separator stepped over silently turns a row with fields run

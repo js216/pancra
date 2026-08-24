@@ -26,6 +26,12 @@ extern const uint8_t icon_speaker[7]; /* alarm output: sound enabled */
 extern const uint8_t icon_vibrate[7]; /* alarm output: vibration enabled */
 extern const uint8_t icon_pencil[7];  /* "edit this row" mark */
 extern const uint8_t icon_dot[7];     /* NEW DATAPOINT beep indicator */
+extern const uint8_t icon_arrow_up[7]; /* alarm row: above this threshold */
+extern const uint8_t icon_arrow_dn[7]; /* alarm row: below this threshold */
+extern const uint8_t icon_pg_prev[7];  /* pager: one page back            */
+extern const uint8_t icon_pg_next[7];  /* pager: one page on              */
+extern const uint8_t icon_pg_first[7]; /* pager: jump to the first page   */
+extern const uint8_t icon_pg_last[7];  /* pager: jump to the last page    */
 extern const uint8_t icon_nolink[7];  /* DISCONNECT (stale-data) alarm */
 extern const uint8_t icon_box[7];     /* checkbox, empty */
 extern const uint8_t icon_boxck[7];   /* checkbox, checked */

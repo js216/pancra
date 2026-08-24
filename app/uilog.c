@@ -45,7 +45,7 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * pre-populate it); FAST shows in the log table's blue, at the same
     * large value size as the other editable fields. */
    y = value_row(fb, h, y, sc, "TYPE", m->ins.ins_type == 1 ? "FAST" : "SLOW",
-                 m->ins.ins_type == 1 ? 0xFFFFAA66 : UI_TEXT, MA_INS_TYPE, 0);
+                 m->ins.ins_type == 1 ? UI_MARK_FAST : UI_TEXT, MA_INS_TYPE, 0);
    y += lh;
 
    /* fmt_date renders "YYYY-MM-DD HH:MM"; the form splits it into YEAR,
@@ -65,7 +65,9 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
       datep[5] = 0; /* "MM-DD" */
    str_snapshot(timep, sizeof timep, (str_len(dt) > 11) ? dt + 11 : "");
    char val[20];
-   (void)snprintf(val, sizeof val, "%d U", m->ins.ins_units);
+   char iu[16];
+   (void)ins_units_str(m->ins.ins_milli, iu, sizeof iu);
+   (void)snprintf(val, sizeof val, "%s U", iu);
    y = value_row(fb, h, y, sc, "UNITS", val, UI_TEXT, MA_INS_EDIT, 0);
    y += lh;
    y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_INS_EDIT, 2);
@@ -112,7 +114,9 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    char dt[20];
    fmt_date(m->ins.ins_t, m->tz_off, dt, sizeof dt);
    char line[40];
-   (void)snprintf(line, sizeof line, "%d U %s", m->ins.ins_units,
+   char iu[16];
+   (void)ins_units_str(m->ins.ins_milli, iu, sizeof iu);
+   (void)snprintf(line, sizeof line, "%s U %s", iu,
                   m->ins.ins_type == 1 ? "FAST" : "SLOW");
    draw_str(px, fb, x, y, sc, line, UI_TEXT);
    y += lh;
@@ -176,8 +180,25 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * (title/close plus the pagination pair) and let the pages absorb the
     * rest: fewer rows per page is a visible, honest consequence; an
     * untappable control is not. */
-   int avail = fb->height - y - (2 * lh);
-   int per   = avail / lh;
+   /* THE SCREEN IS SPLIT SEVENTY / THIRTY IN THE TABLE'S FAVOUR, laid out
+    * from the bottom: the plot takes its share and the table gets the rest,
+    * and the system gesture bar is reserved because this screen reaches the
+    * bottom edge.
+    *
+    * OF WHAT IS BELOW THE HEADER, not of the whole screen. Two fifths of the
+    * screen height left the table with fewer rows than the plot had pixels,
+    * on a screen whose reason for existing is the list of doses -- the plot
+    * is the summary beside it. Measuring from `y` makes the ratio mean what
+    * it says whatever the title and column header cost. */
+   int sysbar   = fb->height / 24;
+   int plot_h   = ((fb->height - y - sysbar) * 3) / 10;
+   int tabs_h   = 2 * lh;
+   int plot_top = fb->height - plot_h - sysbar;
+   int tabs_y   = plot_top - tabs_h;
+   int nav_y    = tabs_y - (2 * lh) - (6 * sc);
+
+   int avail = nav_y - y;
+   int per   = (avail > 0) ? avail / lh : 1;
    if (per > UI_MAX_HITS - UI_LOG_FIXED)
       per = UI_MAX_HITS - UI_LOG_FIXED;
    if (per < 1)
@@ -195,12 +216,17 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       char when[20];
       char row[40];
       fmt_date(d->t, m->tz_off, when, sizeof when);
-      (void)snprintf(row, sizeof row, "%s  %s %4d", when,
-                     d->type == INS_FAST ? "FAST" : "SLOW", d->units);
+      char iu[16];
+      (void)ins_units_str(d->milli, iu, sizeof iu);
+      /* RIGHT-ALIGNED IN THE COLUMN the header names, whatever its width:
+       * "0.5" and "20" are different lengths, and a left-aligned dose column
+       * makes a half-unit look like five. */
+      (void)snprintf(row, sizeof row, "%s  %s %4s", when,
+                     d->type == INS_FAST ? "FAST" : "SLOW", iu);
       /* FAST doses in a soft blue, so the two types separate at a glance
        * (0xAABBGGRR: R=0x66 G=0xAA B=0xFF). */
       draw_str(px, fb, x, y, sc, row,
-               d->type == INS_FAST ? 0xFFFFAA66 : UI_TEXT_DIM);
+               d->type == INS_FAST ? UI_MARK_FAST : UI_TEXT_DIM);
       /* The pencil is the affordance; the WHOLE row is the target (it
        * opens this dose in the EDIT INSULIN form). Centre the pencil in
        * the free column right of UNITS -- glued to the screen edge it
@@ -217,32 +243,53 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += lh;
    }
 
-   if (npages > 1) {
-      int navy = fb->height - lh - (4 * sc);
-      /* Height `lh + 7*sc`, not `2*lh`: from `navy - 3*sc` a 2*lh box ends at
-       * `height + 9*sc`, i.e. always 9*sc BELOW the buffer. The arrows drew
-       * correctly and the top of each box was tappable, so it worked by
-       * accident -- but an out-of-bounds target is exactly what the layout
-       * gate forbids everywhere else, and the bottom strip of the finger
-       * target simply did not exist. This ends flush with the bottom edge. */
-      if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_INSLOG_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(fb->width - (fb->width / 3), navy - (3 * sc),
-                            fb->width / 3, lh + (7 * sc)),
-                    MA_INSLOG_NEXT, 0);
+   pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_INSLOG_PAGE);
+
+   /* ONE DOT PER DOSE, coloured by type -- see the log plot's own note. */
+   int tab = m->ins.inslog_tab;
+   if (tab < 0 || tab >= UI_DAY_TABS)
+      tab = 0;
+   struct log_pt pts[UI_LOG_PTS];
+   long from = 0;
+   int npt   = ins_points(m, pts, UI_LOG_PTS, &from);
+
+   /* Span tabs -- OR the scrub readout, the same swap the weight trend makes.
+    */
+   int colw  = (fb->width - (2 * x)) / UI_DAY_TABS;
+   int trow  = 14 * sc;
+   int laby  = plot_top - trow + ((trow - (7 * sc)) / 2);
+   int scrub = m->log_scrub;
+   if (scrub >= 0 && scrub < npt && scrub < m->ins.ins_nlog) {
+      const struct ins_rec *d = &m->ins.ins_log[scrub];
+      char when[24];
+      char line[48];
+      fmt_date(d->t, m->tz_off, when, sizeof when);
+      /* THE WHOLE INSTANT, not just the date: a dot is one dose, and which
+       * doses fell when is the pattern this plot exists to show. */
+      char iu[16];
+      (void)ins_units_str(d->milli, iu, sizeof iu);
+      (void)snprintf(line, sizeof line, "%s  %s %s U", when,
+                     d->type == INS_FAST ? "FAST" : "SLOW", iu);
+      int tsc2 = 2 * sc;
+      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
+         tsc2--;
+      int lw = str_len(line) * 6 * tsc2;
+      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
+               UI_TEXT);
+   } else {
+      for (int i = 0; i < UI_DAY_TABS; i++) {
+         int lw   = str_len(ui_day_tab_lbl[i]) * 6 * sc;
+         int tabx = x + (i * colw);
+         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, ui_day_tab_lbl[i],
+                  i == tab ? UI_TEXT : UI_MUTED);
+         add_hit_ix(h, ui_rect(tabx, tabs_y, colw, tabs_h), MA_INSTAB, i);
       }
    }
+
+   int pw = fb->width - (2 * x);
+   log_plot(px, fb, pts, npt, from, m->now, x, plot_top, pw, plot_h, sc,
+            m->tz_off, scrub, "U", 3, ui_ins_col, UI_INS_SERIES);
+   add_hit(h, ui_rect(x, plot_top, pw, plot_h), ACT_SCRUB, sc);
 }
 
 /* ---- WEIGHT: the entry form and the log table ----
@@ -490,9 +537,9 @@ int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x)
 static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
                     const struct ui_wtview *wt, const struct ui_prefs *prefs,
                     long now, long tz_off, int px0, int py0, int pw, int ph,
-                    int sc, long from)
+                    int sc, long from, int scrub)
 {
-   draw_frame(px, fb, px0, py0, pw, ph, 0xFF444444);
+   draw_frame(px, fb, px0, py0, pw, ph, UI_LOG_FRAME);
    struct wt_win w;
    wt_window(wt, now, from, &w);
    if (!w.n) {
@@ -517,7 +564,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
     * it: the trace is the data, the grid is only a ruler. Four horizontal
     * divisions, and vertical lines on the same columns the date labels use so
     * a label always names a line rather than floating between two. */
-   const uint32_t grid = 0xFF2A2A2A;
+   const uint32_t grid = UI_LOG_GRID;
    for (int i = 1; i < 4; i++) {
       int gy = py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4);
       fill_rect(px, fb, px0 + 1, gy, pw - 2, 1, grid);
@@ -556,7 +603,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       if (str_len(md) > 5)
          md[5] = 0; /* "MM-DD" */
       int lw = str_len(md) * 6 * sc;
-      draw_str(px, fb, gx - (lw / 2), py0 + ph - (9 * sc), sc, md, 0xFF777777);
+      draw_str(px, fb, gx - (lw / 2), py0 + ph - (9 * sc), sc, md, UI_DISCLAIM);
    }
 
    int prevx = 0;
@@ -581,7 +628,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
          int st = ax > ay ? ax : ay;
          for (int k = 1; k <= st && st > 0; k++)
             fill_rect(px, fb, prevx + ((dx * k) / st), prevy + ((dy * k) / st),
-                      sc, sc, 0xFFFFAA66);
+                      sc, sc, UI_MARK_FAST);
       }
       /* White, like the glucose trace. The SCRUBBED point is redrawn below in
        * UI_HILITE grey -- the same "white normally, grey when picked" pair
@@ -595,12 +642,11 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    /* SCRUB CURSOR: a full-height rule through the picked point and its value
     * spelled out, so the number under the finger is readable rather than
     * estimated off the axis. */
-   if (wt->wt_scrub >= 0 && wt->wt_scrub < wt->nwt &&
-       wt->wt[wt->wt_scrub].t >= from) {
-      const struct wt_rec *p = &wt->wt[wt->wt_scrub];
+   if (scrub >= 0 && scrub < wt->nwt && wt->wt[scrub].t >= from) {
+      const struct wt_rec *p = &wt->wt[scrub];
       int cx                 = wt_px(&w, p->t, px0, pw, pad);
       int cy                 = wt_py(&w, p->g, py0, ph, pad_t, pad_b);
-      fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, 0xFF666666);
+      fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, UI_LOG_CURSOR);
       fill_rect(px, fb, cx - (3 * sc), cy - (3 * sc), 6 * sc, 6 * sc,
                 UI_HILITE);
    }
@@ -613,7 +659,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
  * weight model, the display unit, the clock and the zone, and now says so. */
 void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                   const struct ui_prefs *prefs, long now, long tz_off,
-                  struct hits *h)
+                  int scrub, struct hits *h)
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
@@ -706,25 +752,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
       y += lh;
    }
 
-   if (npages > 1) {
-      if (page > 0) {
-         draw_str(px, fb, x, nav_y, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, nav_y - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_WTLOG_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, nav_y, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), nav_y, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(fb->width - (fb->width / 3), nav_y - (3 * sc),
-                            fb->width / 3, lh + (7 * sc)),
-                    MA_WTLOG_NEXT, 0);
-      }
-   }
+   pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_WTLOG_PAGE);
 
    /* Span tabs -- OR the scrub readout, exactly as the glucose plot does it:
     * while a finger is down the tab row becomes the value under it, and the
@@ -737,8 +765,8 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    int colw = (fb->width - (2 * x)) / UI_WT_TABS;
    int trow = 14 * sc; /* render_glucose's tab row height */
    int laby = plot_top - trow + ((trow - (7 * sc)) / 2);
-   if (wt->wt_scrub >= 0 && wt->wt_scrub < wt->nwt) {
-      const struct wt_rec *p = &wt->wt[wt->wt_scrub];
+   if (scrub >= 0 && scrub < wt->nwt) {
+      const struct wt_rec *p = &wt->wt[scrub];
       char wv[16];
       char when[24];
       char line[48];
@@ -773,12 +801,434 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
 
    int pw = fb->width - (2 * x);
    wt_plot(px, fb, wt, prefs, now, tz_off, x, plot_top, pw, plot_h, sc,
-           wt_from_of(wt, now));
+           wt_from_of(wt, now), scrub);
    /* The whole plot scrubs; the shell resolves the point via ui_wt_hit. */
    /* arg carries sc: the shell needs the SAME scale the plot was drawn at to
     * map a finger x back to a point, and re-deriving it there would be a
     * second copy of the layout that can drift. */
    add_hit(h, ui_rect(x, plot_top, pw, plot_h), ACT_SCRUB, sc);
+}
+
+/* ================= THE LOG PLOT =================================
+ *
+ * ONE CHART FOR THE THREE LOGS, and it is the weight trend's: a frame, a
+ * light grid, both y bounds named against the axis end each describes, date
+ * ticks along the bottom, and the entries themselves as squares joined by a
+ * line. Exercise and insulin draw it too, so the three log screens are one
+ * instrument read three ways rather than three that have to be learned
+ * separately.
+ *
+ * WHAT DIFFERS IS COLOUR, and only colour. Weight is one series; insulin has
+ * two (slow and fast) and exercise three (its levels), and a dot's colour is
+ * which one it belongs to. The joining line follows the same rule: it runs
+ * within a series and never between them, because a line drawn from a 20-unit
+ * slow dose to a 4-unit fast one would state a quantity that was never held.
+ *
+ * NOT BARS. Daily totals were the first shape of this, and they cannot carry
+ * the colours: a day with a light session and a hard one has no single level,
+ * and a day's insulin no single type. One dot per entry keeps every entry's
+ * own category, which is the thing being asked for. */
+
+const int ui_day_days[UI_DAY_TABS]            = {7, 14, 30, 90, 0};
+const char *const ui_day_tab_lbl[UI_DAY_TABS] = {"1W", "2W", "1M", "3M",
+                                                 "ALL"};
+
+#define LOG_PAD 4
+
+long day_from_of(int tab, long now, long oldest)
+{
+   if (tab < 0 || tab >= UI_DAY_TABS)
+      tab = 0;
+   /* 0 = everything, the sentinel ui_wt_days uses for its own ALL tab. It
+    * reaches back to the log's first entry: there is nothing before it to
+    * show, so starting at the epoch would be a chart that is mostly empty. */
+   if (ui_day_days[tab] <= 0)
+      return (oldest > 0 && oldest < now) ? oldest : now;
+   return now - ((long)ui_day_days[tab] * 86400);
+}
+
+/* The window a set of points occupies: the time span actually covered and the
+ * value range to scale against. */
+struct log_win {
+   long tmin, tmax;
+   long lo, hi;
+   int n;
+};
+
+static void log_window(const struct log_pt *p, int n, long from, long now,
+                       struct log_win *w)
+{
+   w->n    = 0;
+   w->tmin = from;
+   w->tmax = now;
+   w->lo   = 0;
+   w->hi   = 0;
+   for (int i = 0; i < n; i++) {
+      /* BOTH ends. An entry after the window -- the forms accept any date, so
+       * a mistyped year lands one decades ahead -- would otherwise be
+       * excluded from the drawing and still counted in lo/hi, scaling the
+       * axis to a value that is never plotted. */
+      if (p[i].t < from || p[i].t > now)
+         continue;
+      if (!w->n) {
+         w->tmin = p[i].t;
+         w->lo   = p[i].v;
+         w->hi   = p[i].v;
+      }
+      if (p[i].t < w->tmin)
+         w->tmin = p[i].t;
+      if (p[i].v < w->lo)
+         w->lo = p[i].v;
+      if (p[i].v > w->hi)
+         w->hi = p[i].v;
+      w->n++;
+   }
+   if (w->tmax <= w->tmin)
+      w->tmax = w->tmin + 1; /* never divide by a zero-width window */
+   /* lo AND hi ARE THE DATA'S OWN, even when they are equal. Widening the
+    * range here to keep the division safe would put the fudge on the axis:
+    * with doses held in thousandths, a lo+1 upper bound labels a flat run of
+    * 20 U doses "20.001 U". log_py handles the flat case instead, where it
+    * is a question about where to draw rather than about what the data is. */
+}
+
+/* THE RESERVED STRIPS, top and bottom, worked out ONCE.
+ *
+ * The y bounds are printed inside the plot, so the data band stops short of
+ * both or a point lands on the text naming it. The picker needs the same
+ * numbers the drawing used -- it maps a finger back to a point through the
+ * identical geometry -- and two copies of this arithmetic is exactly how a
+ * pick comes to name a point other than the one under the finger. */
+static void log_pads(int ph, int sc, int *pad_t, int *pad_b)
+{
+   const int half = (7 * sc) / 2;
+   int t          = (13 * sc) + half;
+   int b          = (22 * sc) + half;
+   if (t + b > (ph * 2) / 3) { /* a very short plot: share it out */
+      t = ph / 6;
+      b = ph / 4;
+   }
+   *pad_t = t;
+   *pad_b = b;
+}
+
+static int log_px(const struct log_win *w, long t, int px0, int pw, int pad)
+{
+   return px0 + pad +
+          (int)(((t - w->tmin) * (long)(pw - (2 * pad))) / (w->tmax - w->tmin));
+}
+
+/* Separate top and bottom insets: the y bounds are printed INSIDE the plot,
+ * so the data band stops short of both or a point lands on the text naming
+ * it. Insetting the band is the same thing as widening the range, and it is
+ * exact -- no point can enter a reserved strip, whatever the data does. */
+static int log_py(const struct log_win *w, long v, int py0, int ph, int pad_t,
+                  int pad_b)
+{
+   const int band = ph - pad_t - pad_b;
+   /* A SERIES THAT NEVER MOVES draws down the middle of the band. There is no
+    * scale to place it on -- every point is the same value -- and pinning it
+    * to the top or the bottom would suggest one. */
+   if (w->hi <= w->lo)
+      return py0 + pad_t + (band / 2);
+   return py0 + pad_t + band -
+          (int)(((v - w->lo) * (long)band) / (w->hi - w->lo));
+}
+
+int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
+             int py0, int pw, int ph, int sc, int x, int y, int lock)
+{
+   struct log_win w;
+   log_window(p, n, from, now, &w);
+   if (!w.n)
+      return -1;
+   const int pad = LOG_PAD * sc;
+   int pad_t     = 0;
+   int pad_b     = 0;
+   log_pads(ph, sc, &pad_t, &pad_b);
+   int best = -1;
+   long bd  = 0;
+   for (int i = 0; i < n; i++) {
+      if (p[i].t < from || p[i].t > now)
+         continue; /* the same window the renderer draws, or the pick misses */
+      /* BOUND TO ONE SERIES once the gesture has chosen it. With two traces
+       * crossing -- and a day's slow and fast doses are minutes apart on the
+       * x axis -- an unbound drag hops between them wherever they pass, so
+       * the readout changes type under a finger that never left the curve it
+       * started on. -1 means nothing is bound yet: the press is free to land
+       * on either. */
+      if (lock >= 0 && p[i].series != lock)
+         continue;
+      /* BOTH AXES TO CHOOSE, ONE AXIS TO TRACK.
+       *
+       * The press has to decide WHICH curve the gesture is about, and on x
+       * alone every dose in a day is the same distance away -- a finger
+       * anywhere in a column would take whichever of that day's points came
+       * last in the array rather than the one it was on. So the opening pick
+       * measures both.
+       *
+       * Once a curve is bound, x alone: the finger is sweeping ALONG a trace
+       * to read it, exactly as on the glucose and weight plots, and a
+       * y term there would make the readout stick or skip wherever the hand
+       * drifted off the line it is following. `lock` is what tells the two
+       * apart -- it is -1 only on the press that begins a scrub. */
+      const long dx = log_px(&w, p[i].t, px0, pw, pad) - x;
+      long d        = dx * dx;
+      if (lock < 0) {
+         const long dy = log_py(&w, p[i].v, py0, ph, pad_t, pad_b) - y;
+         d += dy * dy;
+      }
+      if (best < 0 || d < bd) {
+         bd   = d;
+         best = i;
+      }
+   }
+   return best;
+}
+
+/* An axis value as text at the scale its series is held in. dp 0 prints the
+ * number; dp 3 renders thousandths the way a dose is written, which is what
+ * ins_units_str already does -- one renderer for both, so an axis and a
+ * readout cannot disagree about the same quantity. */
+static void log_val_str(long v, int dp, char *out, int cap)
+{
+   if (dp == 3)
+      (void)ins_units_str((int)v, out, cap);
+   else
+      (void)snprintf(out, (size_t)cap, "%ld", v);
+}
+
+void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+              const struct log_pt *p, int n, long from, long now, int px0,
+              int py0, int pw, int ph, int sc, long tz_off, int hilite,
+              const char *unit, int dp, const uint32_t *col, int ncol)
+{
+   draw_frame(px, fb, px0, py0, pw, ph, UI_LOG_FRAME);
+   struct log_win w;
+   log_window(p, n, from, now, &w);
+   if (!w.n) {
+      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "no data in range",
+               UI_MUTED);
+      return;
+   }
+   const int pad = LOG_PAD * sc;
+   int pad_t     = 0;
+   int pad_b     = 0;
+   log_pads(ph, sc, &pad_t, &pad_b);
+
+   const uint32_t grid = UI_LOG_GRID;
+   for (int i = 1; i < 4; i++)
+      fill_rect(px, fb, px0 + 1,
+                py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4), pw - 2, 1,
+                grid);
+   const int nticks = 4; /* 3 interior + the right edge; see the label loop */
+   for (int i = 1; i <= nticks; i++)
+      fill_rect(px, fb, px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1)),
+                py0 + 1, 1, ph - 2, grid);
+
+   /* BOTH BOUNDS, each against the axis end it names -- not one "lo-hi" in a
+    * corner, which states the range but not which end is which way up. */
+   {
+      char lab[24];
+      char v[16];
+      log_val_str(w.hi, dp, v, sizeof v);
+      (void)snprintf(lab, sizeof lab, "%s %s", v, unit ? unit : "");
+      draw_str(px, fb, px0 + (4 * sc), py0 + (3 * sc), sc, lab, UI_MUTED);
+      log_val_str(w.lo, dp, v, sizeof v);
+      (void)snprintf(lab, sizeof lab, "%s %s", v, unit ? unit : "");
+      draw_str(px, fb, px0 + (4 * sc), py0 + ph - (19 * sc), sc, lab, UI_MUTED);
+   }
+
+   for (int i = 1; i <= nticks; i++) {
+      const int gx = px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1));
+      const long tt =
+          w.tmin + (((w.tmax - w.tmin) * (long)i) / (long)(nticks + 1));
+      char dt[20];
+      char md[8];
+      fmt_date(tt, tz_off, dt, sizeof dt);
+      str_snapshot(md, sizeof md, (str_len(dt) > 5) ? dt + 5 : "");
+      if (str_len(md) > 5)
+         md[5] = 0; /* "MM-DD" */
+      draw_str(px, fb, gx - ((str_len(md) * 6 * sc) / 2), py0 + ph - (9 * sc),
+               sc, md, UI_DISCLAIM);
+   }
+
+   /* ONE PASS PER SERIES, so each trace joins only its own entries and the
+    * line never crosses between two kinds. */
+   for (int s = 0; s < ncol; s++) {
+      int prevx = 0;
+      int prevy = 0;
+      int have  = 0;
+      for (int i = 0; i < n; i++) {
+         if (p[i].series != s || p[i].t < from || p[i].t > now)
+            continue;
+         const int cx = log_px(&w, p[i].t, px0, pw, pad);
+         const int cy = log_py(&w, p[i].v, py0, ph, pad_t, pad_b);
+         if (have) {
+            const int dx = cx - prevx;
+            const int dy = cy - prevy;
+            const int ax = dx < 0 ? -dx : dx;
+            const int ay = dy < 0 ? -dy : dy;
+            const int st = ax > ay ? ax : ay;
+            for (int k = 1; k <= st && st > 0; k++)
+               fill_rect(px, fb, prevx + ((dx * k) / st),
+                         prevy + ((dy * k) / st), sc, sc, col[s]);
+         }
+         fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc,
+                   col[s]);
+         prevx = cx;
+         prevy = cy;
+         have  = 1;
+      }
+   }
+
+   /* SCRUB CURSOR: a full-height rule through the picked entry and the entry
+    * itself redrawn larger in UI_HILITE grey -- the same "coloured normally,
+    * grey when picked" pair the weight trend and the glucose plot use, so all
+    * three read the same way. */
+   if (hilite >= 0 && hilite < n && p[hilite].t >= from &&
+       p[hilite].t <= now) {
+      const int cx = log_px(&w, p[hilite].t, px0, pw, pad);
+      const int cy = log_py(&w, p[hilite].v, py0, ph, pad_t, pad_b);
+      fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, UI_LOG_CURSOR);
+      fill_rect(px, fb, cx - (3 * sc), cy - (3 * sc), 6 * sc, 6 * sc,
+                UI_HILITE);
+   }
+}
+
+/* ---- WHAT EACH LOG PUTS ON THE PLOT ----------------------------
+ *
+ * One builder per log, and each is the ONLY definition of its series -- the
+ * renderer draws what it returns and the scrub picker picks from what it
+ * returns, so a finger can never resolve against a different set of entries
+ * than the one on screen. `from` comes back too, because the window is part
+ * of the answer. */
+
+const uint32_t ui_ins_col[UI_INS_SERIES] = {
+    UI_TEXT_DIM,  /* SLOW: the dim its rows are printed in */
+    UI_MARK_FAST, /* FAST: the same soft blue theirs carry */
+};
+
+int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
+{
+   const long f = day_from_of(m->ins.inslog_tab, m->now,
+                              (m->ins.ins_nlog > 0) ? m->ins.ins_log[0].t : 0);
+   if (from)
+      *from = f;
+   int n = 0;
+   for (int i = 0; i < m->ins.ins_nlog && n < cap; i++) {
+      const struct ins_rec *d = &m->ins.ins_log[i];
+      out[n].t                = d->t;
+      /* THOUSANDTHS on the axis, so a 0.5 U dose sits half a unit up rather
+       * than being rounded to nothing. The bound labels render through
+       * ins_units_str, so the axis still reads in units. */
+      out[n].v                = d->milli;
+      out[n].series           = (d->type == INS_FAST) ? 1 : 0;
+      n++;
+   }
+   return n;
+}
+
+/* Local midnight at or before `t`, read in the offset the rest of the screen
+ * renders its dates in. ONE offset for the whole plot, the same one the table
+ * above it uses: a point and the rows it totals must land on the same date,
+ * and reading each instant in its own historical offset would put a session
+ * from the other side of a DST change on a different day from the row that
+ * prints it. */
+static long day_of(long t, long tz_off)
+{
+   const long l = t + tz_off;
+   long d       = l / 86400;
+   if (l < 0 && (l % 86400) != 0)
+      d--; /* floor, not the truncation toward zero C division gives */
+   return (d * 86400) - tz_off;
+}
+
+/* ONE POINT PER DAY, carrying every minute exercised that day whatever the
+ * level.
+ *
+ * NOT one point per session, and not one series per level. The question this
+ * plot answers is how much was done each day, and a day's exercise is a total
+ * -- a morning walk and an evening run are one day's effort, not two competing
+ * readings. Splitting by level would also give a day with both no single
+ * colour to be.
+ *
+ * THE ZERO DAYS ARE DRAWN, because a rest day is data. Emitting only the days
+ * with something on them would join two active days with a line straight
+ * across the gap, drawing effort that did not happen. */
+int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from)
+{
+   const long f = day_from_of(m->food.exlog_tab, m->now,
+                              (m->food.nexlog > 0) ? m->food.exlog[0].t : 0);
+   long d0      = day_of(f, m->tz_off);
+   const long d1 = day_of(m->now, m->tz_off);
+   long n        = ((d1 - d0) / 86400) + 1;
+   if (n < 1)
+      n = 1;
+   if (n > cap) {
+      /* CLAMPED FROM THE OLD END, so the right-hand edge stays today.
+       * Dropping the newest days instead would quietly turn a long span into
+       * a chart of some earlier window with nothing on screen to say so. */
+      d0 = d1 - ((long)(cap - 1) * 86400);
+      n  = cap;
+   }
+   /* The window starts at the first day drawn, not at the raw span start: a
+    * point sits at its day's MIDNIGHT, so a `from` part-way through that day
+    * would put the leftmost point outside the window and drop it. */
+   if (from)
+      *from = d0;
+   for (long i = 0; i < n; i++) {
+      out[i].t      = d0 + (i * 86400);
+      out[i].v      = 0;
+      out[i].series = 0;
+   }
+   for (int i = 0; i < m->food.nexlog; i++) {
+      const struct ex_rec *e = &m->food.exlog[i];
+      /* THE RUNNING SESSION COUNTS WHAT IT HAS DONE SO FAR. Its dur is 0
+       * until it is closed, so taking the column at face value would leave
+       * today flat through an hour's walk and then jump. A row that is open
+       * and is NOT running has no length at all and adds nothing -- the same
+       * distinction the MIN column draws. */
+      long secs = e->dur;
+      if (i == m->food.exlog_act)
+         secs = (m->now > e->t) ? m->now - e->t : 0;
+      if (secs <= 0)
+         continue;
+      const long k = (day_of(e->t, m->tz_off) - d0) / 86400;
+      if (k < 0 || k >= n)
+         continue; /* outside the span, which also drops a mistyped year */
+      out[k].v += secs / 60;
+   }
+   return (int)n;
+}
+
+int ui_log_hit(const struct screen *m, int plot_x, int plot_y, int plot_w,
+               int plot_h, int sc, int x, int y, int *lock)
+{
+   /* An if-chain, not a switch: -Wswitch-enum makes a switch over a screen
+    * name all forty of them, and thirty-seven "not this one" cases would bury
+    * the three that answer. */
+   if (m->scr == SCR_WTLOG)
+      return ui_wt_hit(m, plot_x, plot_w, sc, x);
+   struct log_pt pts[UI_LOG_PTS];
+   long from = 0;
+   int n     = 0;
+   if (m->scr == SCR_EXLOG)
+      n = ex_points(m, pts, UI_LOG_PTS, &from);
+   else if (m->scr == SCR_INSLOG)
+      n = ins_points(m, pts, UI_LOG_PTS, &from);
+   else
+      return -1;
+   const int held = lock ? *lock : -1;
+   int at = log_pick(pts, n, from, m->now, plot_x, plot_y, plot_w, plot_h, sc,
+                     x, y, held);
+   /* THE SERIES IS BOUND BY THE FIRST PICK OF THE GESTURE and reported back,
+    * so the caller can hand it to every move that follows. Only when nothing
+    * was bound yet: a drag must not be able to re-bind itself onto a curve it
+    * has wandered near. */
+   if (lock && held < 0 && at >= 0)
+      *lock = pts[at].series;
+   return at;
 }
 
 /* ---- OLD DEVICES: DISCONNECTED devices. Each keeps its whole slot, so a row

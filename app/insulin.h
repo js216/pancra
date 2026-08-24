@@ -61,7 +61,12 @@
 struct ins_rec {
    long t;    /* dose instant, epoch seconds */
    int type;  /* INS_SLOW / INS_FAST */
-   int units; /* whole units, INS_UNITS_MIN..INS_UNITS_MAX */
+   /* THOUSANDTHS OF A UNIT, INS_MILLI_MIN..INS_MILLI_MAX -- 500 is half a
+    * unit. Named `milli` and not `units` on purpose: the two are not the same
+    * number, and a field called `units` holding 500 for a half-unit dose is
+    * the kind of quiet unit confusion that puts a dose out by a thousand.
+    * ins_units_str renders it for a screen. */
+   int milli;
 };
 
 /* THE TAIL IS PRIVATE, for the same reasons as the weight log's (weight.h):
@@ -125,7 +130,7 @@ const char *insulin_type_name(int type); /* "SLOW" / "FAST" */
 struct ins_form {
    long t;   /* the dose's instant */
    int type; /* INS_SLOW / INS_FAST */
-   int units;
+   int milli; /* thousandths of a unit, like struct ins_rec's */
    int edit;
 };
 

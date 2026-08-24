@@ -19,11 +19,15 @@
  * phone, so the ceiling is the layout's and not an arbitrary round number --
  * raise them together or not at all.
  *
- * It was three, one row, until the out-of-range banner moved off the bottom of
- * the screen and left the space for a second. Files written before that hold
- * three fields and load with the last three empty; see settings.c's positional
- * format, which is what makes appending safe. */
-#define SC_MAX 6
+ * NINE, WHICH IS THREE ROWS OF THREE. It grew as space did: three in one row,
+ * then six when the out-of-range banner moved off the bottom, then nine when
+ * the ALARM and NUDGE rows became one. The main screen packs them two to a row
+ * until there are more than six and three to a row after that, so this number
+ * and that rule are the same fact -- see pin_percol in uimain.c.
+ *
+ * Files written before each rise hold fewer fields and load with the rest
+ * empty; settings.c's positional format is what makes appending safe. */
+#define SC_MAX 9
 
 /* THE PREFERENCES, READ-ONLY.
  *

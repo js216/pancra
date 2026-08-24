@@ -112,8 +112,10 @@ struct mutex set_lk = MUTEX_INIT;
  * A version this build does not know is REFUSED WHOLE. Not partly applied,
  * not defaulted field by field -- refused, with the state left untouched, so
  * a downgrade cannot quietly discard settings the newer build stored. */
-#define SETTINGS_VERSION 1
-#define REMOTE_VERSION   1
+/* SETTINGS_VERSION and REMOTE_VERSION are setpriv.h's, which this file
+ * includes. Both were declared here as well, each with its own copy of the
+ * number, so raising one meant remembering to raise it twice -- which is
+ * exactly the drift a shared private header exists to prevent. */
 
 /* The version at the head of `b`, and `*rest` advanced past it. 0 when there
  * is no marker, which is what a deployed file looks like. -1 when there is a

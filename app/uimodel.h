@@ -330,8 +330,9 @@ struct ui_insview {
    long ins_t;
    /* INSULIN LOG table (borrowed; oldest first, like insulin.h's tail) */
    const struct ins_rec *ins_log;
-   int ins_type, ins_units, ins_edit;
+   int ins_type, ins_milli, ins_edit;
    int ins_nlog, inslog_page;
+   int inslog_tab; /* which span the units-per-day plot is showing */
    /* insulin plot styling per type (index INS_SLOW / INS_FAST), and which
     * insulin type the marker picker is editing (-1 = a sensor's) */
    int ins_marker[2], ins_color[2], ins_size[2], markpick_ins;
@@ -350,7 +351,6 @@ struct ui_wtview {
    int nwt, wt_page;
    int wt_edit;  /* 1 = the form is EDITING an entry, not logging a new one */
    int wt_tab;   /* index into ui_wt_days: the plot's span */
-   int wt_scrub; /* index into wt of the scrubbed point, -1 = none */
    int wt_tenths;
 };
 
@@ -391,6 +391,12 @@ struct ui_foodview {
     * what exercise_update matches on. */
    const struct ex_rec *exlog;
    int nexlog, exlog_page;
+   /* WHICH ROW OF `exlog` IS THE RUNNING SESSION, or -1 for none. Resolved
+    * from exercise_active rather than re-derived here: "the newest row while
+    * it is still open" is one rule, and a renderer holding its own copy of it
+    * is how the table and the button come to disagree. */
+   int exlog_act;
+   int exlog_tab; /* which span the minutes-per-day plot is showing */
    long ex_t;         /* the instant the form holds */
    long ex_form_dur;  /* the duration it holds, SECONDS, 0 = not known */
    int ex_edit;       /* 1 = correcting an existing entry */
@@ -451,6 +457,12 @@ struct screen {
     * it: which screen, when it is, the zone to render times in, and the one
     * line of status across the top. */
    enum ui_screen scr;
+   /* WHICH BAR OR POINT THE FINGER IS ON in the log plot that is open, or -1.
+    * ONE field for all of them: only one log screen is ever up, the index is
+    * meaningless off the screen that drew it, and it is cleared the moment
+    * the finger lifts. What it indexes is that screen's own plot -- a day for
+    * the exercise and insulin logs, a sample for the weight trend. */
+   int log_scrub;
    long now;    /* realtime_s() at frame time */
    long tz_off; /* local timezone offset (seconds) */
    /* THE STATUS TEXT, COPIED INTO THE FRAME rather than pointed at.

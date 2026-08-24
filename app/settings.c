@@ -324,7 +324,7 @@ void set_render_settings(struct save_job *j)
     * counter per FILE, and nothing outside its renderer may write it. */
    set_fault_note_written(&written);
 #endif
-   /* 192, MATCHING settings_load's READER -- the two numbers move together or
+   /* 256, MATCHING settings_load's READER -- the two numbers move together or
     * not at all. At 96 they disagreed the moment the field count grew, and a
     * truncated line does not fail loudly: clampn writes the prefix, the loader
     * parses what it finds and stops, and the tail fields silently revert to
@@ -339,25 +339,26 @@ void set_render_settings(struct save_job *j)
    int n = snprintf(
        j->buf, sizeof j->buf,
        "v%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d "
-       "%d %d %d %d %d\n",
+       "%d %d %d %d %d %d %d %d\n",
        SETTINGS_VERSION, g_p.sound_on, g_p.vib_on, g_p.orient, g_p.units,
        g_p.disc, g_p.plot_max, g_p.screen_on, g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
        g_p.ins_color[1], g_p.ins_size[1], g_p.statbar_val, g_p.lockscr_val,
        g_p.nudge_sound, g_p.nudge_vib, g_p.wunits, g_p.shortcut[0],
        g_p.shortcut[1], g_p.shortcut[2], g_p.shortcut[3], g_p.shortcut[4],
-       g_p.shortcut[5], g_p.best_streak_s);
-   set_job_stamp(j, g_settings_path, &written, n, n > 0 && n < 192);
+       g_p.shortcut[5], g_p.shortcut[6], g_p.shortcut[7], g_p.shortcut[8],
+       g_p.best_streak_s);
+   set_job_stamp(j, g_settings_path, &written, n, n > 0 && n < 256);
 }
 
 enum load_result settings_load(void)
 {
-   /* 192, and settings_render's length guard is the same number. See there. */
+   /* 256, and settings_render's length guard is the same number. See there. */
    /* ONE EXACT READ: the short-read loop, EINTR, and the
     * probe that tells a full buffer from a file longer than this build
     * can hold, all in read_file_exact rather than one unchecked read whose
     * return is taken as the file's length. */
-   char b[192];
+   char b[256];
    int n               = 0;
    enum load_result rr = read_file_exact(g_settings_path, b, sizeof b, &n);
    if (rr != LOAD_OK)
@@ -375,14 +376,30 @@ enum load_result settings_load(void)
            g_settings_path);
       return LOAD_CORRUPT;
    }
-   int v[26] = {
+   /* AND AN OLDER ONE IS REFUSED TOO, from v2 on.
+    *
+    * Every rise before this one only APPENDED fields, so an old file could be
+    * read by the current parser and simply stopped early. v2 moved them: the
+    * pin slots grew from six to nine and best_streak_s went from field 25 to
+    * 28, so a v1 file read with this layout takes its streak for a pin and
+    * its pins for nothing. Refusing leaves the defaults and the next save
+    * writes v2, which loses a few preferences; misreading writes a nonsense
+    * pin list back to disk, which loses them silently and for good. */
+   if (filever < SETTINGS_VERSION) {
+      LOGW("settings: %s is v%d, and v%d moved the fields; starting from "
+           "defaults rather than reading it wrong",
+           g_settings_path, filever, SETTINGS_VERSION);
+      return LOAD_CORRUPT;
+   }
+   int v[29] = {
        g_p.sound_on,      g_p.vib_on,       g_p.orient,      g_p.units,
        g_p.disc,          g_p.plot_max,     g_p.screen_on,   g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
        g_p.ins_color[1],  g_p.ins_size[1],  g_p.statbar_val, g_p.lockscr_val,
        g_p.nudge_sound,   g_p.nudge_vib,    g_p.wunits,      g_p.shortcut[0],
        g_p.shortcut[1],   g_p.shortcut[2],  g_p.shortcut[3], g_p.shortcut[4],
-       g_p.shortcut[5],   g_p.best_streak_s};
+       g_p.shortcut[5],   g_p.shortcut[6],  g_p.shortcut[7],
+       g_p.shortcut[8],   g_p.best_streak_s};
    /* VERSION 0 AND VERSION 1 SHARE THIS READER, and that is the migration:
     * v1 added the marker and changed nothing else, so a v0 file is read
     * field-for-field as it always was and is rewritten as v1 at the next
@@ -390,7 +407,7 @@ enum load_result settings_load(void)
     * step for it goes -- keyed on `filever`, applied in order, with the v0
     * reader kept for the files already on phones. */
    char *q = vq;
-   for (int i = 0; i < 26; i++) {
+   for (int i = 0; i < 29; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -454,11 +471,9 @@ enum load_result settings_load(void)
    g_p.nudge_sound = v[16] ? 1 : 0;
    g_p.nudge_vib   = v[17] ? 1 : 0;
    g_p.wunits      = v[18] ? WT_LB : WT_KG;
-   /* Fields 19-21: the main-screen shortcuts, appended after them. An older
-    * file stops the loop before these and leaves the (empty) defaults, which
-    * is the whole point of the positional format. Compacted so a hole in the
-    * middle -- which nothing writes, but a hand-edited file could -- cannot
-    * leave a live slot stranded behind an empty one. */
+   /* Fields 19-27: the main-screen shortcuts, all nine together. Compacted so
+    * a hole in the middle -- which nothing writes, but a hand-edited file
+    * could -- cannot leave a live slot stranded behind an empty one. */
    {
       int n2 = 0;
       for (int i = 0; i < SC_MAX; i++) {
@@ -478,7 +493,11 @@ enum load_result settings_load(void)
     * best, which is the truth about what this install has seen. Bounded like
     * everything else here: a negative or absurd value is a corrupt file, not
     * a person who has been in range since the Bronze Age. */
-   g_p.best_streak_s = (v[25] >= 0 && v[25] <= BEST_STREAK_MAX) ? v[25] : 0;
+   /* FIELD 28, THE LAST ONE. It was 25 while six pins preceded it; nine push
+    * it along, and this assignment is the one place the move is spelled as a
+    * number rather than derived -- which is why it was missed and read a pin
+    * slot as the record. */
+   g_p.best_streak_s = (v[28] >= 0 && v[28] <= BEST_STREAK_MAX) ? v[28] : 0;
    return LOAD_OK;
 }
 

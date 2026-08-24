@@ -358,10 +358,12 @@ static int devlist_menu_action(int action, int ix)
        * middle one closes the gap -- because the main screen walks it and an
        * empty slot between two live ones would draw a hole in the row.
        *
-       * At SC_MAX the extra tap is REFUSED rather than evicting something: the
-       * user picked those three, and silently dropping one to make room for a
-       * fourth is the kind of helpfulness that loses a setting. The status line
-       * says why, so the tap is not simply inert. */
+       * At SC_MAX the extra tap is REFUSED rather than evicting something:
+       * the user picked those, and silently dropping one to make room is the
+       * kind of helpfulness that loses a setting. The status line says why,
+       * so the tap is not simply inert -- and it says the LIMIT rather than a
+       * number typed here, which was still "3 PINS MAX" two rises after the
+       * limit stopped being three. */
       /* The STABLE id, not the touch code: this goes to disk. See
        * enum shortcut_id in settings.h. */
       int id = ui_shortcut_id(ix);
@@ -370,24 +372,21 @@ static int devlist_menu_action(int action, int ix)
             set_status("PIN NOT SAVED");
       } else {
          int pr = settings_pin_add(id);
-         if (pr == SETTINGS_FULL)
-            set_status("3 PINS MAX");
+         if (pr == SETTINGS_FULL) {
+            char full[24];
+            (void)snprintf(full, sizeof full, "%d PINS MAX", SC_MAX);
+            set_status(full);
+         }
          else if (pr != SETTINGS_OK)
             set_status("PIN NOT SAVED");
       }
-   } else if (action == MA_DEVPAGE_PREV) {
-      if (g_dev_page > 0)
-         g_dev_page--;
-   } else if (action == MA_DEVPAGE_NEXT) {
-      g_dev_page++; /* render clamps to the last page */
+   } else if (action == MA_DEVPAGE) {
+      g_dev_page = ix;
    } else if (action == MA_OLDDEV_OPEN) {
       g_old_page = 0; /* always open on the first page */
       nav_go(SCR_OLDDEV);
-   } else if (action == MA_OLDPAGE_PREV) {
-      if (g_old_page > 0)
-         g_old_page--;
-   } else if (action == MA_OLDPAGE_NEXT) {
-      g_old_page++; /* render clamps to the last page */
+   } else if (action == MA_OLDPAGE) {
+      g_old_page = ix;
    } else if (action == MA_OLDDEV_BACK) {
       /* OLD DEVICES hangs off the DEVICES screen, not off settings. */
       nav_go(SCR_DEVICES);

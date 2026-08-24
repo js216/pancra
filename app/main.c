@@ -58,7 +58,6 @@
 #include "sesscache.h"
 #include "settings.h"
 #include "shell.h"
-#include "shellstate.h" /* the saved-state workflow, split out of this file */
 #include "stategen.h"   /* state.gen: one generation, for a backup */
 #include "stats.h"
 #include "status.h"
@@ -1447,11 +1446,14 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    activity->callbacks->onInputQueueCreated        = on_queue_created;
    activity->callbacks->onInputQueueDestroyed      = on_queue_destroyed;
    activity->callbacks->onDestroy                  = on_destroy;
-   /* THE ONE CALLBACK THAT WAS NEVER INSTALLED. Without it the framework has
-    * nothing to hand back at the next onCreate, so `saved` below was always
-    * NULL and the two parameters were cast to void -- which is exactly what
-    * they were. See the state_* family above. */
-   activity->callbacks->onSaveInstanceState = shellstate_save;
+   /* NO onSaveInstanceState. THE APP ALWAYS OPENS ON THE MAIN SCREEN.
+    *
+    * Coming back to a glucose reading is the whole point of opening this app,
+    * and being put back three screens deep in a log or a settings submenu --
+    * where the user was when Android happened to kill the process, possibly
+    * hours earlier -- puts a menu between them and the number. There is
+    * nothing here worth carrying across a process death that is worth that.
+    */
 
    /* Process-wide, one-time setup: JNI globals, the BLE driver, and the
     * loaded history/settings. The foreground service can outlive the
@@ -1466,20 +1468,28 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
       g_inited = 1;
    }
 
-   /* THE SAVED SCREEN STATE, AND ONLY ON A COLD PROCESS.
+   /* The framework's saved bundle is IGNORED, and none is ever produced --
+    * see the onSaveInstanceState note above. `cold` still gates the one-time
+    * setup a few lines up; nothing else is restored. */
+   (void)cold;
+   (void)saved;
+   (void)saved_size;
+
+   /* AND THE APP OPENS ON THE MAIN SCREEN, on EVERY launch -- not only a cold
+    * one.
     *
-    * AFTER init_data, because the snapshot is validated against what the
-    * durable data actually says -- the display units the draft was typed in
-    * above all -- and before init_data those are the compiled defaults.
+    * Dropping the saved bundle is not enough on its own. The foreground
+    * service outlives the activity, so closing the app from the task switcher
+    * destroys the activity while the PROCESS survives with nav still holding
+    * whatever menu was open; reopening from the notification then re-enters
+    * here and lands back on it. Nothing was restored -- it was simply never
+    * left.
     *
-    * ONLY WHEN THIS PROCESS IS NEW. The service outlives the activity, so an
-    * onCreate can arrive in a process where nav and the forms are still
-    * exactly as the user left them; the snapshot would at best be a copy of
-    * what is already in memory and at worst older than it. `cold` is the same
-    * question `g_inited` already answers for the JNI globals and the loaded
-    * history, asked one line earlier. */
-   if (cold)
-      shellstate_restore(saved, saved_size);
+    * SAFE ON EVERY onCreate because the manifest declares configChanges for
+    * orientation and screen size, so a rotation does not come through here:
+    * this runs on a genuine (re)launch and nowhere else. */
+   nav_home();
+
 
    /* Window flags are per-window, so this must run on every onCreate -- not
     * just the first -- and only once settings_load() has supplied the user's

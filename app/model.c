@@ -599,7 +599,10 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
    for (int i = 0; i < nins && nh < UI_PTS_MAX; i++) {
       struct ins_rec ir = ins_at(i);
       f->pts[nh].t      = ir.t;
-      f->pts[nh].glu    = ir.units;
+      /* THOUSANDTHS, carried through the plot point unchanged: the scrub
+       * readout renders it with ins_units_str, so a half-unit dose reads
+       * "0.5 U" there rather than being flattened on the way in. */
+      f->pts[nh].glu    = ir.milli;
       f->pts[nh].src    = ir.type; /* the scrub shows "2U FAST" etc. */
       f->pts[nh].kind   = KIND_INS;
       nh++;
@@ -887,13 +890,14 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    /* LOG INSULIN form state */
    m->ins.ins_t     = f->fv.ins_t;
    m->ins.ins_type  = f->fv.ins_type;
-   m->ins.ins_units = f->fv.ins_units;
+   m->ins.ins_milli = f->fv.ins_milli;
    /* A COPY, into frame-owned storage: the tail is reloaded whenever a dose
     * is logged or edited, and a frame that borrowed it would be drawing an
     * array rewritten underneath it. */
    m->ins.ins_nlog    = ins_copy(f->inslog, NINS);
    m->ins.ins_log     = f->inslog;
    m->ins.inslog_page = f->fv.inslog_page;
+   m->ins.inslog_tab  = f->fv.inslog_tab;
    /* A COPY, into frame-owned storage: the tail is reloaded whenever a weight
     * is logged or edited, and a frame that borrowed it would be drawing an
     * array rewritten underneath it. */
@@ -905,7 +909,6 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->prefs.wunits = f->prefs.wunits;
    m->wt.wt_edit   = (f->fv.wt_edit >= 0);
    m->wt.wt_tab    = f->fv.wt_tab;
-   m->wt.wt_scrub  = f->fv.wt_scrub;
    m->wt.wt_orig_t = f->fv.wt_orig.t;
    m->wt.wt_orig_g = f->fv.wt_orig.g;
    /* A COPY, into frame-owned storage, for the reason the two above are:
@@ -937,6 +940,18 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->food.nexlog        = ex_copy(f->exlog, NEX);
    m->food.exlog         = f->exlog;
    m->food.exlog_page    = f->fv.exlog_page;
+   m->food.exlog_tab     = f->fv.exlog_tab;
+   /* THE RUNNING ROW, named by its position in the copy above. ex_copy keeps
+    * the tail's order (oldest first), so the running session -- which is
+    * always the newest row -- is the last one copied; the instant is compared
+    * so a tail that was truncated or has moved cannot mislabel a neighbour. */
+   m->food.exlog_act = -1;
+   {
+      struct ex_rec act;
+      if (exercise_active(&act) && m->food.nexlog > 0 &&
+          m->food.exlog[m->food.nexlog - 1].t == act.t)
+         m->food.exlog_act = m->food.nexlog - 1;
+   }
    m->food.ex_t          = f->fv.ex_t;
    m->food.ex_form_level = f->fv.ex_level;
    m->food.ex_form_dur   = f->fv.ex_dur;
@@ -1057,7 +1072,8 @@ void build_model(struct screen *m)
    forms_view_get(&f->fv);
 
    *m        = (struct screen){0};
-   m->scr    = shell_gate() ? SCR_GATE : cur_screen();
+   m->scr       = shell_gate() ? SCR_GATE : cur_screen();
+   m->log_scrub = f->fv.log_scrub;
    m->now    = now;
    m->tz_off = tz_off_now();
 

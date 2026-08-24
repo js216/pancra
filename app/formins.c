@@ -17,12 +17,15 @@
 #include "nav.h"
 #include "shell.h"
 #include "status.h"
+#include "uifmt.h" /* UI_DAY_TABS: the plot spans */
 #include "uiact.h"
 #include "uimodel.h"
 
 /* Which page of the DOSE table is showing. See formwt.c on why paging lives
  * with the workflow whose screen it is. */
 static int g_inslog_page;
+/* And which span its units-per-day plot covers: an index into ui_day_days. */
+static int g_inslog_tab;
 
 /* LOG/EDIT INSULIN. Same shape and same reason as the weight draft above:
  * insulin.h's `struct ins_form` is the model (the instant is edited as a
@@ -51,7 +54,7 @@ static void ins_draft_edit(struct ins_draft *d, int i)
    d->f.edit          = i;
    d->f.t             = row.t;
    d->f.type          = row.type;
-   d->f.units         = row.units;
+   d->f.milli         = row.milli;
 }
 
 static void ins_draft_done(struct ins_draft *d)
@@ -86,11 +89,14 @@ int form_ins_action(int action, int ix)
    } else if (action == MA_INSLOG_OPEN) {
       g_inslog_page = 0;
       nav_go(SCR_INSLOG);
-   } else if (action == MA_INSLOG_PREV) {
-      if (g_inslog_page > 0)
-         g_inslog_page--;
-   } else if (action == MA_INSLOG_NEXT) {
-      g_inslog_page++; /* render clamps to the last page */
+   } else if (action == MA_INSLOG_PAGE) {
+      g_inslog_page = ix;
+   } else if (action == MA_INSTAB) {
+      if (ix >= 0 && ix < UI_DAY_TABS)
+         g_inslog_tab = ix;
+      /* Dropped with the span, for the reason the exercise log's tab gives:
+       * the index counts days from the old window's left edge. */
+      forms_set_log_scrub(-1);
    } else if (action == MA_INS_EDIT) {
       /* Tapping a form value opens the keypad for EXACT entry: units (2
        * digits), date (MMDD), time (HHMM) or year (YYYY). The keypad's OK
@@ -111,13 +117,15 @@ int form_ins_action(int action, int ix)
          long itz = form_zone(0, g_ins.f.t);
          if (g_ins.f.edit >= 0)
             rc = insulin_update(&g_ins.orig, g_ins.f.t, g_ins.f.type,
-                                g_ins.f.units, itz);
+                                g_ins.f.milli, itz);
          else
-            rc = insulin_append(g_ins.f.t, g_ins.f.type, g_ins.f.units, itz);
+            rc = insulin_append(g_ins.f.t, g_ins.f.type, g_ins.f.milli, itz);
          enum draft_fate fate = rc == 0 ? DRAFT_DONE : DRAFT_RETRY;
          if (fate == DRAFT_DONE) {
-            LOGI("insulin %s: %d U %s at %ld",
-                 g_ins.f.edit >= 0 ? "edited" : "logged", g_ins.f.units,
+            char uu[16];
+            (void)ins_units_str(g_ins.f.milli, uu, sizeof uu);
+            LOGI("insulin %s: %s U %s at %ld",
+                 g_ins.f.edit >= 0 ? "edited" : "logged", uu,
                  insulin_type_name(g_ins.f.type), g_ins.f.t);
             set_status(g_ins.f.edit >= 0 ? "INSULIN EDITED" : "INSULIN LOGGED");
          } else {
@@ -205,16 +213,6 @@ int form_ins_action(int action, int ix)
 }
 
 /* The same for a saved INSULIN draft, and for the same reason. */
-void forms_ins_restore(long t, int type, int units)
-{
-   struct ins_rec none = {0, 0, 0};
-   g_ins.orig          = none;
-   g_ins.f.edit        = -1;
-   g_ins.f.t           = t;
-   g_ins.f.type        = type;
-   g_ins.f.units       = units;
-}
-
 /* ---- WHAT THE KEYPAD AND THE FRAME ASK OF THIS WORKFLOW -------------- */
 
 long *form_ins_instant(void)
@@ -224,16 +222,17 @@ long *form_ins_instant(void)
 
 /* WHOLE UNITS. The keypad has already bounded it (1..99); this is the
  * assignment that follows. */
-void form_ins_set_units(int units)
+void form_ins_set_units(int milli)
 {
-   g_ins.f.units = units;
+   g_ins.f.milli = milli;
 }
 
 void form_ins_view(struct forms_view *out)
 {
    out->ins_t       = g_ins.f.t;
    out->ins_type    = g_ins.f.type;
-   out->ins_units   = g_ins.f.units;
+   out->ins_milli   = g_ins.f.milli;
    out->ins_edit    = g_ins.f.edit;
    out->inslog_page = g_inslog_page;
+   out->inslog_tab  = g_inslog_tab;
 }

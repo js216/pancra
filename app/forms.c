@@ -670,20 +670,44 @@ int kp_commit_number(void)
          g_kp.len = 0;
          keypad_close();
       }
-   } else if (g_kp.mode == KP_INS_UNITS) { /* 1..99 */
+   } else if (g_kp.mode == KP_INS_UNITS) { /* "20" or "0.5" */
       if (g_kp.len > 0) {
-         int v = 0;
-         for (int i = 0; i < g_kp.len; i++)
-            v = (v * 10) + (g_kp.entry[i] - '0');
-         if (v < INS_UNITS_MIN || v > INS_UNITS_MAX) {
-            LOGI("insulin %d units out of range, not saved", v);
-            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE %d..%d",
-                           INS_UNITS_MIN, INS_UNITS_MAX);
+         /* THE NUMBER AS IT IS SPOKEN, decimal point and all: half units are
+          * how insulin is dosed, so "0.5" and "16.5" have to be typeable in
+          * the form the pen is set to. The weight field above has the same
+          * shape and the same reasoning; this one carries THREE decimal
+          * places because the record already holds a 0.7. */
+         int milli = 0;
+         int scale = 0;   /* 0 = before the point, then 1..3 places consumed */
+         int dot   = 0;
+         int bad   = 0;
+         for (int i = 0; i < g_kp.len; i++) {
+            char ch = g_kp.entry[i];
+            if (ch == '.') {
+               if (dot)
+                  bad = 1; /* one dot only */
+               else
+                  dot = 1;
+            } else if (!dot) {
+               milli = (milli * 10) + (ch - '0');
+            } else if (scale < 3) {
+               milli = (milli * 10) + (ch - '0');
+               scale++;
+            } else {
+               bad = 1; /* a fourth decimal place: not a dose this log holds */
+            }
+         }
+         while (scale++ < 3)
+            milli *= 10;
+         if (bad || milli < INS_MILLI_MIN || milli > INS_MILLI_MAX) {
+            LOGI("insulin dose out of range, not saved");
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE 0..%d",
+                           INS_UNITS_MAX);
             g_kp.len = 0;
             shell_ui_dirty();
             return COMMIT_STAY; /* stay: cleared entry is the refusal */
          }
-         form_ins_set_units(v);
+         form_ins_set_units(milli);
          g_kp.len = 0;
          keypad_close();
       }
@@ -910,6 +934,19 @@ int forms_scrub(void)
    return g_scrub;
 }
 
+/* THE LOG PLOTS' SCRUB, and ONE of it for all of them.
+ *
+ * Only one log screen is ever open, the index means nothing off the screen
+ * that drew it, and the shell clears it the instant the finger lifts -- so a
+ * value per screen would be three variables that are -1 together for all but
+ * a few hundred milliseconds, and three chances to leave one set. */
+static int g_log_scrub = -1;
+
+void forms_set_log_scrub(int idx)
+{
+   g_log_scrub = idx;
+}
+
 /* ---- ONE TAP, TRIED AGAINST EACH WORKFLOW IN TURN ---------------------
  *
  * The order is the order these were `||`-ed together in menu_action, and it
@@ -941,7 +978,8 @@ void forms_view_get(struct forms_view *out)
    form_wt_view(out);
    form_food_view(out);
    form_ex_view(out);
-   out->scrub = g_scrub;
+   out->scrub     = g_scrub;
+   out->log_scrub = g_log_scrub;
    /* the odds and ends */
    out->label_field   = g_kp.label_field;
    out->rescale_entry = g_kp.rescale;

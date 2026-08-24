@@ -161,8 +161,6 @@ void forms_kp_text(char *out, int cap);
  * workflows it orders rather than in the menu. */
 int forms_action(int action, int ix);
 
-void forms_wt_restore(long t, int tenths);
-void forms_ins_restore(long t, int type, int units);
 
 /* The odds and ends the menus set. */
 void forms_set_label_field(int field);
@@ -181,7 +179,6 @@ int forms_rescale_entry(void);
 void forms_set_cal_pending(int mgdl);
 int forms_cal_pending(void);
 /* The weight plot's scrub cursor: -1 = none. */
-void forms_set_wt_scrub(int idx);
 
 /* THE GLUCOSE PLOT'S SCRUB CURSOR, the same way and for the same reason.
  *
@@ -215,14 +212,14 @@ struct forms_view {
    char kp_err[40];
    /* the insulin form and its log */
    long ins_t;
-   int ins_type, ins_units, ins_edit;
+   int ins_type, ins_milli, ins_edit;
    int inslog_page;
    int markpick_ins;
    /* the weight form, its log and its plot */
    long wt_t;
    int wt_tenths, wt_edit;
    struct wt_rec wt_orig;
-   int wtlog_page, wt_tab, wt_scrub;
+   int wtlog_page, wt_tab;
    /* the food form and the picker's page */
    long food_t;
    int food_type; /* the chosen type ID, not an index: see ui_foodview */
@@ -240,6 +237,8 @@ struct forms_view {
    const char *ex_err; /* why the last CONFIRM was refused; "" = nothing */
    struct ex_rec ex_orig;
    int foodtype_page, foodlog_page, exlog_page;
+   int exlog_tab, inslog_tab; /* the two daily plots' spans */
+   int log_scrub;             /* the bar/point under the finger, or -1 */
    int scrub; /* the glucose plot cursor, -1 = none */
    /* the odds and ends */
    int label_field;
@@ -265,6 +264,10 @@ void forms_ex_edit(int i);
 void forms_food_type_set(int type_id);
 
 /* One consistent copy of all of it. */
+/* The bar or point the finger is on in whichever log plot is open; -1 clears
+ * it. Set by the shell's scrub gesture, read back through the frame. */
+void forms_set_log_scrub(int idx);
+
 void forms_view_get(struct forms_view *out);
 
 #endif

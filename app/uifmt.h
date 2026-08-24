@@ -109,6 +109,42 @@ int ui_sensor_capacity(int w, int h);
 #define UI_WT_TABS 5
 extern const int ui_wt_days[UI_WT_TABS];
 
+/* SPANS FOR THE TWO DAILY-TOTAL PLOTS -- the exercise log's minutes per day
+ * and the insulin log's units per day. Shorter than the weight tabs on
+ * purpose: a body weight is read as a trend over months, while "how much did
+ * I do each day" is a question about the last week or two, and a year of
+ * daily bars on a phone is a grey smear. */
+#define UI_DAY_TABS 5
+extern const int ui_day_days[UI_DAY_TABS];
+extern const char *const ui_day_tab_lbl[UI_DAY_TABS];
+
+/* THE MOST DAYS A BUCKETED PLOT WILL DRAW, which is what sizes the array the
+ * renderer lays out on its stack. A year: past that the bars are thinner than
+ * the gaps between them and the chart stops being readable before it stops
+ * fitting. ALL asks for everything and is clamped to this from the OLD end,
+ * so the right-hand edge is always today. */
+#define UI_DAY_MAX 366
+
+/* ONE PLOTTED POINT. `series` picks its colour and decides which trace it is
+ * joined into -- the two kinds of insulin -- because a line means "this
+ * quantity moved from here to here" and that is only true within one
+ * comparable series. A log with one kind leaves it 0.
+ *
+ * `v` is already in the unit the axis is labelled with, so the plot neither
+ * converts nor knows what it is counting.
+ *
+ * WHAT A POINT IS varies by log, and that is the log's business: a dose for
+ * the insulin plot, a whole DAY's exercise for the exercise one. */
+struct log_pt {
+   long t;
+   long v;
+   int series;
+};
+
+/* The most points any log plot will draw: every tail in the app is 256, and
+ * the exercise plot's days are capped to the same number. */
+#define UI_LOG_PTS 256
+
 /* The characters the rename keypad offers, in grid order. Exposed so the shell
  * can map an MA_CHAR code back to the character that was tapped. */
 extern const char ui_label_chars[];

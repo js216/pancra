@@ -334,16 +334,16 @@ uint32_t ui_text_on(uint32_t bg)
    unsigned b = (bg >> 16U) & 0xFFU;
    unsigned y = ((2126U * r) + (7152U * g) + (722U * b)) / 10000U;
 
-   return (y >= 128U) ? 0xFF000000U : UI_TEXT;
+   return (y >= 128U) ? UI_BLACK : UI_TEXT;
 }
 
 uint32_t ui_ex_color(int level, uint32_t rest_col)
 {
    static const uint32_t exc[EX_MAX_LEVEL + 1] = {
        0,          /* unused: level 0 takes rest_col */
-       0xFFFF9955, /* 1 */
-       0xFFFF6622, /* 2 */
-       0xFFFF3300  /* 3: ABGR, so these deepen towards saturated blue */
+       UI_EX_LIGHT, /* 1 */
+       UI_EX_MOD,   /* 2 */
+       UI_EX_HARD  /* 3: ABGR, so these deepen towards saturated blue */
    };
    if (level < EX_MIN_LEVEL || level > EX_MAX_LEVEL)
       return rest_col;
@@ -448,17 +448,23 @@ uint32_t glu_color_band(int g, int alarm_low, int alarm_high, int nudge_low,
       return fixed;
    /* How alarming a colour is, so the two scales can be compared rather than
     * one blindly overwriting the other. */
+   /* BY DIRECTION AS WELL AS BY BAND, and in the same order of precedence the
+    * threshold row lights its groups in -- the number and the row are saying
+    * one thing about one reading, so they take their colour from one list. */
    uint32_t pick = 0;
-   if ((alarm_low > 0 && g <= alarm_low) || (alarm_high > 0 && g >= alarm_high))
-      pick = 0xFF2020E0; /* the alarm's own red, as the banner uses */
-   else if ((nudge_low > 0 && g <= nudge_low) ||
-            (nudge_high > 0 && g >= nudge_high))
-      pick = 0xFF20A0FF; /* the nudge band: the banner's amber */
+   if (alarm_low > 0 && g <= alarm_low)
+      pick = UI_BAND_ALARM_LO;
+   else if (alarm_high > 0 && g >= alarm_high)
+      pick = UI_BAND_ALARM_HI;
+   else if (nudge_low > 0 && g <= nudge_low)
+      pick = UI_BAND_NUDGE_LO;
+   else if (nudge_high > 0 && g >= nudge_high)
+      pick = UI_BAND_NUDGE_HI;
    if (!pick)
       return fixed;
    /* The fixed scale already says hypo: keep it. Its red and orange are the
     * more urgent statement, and they are about a number, not a preference. */
-   if (fixed == UI_ALERT || fixed == 0xFF0080FF)
+   if (fixed == UI_ALERT || fixed == UI_GLU_SOFT)
       return fixed;
    return pick;
 }
@@ -588,12 +594,12 @@ void fmt_dur(long seconds, char *out, int n)
 _Static_assert(UI_NCOLORS == SET_NCOLORS,
                "UI_NCOLORS and SET_NCOLORS disagree");
 static const uint32_t ui_sensor_colors[UI_NCOLORS] = {
-    0xFF88FF33 /* GREEN */,
-    0xFFFFAA44 /* BLUE */,
+    UI_SENS_GREEN /* GREEN */,
+    UI_SENS_BLUE /* BLUE */,
     UI_BUSY /* AMBER */,
-    0xFFAA66FF /* PINK */,
-    0xFFEEFF66 /* CYAN */,
-    0xFFFF88BB /* VIOLET */,
+    UI_SENS_PINK /* PINK */,
+    UI_SENS_CYAN /* CYAN */,
+    UI_SENS_VIOLET /* VIOLET */,
     UI_TEXT /* WHITE -- the default primary-trace colour */};
 
 /* (ui_color_names and ui_marker_names went with ui_color_name and
@@ -818,140 +824,290 @@ void fmt_thresh(int mgdl, int units, int ishigh, char *out, int n)
 
 /* lx0 / rx1 are the row's EXACT left and right ink edges, not a column to be
  * distributed inside. They are the progress bar's leftmost pixel and the right
- * edge of the units label beside the big number, so these two rows share their
- * margins with the top of the screen rather than using the content column's own
- * wider one -- three different left margins in one vertical line was the thing
- * that made the screen look untidy even when every individual row was fine. */
+ * edge of the units label beside the big number, so this row shares its
+ * margins with the top of the screen rather than using the content column's
+ * own wider one -- three different left margins in one vertical line was the
+ * thing that made the screen look untidy even when every individual row was
+ * fine. */
+
+/* ONE ROW FOR ALL FOUR THRESHOLDS, and the arrows are what makes it one.
+ *
+ * It was two: an ALARM row and a NUDGE row, each spelling "LOW" and "HIGH".
+ * Four numbers that describe ONE axis were split across two lines, each line
+ * spending half its width on words, and reading "is 110 the nudge or the
+ * alarm" meant looking at which row it sat on. Ordered low to high with the
+ * count of arrows saying how far out the band is -- two down, one down, one
+ * up, two up -- the four read as the scale they actually are, and the row
+ * they used to need is what the second and third rows of shortcut buttons are
+ * drawn in.
+ *
+ * THE SYMBOLS ARE THE ALARM'S ONLY. Sound, vibration and the disconnect
+ * alarm are alarm outputs; the dot is NEW DATAPOINT. The nudge has its own
+ * sound and vibration settings and shows neither, because with one row there
+ * is nothing to tell them apart by -- two speakers side by side would be a
+ * puzzle, not a legend. The alarm is the one whose outputs are worth knowing
+ * at a glance. */
+/* Black or white, whichever stands out on `bg`. Rec. 709 luminance, because
+ * the two backgrounds this picks between are a dark red and a light amber and
+ * eyeballing it gets one of them wrong: white on the amber is the pairing
+ * that looks fine at desk brightness and vanishes in sunlight. */
+static uint32_t on_color(uint32_t bg)
+{
+   /* 0xAABBGGRR, so the channels come out in this order. */
+   const unsigned r = bg & 0xFFU;
+   const unsigned g = (bg >> 8) & 0xFFU;
+   const unsigned b = (bg >> 16) & 0xFFU;
+   const unsigned l = ((2126U * r) + (7152U * g) + (722U * b)) / 10000U;
+   return l > 140U ? UI_BLACK : UI_TEXT;
+}
+
+/* WHICH THRESHOLD THE READING IS CURRENTLY BREACHING, as an index into the
+ * four groups, or -1.
+ *
+ * ONE AT A TIME, AND THE ALARM WINS. A reading below the low alarm is below
+ * the low nudge as well -- the bands nest -- so lighting both would say the
+ * nudge is what is happening when the alarm is. Same precedence, and the same
+ * two colours, as glu_color_band uses on the big number: the row and the
+ * number must not disagree about which band the reading is in.
+ *
+ * ONLY WHILE THE READING IS CURRENT. A threshold lit from a value hours old
+ * states a condition that is not known to hold; the whole point of the
+ * highlight is that it is present NOW. */
+static int thresh_hot(const struct screen *m)
+{
+   if (!m->reading.has_cgm || m->reading.glu < 0)
+      return -1;
+   if (m->now - m->reading.t > AL_FRESH_S)
+      return -1;
+   const int g = m->reading.glu;
+   /* INCLUSIVE, exactly like alarm_zone and the banner: the alarm fires AT
+    * the limit, so the row must light at the limit too. */
+   if (m->prefs.alarm_low > 0 && g <= m->prefs.alarm_low)
+      return 0;
+   if (m->prefs.alarm_high > 0 && g >= m->prefs.alarm_high)
+      return 3;
+   if (m->prefs.nudge_low > 0 && g <= m->prefs.nudge_low)
+      return 1;
+   if (m->prefs.nudge_high > 0 && g >= m->prefs.nudge_high)
+      return 2;
+   return -1;
+}
+
 int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
-               struct hits *h, int lx0, int rx1, int y, int sc, int pad,
-               int isalarm)
+               struct hits *h, int lx0, int rx1, int y, int sc, int pad)
 {
    uint32_t *px      = fb->bits;
    const uint32_t gy = UI_MUTED;
    const uint32_t wt = UI_TEXT;
-   int cwid          = 6 * sc;
-   char lo[8];
-   char hi[8];
-   fmt_thresh(isalarm ? m->prefs.alarm_low : m->prefs.nudge_low, m->prefs.units,
-              0, lo, sizeof lo);
-   fmt_thresh(isalarm ? m->prefs.alarm_high : m->prefs.nudge_high,
-              m->prefs.units, 1, hi, sizeof hi);
-   const char *tok[5] = {isalarm ? "ALARM" : "NUDGE", "LOW", lo, "HIGH", hi};
-   uint32_t tcol[5]   = {gy, gy, wt, gy, wt};
-   /* Four icon cells LEFT of the name, at a FIXED 6*sc pitch, and the SAME
-    * four columns on both rows: speaker (sound), phone (vibration), then a
-    * row-specific third, then dot (NEW DATAPOINT). Each symbol always appears
-    * in the same place regardless of which others are enabled; an off state
-    * just leaves its cell empty, so toggling never shifts anything, and
-    * speaker sits above speaker so the two rows read as a table.
+   const int cwid    = 6 * sc;
+
+   /* LOW TO HIGH, left to right -- the order they sit in on the axis. */
+   char v[4][8];
+   fmt_thresh(m->prefs.alarm_low, m->prefs.units, 0, v[0], sizeof v[0]);
+   fmt_thresh(m->prefs.nudge_low, m->prefs.units, 0, v[1], sizeof v[1]);
+   fmt_thresh(m->prefs.nudge_high, m->prefs.units, 1, v[2], sizeof v[2]);
+   fmt_thresh(m->prefs.alarm_high, m->prefs.units, 1, v[3], sizeof v[3]);
+   static const int narrow[4] = {2, 1, 1, 2};
+   static const int updn[4]   = {0, 0, 1, 1}; /* 0 = down, 1 = up */
+   static const int code[4]   = {MA_ALARM_LOW, MA_NUDGE_LOW, MA_NUDGE_HIGH,
+                                 MA_ALARM_HIGH};
+   /* The same four the big number takes its colour from -- see uidraw.h. */
+   static const uint32_t band[4] = {UI_BAND_ALARM_LO, UI_BAND_NUDGE_LO,
+                                    UI_BAND_NUDGE_HI, UI_BAND_ALARM_HI};
+   const int hot                 = thresh_hot(m);
+
+   /* THE WORD IS THE ANNUNCIATOR. It was four icon cells -- speaker, phone,
+    * slashed circle, dot -- and they answered a question nobody was asking:
+    * which OUTPUTS are armed, spelled in symbols that have to be learned,
+    * next to four numbers that need none. What is worth knowing at a glance
+    * is whether this row will make a noise at all, and that is one word.
     *
-    * Each row shows ITS OWN outputs. The nudge has its own sound and
-    * vibration -- one alert says "act now" and the other says "have a look",
-    * and muting either must not mute the other. The third cell is the
-    * DISCONNECT alarm on the ALARM row and nothing on the NUDGE row; the dot
-    * is on the NUDGE row because NEW DATAPOINT lives in the NUDGE section of
-    * the menu these rows open, and icons that contradict the menu behind them
-    * are worse than no icons. */
-   int icon_w = 23 * sc;
-   /* FIXED COLUMNS, SIZED FROM BOTH ROWS.
+    * ALARM when the alarm itself will sound. NUDGE when it will not but the
+    * nudge still will -- the row can still speak, just not for the band it is
+    * named after. SILENT when neither will, which is the state worth being
+    * able to see from across a room. Vibration, the disconnect alarm and the
+    * new-datapoint beep have their own rows in the ALARM submenu, which this
+    * word opens. */
+   const char *name = m->prefs.sound_on      ? "ALARM"
+                      : m->prefs.nudge_sound ? "NUDGE"
+                                             : "SILENT";
+
+   /* THE NUMBER FIELD IS SIZED BY THE UNIT, NOT BY THE VALUES IN IT.
     *
-    * Taking the widths from THIS row's own tokens makes the two rows
-    * disagree the moment their values differ in length: with ALARM 95/300
-    * and NUDGE 100/250 the nudge row is one character wider, which shrinks
-    * its gap and shifts everything left -- measured 3 px on the icons and up
-    * to 9 px on the labels. The two rows are read as a table, so every column
-    * must start at the same x whatever the numbers happen to be. Take each
-    * column's width from the WIDER of the two rows and use it for both. */
-   char olo[8];
-   char ohi[8];
-   fmt_thresh(isalarm ? m->prefs.nudge_low : m->prefs.alarm_low, m->prefs.units,
-              0, olo, sizeof olo);
-   fmt_thresh(isalarm ? m->prefs.nudge_high : m->prefs.alarm_high,
-              m->prefs.units, 1, ohi, sizeof ohi);
-   const char *oth[5] = {"XXXXX", "LOW", olo, "HIGH", ohi};
-   int colw[5];
-   int total = icon_w;
-   for (int i = 0; i < 5; i++) {
-      int a   = str_len(tok[i]);
-      int b   = str_len(oth[i]);
-      colw[i] = (a > b ? a : b) * cwid;
-      total += colw[i];
-   }
-   /* SIX elements (the icon block plus five columns) means FIVE gaps between
-    * them -- no leading or trailing gap, because the row's outer edges are
-    * given, not derived. The last column's ink stops one unit short of its
-    * cell (draw_str emits no trailing gap), so add that sc back before
-    * dividing or the row lands a pixel inside rx1 rather than on it. */
-   int g = ((rx1 - lx0) + sc - total) / 5;
-   if (g < cwid)
-      g = cwid;
+    * Three digits in mg/dL ("400", and "OFF" is three too); four in mmol/L,
+    * where the same ceiling reads "22.2". Taking the width from the current
+    * values instead would move every column on the row the day a threshold
+    * gained or lost a digit -- and the numbers are right-aligned in the
+    * field, so with the width fixed the ones, tens and hundreds each keep one
+    * column for good, whatever is typed. */
+   const int vw    = (m->prefs.units ? 4 : 3) * cwid;
+   /* THE WORD'S OWN WIDTH, not the widest of the three. Padding ALARM out to
+    * SILENT's six characters would leave a blank column after it and make the
+    * first gap read wider than the other three, which is the one thing this
+    * row's spacing is for. The groups shift by a character when the word
+    * changes; the word only changes when a sound setting is toggled, which is
+    * a deliberate act and not something that happens while reading. */
+   const int namew = str_len(name) * cwid;
+
+   /* EACH GROUP IS AS WIDE AS ITS OWN CONTENTS, so the SPACE BETWEEN groups
+    * is what is equal rather than the groups themselves.
+    *
+    * Reserving two arrow slots on every group made the four equal and the
+    * gaps unequal: a single-arrow marker left its outer slot blank, so the
+    * eye saw twice the space before a nudge as before an alarm and the row
+    * read as two pairs rather than one scale. The arrows still never move
+    * when a value changes -- nothing here depends on the digits -- they are
+    * simply not padded out to a width they do not use. */
+   int cellw[4];
+   for (int i = 0; i < 4; i++)
+      cellw[i] = (narrow[i] * cwid) + cwid + vw; /* arrows, a space, number */
+
+   /* FIVE elements -- the word and four groups -- so four gaps, all equal,
+    * and no leading or trailing gap because the row's outer edges are given
+    * rather than derived. draw_str emits no trailing gap, so the last group's
+    * ink stops one unit short of it; add that sc back before dividing or the
+    * row lands a pixel inside rx1 rather than on it. */
+   int total = namew;
+   for (int i = 0; i < 4; i++)
+      total += cellw[i];
+   int g             = ((rx1 - lx0) + sc - total) / 4;
+   /* THE FLOOR IS A COLLISION GUARD, NOT A LOOK. The row's outer edges are
+    * GIVEN -- it aligns with the plot above it -- so the gap is whatever is
+    * left over, and a floor of a whole character was clamping it UP on a
+    * 720-wide screen and pushing the last number six pixels past the right
+    * edge it was supposed to land on. 2*sc is close enough to touching to be
+    * worth refusing and far enough below the natural spacing never to bite
+    * except where nothing would have fitted anyway. */
+   if (g < 2 * sc)
+      g = 2 * sc;
+
    int ax = lx0;
-   if (isalarm ? m->prefs.sound_on : m->prefs.nudge_sound)
-      draw_icon(px, fb, ax, y, sc, icon_speaker, gy);
-   if (isalarm ? m->prefs.vib_on : m->prefs.nudge_vib)
-      draw_icon(px, fb, ax + (6 * sc), y, sc, icon_vibrate, gy);
-   if (isalarm && m->prefs.disc)
-      draw_icon(px, fb, ax + (12 * sc), y, sc, icon_nolink, gy);
-   if (!isalarm && m->prefs.newdata_mode)
-      draw_icon(px, fb, ax + (18 * sc), y, sc, icon_dot, gy);
-   ax += icon_w + g;
-   int al_y = y - (3 * sc);
-   /* EXACTLY the row advance, so consecutive rows ABUT rather than overlap.
-    * At (3 + 7)*sc + pad against an advance of (7*sc) + pad it is 3*sc
-    * taller than its own row -- harmless while ALARM is the only such row,
-    * and a mis-actuation the moment NUDGE appears below it: ui_hit_idx scans
-    * backwards, so the bottom 3*sc of "ALARM HIGH" (9 px at 1080x1920) opens
-    * the NUDGE HIGH keypad instead. Measured at every geometry. */
-   int al_h = (7 * sc) + pad;
-   /* Three targets on the row: everything LEFT of "LOW" (the icons and the
-    * ALARM label, from the screen's leftmost pixel) opens the ALARM
-    * submenu; "LOW <value>" and "HIGH <value>" are each ONE target (label +
-    * value + surrounding gap, full row height) opening that threshold's
-    * keypad. The three are DISJOINT -- the pressed highlight lights the
-    * armed control's whole rectangle, so they must not contain each other's
-    * pixels. Both rows open the SAME submenu: it holds both sections. */
-   int pair_x = 0;
-   for (int i = 0; i < 5; i++) {
-      if (i == 1 || i == 3)
-         pair_x = ax; /* start of the LOW / HIGH pair */
-      if (i == 1)
-         add_hit_ix(h, ui_rect(0, al_y, ax - (g / 2), al_h), MA_ALARM_OPEN, 0);
-      /* Values RIGHT-aligned in their column so the digits line up under one
-       * another; labels left-aligned. Advance by the COLUMN width, never by
-       * this token's own width, or the columns drift apart again. */
-      int tw = str_len(tok[i]) * cwid;
-      int tx = (i == 2 || i == 4) ? ax + (colw[i] - tw) : ax;
-      draw_str(px, fb, tx, y, sc, tok[i], tcol[i]);
-      if (i == 2 || i == 4) {
-         int code = (i == 2) ? MA_ALARM_LOW : MA_ALARM_HIGH;
-         if (!isalarm)
-            code = (i == 2) ? MA_NUDGE_LOW : MA_NUDGE_HIGH;
-         /* CLAMPED TO THE ROW'S OWN RIGHT EDGE. The pair's box reaches half a
-          * gap left and a full gap right so the label, the value and the air
-          * around them are all pressable -- but rx1 is now an EXACT edge, not
-          * a column with slack after it, so that trailing gap ran off the
-          * buffer on the HIGH pair and the target was dropped as off-screen.
-          * Half a gap of overhang is still comfortable and always fits. */
-         int hx    = pair_x - (g / 2);
-         int hw    = (ax + colw[i]) - pair_x + g;
-         int hmaxw = rx1 - hx;
-         if (hw > hmaxw)
-            hw = hmaxw;
-         /* A non-positive width would register a box no tap can ever fall
-          * inside -- a control that draws normally and is dead to touch,
-          * which is the failure add_hit's own overflow flag exists to make
-          * loud. Unreachable at any real geometry; skip rather than record a
-          * lie if one ever gets there. */
-         if (hw > 0)
-            add_hit_ix(h, ui_rect(hx, al_y, hw, al_h), code, 0);
+
+   /* EXACTLY the row advance, so this row and whatever follows it ABUT
+    * rather than overlap: ui_hit_idx scans backwards, so an over-tall target
+    * here would swallow the top of the control below it. */
+   const int al_y = y - (3 * sc);
+   const int al_h = (7 * sc) + pad;
+
+   /* Everything LEFT of the first value -- the icons and the name, from the
+    * screen's leftmost pixel -- opens the ALARM submenu, which holds both
+    * sections. The four value cells are each their own target opening that
+    * threshold's keypad. All five are DISJOINT: the pressed highlight lights
+    * the armed control's whole rectangle, so one must not contain another's
+    * pixels. */
+   draw_str(px, fb, ax, y, sc, name, gy);
+   add_hit_ix(h, ui_rect(0, al_y, ax + namew + (g / 2), al_h), MA_ALARM_OPEN,
+              0);
+   ax += namew + g;
+
+   for (int i = 0; i < 4; i++) {
+      /* Arrows at the group's left edge, the number RIGHT-aligned at its
+       * right: the ones digit lands on the group's last column whatever the
+       * value, so a two-digit threshold leaves the hundreds column blank
+       * rather than sliding the whole number over. */
+      /* THE BREACHED THRESHOLD IS REVERSED: its band colour behind, and
+       * whatever reads on that in front. A colour swap alone would put a red
+       * number among four grey ones and leave the eye to notice it; filling
+       * the group makes the row itself say which band the reading is in, the
+       * same statement the big number above is already making. */
+      uint32_t acol = gy;
+      uint32_t ncol = wt;
+      if (i == hot) {
+         /* One character of margin each side and 2*sc above and below the
+          * glyph, which is what the row's own advance (7*sc + pad) has to
+          * spare -- pad is 18*sc in portrait and 6*sc in landscape. */
+         fill_rect(px, fb, ax - (cwid / 2), y - (2 * sc), cellw[i] + cwid,
+                   (7 * sc) + (4 * sc), band[i]);
+         acol = on_color(band[i]);
+         ncol = acol;
       }
-      ax += colw[i] + g;
+      const uint8_t *ic = updn[i] ? icon_arrow_up : icon_arrow_dn;
+      for (int k = 0; k < narrow[i]; k++)
+         draw_icon(px, fb, ax + (k * cwid), y, sc, ic, acol);
+      const int tw = str_len(v[i]) * cwid;
+      draw_str(px, fb, ax + cellw[i] - tw, y, sc, v[i], ncol);
+      /* Half a gap either side, clamped to the row's own right edge: rx1 is
+       * an exact edge, not a column with slack after it, so an overhanging
+       * target on the last cell would run off the buffer and be dropped. */
+      int hx          = ax - (g / 2);
+      int hw          = cellw[i] + g;
+      const int hmaxw = rx1 - hx;
+      if (hw > hmaxw)
+         hw = hmaxw;
+      if (hw > 0)
+         add_hit_ix(h, ui_rect(hx, al_y, hw, al_h), code[i], 0);
+      ax += cellw[i] + g;
    }
    return y + (7 * sc) + pad;
 }
 
-/* One "LOW"/"HIGH" row: the value in display units, or OFF when the threshold
- * can never be reached (fmt_thresh). */
+/* ALL FOUR BUTTONS, ALWAYS, AND GREYED WHEN THEY HAVE NOWHERE TO GO.
+ *
+ * They used to appear and disappear: at page one there was no "<" at all, so
+ * the row's controls moved under the finger as you paged, and "am I at the
+ * start" had to be inferred from a missing glyph. A control that is present
+ * but dim says the same thing without moving anything, and the four cells
+ * give the counter a fixed place to sit between them.
+ *
+ * FIRST AND LAST EARN THEIR PLACE on the logs, where the page count runs to
+ * twenty-five: stepping back to the newest entries one page at a time is not
+ * a thing anybody should have to do, and the newest entries are the ones
+ * these tables are read for.
+ *
+ * THE DESTINATION IS IN THE HIT, not worked out later. The renderer is what
+ * knows how many pages there are -- it derives the count from the window it
+ * just laid out -- so it is the only place that can say where "last" is.
+ * Handlers that incremented a page and left the renderer to clamp it let the
+ * stored number run past the end, so a NEXT pressed ten times at the bottom
+ * needed ten PRESSES of PREV to come back. */
+void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
+               int y, int sc, int lh, int page, int npages, int code)
+{
+   uint32_t *px  = fb->bits;
+   const int tsc = 2 * sc;
+   /* Two character cells per button, so the single-glyph ones line up with
+    * the doubles and every target is the same size. */
+   const int bw  = 12 * tsc;
+   const int hy  = y - (3 * sc);
+   const int hh  = lh + (7 * sc);
+   struct {
+      const uint8_t *ic;
+      int cx; /* cell's left edge */
+      int to; /* the page it goes to */
+   } b[4] = {
+       {icon_pg_first, x, 0},
+       {icon_pg_prev, x + bw, page - 1},
+       {icon_pg_next, rx - (2 * bw), page + 1},
+       {icon_pg_last, rx - bw, npages - 1},
+   };
+   for (int i = 0; i < 4; i++) {
+      /* A destination outside the range, or the page already showing, is a
+       * button with nothing to do -- which is exactly when it greys. */
+      const int live = b[i].to >= 0 && b[i].to < npages && b[i].to != page;
+      /* UI_TEXT_DIM, NOT UI_TEXT, and that is what makes the press visible.
+       * ui_press_overlay brightens a control by scaling its brightest channel
+       * up to full -- so anything already drawn at 0xFF cannot get brighter
+       * and a press on it does nothing at all. Every other tappable label on
+       * these screens is dim for the same reason; these were white, which
+       * looked emphatic and was inert. */
+      /* AND THE DEAD ONE IS UI_RULE, not UI_MUTED. Against a dim-white live
+       * arrow, 0x88 still reads as an arrow you could press -- the pair
+       * differed by one step where the difference has to carry the whole
+       * message. UI_RULE is the tone this app already spends on structure
+       * rather than content, which is what a button with nowhere to go has
+       * become. */
+      draw_icon(px, fb, b[i].cx + ((bw - (5 * tsc)) / 2), y, tsc, b[i].ic,
+                live ? UI_TEXT_DIM : UI_RULE);
+      if (live)
+         add_hit_ix(h, ui_rect(b[i].cx, hy, bw, hh), code, b[i].to);
+   }
+   char pg[24];
+   (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
+   draw_str(px, fb, (x + rx - (str_len(pg) * 6 * sc)) / 2, y, sc, pg, UI_MUTED);
+}
+
+/* One "LOW"/"HIGH" row in the ALARM submenu: the value in display units, or
+ * OFF when the threshold can never be reached (fmt_thresh). */
 void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
                      int sc, int lh, const char *name, int mgdl, int units,
                      int ishigh, int code)
@@ -1036,12 +1192,12 @@ void fmt_rescale_pct(int pm, char *out, int n)
 uint32_t glu_color(int g)
 {
    if (g < 50)
-      return 0xFF0000FF; /* red    */
+      return UI_GLU_LOW;  /* under 50 */
    if (g < 70)
-      return 0xFF0080FF; /* orange */
+      return UI_GLU_SOFT; /* 50..70   */
    if (g < 180)
-      return 0xFF33FF88; /* green  */
-   return 0xFFFFFFFF;    /* white  */
+      return UI_GLU_MID;  /* 70..180  */
+   return UI_GLU_HIGH; /* over 180 */
 }
 
 int thresh_off(int mgdl, int ishigh)

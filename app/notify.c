@@ -131,7 +131,7 @@ static int notify_update(void)
    if (!sp.statbar_val)
       val[0] = 0; /* STATUS BAR: ICON mode -- Java falls back to the glyph */
    for (int i = 0; i < NOTIF_W * NOTIF_H; i++)
-      g_notify_px[i] = 0xFF000000; /* true black, matching the app screen */
+      g_notify_px[i] = UI_BLACK; /* true black, matching the app screen */
    static struct plot_pt pts[NHIST];
 
    /* Per-device styling, SNAPSHOTTED before hist_lock: the plot must colour
@@ -195,7 +195,7 @@ static int notify_update(void)
       if (!found && (src != 0 || snap[i].kind == KIND_BGM)) {
          if (src != 0) {
             mk  = MARK_CROSS;
-            col = 0xFF8A8AA0; /* UI_ORPHAN */
+            col = UI_ORPHAN;
          }
       }
       if (hide)

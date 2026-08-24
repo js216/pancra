@@ -85,7 +85,12 @@ int input_row_value(int action, int row, int *val)
 static int g_scrubbing; /* a plot drag is in progress */
 /* A drag across the WEIGHT plot is in progress. Gesture state, like the
  * glucose scrub above: the highlighted point itself belongs to the form. */
-static int g_wt_scrubbing;
+static int g_log_scrubbing;
+/* WHICH CURVE THE SCRUB IS BOUND TO, or -1 between gestures. The press picks
+ * freely and this remembers what it landed on; every move until the finger
+ * lifts is confined to it. Gesture state, so it lives here with the flag
+ * above rather than in the frame -- nothing draws it. */
+static int g_log_series = -1;
 
 static int g_scrub_ins; /* what that drag scrubs: 1 insulin, 0 glucose.
                          * Latched at the DOWN and held for the whole
@@ -167,13 +172,14 @@ static int g_gesture_ptr = -1;
 static void gesture_abandon(void)
 {
    g_gesture_ptr = -1;
-   int dirty     = (g_arm_kind != ACT_NONE) || g_scrubbing || g_wt_scrubbing ||
+   int dirty     = (g_arm_kind != ACT_NONE) || g_scrubbing || g_log_scrubbing ||
                    forms_scrub() >= 0;
    press_cancel();
    g_scrubbing = 0;
-   if (g_wt_scrubbing) {
-      g_wt_scrubbing = 0;
-      forms_set_wt_scrub(-1);
+   if (g_log_scrubbing) {
+      g_log_scrubbing = 0;
+      g_log_series    = -1;
+      forms_set_log_scrub(-1);
       shell_ui_dirty();
    }
    if (forms_scrub() >= 0)
@@ -372,14 +378,21 @@ int on_input(int fd, int events, void *data)
           * -- back on the same target -- dispatches its menu_action code.
           * Sliding off first cancels without firing anything. */
          if (cur_screen()) {
-            /* The WEIGHT LOG plot scrubs. It lives on a MENU screen, where
-             * every other target is press-arm/release, so it is handled here
-             * rather than in the main screen's gesture code: a press picks
-             * the nearest point and a drag keeps picking, using the plot
-             * rect the last render recorded. */
-            if (cur_screen() == SCR_WTLOG &&
+            /* THE LOG PLOTS SCRUB -- the weight trend, and the exercise and
+             * insulin logs' daily totals. They live on MENU screens, where
+             * every other target is press-arm/release, so they are handled
+             * here rather than in the main screen's gesture code: a press
+             * picks the nearest point or bar and a drag keeps picking, using
+             * the plot rect the last render recorded.
+             *
+             * ONE BRANCH FOR ALL THREE. Which plot it is, and therefore what
+             * the picked index means, is ui_log_hit's question -- asked of
+             * the frame, which knows the screen. The shell only knows that a
+             * finger is inside something scrubbable. */
+            if ((cur_screen() == SCR_WTLOG || cur_screen() == SCR_EXLOG ||
+                 cur_screen() == SCR_INSLOG) &&
                 (action == AMOTION_EVENT_ACTION_DOWN ||
-                 (action == AMOTION_EVENT_ACTION_MOVE && g_wt_scrubbing))) {
+                 (action == AMOTION_EVENT_ACTION_MOVE && g_log_scrubbing))) {
                for (int i = 0; i < g_hits.n; i++) {
                   if (g_hits.box[i].kind != ACT_SCRUB)
                      continue;
@@ -397,18 +410,25 @@ int on_input(int fd, int events, void *data)
                   struct screen sm;
                   if (!model_frame(&sm))
                      break;
-                  int pick = ui_wt_hit(&sm, g_hits.box[i].x, g_hits.box[i].w,
-                                       g_hits.box[i].arg, tx);
+                  /* A PRESS BEGINS A FRESH BINDING; a move keeps the one the
+                   * press made. Cleared here rather than on the way out so a
+                   * press that lands on nothing still starts clean. */
+                  if (action == AMOTION_EVENT_ACTION_DOWN)
+                     g_log_series = -1;
+                  int pick = ui_log_hit(
+                      &sm, g_hits.box[i].x, g_hits.box[i].y, g_hits.box[i].w,
+                      g_hits.box[i].h, g_hits.box[i].arg, tx, ty,
+                      &g_log_series);
                   if (pick >= 0) {
-                     forms_set_wt_scrub(pick);
-                     g_wt_scrubbing = 1;
+                     forms_set_log_scrub(pick);
+                     g_log_scrubbing = 1;
                      press_cancel(); /* scrubbing is not a button press */
                      shell_ui_dirty();
                      shell_repaint();
                   }
                   break;
                }
-               if (g_wt_scrubbing) {
+               if (g_log_scrubbing) {
                   AInputQueue_finishEvent(q, ev, 1);
                   continue;
                }
@@ -419,9 +439,10 @@ int on_input(int fd, int events, void *data)
                 * glucose plot: the readout borrows the tab row, so leaving
                 * it up would hide the span tabs indefinitely and leave a
                 * stale value on screen with nothing touching it. */
-               if (g_wt_scrubbing) {
-                  g_wt_scrubbing = 0;
-                  forms_set_wt_scrub(-1);
+               if (g_log_scrubbing) {
+                  g_log_scrubbing = 0;
+                  g_log_series    = -1;
+                  forms_set_log_scrub(-1);
                   shell_ui_dirty();
                   shell_repaint();
                }

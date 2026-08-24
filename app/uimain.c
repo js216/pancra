@@ -73,6 +73,40 @@ static void streak_len(long s, char *out, size_t cap)
       (void)snprintf(out, cap, "%ld MIN", s / 60);
 }
 
+/* HOW THE PINNED SHORTCUTS PACK: how many go on a row, and how many rows that
+ * comes to.
+ *
+ * AT MOST TWO PER ROW UNTIL THERE ARE MORE THAN SIX, THEN THREE, AND NEVER
+ * MORE THAN THREE ROWS. A two-wide button holds its full label ("SLOW
+ * INSULIN"); a three-wide one starts falling back to the abbreviation, so the
+ * tighter packing is spent only once the alternative is a fourth row there is
+ * no height for. Nine is three rows of three, and SC_MAX is that same number.
+ *
+ * BALANCED, NOT FILLED: five pins are 2+2+1, never 2+2+1 arrived at by
+ * filling -- the difference shows at seven, where filling gives 3+3+1 and a
+ * lone button under two full rows reads as an afterthought. One percol for
+ * every row, because the rows must share their columns: two rows of controls
+ * that do not line up read as two unrelated groups.
+ *
+ * ONE DEFINITION, because three places need the answer -- the height budget
+ * before the font is chosen, the drawing loop, and the row the '+' sits on --
+ * and a layout that disagrees with its own budget overflows the screen. */
+static int pin_rows(int n)
+{
+   const int cap = (n > 6) ? 3 : 2;
+   int rows      = (n + cap - 1) / cap;
+   if (rows > 3)
+      rows = 3;
+   return rows < 1 ? 1 : rows;
+}
+
+static int pin_percol(int n)
+{
+   const int rows = pin_rows(n);
+   const int pc   = (n + rows - 1) / rows;
+   return pc < 1 ? 1 : pc;
+}
+
 /* The CGM that owns the big number, or NULL. Four places open-coded this same
  * scan; the big number, its session line and the plot all have to agree on
  * which sensor they are describing, so there is one answer to the question. */
@@ -427,7 +461,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
       bgap = bigsc3 + pad - bar_h;
    int bar_y = y + (7 * bigsc3) + bgap;
    if (m->reading.t > 0 && m->reading.has_cgm) {
-      fill_rect(px, fb, bx3, bar_y, bar_w, bar_h, 0xFF444444);
+      fill_rect(px, fb, bx3, bar_y, bar_w, bar_h, UI_BAR_AGE);
       if (a >= AGE_BAR_S) {
          int dash = 3 * sc; /* dash == gap */
          for (int dx = 0; dx < bar_w; dx += 2 * dash) {
@@ -671,7 +705,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
        * converted from the stored GRAMS into whichever display unit is set,
        * so switching KG/LB re-renders history rather than relabelling it. */
       if (ins) {
-         (void)snprintf(gv, sizeof gv, "%d U", m->plot.hist[m->plot.scrub].glu);
+         /* `glu` carries THOUSANDTHS for an insulin point (model.c), so the
+          * dose is rendered rather than printed: "0.5 U", not "500 U". */
+         char iu[16];
+         (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
+         (void)snprintf(gv, sizeof gv, "%s U", iu);
       } else if (wt) {
          /* Clamped so the format is provably bounded: the store's own range
           * (WT_MIN_G..WT_MAX_G) tops out at 400 kg / 882 lb, i.e. four digits
@@ -823,38 +861,50 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * room to spare -- never clip. */
    /* Reserve, in sc units, everything drawn between the plot bottom and the
     * screen bottom AT FULL FONT:
-    *   59 = what render_glucose itself adds after the plot: a 9 gap, then the
-    *        ALARM and NUDGE threshold rows at 7 row + 18 portrait pad EACH.
-    *        BOTH rows are counted: a row the reserve leaves out is a row the
-    *        plot grows over, and the overlap lands on the thresholds -- the
-    *        numbers whose whole purpose is to be readable at a glance.
-    *  186 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
-    *        the banner's advance and glyph),
+    *   34 = what render_glucose itself adds after the plot: a 9 gap, then the
+    *        threshold row at 7 row + 18 portrait pad. A row the reserve
+    *        leaves out is a row the plot grows over, and the overlap would
+    *        land on the thresholds -- the numbers whose whole purpose is to
+    *        be readable at a glance.
+    *  211 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
+    *        the banner's advance and glyph) plus the THIRD shortcut row.
+    *
     *   16 = one blank line BELOW the alarm's large letters.
+    *
+    * 34 + 211 IS THE 59 + 186 IT REPLACES, and deliberately so: collapsing
+    * the ALARM and NUDGE rows into one freed 25 of height, and that height
+    * belongs to the shortcut grid rather than to the plot. Leaving the total
+    * alone is what hands it over -- the plot ends where it always did and the
+    * block below it is 25 taller.
+    *
     * Reserving render_info's full budget keeps its font at sc (it only
     * downscales when squeezed), which is the point -- the plot grows into the
     * dead space, the text below it does NOT shrink. */
-   int reserve = (59 + 186 + 16) * sc;
+   int reserve = (34 + 211 + 16) * sc;
    int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
    int ph   = 0;
    if (landscape)
-   /* 39, BECAUSE TWO THRESHOLD ROWS COME AFTER THE PLOT. In landscape the
+   /* 26, BECAUSE ONE THRESHOLD ROW COMES AFTER THE PLOT. In landscape the
     * plot is sized by subtracting what follows it: a 9 gap, then 7 glyph +
-    * 6 landscape pad EACH, i.e. 35, plus 4 sc of slack.
+    * 6 landscape pad, i.e. 22, plus 4 sc of slack.
     *
-    * A NUMBER TOO SMALL HERE DOES NOT CROP THE PLOT -- it puts the NUDGE row
-    * and all three of its tap targets below the buffer, on every wide-short
-    * geometry. This app does not scroll, so that is drawn nowhere and
-    * tappable nowhere. uitest sweeps the geometries. */
-   /* THREE QUARTERS of what is left, not all of it. The rest is the two
-    * threshold rows (39*sc).
+    * A NUMBER TOO SMALL HERE DOES NOT CROP THE PLOT -- it puts the threshold
+    * row and all five of its tap targets below the buffer, on every
+    * wide-short geometry. This app does not scroll, so that is drawn nowhere
+    * and tappable nowhere.
+    *
+    * The shortcut grid is in the OTHER column in landscape, so the row freed
+    * by collapsing ALARM and NUDGE has nothing to be handed to here and goes
+    * to the plot. */
+   /* THREE QUARTERS of what is left, not all of it. The rest is the
+    * threshold row (26*sc).
     *
     * The banner needs no reservation here: it is above the big number, in the
     * other column. The three-quarter cap stays anyway, because what it
     * protects is the threshold rows' own room on a short window, not
     * the banner's. */
    {
-      ph      = bottom - y - (39 * sc);
+      ph      = bottom - y - (26 * sc);
       int cap = ((bottom - y) * 3) / 4;
       if (ph > cap)
          ph = cap;
@@ -941,14 +991,14 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       if (m->plot.hist[i].kind == KIND_FOOD) {
          pts[i].glu    = 60;
          pts[i].marker = PLOT_MARK_F;
-         pts[i].col    = 0xFF66DDFF;
+         pts[i].col    = UI_MARK_FOOD;
          pts[i].size   = MARK_SIZE_DEF;
          continue;
       }
       if (m->plot.hist[i].kind == KIND_WT) {
          pts[i].glu    = 60;
          pts[i].marker = PLOT_MARK_W;
-         pts[i].col    = 0xFF88CCFF;
+         pts[i].col    = UI_MARK_WT;
          pts[i].size   = MARK_SIZE_DEF;
          continue;
       }
@@ -961,7 +1011,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       if (m->plot.hist[i].kind == KIND_EX) {
          pts[i].glu    = 60;
          pts[i].marker = PLOT_MARK_E;
-         pts[i].col    = ui_ex_color(m->plot.hist[i].glu, 0xFFFF9955);
+         pts[i].col    = ui_ex_color(m->plot.hist[i].glu, UI_EX_LIGHT);
          pts[i].size   = MARK_SIZE_DEF;
          pts[i].span   = m->plot.hist[i].src;
          continue;
@@ -1118,9 +1168,9 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
           * letters' baseline to read as an underline of the words rather
           * than a measure of the run. */
          int by = sy + (7 * sc) + (sc < 2 ? 1 : sc / 2) + bh;
-         fill_rect(px, fb, sx, by, sw, bh, 0xFF333333);
+         fill_rect(px, fb, sx, by, sw, bh, UI_BAR_STREAK);
          if (fill > 0)
-            fill_rect(px, fb, sx, by, (int)fill, bh, 0xFF9A9A9A);
+            fill_rect(px, fb, sx, by, (int)fill, bh, UI_BAR_FILL);
       }
    }
    /* the whole plot rect scrubs; the shell resolves the datapoint via plot_hit
@@ -1134,16 +1184,23 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    h->plot = pcfg;
    y += ph + (9 * sc);
 
-   /* Threshold rows: "ALARM  LOW 110  HIGH 300" and, below it, the NUDGE
-    * pair. Both are the full column and both are laid out by thresh_row, so
-    * their LOW/HIGH columns line up exactly (see there). */
+   /* The threshold row: all four values on one line, low to high, each
+    * marked by how far out of band it is (see thresh_row).
+    *
+    * ALIGNED TO THE PLOT, inset one character each side. The row and the plot
+    * are the two full-width blocks in this column and they sit one above the
+    * other, so ink that starts and ends anywhere else reads as a misalignment
+    * however tidy each block is on its own -- which is what the old edges
+    * (the progress bar's left, the units label's right) did. The character of
+    * inset keeps the outermost arrow and digit off the plot's frame rather
+    * than flush against it. */
    /* Left edge = the progress bar's leftmost pixel (bx3); right edge = the
     * right ink edge of the units label beside the big number. Both are locals
     * of THIS function -- the number, the bar and these rows are all laid out
     * here -- so the margins are shared by construction rather than by two
     * copies of the same arithmetic that could drift apart. */
-   y = thresh_row(fb, m, h, g.x0, g.x1, y, sc, pad, 1);
-   y = thresh_row(fb, m, h, g.x0, g.x1, y, sc, pad, 0);
+   y = thresh_row(fb, m, h, plot_x + (6 * sc), plot_x + plot_w - (6 * sc), y,
+                  sc, pad);
    /* NO BANNER HERE. It rides above the big number in both orientations, so
     * neither column places it and neither has to know it exists. */
    return y;
@@ -1175,35 +1232,24 @@ static const char *banner_of(const struct screen *m, uint32_t *col)
 {
    const char *msg = 0;
    uint32_t c      = 0;
+   /* STALE IS THE ONLY BANNER LEFT.
+    *
+    * LOW and HIGH used to sit here too. The threshold row below the plot now
+    * reverses the breached number into its band's colour, which says the same
+    * thing and says it against the limit that was crossed -- the banner could
+    * only name a direction. Two announcements of one fact, one of them less
+    * specific, is the kind of duplication that gets one of them changed and
+    * not the other.
+    *
+    * STALE stays because nothing else on this screen says that readings have
+    * stopped arriving, and the row cannot: it is about thresholds, and a
+    * reading that is not coming is not breaching one. */
    if (m->reading.disc_alarmed) {
       msg = "STALE";
-      /* A banner-only colour, for the same visibility-check reason as LOW. */
-      c = 0xFF00D0FF;
-   } else if (m->now - m->reading.t <= AL_FRESH_S) {
-      /* INCLUSIVE, exactly like alarm_zone (alarmlogic.c): the alarm fires AT
-       * the limit, so the banner must appear at the limit too. While this read
-       * `<` and the alarm read `<=`, a reading of exactly LOW sounded the alarm
-       * and posted "Glucose LOW" while this screen drew no banner and coloured
-       * the big number in-range -- the app contradicting its own alarm, which
-       * is a reason to dismiss a real hypo. One threshold, one comparison. */
-      if (m->reading.glu >= 0 && m->reading.glu <= m->prefs.alarm_low) {
-         msg = "LOW";
-         /* Deliberately NOT glu_color's red (0xFF0000FF): sharing that value
-          * made the offline visibility check vacuous, because the big number
-          * is drawn in it too whenever glu < 50 -- so "the banner is visible"
-          * passed while the banner was entirely off-screen. A banner-only
-          * colour is what makes that assertion mean something. */
-         c = 0xFF2020E0;
-      } else if (m->reading.glu >=
-                 m->prefs.alarm_high) { /* inclusive, as above */
-         msg = "HIGH";
-         /* Banner-only, like LOW. Sharing glu_color's orange is what made the
-          * LOW visibility assertion vacuous for five review rounds -- the
-          * check passed on the big number while the banner was off-screen.
-          * HIGH is safe today only by the coincidence that a high reading puts
-          * the number in the white band; do not rely on that. */
-         c = 0xFF20A0FF;
-      }
+      /* Banner-only, deliberately not a colour the big number can take: it is
+       * what makes an offline "is the banner visible" check mean something
+       * rather than passing on the number underneath it. */
+      c = UI_BANNER;
    }
    *col = c;
    return msg;
@@ -1255,8 +1301,8 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * 51 units for a banner it drew underneath: that slack was absorbing an
     * overhang nobody had budgeted. Removing the banner is what exposed it, at
     * 3120x1440 and 1600x720. */
-   /* AND THE SECOND SHORTCUT ROW, when there is one. 28 = the button (25) and
-    * the 3 of air between the rows -- rowpitch, below, in the same units.
+   /* AND EVERY SHORTCUT ROW PAST THE FIRST. 28 = the button (25) and the 3 of
+    * air between rows -- rowpitch, below, in the same units.
     *
     * Counted HERE, before the scale is chosen, because this block sizes its
     * own font from the space it is given: a row added after the fact does not
@@ -1266,7 +1312,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    for (int i = 0; i < SC_MAX; i++)
       if (m->prefs.shortcut[i] > 0)
          npin++;
-   int needv  = 7 + (4 * 16) + 24 + 3 + (npin > 3 ? 28 : 0);
+   int needv  = 7 + (4 * 16) + 24 + 3 + ((pin_rows(npin) - 1) * 28);
    int availv = fb->height - y;
    int vsc    = availv > 0 ? availv / needv : 1;
    int hsc    = cw / (2 + (35 * 6)); /* 35 = the stats table's fixed width */
@@ -1361,20 +1407,12 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
       for (int i = 0; i < SC_MAX; i++)
          if (ui_shortcut_slot_by_id(m->prefs.shortcut[i]) >= 0)
             nsc++;
-      /* AT MOST THREE PER ROW, AT MOST TWO ROWS.
-       *
-       * Three or fewer keep the single row this has always been. Four to six
-       * split into two, balanced rather than filled -- four is 2+2, not 3+1 --
-       * because a lone button under a full row reads as an afterthought, and
-       * the eye pairs the columns of two equal rows without being told to.
-       *
-       * ceil(nsc/2) is that balance, and it is capped implicitly by SC_MAX: at
-       * six it gives exactly three, which is the per-row ceiling. The two
-       * numbers are the same fact, stated in settings.h where SC_MAX lives. */
-      int nrows  = nsc > 3 ? 2 : 1;
-      int percol = nrows == 2 ? ((nsc + 1) / 2) : nsc;
-      /* Pitch between the two rows: the button (25*sc, see menu_button) and
-       * 3*sc of air. Named because the '+' is placed from it too. */
+      /* The packing rule and its one definition are pin_rows / pin_percol
+       * above -- the same answer the height budget was derived from. */
+      int nrows  = pin_rows(nsc);
+      int percol = pin_percol(nsc);
+      /* Pitch between rows: the button (25*sc, see menu_button) and 3*sc of
+       * air. Named because the '+' is placed from it too. */
       int rowpitch = (25 * sc) + (3 * sc);
       /* AIR BETWEEN THE STATS TABLE AND THIS ROW. The table is a block of
        * numbers and this row is a set of controls, and at 2*sc they touched.

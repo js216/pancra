@@ -16,7 +16,10 @@
  *   2  insulin units, 1..99
  *   4  MMDD, HHMM, YYYY
  *   4  a threshold: holds "999" and the mmol/L form "55.5"
- *   5  a weight: "162.4" -- three digits, a dot and a tenth
+ *   5  a weight: "162.4" -- three digits, a dot and a tenth, and a dose:
+ *      "16.5" or "0.5", two digits either side of the point. Insulin is
+ *      dosed in half units, so the field has to accept the number the pen is
+ *      set to; two digit cells and no point could only spell whole ones
  *   6  the SERVER's pairing code, which is six digits and burns after three
  *      attempts; a four-slot field would make pairing impossible rather than
  *      merely awkward
@@ -27,7 +30,7 @@ static const struct kp_info g_modes[KP_NMODES] = {
     [KP_CALIB]      = {"CALIBRATION",  3, 0, KP_UNIT_GLU,  0, 0, 0},
     [KP_RESCALE]    = {"RESCALE",      3, 0, KP_UNIT_GLU,  0, 0, 0},
     [KP_PORT]       = {"REMOTE PORT",  5, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_INS_UNITS]  = {"UNITS",        2, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_INS_UNITS]  = {"UNITS",        5, 0, KP_UNIT_NONE, 1, 0, 0},
     [KP_DATE]       = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_TIME]       = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_YEAR]       = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},

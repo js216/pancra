@@ -69,6 +69,7 @@ int form_food_action(int action, int ix)
 {
    if (action == MA_FOOD_OPEN) {
       forms_food_open(realtime_s());
+      g_foodtype_page = 0; /* always page one: see the food log's note */
       /* Both, in this order. See above: the form has to be BELOW the picker
        * on the path or there is nothing for the picker to return to. */
       nav_go(SCR_FOOD);
@@ -138,17 +139,12 @@ int form_food_action(int action, int ix)
          nav_back();
       }
    } else if (action == MA_FOODLOG_OPEN) {
+      g_foodlog_page = 0; /* always page one: see the exercise log's note */
       nav_go(SCR_FOODLOG);
    } else if (action == MA_FOODLOG_BACK) {
       nav_back();
-   } else if (action == MA_FOODLOG_PREV) {
-      if (g_foodlog_page > 0)
-         g_foodlog_page--;
-   } else if (action == MA_FOODLOG_NEXT) {
-      /* The renderer clamps an over-large page to the last one, so walking
-       * past the end shows the end rather than an empty table -- how many
-       * rows fit is a property of the window, which nothing here can see. */
-      g_foodlog_page++;
+   } else if (action == MA_FOODLOG_PAGE) {
+      g_foodlog_page = ix;
    } else if (action == MA_FOODTYPE_BACK) {
       nav_back();
    } else if (action == MA_FOOD_EDIT) {
@@ -159,6 +155,7 @@ int form_food_action(int action, int ix)
        * arithmetic version of that (`KP_FOOD_G + ix`) is what keypad.h
        * records going wrong for the insulin form. */
       if (ix == 0) {
+         g_foodtype_page = 0;
          nav_go(SCR_FOODTYPE);
       } else {
          enum keypad_mode mode = kp_food_field(ix - 1);
@@ -211,16 +208,8 @@ int form_food_action(int action, int ix)
        * fresh form starts from. Clearing it here as well would be a second
        * opinion about that, in the function that knows least about it. */
       nav_back();
-   } else if (action == MA_FOODPAGE_PREV) {
-      if (g_foodtype_page > 0)
-         g_foodtype_page--;
-   } else if (action == MA_FOODPAGE_NEXT) {
-      /* THE UPPER BOUND IS THE RENDERER'S, not this function's: how many
-       * types fit on a page depends on the window, which nothing here can
-       * see. The renderer clamps the page it is given, so an over-large value
-       * shows the last page rather than an empty one -- and the next tap on
-       * '<' walks back from where the user actually is. */
-      g_foodtype_page++;
+   } else if (action == MA_FOODPAGE) {
+      g_foodtype_page = ix;
    } else {
       return 0;
    }

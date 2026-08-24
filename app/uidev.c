@@ -320,24 +320,8 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * Same shape as OLD DEVICES: "<" and ">" with the page count between them,
     * drawn only when there IS more than one page so a short list stays
     * quiet. */
-   if (npages > 1) {
-      if (page > 0) {
-         draw_str(px, fb, x, y, sc, "<", UI_TEXT);
-         add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width / 3, lh),
-                    MA_DEVPAGE_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, y, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * sc), y, sc, ">", UI_TEXT);
-         add_hit_ix(
-             h, ui_rect((2 * fb->width) / 3, y - (3 * sc), fb->width / 3, lh),
-             MA_DEVPAGE_NEXT, 0);
-      }
-      y += lh;
-   }
+   pager_row(fb, h, x, rx, y, sc, lh, page, npages, MA_DEVPAGE);
+   y += lh;
    /* OLD DEVICES: DISCONNECTED devices. Each keeps its full slot, so the row
     * opens the SAME per-device menu (state EXPIRED). Only shown when there is
     * at least one, so it never adds noise on a fresh install. A blank line
@@ -397,7 +381,7 @@ void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
    menu_row(fb, h, y, sc, lh, "STANDBY", ui_bucket_label(m->sys.standby_bucket),
             (m->sys.standby_bucket > 0 && m->sys.standby_bucket <= 20)
                 ? UI_OK
-                : 0xFFAA8844,
+                : UI_SYNC_STALE,
             -1, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "BG EXEC",
@@ -816,7 +800,7 @@ static int sensor_info_rows(struct ANativeWindow_Buffer *fb,
             fmt_glu(s->cal_mgdl, m->prefs.units, gv, sizeof gv);
             (void)snprintf(cv, sizeof cv, "%s %s %s", cd, gv,
                            UI_LBL(m->prefs.units));
-            ccol = 0xFF88FF33; /* green: accepted */
+            ccol = UI_SENS_GREEN; /* green: accepted */
          } else {
             /* Distinct failure kinds so REJECTED (bad value) is not confused
              * with NOT SUPPORTED (sensor forbids calibration). */
@@ -1172,26 +1156,8 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* Bottom navigation, only when there is more than one page. "<" and ">"
     * are generous tap targets on the left and right; the page count is
     * centred between them. */
-   if (npages > 1) {
-      int navy = fb->height - lh - (4 * sc);
-      if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_OLDPAGE_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect((2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
-                            lh + (7 * sc)),
-                    MA_OLDPAGE_NEXT, 0);
-      }
-   }
+   pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,
+             MA_OLDPAGE);
 }
 
 /* ---- MARKER / COLOR pickers: a full list of options, each with a live glyph,

@@ -240,7 +240,7 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * rejected value -- weeks of a nudge threshold that is never accepted
     * looking like a nudge that no longer works. */
    if (m->entry.kp_err[0]) {
-      draw_str(px, fb, x, y, sc, m->entry.kp_err, 0xFFFF5555);
+      draw_str(px, fb, x, y, sc, m->entry.kp_err, UI_SYNC_ERR);
       y += 2 * lh;
    }
 

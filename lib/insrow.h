@@ -39,10 +39,28 @@
 #define INS_SLOW 0 /* basal / long-acting */
 #define INS_FAST 1 /* bolus / rapid-acting */
 
-/* A dose is whole units. 1..99 is what the keypad accepts and what the log
- * carries; 0 is not a dose and three digits is not a dose anybody takes. */
-#define INS_UNITS_MIN 1
+/* A DOSE IS A DECIMAL NUMBER OF UNITS, held as THOUSANDTHS.
+ *
+ * Half units are how insulin is actually dosed -- 0.5, 1.5, 16.5 -- so a
+ * whole-number field cannot carry the record: it either drops the small
+ * boluses or states every half-unit basal a half low. The file writes what a
+ * person writes ("20", "0.5", "16.5") and this is the integer that text
+ * scales to, because a quantity that must round-trip through a text file
+ * exactly cannot live in a binary float (0.1 is not representable in one).
+ *
+ * MILLI-, not tenths: 0.7 is in the record already, and a scale that only
+ * just covers today's doses is one that has to be widened the first time a
+ * pen measures finer. Three places costs nothing here.
+ *
+ * OLD ROWS NEED NO MIGRATION. A legacy "20" is a decimal that happens to have
+ * no fraction, so it reads as 20000 through the same parser -- the column's
+ * meaning did not change, only the set of values it can express. */
+#define INS_MILLI 1000
 #define INS_UNITS_MAX 99
+/* 0 is not a dose; anything above zero is one, down to the last place the
+ * format carries. Three digits of units is not a dose anybody takes. */
+#define INS_MILLI_MIN 1
+#define INS_MILLI_MAX (INS_UNITS_MAX * INS_MILLI)
 
 /* The year 3000, in epoch seconds: a stamp past this is not a time anybody
  * injected at, it is a corrupted field. */
@@ -63,8 +81,14 @@ struct ins_row {
    int del;
    long t;
    int type;
-   int units;
+   int milli; /* thousandths of a unit: 500 is half a unit */
 };
+
+/* Render `milli` the way a person writes it -- "20", "0.5", "16.5" -- with no
+ * trailing zeros and no decimal point when there is no fraction. Returns the
+ * length written. Both halves of the app and the server format a dose through
+ * this, so a value cannot read one way on a phone and another on a page. */
+int ins_units_str(int milli, char *out, int cap);
 
 /* Decode ONE row, from `p` to `e` (the end of the LINE, not of the file).
  *

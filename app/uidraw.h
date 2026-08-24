@@ -183,12 +183,25 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
                      int sc, int lh, const char *name, int mgdl, int units,
                      int ishigh, int code);
 
+/* THE PAGER: |< < n/m > >|, drawn across [x, rx] at `y`.
+ *
+ * `code` is the ONE action all four buttons carry; the destination page rides
+ * in the hit's index, so the handler is `page = ix` and nothing about
+ * stepping, ends or bounds lives in it. A button with nowhere to go is drawn
+ * greyed and records no target.
+ *
+ * Returns nothing: the row's height is the caller's `lh`, which it had to
+ * reserve before calling. */
+void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
+               int y, int sc, int lh, int page, int npages, int code);
+
 uint32_t white_color(int g);
 /* The big number's colour for `g`, by the fixed medical range. */
 uint32_t glu_color(int g);
+/* The main screen's threshold row: all four values on ONE line, low to high,
+ * marked with arrows. lx0/rx1 are its exact ink edges. */
 int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
-               struct hits *h, int lx0, int rx1, int y, int sc, int pad,
-               int isalarm);
+               struct hits *h, int lx0, int rx1, int y, int sc, int pad);
 /* Is this threshold at the end of its range, where it switches the alarm
  * off? `ishigh` picks which end. */
 int thresh_off(int mgdl, int ishigh);

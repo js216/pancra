@@ -32,13 +32,6 @@
 /* Layout constants owned by the UI (not the shell). */
 #define UI_COLS   33         /* character columns the layout targets */
 #define UI_TABS   6          /* plot-span tabs */
-#define UI_HILITE 0xFFAAAAAA /* scrub highlight dot (gray) */
-/* Readings whose sensor is no longer in a slot: dim, so they stay legible as
- * history without competing with a live trace. Deliberately NOT 0xFF666666 --
- * that is plot.c's x-tick colour, and an orphan marker drawn in it reads as
- * part of the axis. */
-#define UI_ORPHAN 0xFF8A8AA0
-
 /* Sensor trace colours the picker offers; crosschecked against SET_NCOLORS
  * where the palette is defined. */
 #define UI_NCOLORS 7
@@ -120,6 +113,49 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
 void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
                      struct hits *h);
 
+/* ---- THE DAILY-TOTAL PLOT, shared by the exercise and insulin logs ----
+ *
+ * Both answer the same shape of question -- how much of this did I do on each
+ * of the last N days -- so both draw the same chart: one bar per local day,
+ * scrubbable, under the same span tabs. Only the quantity differs, so the
+ * caller buckets its own records and names the unit; nothing about exercise
+ * or insulin is known here. */
+
+/* Where the span tab `tab` starts. `oldest` is the log's first entry, which
+ * is where the ALL tab reaches back to. */
+long day_from_of(int tab, long now, long oldest);
+
+/* The entries, drawn into [px0,px0+pw) x [py0,py0+ph). `hilite` is the index
+ * the finger is on, or -1. `unit` labels the y bounds ("MIN", "U"). `col` has
+ * `ncol` entries, one per series. */
+/* `dp` is how many decimal places `v` is scaled by -- 0 for a plain count,
+ * 3 when the points carry thousandths -- so the axis reads in the unit the
+ * label names rather than in whatever integer the series happens to hold. */
+void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+              const struct log_pt *p, int n, long from, long now, int px0,
+              int py0, int pw, int ph, int sc, long tz_off, int hilite,
+              const char *unit, int dp, const uint32_t *col, int ncol);
+
+/* Which entry a finger at (x,y) is nearest, or -1, through the same geometry
+ * log_plot draws with, so a pick can never name an entry other than the one
+ * under the finger.
+ *
+ * `lock` binds the search to one series, or -1 to search them all -- and it
+ * also picks the metric. Unbound (a press) measures BOTH axes, because the
+ * press is choosing which curve. Bound (a drag) measures x only, because the
+ * finger is then sweeping along one trace to read it. */
+int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
+             int py0, int pw, int ph, int sc, int x, int y, int lock);
+
+/* THE SERIES EACH LOG PUTS ON THE PLOT, and the only definition of them: the
+ * renderer draws what these return and the picker picks from it. `from`
+ * receives the window's start. */
+#define UI_INS_SERIES 2
+extern const uint32_t ui_ins_col[UI_INS_SERIES];
+int ins_points(const struct screen *m, struct log_pt *out, int cap,
+               long *from);
+int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from);
+
 void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
                    struct hits *h);
 void render_pairconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
@@ -149,9 +185,12 @@ void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                    const struct ui_prefs *prefs, long tz_off, struct hits *h);
 void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                   const struct ui_prefs *prefs, long tz_off, struct hits *h);
+/* `scrub` is the point the finger is on, or -1 -- the frame's one log-plot
+ * scrub (see uimodel.h), passed in rather than reached for, so this stays a
+ * function of the weight model, the display unit, the clock and the zone. */
 void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                   const struct ui_prefs *prefs, long now, long tz_off,
-                  struct hits *h);
+                  int scrub, struct hits *h);
 
 
 #endif

@@ -30,6 +30,22 @@
 /* Render model `m` into framebuffer `fb`, recording touch targets into `h`. */
 int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x);
 
+/* WHICH POINT THE FINGER IS OVER in whichever log plot is open, or -1 when
+ * the screen showing has none. The shell asks this one question for all three
+ * log screens: what the index MEANS is a property of the plot that drew it,
+ * so the decision belongs with the plots rather than in the gesture code.
+ *
+ * `lock` is IN OUT and is how a drag stays on the curve it started on. Pass
+ * -1 on the press that begins a scrub and the pick is free to land on any
+ * series; it comes back holding the series it landed on. Pass that value back
+ * on every move and the search is confined to it, so a finger tracking the
+ * fast doses cannot be captured by a slow one crossing underneath.
+ *
+ * A plot with a single series sets it and never uses it, which costs nothing
+ * and keeps one gesture path for all three screens. */
+int ui_log_hit(const struct screen *m, int plot_x, int plot_y, int plot_w,
+               int plot_h, int sc, int x, int y, int *lock);
+
 void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h);
 /* Map a tap at (x,y) against the targets from the last render. Pure. */

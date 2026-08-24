@@ -511,7 +511,7 @@ void h_home(struct req *r, int64_t me, const char *cookie)
  * a row from March says. */
 struct dose {
    int64_t id, t;
-   int type, units;
+   int type, milli; /* thousandths of a unit: see insrow.h */
 };
 
 void h_units(struct req *r, int64_t owner)
@@ -564,7 +564,7 @@ void h_units(struct req *r, int64_t owner)
          int del    = row.del;
          int64_t t  = row.t;
          int type   = row.type;
-         int units  = row.units;
+         int milli  = row.milli;
          int at     = -1;
          for (int i = 0; i < nd; i++)
             if (d[i].id == id) {
@@ -598,7 +598,7 @@ void h_units(struct req *r, int64_t owner)
          d[at].id    = id;
          d[at].t     = t;
          d[at].type  = type;
-         d[at].units = units;
+         d[at].milli = milli;
       }
       if (!db_finished(irc) && !oom)
          nd = 0; /* an incomplete dose list is not a dose list */
@@ -633,7 +633,9 @@ void h_units(struct req *r, int64_t owner)
    for (int i = 0; i < nd; i++) {
       char when[64];
       stamp_local(d[i].t, tz, when, sizeof when);
-      sb_add(&s, "%s %4d  %s\n", when, d[i].units,
+      char iu[16];
+      (void)ins_units_str(d[i].milli, iu, sizeof iu);
+      sb_add(&s, "%s %4s  %s\n", when, iu,
              d[i].type == 1 ? "fast" : "slow");
    }
    sb_add(&s, "</pre>\n");

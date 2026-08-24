@@ -86,8 +86,7 @@ enum ui_menu {
    MA_INS_SLOW,     /* ADD menu: LOG SLOW INSULIN (type preset) */
    MA_INSLOG_OPEN,  /* ADD menu: open the INSULIN LOG table */
    MA_INSLOG_BACK,  /* insulin log: back to the ADD menu */
-   MA_INSLOG_PREV,  /* insulin log: previous page */
-   MA_INSLOG_NEXT,  /* insulin log: next page */
+   MA_INSLOG_PAGE,  /* insulin log: go to page ix (see pager_row) */
    MA_INSMARK_OPEN, /* ix = INS_SLOW / INS_FAST: pick that type's marker */
    MA_INS_DELETE,   /* EDIT INSULIN: delete this dose (red) */
    MA_INSMARK_BACK, /* insulin marker picker: back to DISPLAY */
@@ -125,8 +124,7 @@ enum ui_menu {
    MA_WT_OPEN,    /* ADD menu: open the LOG WEIGHT form */
    MA_WTLOG_OPEN, /* ADD menu: open the weight table */
    MA_WTLOG_BACK, /* weight table: back to the ADD menu */
-   MA_WTLOG_PREV,
-   MA_WTLOG_NEXT,
+   MA_WTLOG_PAGE,
    MA_WT_CONFIRM, /* LOG WEIGHT: append the entry */
    MA_WT_DISCARD, /* LOG WEIGHT: leave without logging */
    /* LOG WEIGHT fields, mirroring MA_INS_EDIT; ix picks one: 0 weight,
@@ -137,6 +135,8 @@ enum ui_menu {
    MA_WTDEL_YES, /* delete confirmation: really delete */
    MA_WTDEL_NO,  /* delete confirmation: back to the form */
    MA_WTTAB,     /* ix = tab index */
+   MA_EXTAB,     /* EXERCISE LOG plot: ix = span tab index */
+   MA_INSTAB,    /* INSULIN LOG plot: ix = span tab index */
    /* WEIGHT LOG row: ix is the tail index, and opens that entry in the EDIT
     * WEIGHT form. */
    MA_WTLOG_EDIT,
@@ -150,8 +150,7 @@ enum ui_menu {
    MA_FOODTYPE_PICK, /* picker: ix = the vocabulary index chosen */
    MA_FOODTYPE_NEW,  /* picker: type a food this list does not have yet */
    MA_FOODTYPE_BACK, /* picker: leave without choosing */
-   MA_FOODPAGE_PREV, /* picker: previous page of the vocabulary */
-   MA_FOODPAGE_NEXT,
+   MA_FOODPAGE, /* food picker: go to page ix */
    MA_FOOD_CONFIRM, /* LOG FOOD: append the entry */
    MA_FOOD_DISCARD, /* LOG FOOD: leave without logging */
    /* LOG FOOD fields, mirroring MA_WT_EDIT; ix picks one: 0 type, 1 grams,
@@ -159,8 +158,7 @@ enum ui_menu {
    MA_FOOD_EDIT,
    MA_FOODLOG_OPEN, /* ADD menu: open the food table */
    MA_FOODLOG_BACK,
-   MA_FOODLOG_PREV,
-   MA_FOODLOG_NEXT,
+   MA_FOODLOG_PAGE,
    MA_FOODLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
    MA_FOOD_DELETE,  /* EDIT FOOD: delete this entry (red) */
    MA_FOODDEL_YES,
@@ -175,8 +173,7 @@ enum ui_menu {
     * other log has. */
    MA_EXLOG_OPEN, /* ADD menu: open the exercise table */
    MA_EXLOG_BACK,
-   MA_EXLOG_PREV,
-   MA_EXLOG_NEXT,
+   MA_EXLOG_PAGE,
    MA_EXLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
    MA_EX_CONFIRM, /* EDIT EXERCISE: rewrite the entry */
    MA_EX_DISCARD, /* EDIT EXERCISE: leave it as it was */
@@ -254,10 +251,8 @@ enum ui_menu {
                             number, or the SETTINGS row */
    MA_OLDDEV_OPEN,  /* DEVICES: open the OLD DEVICES list */
    MA_OLDDEV_BACK,  /* OLD DEVICES list: back to DEVICES */
-   MA_OLDPAGE_PREV, /* OLD DEVICES: previous page */
-   MA_OLDPAGE_NEXT, /* OLD DEVICES: next page */
-   MA_DEVPAGE_PREV, /* DEVICES: previous page of the live list */
-   MA_DEVPAGE_NEXT, /* DEVICES: next page of the live list */
+   MA_OLDPAGE,      /* OLD DEVICES: go to page ix */
+   MA_DEVPAGE,      /* DEVICES: go to page ix of the live list */
    /* The PIN checkbox on the ADD menu; ix is a slot in the ui_shortcut_*
     * table. Nothing bounds that table -- a reserved code range would cap it
     * at 11 entries. */

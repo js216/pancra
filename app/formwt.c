@@ -27,7 +27,6 @@
  * in a struct four workflows can reach. */
 static int g_wtlog_page;    /* which page of the WEIGHT LOG table is showing */
 static int g_wt_tab;        /* which span of the weight plot */
-static int g_wt_scrub = -1; /* -1 = not scrubbing */
 
 struct wt_draft {
    struct wt_form f;
@@ -116,7 +115,9 @@ int form_wt_action(int action, int ix)
       }
    } else if (action == MA_WTTAB) {
       g_wt_tab   = ix;
-      g_wt_scrub = -1; /* the picked point may not be in the new span */
+      /* THE PICKED POINT IS DROPPED WITH THE SPAN: its index is into the
+       * old window's entries, so keeping it would move the readout. */
+      forms_set_log_scrub(-1);
    } else if (action == MA_WT_DELETE) {
       if (g_wt.f.edit >= 0)
          nav_go(SCR_WTDEL); /* confirm first; this tap deletes nothing */
@@ -150,11 +151,8 @@ int form_wt_action(int action, int ix)
    } else if (action == MA_WTLOG_OPEN) {
       g_wtlog_page = 0;
       nav_go(SCR_WTLOG);
-   } else if (action == MA_WTLOG_PREV) {
-      if (g_wtlog_page > 0)
-         g_wtlog_page--;
-   } else if (action == MA_WTLOG_NEXT) {
-      g_wtlog_page++; /* the renderer clamps to the last page */
+   } else if (action == MA_WTLOG_PAGE) {
+      g_wtlog_page = ix;
    } else if (action == MA_WT_EDIT) {
       /* Tapping a form value opens the keypad for EXACT entry. Which field
        * row `ix` is belongs to the keypad's own table (kp_weight_field): the
@@ -228,20 +226,6 @@ int form_wt_action(int action, int ix)
  * forced to -1 and `orig` cleared, so a restored draft can never rewrite a
  * row -- the log behind it was reloaded from disk while the process was
  * gone, and the row this draft named may not be there any more. */
-void forms_wt_restore(long t, int tenths)
-{
-   struct wt_rec none = {0, 0};
-   g_wt.orig          = none;
-   g_wt.f.edit        = -1;
-   g_wt.f.t           = t;
-   g_wt.f.tenths      = tenths;
-}
-
-void forms_set_wt_scrub(int idx)
-{
-   g_wt_scrub = idx;
-}
-
 /* ---- WHAT THE KEYPAD AND THE FRAME ASK OF THIS WORKFLOW ---------------
  *
  * Three narrow entry points, and they are the whole of what the rest of the
@@ -268,5 +252,4 @@ void form_wt_view(struct forms_view *out)
    out->wt_orig    = g_wt.orig;
    out->wtlog_page = g_wtlog_page;
    out->wt_tab     = g_wt_tab;
-   out->wt_scrub   = g_wt_scrub;
 }

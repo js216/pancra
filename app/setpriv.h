@@ -114,7 +114,13 @@ extern char g_remote_path[256];
 /* THE SETTINGS FILE'S OWN FORMAT VERSION, and the remote file's. Here rather
  * than in their modules because set_file_version is given the newest one the
  * build knows and the two readers must agree with their writers. */
-#define SETTINGS_VERSION 1
+/* 2: the pin slots went from six to nine and took the field order with them.
+ * v1 put best_streak_s at field 25 with six pins before it; v2 has all nine
+ * pins at 19..27 and the streak at 28, which is the order they are declared
+ * in. A v1 file read with this layout would take its streak for a pin, so the
+ * loader refuses one outright rather than misreading it -- see settings_load.
+ * There was exactly one v1 file in the world and it was converted in place. */
+#define SETTINGS_VERSION 2
 #define REMOTE_VERSION   1
 
 #endif

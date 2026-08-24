@@ -212,11 +212,29 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, x, y, sc, "Nothing logged yet.", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "TIME              LEVEL", UI_MUTED);
+   /* THREE COLUMNS, and the header spaces them to where the rows put them:
+    * the instant is 16 characters, the level word and its number take 11 with
+    * the padding below, and the length follows. */
+   /* THE SCREEN IS SPLIT: table above, minutes-per-day below, laid out from
+    * the bottom exactly as the weight log's is -- the plot takes a fixed
+    * share and the table gets what is left, so neither can crowd the other
+    * out on a tall or a short screen. The system gesture bar is reserved for
+    * the same reason it is there: this screen reaches the bottom edge. */
+   int sysbar   = fb->height / 24;
+   int plot_h   = (fb->height * 2) / 5;
+   int tabs_h   = 2 * lh;
+   int plot_top = fb->height - plot_h - sysbar;
+   int tabs_y   = plot_top - tabs_h;
+   int nav_y    = tabs_y - (2 * lh) - (6 * sc);
+
+   /* THREE COLUMNS, and the header spaces them to where the rows put them:
+    * the instant is 16 characters, the level word and its number take 11 with
+    * the padding below, and the length follows. */
+   draw_str(px, fb, x, y, sc, "TIME              LEVEL      MIN", UI_MUTED);
    y += lh;
 
-   int avail = fb->height - y - (2 * lh);
-   int per   = avail / lh;
+   int avail = nav_y - y;
+   int per   = (avail > 0) ? avail / lh : 1;
    if (per > UI_MAX_HITS - UI_LOG_FIXED)
       per = UI_MAX_HITS - UI_LOG_FIXED;
    if (per < 1)
@@ -233,13 +251,46 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       const struct ex_rec *e = &m->food.exlog[ti];
       char when[20];
       char row[56];
+      char lvl[16];
+      char durp[12];
       fmt_date(e->t, m->tz_off, when, sizeof when);
-      (void)snprintf(row, sizeof row, "%s  %s %d", when,
-                     ex_level_word(e->level), e->level);
+      (void)snprintf(lvl, sizeof lvl, "%s %d", ex_level_word(e->level),
+                     e->level);
+      /* HOW LONG IT LASTED, and the running session is not a number.
+       *
+       * Its length is `now` minus a start that is still moving, so printing
+       * one would be a figure that is wrong a second later and that no edit
+       * can correct -- the same reason the edit form refuses the field. It
+       * says ACTIVE instead, in the colour the rest of the app uses for
+       * something in progress.
+       *
+       * "--" IS NOT THE SAME ANSWER. A row that is open and is NOT the
+       * running one never got an end recorded (struct ex_rec) -- the app was
+       * killed, or the log predates the column -- and its length is simply
+       * unknown. Showing 0 would claim a session that took no time. */
+      const int running = (ti == m->food.exlog_act);
+      long durm         = e->dur / 60;
+      if (durm > EX_DUR_MAX / 60)
+         durm = EX_DUR_MAX / 60;
+      if (running)
+         (void)snprintf(durp, sizeof durp, "ACTIVE");
+      else if (durm > 0)
+         (void)snprintf(durp, sizeof durp, "%ld", durm);
+      else
+         (void)snprintf(durp, sizeof durp, "--");
+      (void)snprintf(row, sizeof row, "%s  %-11s", when, lvl);
       /* THE WHOLE ROW IN ITS LEVEL'S COLOUR. A log of exercise is read for
        * its shape -- when the hard days were -- and the colour is what makes
        * that visible in a column of near-identical timestamps. */
       draw_str(px, fb, x, y, sc, row, ui_ex_color(e->level, UI_TEXT_DIM));
+      /* THE LENGTH IS DRAWN SEPARATELY so ACTIVE can carry its own colour --
+       * the running session is the one row here whose state, not just its
+       * value, is worth seeing from across the table. Every other row keeps
+       * the level colour the rest of its line has. Placed at the column the
+       * header names: 16 for the instant, 2 of gap, 11 for the padded level.
+       */
+      draw_str(px, fb, x + (29 * 6 * sc), y, sc, durp,
+               running ? UI_BUSY : ui_ex_color(e->level, UI_TEXT_DIM));
       /* THE WHOLE ROW is the target, carrying the TAIL INDEX -- which the
        * dispatcher immediately turns into a copy of the row itself, because
        * an index is only good for as long as the tail is. */
@@ -247,24 +298,62 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += lh;
    }
 
-   if (npages > 1) {
-      int navy = fb->height - lh - (4 * sc);
-      if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_EXLOG_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(fb->width - (fb->width / 3), navy - (3 * sc),
-                            fb->width / 3, lh + (7 * sc)),
-                    MA_EXLOG_NEXT, 0);
+   pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_EXLOG_PAGE);
+
+   /* ONE POINT PER DAY, totalling every level -- see ex_points, which is the
+    * only definition of the series and is shared with the scrub picker so the
+    * two cannot resolve against different points. */
+   int tab = m->food.exlog_tab;
+   if (tab < 0 || tab >= UI_DAY_TABS)
+      tab = 0;
+   struct log_pt pts[UI_LOG_PTS];
+   long from = 0;
+   int npt   = ex_points(m, pts, UI_LOG_PTS, &from);
+
+   /* Span tabs -- OR the scrub readout, the same swap the weight trend and
+    * the glucose plot both make: while a finger is down the tab row becomes
+    * the value under it, and the tabs come back when it lifts. */
+   int colw  = (fb->width - (2 * x)) / UI_DAY_TABS;
+   int trow  = 14 * sc;
+   int laby  = plot_top - trow + ((trow - (7 * sc)) / 2);
+   int scrub = m->log_scrub;
+   if (scrub >= 0 && scrub < npt) {
+      char when[24];
+      char line[48];
+      fmt_date(pts[scrub].t, m->tz_off, when, sizeof when);
+      /* THE DATE ALONE: a point is a whole day, not an instant, so the
+       * midnight its instant carries is not a time worth printing. */
+      if (str_len(when) > 10)
+         when[10] = 0;
+      (void)snprintf(line, sizeof line, "%s   %ld MIN", when, pts[scrub].v);
+      int tsc2 = 2 * sc;
+      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
+         tsc2--;
+      int lw = str_len(line) * 6 * tsc2;
+      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
+               UI_TEXT);
+      /* No tab targets while scrubbing: the row is not showing tabs, and a
+       * target that does not match what is drawn is how a drag ends up
+       * changing the span it was only trying to read. */
+   } else {
+      for (int i = 0; i < UI_DAY_TABS; i++) {
+         int lw   = str_len(ui_day_tab_lbl[i]) * 6 * sc;
+         int tabx = x + (i * colw);
+         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, ui_day_tab_lbl[i],
+                  i == tab ? UI_TEXT : UI_MUTED);
+         add_hit_ix(h, ui_rect(tabx, tabs_y, colw, tabs_h), MA_EXTAB, i);
       }
    }
+
+   /* ONE COLOUR, because a day's total belongs to no single level. The
+    * middle of the three the table prints its rows in: the family's own hue,
+    * without claiming the day was all light or all hard. */
+   const uint32_t excol[1] = {ui_ex_color(EX_MIN_LEVEL + 1, UI_TEXT_DIM)};
+   int pw = fb->width - (2 * x);
+   log_plot(px, fb, pts, npt, from, m->now, x, plot_top, pw, plot_h, sc,
+            m->tz_off, scrub, "MIN", 0, excol, 1);
+   /* arg carries sc: the shell needs the SAME scale the plot was drawn at to
+    * map a finger x back to an entry, and re-deriving it there would be a
+    * second copy of the layout that can drift. */
+   add_hit(h, ui_rect(x, plot_top, pw, plot_h), ACT_SCRUB, sc);
 }

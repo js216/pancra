@@ -105,31 +105,28 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += rowpitch;
    }
    menu_row(fb, h, y, sc, lh, "ALARM", "", UI_TEXT, MA_ALARM_OPEN, 0);
-   /* The row's "value" is the SAME icon language the two main-screen
-    * threshold rows use -- speaker / phone / slashed circle / dot -- in the
-    * SAME fixed, equally spaced cells (6*sc pitch, right-aligned), each
-    * symbol always in its own place with an empty cell when that alert is
-    * off.
+   /* The row's "value" is the SAME icon language the main screen's threshold
+    * row uses -- speaker / phone / slashed circle / dot -- in the SAME fixed,
+    * equally spaced cells (6*sc pitch, right-aligned), each symbol always in
+    * its own place with an empty cell when that alert is off.
     *
-    * SIX cells, in two groups of three: the door leads to both sections, so
-    * summarising only the ALARM half would say a nudge is silent when it is
-    * not. Group order matches the menu -- ALARM's sound/vibration/disconnect,
-    * a half-cell gap, then NUDGE's sound/vibration/new-datapoint. */
+    * THE ALARM'S OUTPUTS ONLY, and the dot. Two speakers side by side, one
+    * for the alarm and one for the nudge, is a puzzle rather than a legend --
+    * nothing on the row says which is which, so a muted alarm beside an
+    * unmuted nudge reads as "sound is on". The alarm is the alert worth
+    * knowing about at a glance; the nudge's own settings are one tap away
+    * behind this row. The main screen makes the same choice for the same
+    * reason. */
    {
-      int iax = rx - (38 * sc);
+      int iax = rx - (23 * sc);
       if (m->prefs.sound_on)
          draw_icon(px, fb, iax, y, sc, icon_speaker, UI_MUTED);
       if (m->prefs.vib_on)
          draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
       if (m->prefs.disc)
          draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, UI_MUTED);
-      int nax = iax + (21 * sc); /* 3 cells + a half-cell group gap */
-      if (m->prefs.nudge_sound)
-         draw_icon(px, fb, nax, y, sc, icon_speaker, UI_MUTED);
-      if (m->prefs.nudge_vib)
-         draw_icon(px, fb, nax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
       if (m->prefs.newdata_mode)
-         draw_icon(px, fb, nax + (12 * sc), y, sc, icon_dot, UI_MUTED);
+         draw_icon(px, fb, iax + (18 * sc), y, sc, icon_dot, UI_MUTED);
    }
    y += rowpitch;
    /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
@@ -521,7 +518,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
       pc = UI_OK;
    } else if (m->sync.remote_on) {
       pv = "NO SERVER";
-      pc = 0xFFAA8844;
+      pc = UI_SYNC_STALE;
    }
    /* Double pitch between the three setting rows: the blank line makes each
     * an easier touch target (menu_row's hit box spans its own row only). */
@@ -578,10 +575,10 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
          (void)snprintf(st, sizeof st, "%s AGO", ago);
          /* Fresh is green; a link that has not been acknowledged in over
           * ten minutes is amber, because that is a backlog building up. */
-         scol = (m->now - m->sync.remote_last_ok <= 600) ? UI_OK : 0xFFAA8844;
+         scol = (m->now - m->sync.remote_last_ok <= 600) ? UI_OK : UI_SYNC_STALE;
       } else {
          (void)snprintf(st, sizeof st, "NEVER");
-         scol = 0xFFAA8844;
+         scol = UI_SYNC_STALE;
       }
       menu_row(fb, h, y, sc, lh, "LAST SYNC", st, scol, -1, 0);
       /* 2*lh like every other row pair on this screen. These two were the
@@ -609,9 +606,9 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
       uint32_t rcol = UI_FAINT; /* nothing has been attempted yet */
       switch (sync_outcome_severity(m->sync.remote_outcome)) {
          case SYNC_SEV_GOOD: rcol = UI_OK; break;      /* green */
-         case SYNC_SEV_WARN: rcol = 0xFFFFCC44; break; /* amber: yours to fix */
+         case SYNC_SEV_WARN: rcol = UI_SYNC_WARN; break; /* amber: yours to fix */
          case SYNC_SEV_BAD:
-            rcol = 0xFFFF5555;
+            rcol = UI_SYNC_ERR;
             break; /* red, as the keypad
                       refusals use */
          case SYNC_SEV_NONE:
@@ -739,10 +736,8 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h)
 {
    uint32_t *px = fb->bits;
-   /* 26 rows, unchanged. The two weight buttons are paid for out of the GAPS
-    * (see `gap` below), not out of the font: raising the budget to fit them
-    * shrank every label on this screen, and a smaller font on the menu that
-    * logs medication is a worse trade than tighter spacing. */
+   /* 26 rows. What that has to cover is worked out where `gap` is chosen
+    * below; the font is not what gives way when it gets tight. */
    int sc  = ui_fit_scale(fb->width, fb->height, 26);
    int tsc = 2 * sc;
    int lh  = 16 * sc;
@@ -755,77 +750,37 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* This menu opens from the MAIN screen, so its X returns there (MA_CLOSE),
     * not into SETTINGS. Generous close target across the title band. */
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_CLOSE, 0);
-   /* TWO ROWS UNDER THE TITLE, not three. The eleventh button on this screen
-    * put the last DEVICES entry and its target below the buffer again --
-    * measured at 1080x2280 and 1440x3200 -- and the title band was the only
-    * slack left that is not between two controls. Taken from whitespace, as
-    * every previous round was; the font is not negotiable.
-    *
-    * THIS SCREEN IS NOW FULL. The gaps are half a row, the section break is
-    * one, and the title band is two. A twelfth button does not fit at this
-    * text size on the shortest supported window, and the next one to be added
-    * needs pagination or a two-column LOG section -- not another slice off
-    * the whitespace, because there is none left to take. */
+   /* TWO ROWS UNDER THE TITLE, not three: whitespace is what this screen
+    * spends when it needs height, never the font. */
    y += 2 * lh;
 
-   /* Three sections. LOG: what the user records by hand -- the insulin type
+   /* TWO SECTIONS. LOG is what the user records by hand -- the insulin type
     * is chosen HERE (FAST / SLOW), so the form opens already knowing it, and
-    * weight sits alongside because it is the same kind of act. DEVICES: the
-    * device types from the ADD DEVICE picker, one tap rather than two. */
+    * weight, food and exercise sit alongside because they are the same kind
+    * of act. VIEW LOG opens the tables those entries land in.
+    *
+    * NO DEVICES SECTION. Adding a sensor or a meter belongs to the DEVICES
+    * screen, which owns the whole of a device's life -- pairing it, naming
+    * it, retiring it -- and duplicating the type picker here made this menu
+    * carry three buttons for an act that is not "add an entry" at all. */
    int bw = fb->width - (2 * x);
-   /* Air BETWEEN buttons: this screen is nothing but stacked buttons, several
-    * of them destructive-adjacent (logging a dose vs. adding a device), so
-    * the separation is what stops a mistap. Header-to-button spacing stays at
-    * one row, which keeps each label visibly attached to the button it names.
+   /* Air BETWEEN buttons: this screen is nothing but stacked buttons,
+    * several of them destructive-adjacent, so the separation is what stops a
+    * mistap. Header-to-button spacing stays at one row, which keeps each
+    * label visibly attached to the button it names.
     *
-    * ONE row, reduced from one and a half when the two weight buttons landed.
-    * The arithmetic at the 26-row budget, in sc: 48 title + 16 header +
-    * 5*25 LOG buttons + 32 + 16 header + 3*25 device buttons = 312, leaving
-    * 416 - 312 = 104 for the six gaps between adjacent buttons, i.e. at most
-    * 17 each. A 24 gap does not fit and a 17 gap clears by 2 sc, which is no
-    * margin at all; one row (16) clears by 8 and is the spacing the rest of
-    * the menus already use. Recheck this if a button is ever added. */
-   /* HALF A ROW between buttons, not a full one.
-    *
-    * The arithmetic below is what forced it, and it is worth writing out
-    * because the previous version of this comment ended "Recheck this if a
-    * button is ever added" and a button has now been added. At the 26-row
-    * budget (416 sc): 48 title + 16 header + 6*25 LOG buttons + 32 + 16
-    * header + 3*25 device buttons = 387, leaving 29 for the seven gaps
-    * between adjacent buttons. A full row (16) needs 112 and overflowed on
-    * EVERY geometry in the sweep -- measured: the last DEVICES button and its
-    * target landed below the buffer at 1080x1920, 1080x2280, 1440x3200,
-    * 1080x2340 and 828x1792.
-    *
-    * Half a row is 8, i.e. 56 for the seven, which still does not fit on
-    * paper -- and does in practice because the title band and the section
-    * break below are the slack the calculation above treats as fixed. The
-    * sweep is the authority, not this paragraph: it is what caught the
-    * overflow and what has to stay green.
+    * HALF A ROW, and the arithmetic that allows it, in sc at the 26-row
+    * budget (416): 32 title band + 16 LOG header + 5*25 LOG buttons + the
+    * section break (16 - gap) + 16 VIEW header + 4*25 VIEW buttons = 305,
+    * plus nine gaps (one after each button). At gap 8 that is 369, clearing
+    * by 47; a full row would need 433 and does not fit.
     *
     * NOT taken out of the FONT. Shrinking the text to make room is a
     * standing prohibition here -- ui_fit_scale's row count is a cliff, and
     * one more row makes every label on the screen smaller. Air between
-    * controls is the only thing this screen has to give. */
-   /* TWO FIFTHS of a row between buttons.
-    *
-    * It was a full row, then a half when the tenth button arrived, and the
-    * eleventh needs this. At sc=5 that is 32 px of air -- still six times the
-    * 2*sc at which the comment above records that buttons "touched each other
-    * and crowded the plus", so it is thinner than it was and not yet thin.
-    *
-    * What forced it: the LAST device button's hit target ended nine pixels
-    * below the buffer at 1080x2280 (and five at 1440x3200), and a target is
-    * the button, so the button itself did not fit. Removing the trailing gap
-    * after it changed nothing -- that space is BELOW the target, not above
-    * it -- which is worth recording, because it is the obvious fix and it
-    * does not work.
-    *
-    * THE SCREEN IS FULL. Gaps are two fifths of a row, the section break is
-    * one, the title band is two. A twelfth button does not fit at this text
-    * size on the shortest supported window; the next one needs pagination or
-    * a two-column LOG section, not another slice off the whitespace. */
-   int gap = (2 * lh) / 5;
+    * controls is the only thing this screen has to give, and the sweep across
+    * window geometries is the authority on whether it has given enough. */
+   int gap = lh / 2;
    /* THE PIN COLUMN. A checkbox per promotable action at the right, under its
     * own header, with the buttons shortened to make room -- a quarter of the
     * old button width, which is enough for the header and a comfortable tap
@@ -835,8 +790,8 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * else to be gone looking for, it PINS this action to the main screen, and
     * the shorter word says the same thing in three characters.
     *
-    * Only the LOG buttons get one (see ui_sc_tab), so the column header sits
-    * over that section and the DEVICES buttons below keep the full width. */
+    * Every promotable action gets one, so the column runs the full height of
+    * the screen and the two sections share one axis. */
    int scw = bw / 4;   /* the checkbox column */
    int lbw = bw - scw; /* what the LOG buttons keep */
    int scx = x + lbw + (2 * sc);
@@ -909,58 +864,23 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += lh - gap;
    draw_str(px, fb, x, y, sc, "VIEW LOG", UI_MUTED);
    y += lh;
-   {
-      int cellw = (bw - (2 * sc)) / 2; /* two cells, 2*sc of air between */
-      int col   = 0;
-      int rowy  = y;
-      for (int i = 0; i < ui_shortcut_count(); i++) {
-         if (ui_shortcut_sect(i) != SC_SECT_VIEW)
-            continue;
-         int cx = x + (col * (cellw + (2 * sc)));
-         /* The button keeps the cell minus the checkbox, exactly as the LOG
-          * rows keep bw minus the PIN column. */
-         int cbw  = cbs + (2 * sc);
-         int bwid = cellw - cbw;
-         int on   = sc_on(m, i);
-         int ny =
-             menu_button(fb, h, cx, rowy, bwid, sc, ui_shortcut_label(i, 1),
-                         UI_TEXT, ui_shortcut_code(i), 0);
-         draw_checkbox(px, fb, cx + bwid + (2 * sc), rowy, cbs, sc, on,
-                       on ? UI_OK : UI_FAINT);
-         add_hit_ix(h, ui_rect(cx + bwid, rowy, cbw, ny - rowy), MA_SCTOGGLE,
-                    i);
-         col++;
-         if (col == 2) { /* row complete: drop to the next one */
-            col  = 0;
-            rowy = ny + gap;
-         }
-      }
-      /* The y below the grid: a partly filled last row still occupies it. */
-      y = (col == 0) ? rowy - gap : rowy + (25 * sc);
-   }
-
-   /* THE SECTION BREAK before DEVICES, and it is the last slack this screen
-    * had.
-    *
-    * It was 2*lh - gap (a blank line between the two groups). With EXERCISE
-    * added the screen overflowed again -- measured at 1080x2280, 828x1792 and
-    * 640x900, by between 4 and 13 pixels -- and a break of one row clears it
-    * while still reading as a break: the DEVICES header sits under it and
-    * does its own separating. Whitespace, again, rather than the font. */
-   y += lh - gap;
-
-   draw_str(px, fb, x, y, sc, "DEVICES", UI_MUTED);
-   y += lh;
-   for (int t = SENSOR_STELO; t < SENSOR_NTYPES; t++) {
-      y = menu_button(fb, h, x, y, bw, sc, sensor_disp_name(t), UI_TEXT,
-                      MA_TYPE, t);
-      /* NO GAP AFTER THE LAST ONE. A gap separates two controls, and below
-       * the final button there is no second control to separate it from --
-       * it was simply a row of empty space at the bottom of the screen, paid
-       * for out of the budget that the last button's TARGET then overran by
-       * nine pixels. Measured at 1080x2280 and 1440x3200. */
-      if (t + 1 < SENSOR_NTYPES)
-         y += gap;
+   /* FULL-WIDTH ROWS, like the LOG buttons above them and for the same
+    * reason: each keeps its whole label and its PIN box sits in the same
+    * column all the way down the screen. They were paired two to a row only
+    * because a DEVICES section below needed the height; with device types
+    * added from the DEVICES screen instead, the height is here to spend. */
+   for (int i = 0; i < ui_shortcut_count(); i++) {
+      if (ui_shortcut_sect(i) != SC_SECT_VIEW)
+         continue;
+      int on = sc_on(m, i);
+      int ny = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0),
+                           UI_TEXT, ui_shortcut_code(i), 0);
+      /* cbx and the same target rectangle the LOG boxes use, so the whole
+       * PIN column sits on one axis under its header rather than stepping
+       * left halfway down the screen. */
+      draw_checkbox(px, fb, cbx, y, cbs, sc, on, on ? UI_OK : UI_FAINT);
+      add_hit_ix(h, ui_rect(x + lbw, y, bw - lbw, ny - y), MA_SCTOGGLE, i);
+      y = ny + gap;
    }
 }
 
@@ -1208,7 +1128,7 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    };
    y += bh + (3 * lh);
    for (int i = 0; i < (int)(sizeof disc / sizeof disc[0]); i++) {
-      draw_str(px, fb, x, y, sc, disc[i], 0xFF777777);
+      draw_str(px, fb, x, y, sc, disc[i], UI_DISCLAIM);
       y += lh;
    }
 }

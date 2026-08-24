@@ -15,11 +15,16 @@
 #include "nav.h"
 #include "status.h"
 #include "uiact.h"
+#include "uifmt.h" /* UI_DAY_TABS: the plot spans */
 #include "uimodel.h"
 #include "util.h" /* str_snapshot */
 
 /* Which page of the EXERCISE LOG table is showing. */
 static int g_exlog_page;
+/* And which span its minutes-per-day plot covers: an index into ui_day_days.
+ * Defaults to the first (a week), which is the window the question "how much
+ * have I been doing" is usually asked over. */
+static int g_exlog_tab;
 
 /* EDIT EXERCISE. The one draft in this file with NO "new entry" state, because
  * there is no way to create an exercise record by typing -- the button and its
@@ -58,17 +63,27 @@ static struct ex_draft g_ex = {
 int form_ex_action(int action, int ix)
 {
    if (action == MA_EXLOG_OPEN) {
+      /* ALWAYS PAGE ONE. Which page was last looked at is not something a
+       * user carries between visits -- they come back for the newest entries,
+       * which is where page one is -- and a log reopening three pages deep
+       * reads as the app having lost the recent ones. */
+      g_exlog_page = 0;
       nav_go(SCR_EXLOG);
    } else if (action == MA_EXLOG_BACK) {
       nav_back();
-   } else if (action == MA_EXLOG_PREV) {
-      if (g_exlog_page > 0)
-         g_exlog_page--;
-   } else if (action == MA_EXLOG_NEXT) {
-      /* The renderer clamps an over-large page to the last one, so walking
-       * past the end shows the end rather than an empty table -- how many
-       * rows fit is a property of the window, which nothing here can see. */
-      g_exlog_page++;
+   } else if (action == MA_EXLOG_PAGE) {
+      /* THE PAGE COMES FROM THE HIT. pager_row works out where each of its
+       * four buttons goes -- it is what knows the page count -- so there is
+       * no stepping or clamping to do here, and no way for the stored page
+       * to run past the end the way an unbounded ++ used to. */
+      g_exlog_page = ix;
+   } else if (action == MA_EXTAB) {
+      if (ix >= 0 && ix < UI_DAY_TABS)
+         g_exlog_tab = ix;
+      /* THE PICKED BAR IS DROPPED WITH THE SPAN. Its index counts days from
+       * the left edge of the old window, so keeping it would move the readout
+       * to a different date the moment the span changed. */
+      forms_set_log_scrub(-1);
    } else if (action == MA_EXLOG_EDIT) {
       if (ix >= 0 && ix < ex_count()) {
          forms_ex_edit(ix);
@@ -213,4 +228,5 @@ void form_ex_view(struct forms_view *out)
    out->ex_err     = g_ex.err;
    out->ex_orig    = g_ex.orig;
    out->exlog_page = g_exlog_page;
+   out->exlog_tab  = g_exlog_tab;
 }

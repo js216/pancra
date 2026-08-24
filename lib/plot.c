@@ -4,6 +4,8 @@
 
 /* plot.c -- see plot.h. Pure pixel rendering; no dependencies beyond stdint. */
 #include "plot.h"
+
+#include "colors.h" /* the palette: every colour the app draws */
 #include <limits.h> /* INT_MAX: the checked multiply below is an INT one */
 #include <stddef.h> /* size_t: every buffer offset is formed in one */
 #include <stdint.h>
@@ -399,10 +401,10 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    int y                = rc.y;
    int w                = rc.w;
    int h                = rc.h;
-   const uint32_t frame = 0xFF555555; /* 50/max reference lines + sides   */
-   const uint32_t band  = 0xFF262626; /* very slight dark-gray shade 70-180 */
-   const uint32_t vgrid = 0xFF2E2E2E; /* faint vertical gridlines         */
-   const uint32_t vtick = 0xFF666666; /* brighter x-tick at the bottom    */
+   const uint32_t frame = UI_PLOT_FRAME; /* 50/max reference lines + sides   */
+   const uint32_t band  = UI_PLOT_BAND; /* very slight dark-gray shade 70-180 */
+   const uint32_t vgrid = UI_PLOT_VGRID; /* faint vertical gridlines         */
+   const uint32_t vtick = UI_PLOT_VTICK; /* brighter x-tick at the bottom    */
    long span            = (long)hours * 3600;
    /* Reserve enough at each end for the LARGEST marker (radius scaled up to
     * MARK_SIZE_MAX/2, +1 for styled points) so the newest datapoint is not half
@@ -432,7 +434,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    /* Thin light lines at the top (180) and bottom (70) edges of the range, so
     * the band stays legible in bright sunlight where the faint fill washes
     * out. */
-   const uint32_t edge = 0xFFAAAAAA;
+   const uint32_t edge = UI_PLOT_EDGE;
    for (int i = 1; i < w - 1; i++) {
       put(fb, stride, fbw, fbh, x + i, y_hi, edge);
       put(fb, stride, fbw, fbh, x + i, y_lo, edge);
@@ -541,7 +543,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    if (hx >= 0) {
       /* white vertical marker; only the dot itself is highlighted in colour */
       for (int j = y_top + 1; j < y50; j++)
-         put(fb, stride, fbw, fbh, hx, j, 0xFFFFFFFF);
+         put(fb, stride, fbw, fbh, hx, j, UI_PLOT_SCRUB);
       /* Same clamp as the ordinary markers: radius is bounded by the buffer,
        * so radius + 2 need not be. */
       long hr = (long)radius + 2;

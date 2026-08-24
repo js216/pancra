@@ -54,7 +54,7 @@ int ins_row_decode(const char *p, const char *e, long legacy_id,
       csv_sep(&c);
       out->type = (int)csv_num(&c, 0);
       csv_sep(&c);
-      out->units = (int)csv_num(&c, 0);
+      out->milli = (int)csv_fixed(&c, 3, 0);
       if (out->id == 0 || delok != CSV_FIELD_OK ||
           (out->del != 0 && out->del != 1))
          return 0;
@@ -69,13 +69,54 @@ int ins_row_decode(const char *p, const char *e, long legacy_id,
       csv_sep(&c);
       out->type = (int)csv_num(&c, 0);
       csv_sep(&c);
-      out->units = (int)csv_num(&c, 0);
+      out->milli = (int)csv_fixed(&c, 3, 0);
    }
    if (out->t <= 0 || out->t >= INS_T_MAX)
       return 0;
    if (out->type != INS_SLOW && out->type != INS_FAST)
       return 0;
-   if (out->units < INS_UNITS_MIN || out->units > INS_UNITS_MAX)
+   if (out->milli < INS_MILLI_MIN || out->milli > INS_MILLI_MAX)
       return 0;
    return 1;
+}
+
+int ins_units_str(int milli, char *out, int cap)
+{
+   if (!out || cap < 2)
+      return 0;
+   int n   = 0;
+   int neg = milli < 0;
+   if (neg)
+      milli = -milli;
+   const int whole = milli / INS_MILLI;
+   int frac        = milli % INS_MILLI;
+   char b[16];
+   int nb = 0;
+   int w  = whole;
+   do {
+      b[nb++] = (char)('0' + (w % 10));
+      w /= 10;
+   } while (w && nb < (int)sizeof b);
+   if (neg && n < cap - 1)
+      out[n++] = '-';
+   while (nb > 0 && n < cap - 1)
+      out[n++] = b[--nb];
+   if (frac) {
+      /* NO TRAILING ZEROS: 500 is "0.5", not "0.500". The file says what a
+       * person would write, and a reader that sees "0.500" learns nothing the
+       * shorter form did not tell it. */
+      char f[3];
+      f[0] = (char)('0' + (frac / 100));
+      f[1] = (char)('0' + ((frac / 10) % 10));
+      f[2] = (char)('0' + (frac % 10));
+      int fl = 3;
+      while (fl > 1 && f[fl - 1] == '0')
+         fl--;
+      if (n < cap - 1)
+         out[n++] = '.';
+      for (int i = 0; i < fl && n < cap - 1; i++)
+         out[n++] = f[i];
+   }
+   out[n] = 0;
+   return n;
 }

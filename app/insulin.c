@@ -275,7 +275,7 @@ static int ins_parse_assert(const char *p, const char *e, long legacy_id,
    a->del     = row.del;
    a->r.t     = row.t;
    a->r.type  = row.type;
-   a->r.units = row.units;
+   a->r.milli = row.milli;
    return 1;
 }
 
@@ -394,11 +394,17 @@ int insulin_load(void)
 
 /* Append one assertion. The log is only ever extended -- there is no rewrite
  * path left, so no crash window in which the file could be truncated. */
-static int ins_write_row(long id, int del, long t, int type, int units, long tz)
+static int ins_write_row(long id, int del, long t, int type, int milli,
+                         long tz)
 {
    char b[96];
-   int n = snprintf(b, sizeof b, "%ld,%ld,%d,%ld,%d,%d,%ld\n", realtime_s(), id,
-                    del, t, type, units, tz);
+   /* THE DOSE AS A PERSON WRITES IT -- "20", "0.5", "16.5". The column has
+    * always been a decimal; whole-unit rows simply never had a fraction to
+    * show, which is why every row already in the file still reads. */
+   char u[16];
+   (void)ins_units_str(milli, u, sizeof u);
+   int n = snprintf(b, sizeof b, "%ld,%ld,%d,%ld,%d,%s,%ld\n", realtime_s(),
+                    id, del, t, type, u, tz);
    n     = clampn(n, sizeof b);
    /* ONE OPERATION, header included: see log_append. */
    int rc = log_append(g_ins_path, g_ins_hdr, (int)sizeof g_ins_hdr - 1, b, n);
@@ -408,20 +414,20 @@ static int ins_write_row(long id, int del, long t, int type, int units, long tz)
    return 0;
 }
 
-static int ins_vet(long t, int type, int units)
+static int ins_vet(long t, int type, int milli)
 {
    if (t <= 0 || t >= INS_T_MAX)
       return 0;
    if (type != INS_SLOW && type != INS_FAST)
       return 0;
-   if (units < INS_UNITS_MIN || units > INS_UNITS_MAX)
+   if (milli < INS_MILLI_MIN || milli > INS_MILLI_MAX)
       return 0;
    return 1;
 }
 
-int insulin_append(long t, int type, int units, long tz)
+int insulin_append(long t, int type, int milli, long tz)
 {
-   if (!ins_vet(t, type, units))
+   if (!ins_vet(t, type, milli))
       return -1;
    mutex_lock(&ins_lk);
    long id = g_live.next;
@@ -430,10 +436,10 @@ int insulin_append(long t, int type, int units, long tz)
     * not be rolled back) is not the same as "the dose was not logged": the
     * file needs saying so, and a caller that retries is appending onto a
     * half-written line. */
-   int rc = ins_write_row(id, 0, t, type, units, tz);
+   int rc = ins_write_row(id, 0, t, type, milli, tz);
    if (rc != LOG_OK)
       return rc;
-   struct ins_rec r = {t, type, units};
+   struct ins_rec r = {t, type, milli};
    /* THE FILE FIRST, THE TAIL UNDER THE LOCK. The write is outside it for
     * the reason app/thread.h gives: a leaf is never held across flash. */
    mutex_lock(&ins_lk);
@@ -453,15 +459,15 @@ static int ins_match(const struct ins_rec *orig)
 {
    for (int i = g_live.n - 1; i >= 0; i--)
       if (g_live.r[i].t == orig->t && g_live.r[i].type == orig->type &&
-          g_live.r[i].units == orig->units)
+          g_live.r[i].milli == orig->milli)
          return i;
    return -1;
 }
 
-int insulin_update(const struct ins_rec *orig, long t, int type, int units,
+int insulin_update(const struct ins_rec *orig, long t, int type, int milli,
                    long tz)
 {
-   if (!ins_vet(t, type, units))
+   if (!ins_vet(t, type, milli))
       return -1;
    /* THE ROW ID IS READ UNDER THE LOCK, THE FILE IS WRITTEN WITHOUT IT, AND
     * THE TAIL IS RE-FOUND UNDER IT. The slot cannot be carried across the
@@ -474,14 +480,14 @@ int insulin_update(const struct ins_rec *orig, long t, int type, int units,
    mutex_unlock(&ins_lk);
    if (at < 0)
       return -1;
-   if (ins_write_row(id, 0, t, type, units, tz) != 0)
+   if (ins_write_row(id, 0, t, type, milli, tz) != 0)
       return -1;
    mutex_lock(&ins_lk);
    at = ins_match(orig);
    if (at >= 0) {
       g_live.r[at].t     = t;
       g_live.r[at].type  = type;
-      g_live.r[at].units = units;
+      g_live.r[at].milli = milli;
       ins_sort(&g_live);
    }
    mutex_unlock(&ins_lk);
@@ -503,7 +509,7 @@ int insulin_delete(const struct ins_rec *orig)
       return -1;
    /* A retraction still carries the dose it retracts, so the row remains
     * readable on its own -- the log is a history, not a diff. */
-   if (ins_write_row(id, 1, r.t, r.type, r.units, 0) != 0)
+   if (ins_write_row(id, 1, r.t, r.type, r.milli, 0) != 0)
       return -1;
    mutex_lock(&ins_lk);
    at = ins_match(orig); /* re-found: see insulin_update */
@@ -521,7 +527,7 @@ int insulin_last_units(int type)
    mutex_lock(&ins_lk);
    for (int i = g_live.n - 1; i >= 0 && !u; i--)
       if (g_live.r[i].type == type)
-         u = g_live.r[i].units;
+         u = g_live.r[i].milli;
    mutex_unlock(&ins_lk);
    return u;
 }
@@ -534,7 +540,7 @@ int insulin_last_units(int type)
 static int form_units_for(int type)
 {
    int lu = insulin_last_units(type);
-   return lu > 0 ? lu : 1;
+   return lu > 0 ? lu : INS_MILLI;
 }
 
 void ins_form_open(struct ins_form *f, int type, long now)
@@ -546,7 +552,7 @@ void ins_form_open(struct ins_form *f, int type, long now)
    /* The WHOLE minute. Seconds would make two doses logged moments apart two
     * distinct instants, and the log dedups on the instant. */
    f->t     = now - (now % 60);
-   f->units = form_units_for(f->type);
+   f->milli = form_units_for(f->type);
    f->edit  = -1;
 }
 
@@ -558,7 +564,7 @@ void ins_form_toggle_type(struct ins_form *f)
    /* A NEW dose's amount follows the type; an EDIT keeps the amount on
     * record, because that is the number the user is correcting. */
    if (f->edit < 0)
-      f->units = form_units_for(f->type);
+      f->milli = form_units_for(f->type);
 }
 
 /* The dose log's filename. */

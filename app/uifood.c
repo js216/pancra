@@ -220,26 +220,8 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += lh;
    }
 
-   if (npages > 1) {
-      int navy = fb->height - lh - (4 * sc);
-      if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_FOODLOG_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (6 * tsc), navy, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(fb->width - (fb->width / 3), navy - (3 * sc),
-                            fb->width / 3, lh + (7 * sc)),
-                    MA_FOODLOG_NEXT, 0);
-      }
-   }
+   pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,
+             MA_FOODLOG_PAGE);
 }
 
 void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
@@ -324,24 +306,6 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += 2 * lh;
    }
 
-   if (npages > 1) {
-      int navy = fb->height - lh - (4 * sc);
-      if (page > 0) {
-         draw_str(px, fb, x, navy, tsc, "<", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect(0, navy - (3 * sc), fb->width / 3, lh + (7 * sc)),
-                    MA_FOODPAGE_PREV, 0);
-      }
-      char pg[24];
-      (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
-      draw_str(px, fb, (fb->width - (str_len(pg) * 6 * sc)) / 2, navy, sc, pg,
-               UI_MUTED);
-      if (page < npages - 1) {
-         draw_str(px, fb, rx - (1 * 6 * tsc), navy, tsc, ">", UI_TEXT);
-         add_hit_ix(h,
-                    ui_rect((2 * fb->width) / 3, navy - (3 * sc), fb->width / 3,
-                            lh + (7 * sc)),
-                    MA_FOODPAGE_NEXT, 0);
-      }
-   }
+   pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,
+             MA_FOODPAGE);
 }
