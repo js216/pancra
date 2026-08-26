@@ -121,6 +121,11 @@ void calib_register_ops(void);
 /* 1 when every path this module persists to fitted; 0 when one did
  * not, and then NONE of them is usable -- see data_path in util.h. */
 int calib_paths(const char *dir);
+/* Where the rescale factors live, for the sync registry: they are per-device
+ * DATA -- what a sensor's readings are multiplied by on the way in -- and a
+ * restore without them silently un-corrects every reading that device makes.
+ * Same category as the per-device styling in slots.csv, which syncs. */
+const char *cal_rescale_path(void);
 /* Restore both from disk: resumes a queued calibration that is still fresh
  * (and records a FAILED one that is not), and the active rescale factor. */
 /* Restore both states. CALIB_OK when each file was read whole or was simply

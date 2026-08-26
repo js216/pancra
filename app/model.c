@@ -27,6 +27,7 @@
 #include "settings.h"
 #include "shell.h"
 #include "stats.h"
+#include "steps.h"
 #include "store.h"
 #include "style.h"
 #include "sync.h"
@@ -199,6 +200,7 @@ struct frame_ctx {
    struct food_type ftypes[NFOODTYPE];
    struct food_rec foodlog[NFOOD];
    struct ex_rec exlog[NEX];
+   struct step_rec steps[NSTEPS];
    char mac[24];
    char entry[64]; /* checked against forms_view::entry below */
 };
@@ -941,6 +943,12 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->food.exlog         = f->exlog;
    m->food.exlog_page    = f->fv.exlog_page;
    m->food.exlog_tab     = f->fv.exlog_tab;
+   m->food.steps_on      = f->prefs.steps_on;
+   m->food.steps_live    = steps_live();
+   /* A COPY, into frame-owned storage, like every other log tail: the sampler
+    * appends from a service tick while this frame is being drawn. */
+   m->food.nsteps        = steps_copy(f->steps, NSTEPS);
+   m->food.steps         = f->steps;
    /* THE RUNNING ROW, named by its position in the copy above. ex_copy keeps
     * the tail's order (oldest first), so the running session -- which is
     * always the newest row -- is the last one copied; the instant is compared

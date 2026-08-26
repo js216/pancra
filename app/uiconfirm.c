@@ -16,6 +16,7 @@
  * rather than each drifting inside the screen family it belongs to.
  */
 
+#include "font.h"
 #include "ndk.h"
 #include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
@@ -33,7 +34,7 @@ void render_calpend(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -74,7 +75,7 @@ void render_rescaleact(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -129,7 +130,7 @@ void render_forget(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * bottom in landscape -- and render_forget records no close target, so
     * it became a dead end with no way back. */
    int sc  = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int y   = (fb->height / 20) + (8 * sc);
@@ -177,7 +178,7 @@ void render_reconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -224,7 +225,7 @@ void render_pairconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* Height-bounded as well as width-bounded, for the same landscape reason
     * as render_forget. */
    int sc  = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int y   = (fb->height / 20) + (8 * sc);
@@ -268,7 +269,7 @@ void render_pendcancel(struct ANativeWindow_Buffer *fb,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);
@@ -327,7 +328,7 @@ void render_syncrestore(struct ANativeWindow_Buffer *fb, const struct screen *m,
    (void)m; /* the question does not depend on the model */
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);

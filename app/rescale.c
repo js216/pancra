@@ -484,6 +484,11 @@ void cal_r_view(int sensor_id, struct calib_view *out)
    out->rescale_unsaved = g_resc_unsaved;
 }
 
+const char *cal_rescale_path(void)
+{
+   return g_rescale_path;
+}
+
 int cal_r_paths(const char *dir)
 {
    return data_path(g_rescale_path, sizeof g_rescale_path, dir,

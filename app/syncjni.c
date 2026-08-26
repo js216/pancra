@@ -23,6 +23,8 @@
 #include "logsload.h" /* pancra_logs_reload: a restore rewrote the files */
 #include "remotecfg.h"
 #include "sensors.h"
+#include "calib.h"
+#include "steps.h"
 #include "store.h"
 #include "sync.h"
 #include "syncreport.h" /* sync_report: how the sync went */
@@ -296,6 +298,7 @@ void syncjni_register_logs(void)
        {"weight",    weight_path(),     1},
        {"food",      food_path(),       1},
        {"exercise",  exercise_path(),   1},
+       {"steps",     steps_path(),      1},
        /* THE FOOD VOCABULARY IS NOT BUCKETED, and it is the one log here
         * whose rows do not begin with a timestamp -- they are "<id>,<name>".
         * Bucketing splits on the leading field read as a UTC day, so asking
@@ -336,9 +339,10 @@ void syncjni_register_logs(void)
  * Cheap either way: an open/lseek pair per file and a counter, no reading. */
 int64_t syncjni_state_stamp(void)
 {
-   const char *paths[] = {store_path(),   insulin_path(),    weight_path(),
-                          food_path(),    food_types_path(), exercise_path(),
-                          sensors_path(), slots_path()};
+   const char *paths[] = {store_path(),   insulin_path(),     weight_path(),
+                          food_path(),    food_types_path(),  exercise_path(),
+                          sensors_path(), slots_path(),       steps_path(),
+                          cal_rescale_path()};
    int64_t total       = 0;
    for (int i = 0; i < (int)(sizeof paths / sizeof paths[0]); i++) {
       if (!paths[i] || !paths[i][0])

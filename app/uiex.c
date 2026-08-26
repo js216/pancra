@@ -61,7 +61,7 @@ void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -165,7 +165,7 @@ void render_exdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 20);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);
@@ -184,7 +184,7 @@ void render_exdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += lh;
    draw_str(px, fb, x, y, sc, when, UI_TEXT_DIM);
    y += 2 * lh;
-   draw_str(px, fb, x, y, sc, "This cannot be undone.", UI_MUTED);
+   draw_str(px, fb, x, y, sc, "THIS CANNOT BE UNDONE.", UI_MUTED);
    y += 2 * lh;
    int bw = fb->width - (2 * x);
    y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_EXDEL_NO, 0);
@@ -197,7 +197,7 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -206,10 +206,41 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    draw_str(px, fb, x, y, tsc, "EXERCISE LOG", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_EXLOG_BACK, 0);
-   y += 3 * lh;
+   y += 2 * lh;
+
+   /* THE STEP COUNT'S ONE LINE, directly under the title.
+    *
+    * The steps are drawn on this screen's plot, so this is where the feature
+    * has to account for itself: the day's total when it is running, and when
+    * it is not, why the second curve is missing and how to get it. The
+    * sentence is the switch -- naming a screen the user then has to go and
+    * find is a direction rather than an answer, and the words promise the tap
+    * turns counting on, so anything less makes the line a liar.
+    *
+    * TODAY IS THE LOCAL CIVIL DAY, floored the way the plot's own day buckets
+    * are, so this figure and the last bar of a day-bucketed tab are the same
+    * arithmetic over the same rows. */
+   if (!m->food.steps_on) {
+      draw_str(px, fb, x, y, sc, "STEP COUNT OFF, PRESS HERE TO ENABLE",
+               UI_MUTED);
+      add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh + (3 * sc)),
+                 MA_STEPS_TOGGLE, 0);
+   } else {
+      const long day = ex_day_floor(m->now, m->tz_off);
+      long tot       = 0;
+      for (int i = 0; i < m->food.nsteps; i++) {
+         const long t = m->food.steps[i].t;
+         if (t >= day && t < day + 86400)
+            tot += m->food.steps[i].n;
+      }
+      char line[32];
+      (void)snprintf(line, sizeof line, "TODAY %ld STEPS", tot);
+      draw_str(px, fb, x, y, sc, line, UI_MUTED);
+   }
+   y += 2 * lh;
 
    if (m->food.nexlog <= 0) {
-      draw_str(px, fb, x, y, sc, "Nothing logged yet.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NOTHING LOGGED YET.", UI_MUTED);
       return;
    }
    /* THREE COLUMNS, and the header spaces them to where the rows put them:
@@ -300,60 +331,125 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
    pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_EXLOG_PAGE);
 
-   /* ONE POINT PER DAY, totalling every level -- see ex_points, which is the
-    * only definition of the series and is shared with the scrub picker so the
-    * two cannot resolve against different points. */
+   /* THE TWO SERIES AND, ON THE 24 H TAB, THE EXERCISE BAND -- see ex_points,
+    * which is the only definition of either and is shared with the scrub
+    * picker so the two cannot resolve against different points. */
    int tab = m->food.exlog_tab;
-   if (tab < 0 || tab >= UI_DAY_TABS)
+   if (tab < 0 || tab >= UI_EXDAY_TABS)
       tab = 0;
    struct log_pt pts[UI_LOG_PTS];
-   long from = 0;
-   int npt   = ex_points(m, pts, UI_LOG_PTS, &from);
+   unsigned char band[UI_LOG_PTS];
+   const int by_min = ui_exday_hours[tab] > 0 && ui_exday_hours[tab] <= 24;
+   long from        = 0;
+   int npt = ex_points(m, pts, UI_LOG_PTS, &from, by_min ? band : NULL,
+                       UI_LOG_PTS);
 
    /* Span tabs -- OR the scrub readout, the same swap the weight trend and
     * the glucose plot both make: while a finger is down the tab row becomes
     * the value under it, and the tabs come back when it lifts. */
-   int colw  = (fb->width - (2 * x)) / UI_DAY_TABS;
+   int colw  = (fb->width - (2 * x)) / UI_EXDAY_TABS;
    int trow  = 14 * sc;
    int laby  = plot_top - trow + ((trow - (7 * sc)) / 2);
    int scrub = m->log_scrub;
    if (scrub >= 0 && scrub < npt) {
       char when[24];
-      char line[48];
+      char val[24];
+      char rhs[24];
       fmt_date(pts[scrub].t, m->tz_off, when, sizeof when);
-      /* THE DATE ALONE: a point is a whole day, not an instant, so the
-       * midnight its instant carries is not a time worth printing. */
-      if (str_len(when) > 10)
-         when[10] = 0;
-      (void)snprintf(line, sizeof line, "%s   %ld MIN", when, pts[scrub].v);
-      int tsc2 = 2 * sc;
-      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
-         tsc2--;
-      int lw = str_len(line) * 6 * tsc2;
-      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
-               UI_TEXT);
+      char *lhs = when;
+      if (by_min) {
+         /* A FIVE-MINUTE BUCKET IS AN INSTANT, so the clock is what names it;
+          * fmt_date lays out "YYYY-MM-DD HH:MM" and the time is the tail. */
+         if (str_len(when) > 11)
+            lhs = when + 11;
+         /* FOUR, not five: a five-minute window holds a few hundred steps,
+          * and padding out to the ten-thousand guard would spend two columns
+          * of the row on space no bucket ever fills. */
+         (void)snprintf(val, sizeof val, "%4ld %s", pts[scrub].v,
+                        ui_steps_word(pts[scrub].v));
+         /* THE BAND UNDER THE FINGER takes the right-hand zone. The strip is
+          * drawn per bucket and `band` is indexed the same way the points
+          * are, so the level in force at the scrubbed instant is simply
+          * band[scrub] -- which is what makes the bands readable rather than
+          * merely visible, the way the main plot's are. THE WORD ALONE, not
+          * the word and its number: the two say the same thing. */
+         /* A CONSTANT WIDTH, PADDED IN FRONT. The middle field is centred in
+          * what the outer two leave, so a right-hand field that changes width
+          * moves the number -- and this one vanishes entirely the moment the
+          * finger leaves a band, which would jog the step count sideways
+          * exactly where the reader is comparing it against the band. Leading
+          * spaces keep the word flush with the row's right edge while the
+          * field it sits in never changes size. */
+         (void)snprintf(rhs, sizeof rhs, "%8s",
+                        band[scrub] > 0 ? ex_level_word(band[scrub]) : "");
+      } else {
+         /* THE DATE ALONE, AND WITHOUT ITS YEAR: a point is a whole day, not
+          * an instant, so the midnight it carries is not a time worth
+          * printing -- and no span this plot offers is long enough for the
+          * year to be the thing in doubt. */
+         if (str_len(when) > 5)
+            lhs = when + 5;
+         if (str_len(lhs) > 5)
+            lhs[5] = 0; /* "MM-DD" */
+         /* BOTH SERIES FOR THE PICKED DAY, whichever curve the finger landed
+          * on. They are the same day and the plot exists to be read across,
+          * so answering with only the trace that was nearest would make the
+          * reader scrub twice for one question. The day's index within its
+          * series is what pairs them: series 0 fills the first half of the
+          * array and series 1 the second, so the partner sits exactly npt/2
+          * away.
+          *
+          * TWO READINGS, NOT A READING AND A UNIT -- so this is the tab where
+          * the right-hand zone carries the second series instead. Exercise is
+          * what the screen is about and takes the middle; the steps beside it
+          * are the comparison it is there to invite. */
+         const int half   = npt / 2;
+         const int di     = (scrub >= half) ? scrub - half : scrub;
+         const long mins  = (di < half) ? pts[di].v : 0;
+         const long steps = (half + di < npt) ? pts[half + di].v : 0;
+         /* Both numbers right-aligned in fixed fields, for the reason the
+          * main plot's readout sets out: a digit gained or lost must change
+          * the digits and not the position of everything around them. */
+         /* BOTH FIELDS PADDED TO A CONSTANT WIDTH. The right-hand one is
+          * anchored by its end, so its own digits keep their columns either
+          * way -- but the middle field is centred in what the outer two
+          * leave, so anything that changes THEIR width moves it. A day's step
+          * count crossing from three digits to four would otherwise nudge the
+          * minutes along with it. */
+         (void)snprintf(val, sizeof val, "%3ld MIN", mins);
+         (void)snprintf(rhs, sizeof rhs, "%5ld %s", steps,
+                        ui_steps_word(steps));
+      }
+      log_scrub_row(px, fb, x, plot_top - trow, fb->width - (2 * x), sc, 2 * sc,
+                    lhs, val, rhs);
       /* No tab targets while scrubbing: the row is not showing tabs, and a
        * target that does not match what is drawn is how a drag ends up
        * changing the span it was only trying to read. */
    } else {
-      for (int i = 0; i < UI_DAY_TABS; i++) {
-         int lw   = str_len(ui_day_tab_lbl[i]) * 6 * sc;
+      for (int i = 0; i < UI_EXDAY_TABS; i++) {
+         int lw   = str_len(ui_exday_tab_lbl[i]) * 6 * sc;
          int tabx = x + (i * colw);
-         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, ui_day_tab_lbl[i],
-                  i == tab ? UI_TEXT : UI_MUTED);
+         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc,
+                  ui_exday_tab_lbl[i], i == tab ? UI_TEXT : UI_MUTED);
          add_hit_ix(h, ui_rect(tabx, tabs_y, colw, tabs_h), MA_EXTAB, i);
       }
    }
 
-   /* ONE COLOUR, because a day's total belongs to no single level. The
-    * middle of the three the table prints its rows in: the family's own hue,
-    * without claiming the day was all light or all hard. */
-   const uint32_t excol[1] = {ui_ex_color(EX_MIN_LEVEL + 1, UI_TEXT_DIM)};
    int pw = fb->width - (2 * x);
-   log_plot(px, fb, pts, npt, from, m->now, x, plot_top, pw, plot_h, sc,
-            m->tz_off, scrub, "MIN", 0, excol, 1);
+   exlog_plot(px, fb, pts, npt, from, m->now, x, plot_top, pw, plot_h, sc,
+              m->tz_off, scrub, by_min ? band : NULL,
+              ex_bucket_for(ui_exday_hours[tab]));
    /* arg carries sc: the shell needs the SAME scale the plot was drawn at to
     * map a finger x back to an entry, and re-deriving it there would be a
     * second copy of the layout that can drift. */
    add_hit(h, ui_rect(x, plot_top, pw, plot_h), ACT_SCRUB, sc);
 }
+
+/* ================= STEP COUNT ==================================
+ *
+ * One control and one plot. The control is the whole feature's switch --
+ * sampling is off until it is on, and the permission is requested at the
+ * moment it is switched on rather than at launch, because a glucose app
+ * asking for activity data on first run has no visible reason to.
+ */
+

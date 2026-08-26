@@ -45,7 +45,7 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -137,7 +137,7 @@ void render_fooddel(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 20);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);
@@ -153,7 +153,7 @@ void render_fooddel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += lh;
    draw_str(px, fb, x, y, sc, when, UI_TEXT_DIM);
    y += 2 * lh;
-   draw_str(px, fb, x, y, sc, "This cannot be undone.", UI_MUTED);
+   draw_str(px, fb, x, y, sc, "THIS CANNOT BE UNDONE.", UI_MUTED);
    y += 2 * lh;
    int bw = fb->width - (2 * x);
    y = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_FOODDEL_NO, 0);
@@ -167,7 +167,7 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -180,7 +180,7 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += 3 * lh;
 
    if (m->food.nlog <= 0) {
-      draw_str(px, fb, x, y, sc, "Nothing logged yet.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NOTHING LOGGED YET.", UI_MUTED);
       return;
    }
    draw_str(px, fb, x, y, sc, "TIME              FOOD            G", UI_MUTED);
@@ -229,7 +229,7 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -263,9 +263,9 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
    int n = m->food.ntypes;
    if (n <= 0) {
-      draw_str(px, fb, x, y, sc, "No foods yet. Add one", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NO FOODS YET. ADD ONE", UI_MUTED);
       y += lh;
-      draw_str(px, fb, x, y, sc, "and it stays on this list.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "AND IT STAYS ON THIS LIST.", UI_MUTED);
       return;
    }
 

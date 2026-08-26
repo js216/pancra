@@ -48,9 +48,10 @@ static const struct kp_info g_modes[KP_NMODES] = {
     [KP_WT_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* The LOG FOOD form. GRAMS is a whole number with a unit suffix and no
      * decimal point: portions are recorded to the gram, and a '.' key would
-     * invite tenths the format does not store. Five digits covers
-     * FOOD_MAX_G. */
-    [KP_FOOD_G]    = {"GRAMS",        5, 0, KP_UNIT_G,    0, 0, 0},
+     * invite tenths the format does not store. THREE digits, which is exactly
+     * FOOD_MAX_G -- so the field cannot accept a number the commit would then
+     * have to refuse. */
+    [KP_FOOD_G]    = {"GRAMS",        3, 0, KP_UNIT_G,    0, 0, 0},
     [KP_FOOD_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_FOOD_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_EX_DATE]   = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},

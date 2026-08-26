@@ -106,6 +106,20 @@ int ui_sensor_capacity(int w, int h);
 
 /* Spans the WEIGHT LOG plot offers, in DAYS; 0 is "everything". Exported so
  * the shell can map a tab tap back to a span without duplicating the list. */
+/* THE PLOT SPANS, shared by the glucose plot and the STEP COUNT one -- the
+ * same six a reader already knows, so a second chart does not teach a second
+ * vocabulary. In uifmt.h rather than uipriv.h because the tap handler picks
+ * the span and it is not a renderer. */
+#define UI_TABS 6
+extern const int ui_tab_hours[UI_TABS];
+/* A SPAN TAB'S NAME, into `out`: hours below two days, whole days above.
+ *
+ * ONE DEFINITION, because two charts offer these same six spans and the rule
+ * written out twice drifted -- the glucose plot named the 24-hour tab "24H"
+ * while the step plot named the very same span "1D", so the two screens
+ * disagreed about what one tab was called. */
+void ui_span_label(int hours, char *out, int n);
+
 #define UI_WT_TABS 5
 extern const int ui_wt_days[UI_WT_TABS];
 
@@ -117,6 +131,20 @@ extern const int ui_wt_days[UI_WT_TABS];
 #define UI_DAY_TABS 5
 extern const int ui_day_days[UI_DAY_TABS];
 extern const char *const ui_day_tab_lbl[UI_DAY_TABS];
+
+/* THE EXERCISE LOG'S OWN SPANS.
+ *
+ * A separate set from ui_day_days because this plot carries the STEP COUNT as
+ * a second series, and a day of steps is worth seeing five minutes at a time
+ * -- a resolution the insulin plot, which shares ui_day_days, has no use for.
+ *
+ * IN HOURS, not days, because two of the spans are shorter than one: the
+ * six-hour view is the one that answers "what have I done this morning". 0 is
+ * ALL, the same sentinel ui_day_days uses. Spans of a day or less are drawn on
+ * the five-minute grid the step log records in; longer ones by day. */
+#define UI_EXDAY_TABS 5
+extern const int ui_exday_hours[UI_EXDAY_TABS];
+extern const char *const ui_exday_tab_lbl[UI_EXDAY_TABS];
 
 /* THE MOST DAYS A BUCKETED PLOT WILL DRAW, which is what sizes the array the
  * renderer lays out on its stack. A year: past that the bars are thinner than
@@ -141,9 +169,12 @@ struct log_pt {
    int series;
 };
 
-/* The most points any log plot will draw: every tail in the app is 256, and
- * the exercise plot's days are capped to the same number. */
-#define UI_LOG_PTS 256
+/* The most points any log plot will draw.
+ *
+ * Sized by the two hungriest cases, not by the tails: the exercise plot's 24 H
+ * tab buckets a whole day into five-minute steps (288 of them), and its longer
+ * tabs carry TWO series of up to 256 days each. */
+#define UI_LOG_PTS 512
 
 /* The characters the rename keypad offers, in grid order. Exposed so the shell
  * can map an MA_CHAR code back to the character that was tapped. */

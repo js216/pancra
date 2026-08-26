@@ -162,6 +162,11 @@ int settings_set_nudge_vib(int on)
    return set_int_field(&g_p.nudge_vib, on ? 1 : 0, set_render_settings);
 }
 
+int settings_set_steps_on(int on)
+{
+   return set_int_field(&g_p.steps_on, on ? 1 : 0, set_render_settings);
+}
+
 int settings_set_best_streak(int seconds)
 {
    if (seconds <= 0 || seconds > BEST_STREAK_MAX)
@@ -339,7 +344,7 @@ void set_render_settings(struct save_job *j)
    int n = snprintf(
        j->buf, sizeof j->buf,
        "v%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d "
-       "%d %d %d %d %d %d %d %d\n",
+       "%d %d %d %d %d %d %d %d %d\n",
        SETTINGS_VERSION, g_p.sound_on, g_p.vib_on, g_p.orient, g_p.units,
        g_p.disc, g_p.plot_max, g_p.screen_on, g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
@@ -347,7 +352,7 @@ void set_render_settings(struct save_job *j)
        g_p.nudge_sound, g_p.nudge_vib, g_p.wunits, g_p.shortcut[0],
        g_p.shortcut[1], g_p.shortcut[2], g_p.shortcut[3], g_p.shortcut[4],
        g_p.shortcut[5], g_p.shortcut[6], g_p.shortcut[7], g_p.shortcut[8],
-       g_p.best_streak_s);
+       g_p.best_streak_s, g_p.steps_on);
    set_job_stamp(j, g_settings_path, &written, n, n > 0 && n < 256);
 }
 
@@ -391,7 +396,7 @@ enum load_result settings_load(void)
            g_settings_path, filever, SETTINGS_VERSION);
       return LOAD_CORRUPT;
    }
-   int v[29] = {
+   int v[30] = {
        g_p.sound_on,      g_p.vib_on,       g_p.orient,      g_p.units,
        g_p.disc,          g_p.plot_max,     g_p.screen_on,   g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
@@ -399,7 +404,7 @@ enum load_result settings_load(void)
        g_p.nudge_sound,   g_p.nudge_vib,    g_p.wunits,      g_p.shortcut[0],
        g_p.shortcut[1],   g_p.shortcut[2],  g_p.shortcut[3], g_p.shortcut[4],
        g_p.shortcut[5],   g_p.shortcut[6],  g_p.shortcut[7],
-       g_p.shortcut[8],   g_p.best_streak_s};
+       g_p.shortcut[8],   g_p.best_streak_s, g_p.steps_on};
    /* VERSION 0 AND VERSION 1 SHARE THIS READER, and that is the migration:
     * v1 added the marker and changed nothing else, so a v0 file is read
     * field-for-field as it always was and is rewritten as v1 at the next
@@ -407,7 +412,7 @@ enum load_result settings_load(void)
     * step for it goes -- keyed on `filever`, applied in order, with the v0
     * reader kept for the files already on phones. */
    char *q = vq;
-   for (int i = 0; i < 29; i++) {
+   for (int i = 0; i < 30; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -498,6 +503,10 @@ enum load_result settings_load(void)
     * number rather than derived -- which is why it was missed and read a pin
     * slot as the record. */
    g_p.best_streak_s = (v[28] >= 0 && v[28] <= BEST_STREAK_MAX) ? v[28] : 0;
+   /* Field 29, and OFF is the default an older file leaves standing -- the
+    * loop above stops at the first field the file does not have. Step
+    * counting asks for a permission, so it starts off and is opted into. */
+   g_p.steps_on = v[29] ? 1 : 0;
    return LOAD_OK;
 }
 

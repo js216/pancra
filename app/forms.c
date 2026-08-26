@@ -587,7 +587,7 @@ int kp_commit_number(void)
           * fractional case to reject: grams are whole, which is the
           * resolution the format stores. */
          if (v < FOOD_MIN_G || v > FOOD_MAX_G) {
-            (void)snprintf(g_kp.err, sizeof g_kp.err, "GRAMS OUT OF RANGE");
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "GRAMS MUST BE 1-999");
             g_kp.len = 0;
             shell_ui_dirty();
             return COMMIT_STAY;

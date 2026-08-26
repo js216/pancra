@@ -29,8 +29,10 @@
 #include "food.h"     /* struct food_type: the FOOD TYPE picker rows */
 #include "insulin.h"  /* struct ins_rec: the INSULIN LOG table rows */
 #include "keypad.h"   /* enum keypad_mode: what the keypad collects */
+#include "menuview.h" /* NPERMS: this struct carries one flag per permission */
 #include "sensors.h"  /* sensor types/kinds the model and renderer share */
 #include "settings.h" /* SC_MAX: the main-screen PIN slots */
+#include "steps.h"    /* struct step_rec: the frame carries the steps tail */
 #include "uifmt.h"    /* UI_MAX_SLOTS and the presentation constants */
 #include "weight.h"   /* struct wt_rec: the WEIGHT LOG table rows */
 #include <stdint.h>
@@ -397,6 +399,12 @@ struct ui_foodview {
     * is how the table and the button come to disagree. */
    int exlog_act;
    int exlog_tab; /* which span the minutes-per-day plot is showing */
+   /* STEP COUNT: the switch, whether the counter is actually answering, and
+    * the log tail. The steps are drawn on the EXERCISE LOG's plot, whose span
+    * is exlog_tab, so there is no separate span to carry here. */
+   int steps_on, steps_live;
+   const struct step_rec *steps;
+   int nsteps;
    long ex_t;         /* the instant the form holds */
    long ex_form_dur;  /* the duration it holds, SECONDS, 0 = not known */
    int ex_edit;       /* 1 = correcting an existing entry */
@@ -438,9 +446,11 @@ struct ui_syncview {
 
 /* What Android is currently allowing us to do, plus the export menu. */
 struct ui_sysview {
-   /* system snapshot for the settings screen (perm[]: BT scan/connect/notify)
-    */
-   int perm[3], batt_ok, bg_restricted, standby_bucket;
+   /* System snapshot for the settings screen. perm[] is one flag per runtime
+    * permission, in the order menu.c requests them and ui_perm_lbl names
+    * them -- SIZED BY NPERMS, because menu.c fills and model.c copies NPERMS
+    * of them and a literal here that disagreed would be written past. */
+   int perm[NPERMS], batt_ok, bg_restricted, standby_bucket;
    /* EXPORT DATA menu state: range 0 = 30 D, 1 = 1 Y, 2 = ALL; the three
     * section checkboxes (1 = included) */
    int exp_range, exp_glu, exp_dev, exp_ins, exp_wt;

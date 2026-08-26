@@ -61,6 +61,7 @@
 #include "stategen.h"   /* state.gen: one generation, for a backup */
 #include "stats.h"
 #include "status.h"
+#include "steps.h"
 #include "store.h"
 #include "sync.h"
 #include "sysabi.h" /* the kernel clock and timer ABI, declared once */
@@ -81,7 +82,10 @@
 
 /* ---- app configuration constants (tunables collected here) ---- */
 #define SCR_MAX 16 /* touch hit-boxes tracked per drawn menu */
-#define NPERMS  3  /* runtime permissions requested at once */
+/* (NPERMS is menuview.h's, which this file includes. It was declared here as
+ * well, with its own copy of the count, and nothing used it -- so raising the
+ * real one made the two disagree loudly rather than quietly, which is the
+ * only good outcome available to a duplicated constant.) */
 /* How long a teardown callback will wait for another thread to finish with
  * shared state before it stops waiting (thread.h, rule 5). Long enough that a
  * history append -- microseconds -- always completes; short enough that the
@@ -488,6 +492,42 @@ void shell_repaint(void)
  * that looper -- which is how a hypo came to be decoded and logged with no
  * sound, and how a phone with the app backgrounded stopped pushing until it
  * was reopened. */
+/* SAMPLE THE STEP COUNTER, and own the listener's lifetime while we are here.
+ *
+ * ONE FUNCTION FOR BOTH, because they are one decision: the listener exists
+ * if and only if the feature is on, and the only thing that reads it is this
+ * sampler. Split across a settings handler and a tick, switching the feature
+ * off while the activity was gone would have left the sensor registered for
+ * the rest of the process.
+ *
+ * A CONTEXT FROM THE TRANSPORT, not from g_act: this runs on the service tick
+ * too, and by then the activity is long destroyed. Same reason notify.c does
+ * it (see there).
+ *
+ * IDEMPOTENT AND CHEAP. stepsListen returns immediately when it is already in
+ * the requested state, and steps_tick is a no-op until a five-minute window
+ * closes, so calling this at 1 Hz costs two JNI calls and a comparison. */
+void steps_request_perm(void)
+{
+   /* THE ACTIVITY, not the transport's Context: a permission dialog needs
+    * something that can start one, and only the activity can. Switching the
+    * feature on is a tap, so there is always an activity here. */
+   jb_request_perm(shell_activity(), "android.permission.ACTIVITY_RECOGNITION");
+}
+
+static void steps_pump(void)
+{
+   JNIEnv *e    = dexble_env();
+   jobject jctx = dexble_ctx();
+   if (!e || !jctx)
+      return;
+   struct prefs sp;
+   settings_get(&sp);
+   jb_steps_listen(e, jctx, sp.steps_on);
+   if (sp.steps_on)
+      steps_tick(realtime_s(), tz_off_now(), jb_steps_count(e));
+}
+
 void shell_service_tick(void)
 {
    /* The stale-data alarm is triggered by the ABSENCE of readings, so
@@ -506,6 +546,10 @@ void shell_service_tick(void)
    meter_sync_watchdog();
    /* Register a sensor that bonded while the UI was gone. */
    pancra_reconcile_tick();
+   /* STEPS. One call drives both the listener's lifetime and the sampling, so
+    * there is no second place that can leave the sensor registered after the
+    * feature is switched off -- see steps_pump. */
+   steps_pump();
    /* THE GENERATION STAMP a backup reads before and after it pulls (item
     * 247). Here rather than only on the activity's timer for the usual
     * reason: the writes it is stamping arrive on a binder thread with no
@@ -727,6 +771,12 @@ static int on_timer(int fd, int events, void *data)
     * from the service tick below, because the minute can expire with the
     * activity gone: the whole point of the delay is that the user presses the
     * button and puts the phone away. */
+   /* The step sampler, on this looper as well as the service's: the activity
+    * is alive for the window a user is actually looking at the plot, and a
+    * sample that waited for the service's slower tick would leave the newest
+    * bar missing exactly then. Idempotent, so both callers is not twice the
+    * work -- see steps_pump. */
+   steps_pump();
    if (exercise_button_tick(realtime_s(), mono_s(), tz_off_now()))
       shell_ui_dirty();
    /* Refresh the UTC offset periodically, rather than reading it once in
@@ -1141,6 +1191,8 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
          pathsok = 0;
       if (!(exercise_paths(dir)))
          pathsok = 0;
+      if (!(steps_paths(dir)))
+         pathsok = 0;
       meter_register_ops(); /* the driver routes callbacks to it: see meter.h */
       if (!(meter_paths(dir)))
          pathsok = 0;
@@ -1191,6 +1243,8 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       if (food_load() < 0)
          lost = 1;
       if (exercise_load() < 0)
+         lost = 1;
+      if (steps_load() < 0)
          lost = 1;
       if (sensors_load() < 0) /* before store_load: readings resolve here */
          lost = 1;

@@ -31,7 +31,6 @@
 
 /* Layout constants owned by the UI (not the shell). */
 #define UI_COLS   33         /* character columns the layout targets */
-#define UI_TABS   6          /* plot-span tabs */
 /* Sensor trace colours the picker offers; crosschecked against SET_NCOLORS
  * where the palette is defined. */
 #define UI_NCOLORS 7
@@ -40,7 +39,6 @@
 
 /* 720h = 30D on the right. 6H went: it sat between 3H and 12H without showing
  * anything either of them didn't. */
-extern const int ui_tab_hours[UI_TABS];
 
 /* Glyph cells discarded by clipping, bumped by the leaf primitives. See
  * ui_clip_reset in the renderer for why this is an instrument rather than
@@ -154,7 +152,29 @@ int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
 extern const uint32_t ui_ins_col[UI_INS_SERIES];
 int ins_points(const struct screen *m, struct log_pt *out, int cap,
                long *from);
-int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from);
+long exday_from_of(int tab, long now, long oldest_ex, long oldest_step);
+long ex_day_floor(long t, long tz_off);
+
+/* THE EXERCISE LOG'S PLOT POINTS: series 0 is exercise, series 1 is the step
+ * count. The picker asks for them here so a finger resolves against exactly
+ * the points that were drawn.
+ *
+ * `band`, when given, is filled parallel to the points on the 24 H tab: the
+ * exercise level in force during each five-minute bucket, 0 for none. It is
+ * left untouched on the day-bucketed tabs, where exercise is a curve. */
+int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
+              unsigned char *band, int bandcap);
+
+/* Draw them: two series that do NOT share a vertical scale, exercise read off
+ * the left axis and steps off the right. */
+void exlog_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+                const struct log_pt *p, int n, long from, long now, int px0,
+                int py0, int pw, int ph, int sc, long tz_off, int hilite,
+                const unsigned char *band, long bucket);
+
+/* The bucket the sub-day tabs group steps into, and its name for the axis. */
+long ex_bucket_for(int hours);
+void ex_bucket_word(long width, char *out, int n);
 
 void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
                    struct hits *h);

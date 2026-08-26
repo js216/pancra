@@ -54,7 +54,8 @@ static int g_dev_page; /* which page the LIVE device list is showing */
 
 static const char *perms[] = {"android.permission.BLUETOOTH_SCAN",
                               "android.permission.BLUETOOTH_CONNECT",
-                              "android.permission.POST_NOTIFICATIONS"};
+                              "android.permission.POST_NOTIFICATIONS",
+                              "android.permission.ACTIVITY_RECOGNITION"};
 /* Cached system states for the settings menu. JNI via the activity's env is
  * only legal on the main thread, so sys_* are never called from a render (which
  * can be requested off a BLE binder thread); sys_refresh samples them from the
@@ -967,7 +968,10 @@ static int system_action(int action, int ix)
       jb_open_settings(shell_activity());
       sys_refresh();
    } /* bg-exec: change in settings */
-   else if (action == MA_PERM) {
+   /* BOUNDED BEFORE IT INDEXES. `ix` arrives from the hit table, and it is
+    * the subscript of two fixed arrays -- a row drawn with a stale or wrong
+    * index would otherwise read past both. */
+   else if (action == MA_PERM && ix >= 0 && ix < NPERMS) {
       /* denied -> request dialog; granted -> app settings (only place to
        * revoke) */
       if (g_sys_perm[ix])

@@ -34,6 +34,7 @@ static jmethodID
 static jmethodID m_batt_ok, m_req_batt, m_bucket,
     m_bg_restricted;             /* background-run ops */
 static jmethodID m_show_glucose; /* push value+plot to the notification */
+static jmethodID m_steps_listen, m_steps_count; /* the hardware step counter */
 static jmethodID
     m_bonded_sensor; /* resolve a bonded sensor's MAC from the bond list */
 
@@ -89,6 +90,8 @@ static const struct jb_method g_platform_methods[] = {
     {&m_req_batt,      "requestBatteryOpt",     "(Landroid/content/Context;)V" },
     {&m_bucket,        "standbyBucket",         "(Landroid/content/Context;)I" },
     {&m_bg_restricted, "isBgRestricted",        "(Landroid/content/Context;)Z" },
+    {&m_steps_listen,  "stepsListen",           "(Landroid/content/Context;Z)V"},
+    {&m_steps_count,   "stepsCount",            "()J"                          },
 };
 
 static const struct jb_method g_export_methods[] = {
@@ -571,6 +574,32 @@ int jb_bonded_sensor(JNIEnv *env, jobject clazz, const char *prefix, char *mac,
    }
    (*env)->DeleteLocalRef(env, jm);
    return mac[0] ? 1 : 0;
+}
+
+/* ---- the hardware step counter ----
+ *
+ * A CONTEXT, NOT AN ACTIVITY, for the reason jb_show_glucose takes one: the
+ * sampler runs on the service tick as well as the activity's, and the
+ * activity is gone for most of a day. Both calls no-op when Java could not be
+ * reached, which reads downstream as "the sensor has not answered" -- the
+ * same state as a phone with no step counter in it. */
+void jb_steps_listen(JNIEnv *e, jobject ctx, int on)
+{
+   if (!e || !ctx || !g_platform || !m_steps_listen)
+      return;
+   (*e)->CallStaticVoidMethod(e, g_platform, m_steps_listen, ctx,
+                              on ? JNI_TRUE : JNI_FALSE);
+   (void)jb_checked(e, "stepsListen");
+}
+
+long jb_steps_count(JNIEnv *e)
+{
+   if (!e || !g_platform || !m_steps_count)
+      return -1;
+   jlong r = (*e)->CallStaticLongMethod(e, g_platform, m_steps_count);
+   if (!jb_checked(e, "stepsCount"))
+      return -1;
+   return (long)r;
 }
 
 void jb_show_glucose(JNIEnv *e, jobject ctx, const char *title,

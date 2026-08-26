@@ -141,6 +141,13 @@ int jb_battery_ok(struct ANativeActivity *a, int *ok); /* background exempt */
 int jb_request_battery(struct ANativeActivity *a);
 /* -1 = unknown, written only when Java answered. */
 int jb_standby_bucket(struct ANativeActivity *a, int *bucket);
+
+/* THE HARDWARE STEP COUNTER. `on` registers or tears down the listener; the
+ * count is its newest total since boot, or -1 when nothing has arrived (no
+ * such sensor, no permission, or no movement yet). A Context rather than an
+ * activity: the sampler runs on the service tick too. */
+void jb_steps_listen(JNIEnv *e, jobject ctx, int on);
+long jb_steps_count(JNIEnv *e);
 int jb_bg_restricted(struct ANativeActivity *a, int *restricted);
 
 /* DID THE LAST JNI CALL ON `e` COMPLETE? 1 clean, 0 it threw -- and then the

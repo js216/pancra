@@ -337,6 +337,97 @@ uint32_t ui_text_on(uint32_t bg)
    return (y >= 128U) ? UI_BLACK : UI_TEXT;
 }
 
+/* ONE SCRUB READOUT, laid out the same way on every plot in the app.
+ *
+ * THREE ZONES ACROSS THE PLOT'S OWN WIDTH: when it happened on the left, the
+ * reading in the middle, its unit -- or, where a plot draws two series, the
+ * second reading -- on the right.
+ *
+ * ANCHORED, NOT PACKED. Each zone is fixed to something that does not move:
+ * the left zone to the plot's left edge, the right zone to its right edge,
+ * the value to the centre. Laying the fields out as one string and centring
+ * that string instead makes every field's position depend on every other
+ * field's width, so a reading losing a digit slides the clock and the unit
+ * sideways -- under a finger that is sweeping the trace precisely to read
+ * them. Space-padding the fields does not fix it either: centring re-centres
+ * the padding too, and the ink ends up off centre by however lopsided the
+ * padding happens to be.
+ *
+ * So the clock and the unit never move at all, and the value grows and
+ * shrinks about the middle, which is the one place a change in width is
+ * symmetrical and reads as the number changing rather than the line moving.
+ *
+ * ONE COLOUR FOR ALL THREE. They are one reading -- the instant, the number
+ * and what it is a number of -- and dimming the outer two made the row read
+ * as a bright value with annotations rather than as a single line, which is
+ * what it is. The zones are already separated by the width of the plot. */
+/* Ink width of a glyph run: n glyphs paint (n*6-1) columns per unit of scale,
+ * the trailing inter-character gap being space the last glyph does not use. */
+static int run_w(const char *s, int sc)
+{
+   const int n = s ? str_len(s) : 0;
+   return n ? ((n * 6) - 1) * sc : 0;
+}
+
+/* THE LARGEST SCALE ALL THREE FIELDS FIT AT, with a glyph cell of air on
+ * either side of the middle one. */
+static int scrub_fit(const char *when, const char *val, const char *unit,
+                     int w, int lo, int hi)
+{
+   for (int k = hi; k > lo; k--)
+      if (run_w(when, k) + run_w(val, k) + run_w(unit, k) + (2 * 6 * k) <= w)
+         return k;
+   return lo;
+}
+
+/* Where the middle field starts: CENTRED IN WHAT THE OUTER TWO LEAVE, not in
+ * the row.
+ *
+ * Pinning it to the row's true centre sounds like the same thing and is not,
+ * because the two outer fields are rarely the same width. On the 30 D span
+ * the left field is a date AND a time -- ten characters against the unit's
+ * five -- and a value nailed to the middle then has to squeeze past it: the
+ * row drops two whole sizes to make the clearance, and spends what it saved
+ * on a gap half the plot wide at the other end. Centring between the
+ * neighbours instead gives equal air on both sides at the largest size that
+ * fits, which is what "in the middle" is actually asking for.
+ *
+ * The two are the same layout whenever the outer fields balance, which is the
+ * common case: a clock and a unit, five characters each. */
+static int scrub_vx(int x, int w, int sc, const char *when, const char *val,
+                    const char *unit)
+{
+   const int gap  = 6 * sc;
+   const int from = x + run_w(when, sc) + gap;
+   const int to   = x + w - run_w(unit, sc) - gap;
+   return from + (((to - from) - run_w(val, sc)) / 2);
+}
+
+void log_scrub_row(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
+                   int y, int w, int lo, int hi, const char *when,
+                   const char *val, const char *unit)
+{
+   const int sc = scrub_fit(when, val, unit, w, lo, hi);
+   if (when && *when)
+      draw_str(px, fb, x, y, sc, when, UI_TEXT);
+   if (unit && *unit)
+      draw_str(px, fb, x + w - run_w(unit, sc), y, sc, unit, UI_TEXT);
+   if (val && *val)
+      draw_str(px, fb, scrub_vx(x, w, sc, when, val, unit), y, sc, val,
+               UI_TEXT);
+}
+
+/* "STEPS", or "STEP " when there is exactly one of them.
+ *
+ * THE SAME FIVE CHARACTERS EITHER WAY. The readouts that use this are laid
+ * out in fixed columns so nothing shifts under a scrubbing finger, so the
+ * singular cannot simply be a shorter word -- it is the plural with its S
+ * replaced by the space that keeps the column. */
+const char *ui_steps_word(long n)
+{
+   return (n == 1) ? "STEP " : "STEPS";
+}
+
 uint32_t ui_ex_color(int level, uint32_t rest_col)
 {
    static const uint32_t exc[EX_MAX_LEVEL + 1] = {
@@ -789,6 +880,65 @@ int menu_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int y,
    return y + bh;
 }
 
+int menu_button_mark(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
+                     int y, int w, int sc, const char *label, uint32_t col,
+                     uint32_t mcol, int action, int ix)
+{
+   uint32_t *px  = fb->bits;
+   const int bh  = 25 * sc;
+   const int lw  = str_len(label) * 6 * sc;
+   const int lhh = 7 * sc;
+   /* THE BULLET AND THE LABEL ARE ONE OBJECT, centred together: 5*sc of dot
+    * plus one 6*sc glyph cell of gap, then the words. Hanging the mark off
+    * the button's right edge instead would put it on top of the text as soon
+    * as a label grew or a button narrowed, and the pair drifting apart as the
+    * row count changes reads as two unrelated things rather than one marked
+    * control. */
+   const int tot = lw + (11 * sc);
+   int bx        = x + ((w - tot) / 2);
+   if (bx < x + (2 * sc))
+      bx = x + (2 * sc); /* never outside its own frame */
+   draw_frame(px, fb, x, y, w, bh, UI_MUTED);
+   draw_icon(px, fb, bx, y + ((bh - lhh) / 2), sc, icon_dot, mcol);
+   draw_str(px, fb, bx + (11 * sc), y + ((bh - lhh) / 2), sc, label, col);
+   add_hit_ix(h, ui_rect(x, y, w, bh), action, ix);
+   return y + bh;
+}
+
+/* A DAY, and the reason it is a day rather than anything finer: weighing is a
+ * once-a-day act done at a fixed point in the routine, so "due" means the
+ * routine has come round again. Anything shorter would light the mark up
+ * again the same evening. NO ENTRIES AT ALL counts as due -- an empty log is
+ * the longest gap there is, not an absence of one. */
+int ui_weight_due(const struct screen *m)
+{
+   if (!m || m->wt.nwt <= 0)
+      return 1;
+   return (m->now - m->wt.wt[m->wt.nwt - 1].t) >= 86400;
+}
+
+/* THE SLOW DOSE, and only the slow one.
+ *
+ * Basal insulin is the other once-a-day act in this app: one injection at a
+ * fixed point in the routine, and the mark means the routine has come round
+ * again -- the same day, and the same reason, as the weighing. FAST insulin
+ * gets no mark and must not: it is taken against meals, several times a day
+ * and at no fixed hour, so a bullet on it would be lit almost always and
+ * would say nothing about whether a dose was missed.
+ *
+ * THE LAST SLOW DOSE, not the last dose. The tail is oldest first and mixes
+ * the two kinds, so the newest entry is usually a fast one -- reading its
+ * instant would let a lunchtime bolus clear a basal dose nobody took. */
+int ui_slow_ins_due(const struct screen *m)
+{
+   if (!m)
+      return 0;
+   for (int i = m->ins.ins_nlog - 1; i >= 0; i--)
+      if (m->ins.ins_log[i].type == INS_SLOW)
+         return (m->now - m->ins.ins_log[i].t) >= 86400;
+   return 1; /* none on record: the longest gap there is */
+}
+
 void menu_head(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
                int lh, const char *name)
 {
@@ -1064,7 +1214,7 @@ void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
                int y, int sc, int lh, int page, int npages, int code)
 {
    uint32_t *px  = fb->bits;
-   const int tsc = 2 * sc;
+   const int tsc = FONT_TITLE(sc);
    /* Two character cells per button, so the single-glyph ones line up with
     * the doubles and every target is the same size. */
    const int bw  = 12 * tsc;
@@ -1106,6 +1256,14 @@ void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
    draw_str(px, fb, (x + rx - (str_len(pg) * 6 * sc)) / 2, y, sc, pg, UI_MUTED);
 }
 
+int fit_scale(const char *s, int maxw, int min, int max)
+{
+   int t = max;
+   while (t > min && ((str_len(s) * 6) - 1) * t > maxw)
+      t--;
+   return t;
+}
+
 /* One "LOW"/"HIGH" row in the ALARM submenu: the value in display units, or
  * OFF when the threshold can never be reached (fmt_thresh). */
 void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
@@ -1142,7 +1300,7 @@ int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
 {
    uint32_t *px = fb->bits;
    int rx       = fb->width - (4 * sc);
-   int vsc      = 2 * sc;
+   int vsc      = FONT_TITLE(sc);
    int vw       = str_len(val) * 6 * vsc;
    draw_str(px, fb, 4 * sc, y + (((7 * vsc) - (7 * sc)) / 2), sc, name,
             UI_TEXT_DIM);
@@ -1176,7 +1334,25 @@ const char *const ui_disc_lbl[] = {"OFF", "15 MIN", "30 MIN", "60 MIN"};
 /* Indexed by ND_OFF / ND_BEEP / ND_CHIRP. */
 const char *const ui_newdata_lbl[] = {"OFF", "BEEP", "CHIRP"};
 
-const char *const ui_perm_lbl[] = {"BT SCAN", "BT CONNECT", "NOTIFY"};
+void ui_span_label(int hours, char *out, int n)
+{
+   /* CLAMPED FIRST. ui_tab_hours holds small constants, but nothing here can
+    * prove that to the compiler; bounding the value bounds the formatted
+    * width. */
+   if (hours < 0)
+      hours = 0;
+   if (hours > 99999)
+      hours = 99999;
+   /* TWO DAYS IS THE CROSSOVER: a day and a half reads more plainly as hours,
+    * a week does not. */
+   if (hours < 48)
+      (void)snprintf(out, (size_t)n, "%dH", hours);
+   else
+      (void)snprintf(out, (size_t)n, "%dD", hours / 24);
+}
+
+const char *const ui_perm_lbl[] = {"BT SCAN", "BT CONNECT", "NOTIFY",
+                                   "STEPS"};
 
 /* App-Standby bucket -> short label. */
 

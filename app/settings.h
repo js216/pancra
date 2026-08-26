@@ -56,6 +56,7 @@ struct prefs {
    int orient;        /* 0 portrait 1 landscape 2 gravity 3 system */
    int screen_on;     /* 1 keep the screen on while open, 0 follow the OS */
    int newdata_mode;  /* an ND_* value; convert with nudge_mode_of() */
+   int steps_on;      /* 1 = sample the hardware step counter (default OFF) */
    int units;         /* glucose: 0 mg/dL, 1 mmol/L */
    int wunits;        /* weight: WT_KG / WT_LB (weight.h) */
    int disc;          /* stale-data alarm: index into disc_min */
@@ -144,7 +145,8 @@ enum shortcut_id {
    SC_EXERCISE = 7,
    SC_FOODLOG  = 8,
    SC_EXLOG    = 9,
-   SC_ID_LAST  = SC_EXLOG /* the largest id this build defines */
+   SC_STEPSLOG = 10,
+   SC_ID_LAST  = SC_STEPSLOG /* the largest id this build defines */
 };
 
 
@@ -185,6 +187,7 @@ int settings_set_vib(int on);
 int settings_set_screen_on(int on);
 int settings_set_statbar(int on);
 int settings_set_lockscr(int on);
+int settings_set_steps_on(int on);
 int settings_set_nudge_sound(int on);
 int settings_set_nudge_vib(int on);
 /* Clamps to 100..400 and applies the renderer's scale, which settings_load

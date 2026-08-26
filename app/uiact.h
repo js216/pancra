@@ -174,6 +174,7 @@ enum ui_menu {
    MA_EXLOG_OPEN, /* ADD menu: open the exercise table */
    MA_EXLOG_BACK,
    MA_EXLOG_PAGE,
+   MA_STEPS_TOGGLE, /* turn step counting on or off */
    MA_EXLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
    MA_EX_CONFIRM, /* EDIT EXERCISE: rewrite the entry */
    MA_EX_DISCARD, /* EDIT EXERCISE: leave it as it was */

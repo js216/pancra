@@ -70,10 +70,31 @@ int form_food_action(int action, int ix)
    if (action == MA_FOOD_OPEN) {
       forms_food_open(realtime_s());
       g_foodtype_page = 0; /* always page one: see the food log's note */
-      /* Both, in this order. See above: the form has to be BELOW the picker
-       * on the path or there is nothing for the picker to return to. */
+      /* STRAIGHT TO THE FORM, CARRYING THE LAST MEAL.
+       *
+       * People eat the same things in the same amounts, so the entry that was
+       * logged last is the best guess at the one being logged now -- and the
+       * button says LOG FOOD, not CHOOSE FOOD. Opening the picker first made
+       * every repeat meal a trip through a list to find the row the form
+       * would have arrived at by itself. The type row on the form still opens
+       * the picker, so choosing something else is one tap, and it is the tap
+       * of somebody who actually wants to choose.
+       *
+       * forms_food_type_set seeds the PORTION from the last time that food
+       * was eaten, so naming the type fills the grams too -- one call, and
+       * the form opens complete.
+       *
+       * WITH NOTHING LOGGED YET there is no last meal to offer, so the picker
+       * is pushed on top exactly as before. The form must be BELOW it on the
+       * path or the picker has nothing to return to (see above). */
+      const int nf              = food_count();
+      const struct food_rec lst = (nf > 0) ? food_at(nf - 1)
+                                           : (struct food_rec){0, 0, 0};
       nav_go(SCR_FOOD);
-      nav_go(SCR_FOODTYPE);
+      if (lst.t > 0 && lst.type != FOOD_TYPE_NONE)
+         forms_food_type_set(lst.type);
+      else
+         nav_go(SCR_FOODTYPE);
    } else if (action == MA_FOODTYPE_PICK) {
       /* THE ROW GAVE AN INDEX; WHAT IS STORED IS AN ID. The vocabulary can
        * grow between the frame that drew the row and the tap that lands on it

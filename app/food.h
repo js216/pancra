@@ -56,12 +56,20 @@
 /* In-memory tail of the entry log; the file keeps everything. */
 #define NFOOD 256
 
-/* Grams in one entry. The lower bound is 1 rather than 0 for the same reason
- * the exercise log has no zero: an entry of nothing is not an entry. The upper
- * bound is loose on purpose -- it exists to stop a corrupt digit run becoming
- * a plausible-looking meal, not to have an opinion about portion sizes. */
+/* Grams in one entry.
+ *
+ * The lower bound is 1 rather than 0 for the same reason the exercise log has
+ * no zero: an entry of nothing is not an entry.
+ *
+ * THE UPPER BOUND IS A PORTION SIZE, and it is meant to be. A kilogram in one
+ * sitting is not a meal anybody logs; three digits covers every real portion
+ * with room to spare, and what falls outside them is a slipped finger or a
+ * corrupt digit run rather than lunch. Keeping the ceiling at the size of a
+ * plausible meal is what lets the keypad offer three slots and every readout
+ * that prints grams reserve three columns -- a looser bound costs width on
+ * screens that have none to spare, to hold space no entry ever uses. */
 #define FOOD_MIN_G 1L
-#define FOOD_MAX_G 20000L
+#define FOOD_MAX_G 999L
 
 /* Epoch bound on an entry instant: same rationale and value as INS_T_MAX,
  * WT_T_MAX and EX_T_MAX. */

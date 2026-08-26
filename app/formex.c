@@ -21,9 +21,9 @@
 
 /* Which page of the EXERCISE LOG table is showing. */
 static int g_exlog_page;
-/* And which span its minutes-per-day plot covers: an index into ui_day_days.
- * Defaults to the first (a week), which is the window the question "how much
- * have I been doing" is usually asked over. */
+/* And which span its plot covers: an index into ui_exday_days. Defaults to
+ * the first, the 24 H view, where the step count is drawn five minutes at a
+ * time against the bands of exercise it was taken during. */
 static int g_exlog_tab;
 
 /* EDIT EXERCISE. The one draft in this file with NO "new entry" state, because
@@ -77,8 +77,21 @@ int form_ex_action(int action, int ix)
        * no stepping or clamping to do here, and no way for the stored page
        * to run past the end the way an unbounded ++ used to. */
       g_exlog_page = ix;
+   } else if (action == MA_STEPS_TOGGLE) {
+      struct prefs sp;
+      settings_get(&sp);
+      if (settings_set_steps_on(!sp.steps_on) != SETTINGS_OK)
+         set_status("NOT SAVED");
+      /* ASK ONLY WHEN SWITCHING ON, and only then: the counter needs
+       * ACTIVITY_RECOGNITION from API 29, and a glucose app demanding activity
+       * data at launch has no visible reason to. Requesting a permission
+       * already held is a no-op, so no state is kept about whether we asked.
+       * The switch itself is honest either way -- the row says WAITING while
+       * the permission is refused, which is what is actually happening. */
+      else if (!sp.steps_on)
+         steps_request_perm();
    } else if (action == MA_EXTAB) {
-      if (ix >= 0 && ix < UI_DAY_TABS)
+      if (ix >= 0 && ix < UI_EXDAY_TABS)
          g_exlog_tab = ix;
       /* THE PICKED BAR IS DROPPED WITH THE SPAN. Its index counts days from
        * the left edge of the old window, so keeping it would move the readout
@@ -228,5 +241,5 @@ void form_ex_view(struct forms_view *out)
    out->ex_err     = g_ex.err;
    out->ex_orig    = g_ex.orig;
    out->exlog_page = g_exlog_page;
-   out->exlog_tab  = g_exlog_tab;
+   out->exlog_tab   = g_exlog_tab;
 }

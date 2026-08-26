@@ -19,6 +19,25 @@ const uint8_t *glyph_for(char c);
 /* strlen for the ASCII strings we render (no libc dependency). */
 int str_len(const char *s);
 
+/* ---- EVERY TEXT SIZE THE APP DRAWS ------------------------------------
+ *
+ * A size is a MULTIPLIER on the 5x7 cell, and each screen works out its own
+ * base from the room it has (ui_fit_scale). What varies between two pieces of
+ * text on one screen is what they scale that base BY, and these are the only
+ * factors any of them may use.
+ *
+ * NOT EVERY SIZE ON SCREEN IS ON THIS LADDER, and the exceptions are all the
+ * same kind: text that is fitted to a space rather than chosen. The big
+ * number fills what the top of the main screen leaves it, the keypad's digits
+ * fill their cells, a long title steps down until it fits (draw_title_fit),
+ * and the plots' scrub readouts fit the width they are given (fit_scale).
+ * Those are answers to "how much room is there", not choices from a
+ * vocabulary, and naming them here would suggest they could be swapped. */
+#define FONT_NOTE(sc)  (((sc) * 2) / 3) /* in-plot marks: the 70/180 labels */
+#define FONT_BODY(sc)  (sc)             /* rows, values: almost all text     */
+#define FONT_TITLE(sc) ((sc) * 2)       /* screen titles and form values     */
+#define FONT_HUGE(sc)  ((sc) * 3)       /* the main screen's '+'             */
+
 /* 5x7 status icons, same bitmap format as the glyphs, for states a letter
  * cannot say. Pure data like the font tables; the renderer's draw_icon blits
  * them. */

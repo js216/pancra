@@ -23,7 +23,7 @@ void render_insulin(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -99,7 +99,7 @@ void render_insdel(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -150,7 +150,7 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -163,7 +163,7 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += 3 * lh;
 
    if (m->ins.ins_nlog <= 0) {
-      draw_str(px, fb, x, y, sc, "No doses logged yet.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NO DOSES LOGGED YET.", UI_MUTED);
       return;
    }
    draw_str(px, fb, x, y, sc, "TIME              TYPE  UNITS", UI_MUTED);
@@ -268,14 +268,14 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * doses fell when is the pattern this plot exists to show. */
       char iu[16];
       (void)ins_units_str(d->milli, iu, sizeof iu);
-      (void)snprintf(line, sizeof line, "%s  %s %s U", when,
-                     d->type == INS_FAST ? "FAST" : "SLOW", iu);
-      int tsc2 = 2 * sc;
-      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
-         tsc2--;
-      int lw = str_len(line) * 6 * tsc2;
-      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
-               UI_TEXT);
+      /* THE DOSE IS THE VALUE; which insulin it was rides with the unit,
+       * because "U FAST" is what the number is a quantity OF. */
+      (void)snprintf(line, sizeof line, "U %s",
+                     d->type == INS_FAST ? "FAST" : "SLOW");
+      char ipad[16];
+      (void)snprintf(ipad, sizeof ipad, "%5s", iu);
+      log_scrub_row(px, fb, x, plot_top - trow, fb->width - (2 * x), sc, 2 * sc,
+                    when, ipad, line);
    } else {
       for (int i = 0; i < UI_DAY_TABS; i++) {
          int lw   = str_len(ui_day_tab_lbl[i]) * 6 * sc;
@@ -317,7 +317,7 @@ void render_weight(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -382,7 +382,7 @@ void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 20);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int y        = (fb->height / 20) + (8 * sc);
@@ -401,7 +401,7 @@ void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    y += lh;
    draw_str(px, fb, x, y, sc, when, UI_TEXT_DIM);
    y += 2 * lh;
-   draw_str(px, fb, x, y, sc, "This cannot be undone.", UI_MUTED);
+   draw_str(px, fb, x, y, sc, "THIS CANNOT BE UNDONE.", UI_MUTED);
    y += 2 * lh;
    int bw = fb->width - (2 * x);
    y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", UI_TEXT, MA_WTDEL_NO, 0);
@@ -543,7 +543,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    struct wt_win w;
    wt_window(wt, now, from, &w);
    if (!w.n) {
-      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "no data in range",
+      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "NO DATA IN RANGE",
                UI_MUTED);
       return;
    }
@@ -599,9 +599,21 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       char dt[20];
       char md[8];
       fmt_date(tt, tz_off, dt, sizeof dt);
-      str_snapshot(md, sizeof md, (str_len(dt) > 5) ? dt + 5 : "");
+      /* A CLOCK ON A SHORT SPAN, A DATE ON A LONG ONE.
+       *
+       * fmt_date lays out "YYYY-MM-DD HH:MM", so the two halves sit at fixed
+       * offsets and both are five characters wide. Which one to show is
+       * decided by how much time the plot covers: four ticks across three
+       * hours all fall on one day and would print one date four times,
+       * saying nothing about where along the axis they sit, while four
+       * across a month all fall at a similar clock time and would repeat one
+       * hour. Two days is the crossover -- past it a tick can no longer be
+       * told from its neighbours by time of day alone. */
+      const int byday = (w.tmax - w.tmin) > 2 * 86400;
+      const int off   = byday ? 5 : 11;
+      str_snapshot(md, sizeof md, (str_len(dt) > off) ? dt + off : "");
       if (str_len(md) > 5)
-         md[5] = 0; /* "MM-DD" */
+         md[5] = 0; /* "MM-DD" or "HH:MM" */
       int lw = str_len(md) * 6 * sc;
       draw_str(px, fb, gx - (lw / 2), py0 + ph - (9 * sc), sc, md, UI_DISCLAIM);
    }
@@ -663,7 +675,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -675,7 +687,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
    y += 3 * lh;
 
    if (wt->nwt <= 0) {
-      draw_str(px, fb, x, y, sc, "No weights logged yet.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NO WEIGHTS LOGGED YET.", UI_MUTED);
       return;
    }
 
@@ -772,16 +784,16 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
       char line[48];
       fmt_weight(p->g, prefs->wunits, wv, sizeof wv);
       fmt_date(p->t, tz_off, when, sizeof when);
-      (void)snprintf(line, sizeof line, "%s   %s", when, wv);
-      int tsc2 = 2 * sc;
-      while (tsc2 > sc && str_len(line) * 6 * tsc2 > fb->width - (4 * sc))
-         tsc2--;
-      int lw = str_len(line) * 6 * tsc2;
-      /* White, and the point marked in UI_HILITE grey -- the same pair the
-       * glucose plot uses. Green means "on / enabled" everywhere else in this
-       * app; a readout is neither. Top-aligned in the tab row, as there. */
-      draw_str(px, fb, (fb->width - lw) / 2, plot_top - trow, tsc2, line,
-               UI_TEXT);
+      /* THE INSTANT, THE WEIGHT, THE UNIT -- the app's one readout layout;
+       * see log_scrub_row. White for the value and the point marked in
+       * UI_HILITE grey, the same pair the glucose plot uses: green means
+       * "on / enabled" everywhere else in this app, and a readout is
+       * neither. */
+      /* Right-aligned in a fixed field so the digits keep their columns as
+        * the finger moves; see the main plot's readout, which explains why. */
+      (void)snprintf(line, sizeof line, "%5s", wv);
+      log_scrub_row(px, fb, x, plot_top - trow, fb->width - (2 * x), sc, 2 * sc,
+                    when, line, wt_unit_name(prefs->wunits));
       /* No tab targets while scrubbing: the row is not showing tabs, and a
        * target that does not match what is drawn is how a drag ends up
        * changing the span it was only trying to read. */
@@ -829,11 +841,30 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
  * and a day's insulin no single type. One dot per entry keeps every entry's
  * own category, which is the thing being asked for. */
 
+const int ui_exday_hours[UI_EXDAY_TABS] = {6, 24, 30 * 24, 90 * 24, 0};
+const char *const ui_exday_tab_lbl[UI_EXDAY_TABS] = {"6H", "24H", "1M", "3M",
+                                                     "ALL"};
+
 const int ui_day_days[UI_DAY_TABS]            = {7, 14, 30, 90, 0};
 const char *const ui_day_tab_lbl[UI_DAY_TABS] = {"1W", "2W", "1M", "3M",
                                                  "ALL"};
 
 #define LOG_PAD 4
+
+/* The EXERCISE LOG's version, over ui_exday_days -- and its ALL tab reaches
+ * back to whichever of the TWO logs starts earlier, because the plot draws
+ * both and a span that covered only one of them would cut the other off. */
+long exday_from_of(int tab, long now, long oldest_ex, long oldest_step)
+{
+   if (tab < 0 || tab >= UI_EXDAY_TABS)
+      tab = 0;
+   if (ui_exday_hours[tab] > 0)
+      return now - ((long)ui_exday_hours[tab] * 3600);
+   long o = oldest_ex;
+   if (o <= 0 || (oldest_step > 0 && oldest_step < o))
+      o = oldest_step;
+   return (o > 0 && o < now) ? o : now;
+}
 
 long day_from_of(int tab, long now, long oldest)
 {
@@ -871,18 +902,25 @@ static void log_window(const struct log_pt *p, int n, long from, long now,
       if (p[i].t < from || p[i].t > now)
          continue;
       if (!w->n) {
-         w->tmin = p[i].t;
-         w->lo   = p[i].v;
-         w->hi   = p[i].v;
+         w->lo = p[i].v;
+         w->hi = p[i].v;
       }
-      if (p[i].t < w->tmin)
-         w->tmin = p[i].t;
       if (p[i].v < w->lo)
          w->lo = p[i].v;
       if (p[i].v > w->hi)
          w->hi = p[i].v;
       w->n++;
    }
+   /* THE X AXIS IS THE SELECTED SPAN, not the data's own extent -- tmin and
+    * tmax are the `from` and `now` set above and nothing below moves them.
+    *
+    * Collapsing them onto the first and last point made a tab a lie: "3M"
+    * holding a week of entries drew that week across the full width, pixel
+    * for pixel identical to the "1W" view, with only the date ticks to tell
+    * them apart. A span the user picked has to be the span they get, and a
+    * short history leaves the left of the plot empty -- which is the truth
+    * about a short history. The weight trend already worked this way; this is
+    * the same rule, stated in the other plot. */
    if (w->tmax <= w->tmin)
       w->tmax = w->tmin + 1; /* never divide by a zero-width window */
    /* lo AND hi ARE THE DATA'S OWN, even when they are equal. Widening the
@@ -912,6 +950,32 @@ static void log_pads(int ph, int sc, int *pad_t, int *pad_b)
    *pad_b = b;
 }
 
+/* Where a series stands at `t`, interpolated between the two entries either
+ * side of it. Used only for the instant a segment crosses the window's edge,
+ * which is why a zero-width step answers with the later value rather than
+ * dividing. */
+static long log_cross(const struct log_pt *a, const struct log_pt *b, long t)
+{
+   const long dt = b->t - a->t;
+   if (dt <= 0)
+      return b->v;
+   return a->v + (((b->v - a->v) * (t - a->t)) / dt);
+}
+
+/* One straight run between two plotted points, stepped along whichever axis is
+ * longer so the line has no gaps. */
+static void log_seg(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x0,
+                    int y0, int x1, int y1, int sc, uint32_t c)
+{
+   const int dx = x1 - x0;
+   const int dy = y1 - y0;
+   const int ax = dx < 0 ? -dx : dx;
+   const int ay = dy < 0 ? -dy : dy;
+   const int st = ax > ay ? ax : ay;
+   for (int k = 1; k <= st && st > 0; k++)
+      fill_rect(px, fb, x0 + ((dx * k) / st), y0 + ((dy * k) / st), sc, sc, c);
+}
+
 static int log_px(const struct log_win *w, long t, int px0, int pw, int pad)
 {
    return px0 + pad +
@@ -933,6 +997,38 @@ static int log_py(const struct log_win *w, long v, int py0, int ph, int pad_t,
       return py0 + pad_t + (band / 2);
    return py0 + pad_t + band -
           (int)(((v - w->lo) * (long)band) / (w->hi - w->lo));
+}
+
+/* THE EXERCISE PLOT PICKS ON X ALONE, at the press as well as during the drag.
+ *
+ * Its two series do not share a vertical scale -- see exlog_plot -- so there is
+ * no single y a finger can be near, and log_pick's opening both-axes measure
+ * would be comparing a distance in minutes against one in steps and taking
+ * whichever came out numerically smaller. There is nothing for it to decide in
+ * any case: the day tabs put both series on the same instants, so an x names
+ * one DAY and the readout gives both of that day's numbers, and the 24 H tab
+ * has only the step buckets on it. */
+static int ex_pick(const struct log_pt *p, int n, long from, long now, int px0,
+                   int pw, int sc, int x)
+{
+   struct log_win w;
+   log_window(p, n, from, now, &w);
+   if (!w.n)
+      return -1;
+   const int pad = LOG_PAD * sc;
+   int best      = -1;
+   long bd       = 0;
+   for (int i = 0; i < n; i++) {
+      if (p[i].t < from || p[i].t > now)
+         continue; /* the same window the renderer draws, or the pick misses */
+      const long dx = log_px(&w, p[i].t, px0, pw, pad) - x;
+      const long d  = dx * dx;
+      if (best < 0 || d < bd) {
+         bd   = d;
+         best = i;
+      }
+   }
+   return best;
 }
 
 int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
@@ -986,6 +1082,82 @@ int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
    return best;
 }
 
+/* THE PLOT'S FURNITURE: the divisions and the date ticks, which every log
+ * plot draws identically and none of them owns.
+ *
+ * ONE DEFINITION, because the two callers differ only in what they put INSIDE
+ * the frame -- one scale or two -- and a grid that drifted between them would
+ * make the same span look like two different charts. */
+static void log_chrome(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+                       const struct log_win *w, int px0, int py0, int pw,
+                       int ph, int sc, long tz_off, int pad, int pad_t,
+                       int pad_b, long step)
+{
+   const uint32_t grid = UI_LOG_GRID;
+   for (int i = 1; i < 4; i++)
+      fill_rect(px, fb, px0 + 1,
+                py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4), pw - 2, 1,
+                grid);
+   /* WHERE THE VERTICAL DIVISIONS FALL.
+    *
+    * `step` > 0 puts them on ROUND INSTANTS -- a whole number of hours in
+    * local time -- rather than at even fractions of the window. On a span of
+    * hours the difference is the whole point of the axis: fifths of six hours
+    * land on 07:12 and 08:24, and a reader who wants to know what they were
+    * doing at nine has to interpolate between two arbitrary numbers. The
+    * window slides with `now`, so these lines drift leftward across the plot
+    * while their labels stay put, which is the honest way round.
+    *
+    * `step` == 0 keeps the even fractions, which is right for the spans
+    * measured in weeks: there is no round instant a month-long axis wants to
+    * be cut at, and a fixed count keeps the plot's furniture stable. */
+   const int nticks = 4; /* 3 interior + the right edge; see the label loop */
+   const int half   = (5 * 6 * sc) / 2; /* a 5-glyph label's half-width */
+   for (int i = 1; i <= nticks; i++) {
+      long tt;
+      int gx;
+      if (step > 0) {
+         /* The i-th round instant at or after the window's left edge. */
+         long t0 = (((w->tmin + tz_off) / step) * step) - tz_off;
+         if (t0 < w->tmin)
+            t0 += step;
+         tt = t0 + ((long)(i - 1) * step);
+         if (tt > w->tmax)
+            break;
+         gx = log_px(w, tt, px0, pw, pad);
+      } else {
+         gx = px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1));
+         tt = w->tmin + (((w->tmax - w->tmin) * (long)i) / (long)(nticks + 1));
+      }
+      fill_rect(px, fb, gx, py0 + 1, 1, ph - 2, grid);
+      /* A LABEL THAT WOULD RUN OFF ITS OWN PLOT IS NOT DRAWN. The rule still
+       * is: the division is the thing being marked, and half a date under it
+       * reads as a rendering fault rather than as a number. */
+      if (gx - half < px0 || gx + half > px0 + pw)
+         continue;
+      char dt[20];
+      char md[8];
+      fmt_date(tt, tz_off, dt, sizeof dt);
+      /* A CLOCK ON A SHORT SPAN, A DATE ON A LONG ONE.
+       *
+       * fmt_date lays out "YYYY-MM-DD HH:MM", so the two halves sit at fixed
+       * offsets and both are five characters wide. Which one to show is
+       * decided by how much time the plot covers: four ticks across three
+       * hours all fall on one day and would print one date four times,
+       * saying nothing about where along the axis they sit, while four
+       * across a month all fall at a similar clock time and would repeat one
+       * hour. Two days is the crossover -- past it a tick can no longer be
+       * told from its neighbours by time of day alone. */
+      const int byday = (w->tmax - w->tmin) > 2 * 86400;
+      const int off   = byday ? 5 : 11;
+      str_snapshot(md, sizeof md, (str_len(dt) > off) ? dt + off : "");
+      if (str_len(md) > 5)
+         md[5] = 0; /* "MM-DD" or "HH:MM" */
+      draw_str(px, fb, gx - ((str_len(md) * 6 * sc) / 2), py0 + ph - (9 * sc),
+               sc, md, UI_DISCLAIM);
+   }
+}
+
 /* An axis value as text at the scale its series is held in. dp 0 prints the
  * number; dp 3 renders thousandths the way a dose is written, which is what
  * ins_units_str already does -- one renderer for both, so an axis and a
@@ -1007,7 +1179,7 @@ void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    struct log_win w;
    log_window(p, n, from, now, &w);
    if (!w.n) {
-      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "no data in range",
+      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "NO DATA IN RANGE",
                UI_MUTED);
       return;
    }
@@ -1016,15 +1188,7 @@ void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    int pad_b     = 0;
    log_pads(ph, sc, &pad_t, &pad_b);
 
-   const uint32_t grid = UI_LOG_GRID;
-   for (int i = 1; i < 4; i++)
-      fill_rect(px, fb, px0 + 1,
-                py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4), pw - 2, 1,
-                grid);
-   const int nticks = 4; /* 3 interior + the right edge; see the label loop */
-   for (int i = 1; i <= nticks; i++)
-      fill_rect(px, fb, px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1)),
-                py0 + 1, 1, ph - 2, grid);
+   log_chrome(px, fb, &w, px0, py0, pw, ph, sc, tz_off, pad, pad_t, pad_b, 0);
 
    /* BOTH BOUNDS, each against the axis end it names -- not one "lo-hi" in a
     * corner, which states the range but not which end is which way up. */
@@ -1039,46 +1203,61 @@ void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       draw_str(px, fb, px0 + (4 * sc), py0 + ph - (19 * sc), sc, lab, UI_MUTED);
    }
 
-   for (int i = 1; i <= nticks; i++) {
-      const int gx = px0 + pad + (((pw - (2 * pad)) * i) / (nticks + 1));
-      const long tt =
-          w.tmin + (((w.tmax - w.tmin) * (long)i) / (long)(nticks + 1));
-      char dt[20];
-      char md[8];
-      fmt_date(tt, tz_off, dt, sizeof dt);
-      str_snapshot(md, sizeof md, (str_len(dt) > 5) ? dt + 5 : "");
-      if (str_len(md) > 5)
-         md[5] = 0; /* "MM-DD" */
-      draw_str(px, fb, gx - ((str_len(md) * 6 * sc) / 2), py0 + ph - (9 * sc),
-               sc, md, UI_DISCLAIM);
-   }
-
    /* ONE PASS PER SERIES, so each trace joins only its own entries and the
-    * line never crosses between two kinds. */
+    * line never crosses between two kinds.
+    *
+    * A SEGMENT THAT CROSSES THE WINDOW'S EDGE IS DRAWN AS FAR AS THE EDGE.
+    *
+    * Skipping every out-of-window point took the crossing segment with it, so
+    * a trace whose previous entry fell just before the span began started in
+    * mid-air a little way in from the frame -- the reader sees a gap and has
+    * no way to tell "no doses that early" from "the line is off-screen".
+    * There IS a line there: it is the run between two real entries, and part
+    * of it lies inside the plot.
+    *
+    * The out-of-window end is not drawn where it belongs -- that is off the
+    * plot, and a line stepped to it would spill across the frame -- so it is
+    * replaced by where the segment CUTS the edge, interpolated between the
+    * two entries. The visible part is then exactly the part that is inside,
+    * and it meets the frame instead of stopping short of it. Only the line:
+    * an entry outside the span still gets no marker, because there is no
+    * instant on this axis to put one at. */
    for (int s = 0; s < ncol; s++) {
-      int prevx = 0;
-      int prevy = 0;
-      int have  = 0;
+      const struct log_pt *pv = NULL; /* previous entry of THIS series */
+      int prevx               = 0;
+      int prevy               = 0;
+      int have                = 0;
       for (int i = 0; i < n; i++) {
-         if (p[i].series != s || p[i].t < from || p[i].t > now)
+         if (p[i].series != s)
             continue;
-         const int cx = log_px(&w, p[i].t, px0, pw, pad);
-         const int cy = log_py(&w, p[i].v, py0, ph, pad_t, pad_b);
-         if (have) {
-            const int dx = cx - prevx;
-            const int dy = cy - prevy;
-            const int ax = dx < 0 ? -dx : dx;
-            const int ay = dy < 0 ? -dy : dy;
-            const int st = ax > ay ? ax : ay;
-            for (int k = 1; k <= st && st > 0; k++)
-               fill_rect(px, fb, prevx + ((dx * k) / st),
-                         prevy + ((dy * k) / st), sc, sc, col[s]);
+         const struct log_pt *cu = &p[i];
+         if (cu->t >= from && cu->t <= now) {
+            const int cx = log_px(&w, cu->t, px0, pw, pad);
+            const int cy = log_py(&w, cu->v, py0, ph, pad_t, pad_b);
+            if (!have && pv && pv->t < from) {
+               prevx = log_px(&w, from, px0, pw, pad);
+               prevy = log_py(&w, log_cross(pv, cu, from), py0, ph, pad_t,
+                              pad_b);
+               have  = 1;
+            }
+            if (have)
+               log_seg(px, fb, prevx, prevy, cx, cy, sc, col[s]);
+            fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc,
+                      col[s]);
+            prevx = cx;
+            prevy = cy;
+            have  = 1;
+         } else if (have && cu->t > now) {
+            /* Leaving to the right: only reachable from an entry dated in the
+             * future, which the forms accept and log_window excludes. The
+             * line still runs to the edge rather than stopping at the last
+             * real reading. */
+            log_seg(px, fb, prevx, prevy, log_px(&w, now, px0, pw, pad),
+                    log_py(&w, log_cross(pv, cu, now), py0, ph, pad_t, pad_b),
+                    sc, col[s]);
+            have = 0;
          }
-         fill_rect(px, fb, cx - (2 * sc), cy - (2 * sc), 4 * sc, 4 * sc,
-                   col[s]);
-         prevx = cx;
-         prevy = cy;
-         have  = 1;
+         pv = cu;
       }
    }
 
@@ -1129,48 +1308,180 @@ int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
    return n;
 }
 
-/* Local midnight at or before `t`, read in the offset the rest of the screen
- * renders its dates in. ONE offset for the whole plot, the same one the table
- * above it uses: a point and the rows it totals must land on the same date,
- * and reading each instant in its own historical offset would put a session
- * from the other side of a DST change on a different day from the row that
- * prints it. */
-static long day_of(long t, long tz_off)
+/* THE EXERCISE LOG'S TWO SERIES, on whichever grid the chosen tab uses.
+ *
+ * SERIES 0 IS EXERCISE, one point per day carrying every minute exercised
+ * that day whatever the level. Not one point per session, and not one series
+ * per level: the question the plot answers is how much was done each day, and
+ * a day's exercise is a total -- a morning walk and an evening run are one
+ * day's effort, not two competing readings. Splitting by level would also
+ * leave a day with both no single colour to be. THE ZERO DAYS ARE DRAWN,
+ * because a rest day is data; emitting only the days with something on them
+ * would join two active days with a line straight across the gap.
+ *
+ * SERIES 1 IS THE STEP COUNT on the same grid, so the two can be read against
+ * each other -- which is the whole reason they share a plot. The scales are
+ * not shared; see exlog_plot.
+ *
+ * THE 24 H TAB IS A DIFFERENT GRID and a different shape. A day of steps is
+ * worth seeing at the resolution it was recorded in, so there the buckets are
+ * the log's own five minutes and exercise stops being a curve: a day holds
+ * one or two sessions, which as a line is two spikes and a lot of floor.
+ * `band` takes it instead -- the level in force during each bucket -- and
+ * exlog_plot draws that as a strip.
+ */
+/* The start of the bucket `t` falls in, read in the offset the rest of the
+ * screen renders its dates in. ONE offset for the whole plot, the same one the
+ * table above it uses: a point and the rows it totals must land on the same
+ * date, and reading each instant in its own historical offset would put a
+ * session from the other side of a DST change on a different day from the row
+ * that prints it. Five-minute buckets need no such care -- every zone this app
+ * meets is a whole number of hours off -- but they go through the same floor
+ * so one rule covers both. */
+static long ex_floor(long t, long width, long tz_off)
 {
    const long l = t + tz_off;
-   long d       = l / 86400;
-   if (l < 0 && (l % 86400) != 0)
+   long d       = l / width;
+   if (l < 0 && (l % width) != 0)
       d--; /* floor, not the truncation toward zero C division gives */
-   return (d * 86400) - tz_off;
+   return (d * width) - tz_off;
 }
 
-/* ONE POINT PER DAY, carrying every minute exercised that day whatever the
- * level.
- *
- * NOT one point per session, and not one series per level. The question this
- * plot answers is how much was done each day, and a day's exercise is a total
- * -- a morning walk and an evening run are one day's effort, not two competing
- * readings. Splitting by level would also give a day with both no single
- * colour to be.
- *
- * THE ZERO DAYS ARE DRAWN, because a rest day is data. Emitting only the days
- * with something on them would join two active days with a line straight
- * across the gap, drawing effort that did not happen. */
-int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from)
+/* Every minute of a record that falls inside the plot, the running session
+ * measured up to `now`. Its `dur` is 0 until it is closed, so taking the
+ * column at face value would leave today flat through an hour's walk and then
+ * jump; a row that is open and is NOT running has no length at all and adds
+ * nothing, which is the same distinction the MIN column draws. */
+static long ex_secs_of(const struct screen *m, int i)
 {
-   const long f = day_from_of(m->food.exlog_tab, m->now,
-                              (m->food.nexlog > 0) ? m->food.exlog[0].t : 0);
-   long d0      = day_of(f, m->tz_off);
-   const long d1 = day_of(m->now, m->tz_off);
-   long n        = ((d1 - d0) / 86400) + 1;
+   const struct ex_rec *e = &m->food.exlog[i];
+   if (i == m->food.exlog_act)
+      return (m->now > e->t) ? m->now - e->t : 0;
+   return e->dur;
+}
+
+/* Local midnight at or before `t`. Exported so the EXERCISE LOG's TODAY line
+ * and the plot's day buckets floor the day identically -- two copies of this
+ * is how a total comes to disagree with the bar beside it. */
+long ex_day_floor(long t, long tz_off)
+{
+   return ex_floor(t, 86400, tz_off);
+}
+
+/* HOW WIDE A BUCKET IS on the sub-day tabs, and the ONE place that decides.
+ *
+ * Six hours of steps is worth seeing at the resolution the log records in.
+ * A whole day at that resolution is 288 buckets sharing a few hundred pixels
+ * -- a smear rather than data, and a readout that answers "how many steps in
+ * these five minutes" when the question a day-long view asks is "when was I
+ * moving". An hour is the unit that question comes in.
+ *
+ * The plot, the exercise band under it, the axis label and the scrub readout
+ * must all agree about this number, which is why they ask for it rather than
+ * each writing it down. */
+long ex_bucket_for(int hours)
+{
+   return (hours <= 6) ? STEP_BUCKET_S : 3600;
+}
+
+/* The bucket's name for the axis: whole hours say so, anything shorter says
+ * how many minutes it is. */
+void ex_bucket_word(long width, char *out, int n)
+{
+   if (width >= 3600)
+      (void)snprintf(out, (size_t)n, "HOUR");
+   else
+      (void)snprintf(out, (size_t)n, "%ld MIN", width / 60);
+}
+
+int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
+              unsigned char *band, int bandcap)
+{
+   int tab = m->food.exlog_tab;
+   if (tab < 0 || tab >= UI_EXDAY_TABS)
+      tab = 0;
+
+   /* ---- A DAY OR LESS: bucketed steps, exercise as a band ---- */
+   if (ui_exday_hours[tab] > 0 && ui_exday_hours[tab] <= 24) {
+      const long width = ex_bucket_for(ui_exday_hours[tab]);
+      const long start =
+          ex_floor(m->now - ((long)ui_exday_hours[tab] * 3600), width,
+                   m->tz_off);
+      long n = ((ex_floor(m->now, width, m->tz_off) - start) / width) + 1;
+      if (n < 1)
+         n = 1;
+      if (n > cap)
+         n = cap;
+      if (from)
+         *from = start;
+      for (long i = 0; i < n; i++) {
+         out[i].t      = start + (i * width);
+         out[i].v      = 0;
+         out[i].series = 1;
+      }
+      int got = 0;
+      for (int i = 0; i < m->food.nsteps; i++) {
+         const long k =
+             (ex_floor(m->food.steps[i].t, width, m->tz_off) - start) / width;
+         if (k >= 0 && k < n) {
+            out[k].v += m->food.steps[i].n;
+            got = 1;
+         }
+      }
+      /* THE OPEN WINDOW, WHILE IT IS STILL EMPTY, IS NOT A DATAPOINT: it has
+       * not closed, so nothing has been written for it and nothing is known
+       * about it. Earlier zeroes stay -- those windows did close, and their
+       * emptiness was observed. */
+      if (n > 0 && out[n - 1].v == 0)
+         n--;
+      /* THE BAND, one entry per bucket, carrying the HARDEST level in force
+       * during it. A bucket straddling the end of one session and the start
+       * of a harder one is coloured by the harder: the strip answers "was I
+       * exercising, and how hard", and the gentler reading would understate
+       * it. */
+      if (band) {
+         const long bn = (n < bandcap) ? n : bandcap;
+         for (long i = 0; i < bn; i++)
+            band[i] = 0;
+         for (int i = 0; i < m->food.nexlog; i++) {
+            const long secs = ex_secs_of(m, i);
+            if (secs <= 0)
+               continue;
+            const struct ex_rec *e = &m->food.exlog[i];
+            long k0                = (e->t - start) / width;
+            long k1                = (e->t + secs - 1 - start) / width;
+            if (e->t < start)
+               k0 = 0;
+            if (k1 >= bn)
+               k1 = bn - 1;
+            if (k0 < 0)
+               k0 = 0;
+            for (long k = k0; k <= k1; k++)
+               if (band[k] < (unsigned char)e->level)
+                  band[k] = (unsigned char)e->level;
+         }
+      }
+      return got ? (int)n : 0;
+   }
+
+   /* ---- THE DAY TABS: both series, one point per day each ---- */
+   /* HALF THE ARRAY EACH. Two series live in one array, so the day count is
+    * bounded by half the capacity rather than all of it. */
+   const int half = cap / 2;
+   const long f   = exday_from_of(tab, m->now,
+                                  (m->food.nexlog > 0) ? m->food.exlog[0].t : 0,
+                                  (m->food.nsteps > 0) ? m->food.steps[0].t : 0);
+   long d0        = ex_floor(f, 86400, m->tz_off);
+   const long d1  = ex_floor(m->now, 86400, m->tz_off);
+   long n         = ((d1 - d0) / 86400) + 1;
    if (n < 1)
       n = 1;
-   if (n > cap) {
+   if (n > half) {
       /* CLAMPED FROM THE OLD END, so the right-hand edge stays today.
        * Dropping the newest days instead would quietly turn a long span into
        * a chart of some earlier window with nothing on screen to say so. */
-      d0 = d1 - ((long)(cap - 1) * 86400);
-      n  = cap;
+      d0 = d1 - ((long)(half - 1) * 86400);
+      n  = half;
    }
    /* The window starts at the first day drawn, not at the raw span start: a
     * point sits at its day's MIDNIGHT, so a `from` part-way through that day
@@ -1178,28 +1489,240 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from)
    if (from)
       *from = d0;
    for (long i = 0; i < n; i++) {
-      out[i].t      = d0 + (i * 86400);
-      out[i].v      = 0;
-      out[i].series = 0;
+      out[i].t          = d0 + (i * 86400);
+      out[i].v          = 0;
+      out[i].series     = 0;
+      out[n + i].t      = out[i].t;
+      out[n + i].v      = 0;
+      out[n + i].series = 1;
    }
    for (int i = 0; i < m->food.nexlog; i++) {
-      const struct ex_rec *e = &m->food.exlog[i];
-      /* THE RUNNING SESSION COUNTS WHAT IT HAS DONE SO FAR. Its dur is 0
-       * until it is closed, so taking the column at face value would leave
-       * today flat through an hour's walk and then jump. A row that is open
-       * and is NOT running has no length at all and adds nothing -- the same
-       * distinction the MIN column draws. */
-      long secs = e->dur;
-      if (i == m->food.exlog_act)
-         secs = (m->now > e->t) ? m->now - e->t : 0;
+      const long secs = ex_secs_of(m, i);
       if (secs <= 0)
          continue;
-      const long k = (day_of(e->t, m->tz_off) - d0) / 86400;
+      const long k = (ex_floor(m->food.exlog[i].t, 86400, m->tz_off) - d0)
+                     / 86400;
       if (k < 0 || k >= n)
          continue; /* outside the span, which also drops a mistyped year */
       out[k].v += secs / 60;
    }
-   return (int)n;
+   for (int i = 0; i < m->food.nsteps; i++) {
+      const long k = (ex_floor(m->food.steps[i].t, 86400, m->tz_off) - d0)
+                     / 86400;
+      if (k >= 0 && k < n)
+         out[n + k].v += m->food.steps[i].n;
+   }
+   return (int)(2 * n);
+}
+
+/* WHERE A VALUE SITS ON ITS OWN AXIS, from zero to that series' maximum.
+ *
+ * ZERO IS ALWAYS THE FLOOR, unlike log_py's data-relative scale. Both series
+ * here are counts of something done -- minutes, steps -- so a day with none
+ * is a real zero and belongs at the bottom; floating the axis on the smallest
+ * value would draw the quietest day of the week as though it were nothing at
+ * all, and the two series would each float by a different amount and stop
+ * being comparable. */
+static int ex_py(long v, long hi, int py0, int ph, int pad_t, int pad_b)
+{
+   const int h = ph - pad_t - pad_b;
+   if (hi <= 0 || h <= 0)
+      return py0 + pad_t + (h > 0 ? h : 0);
+   long yy = (v * (long)h) / hi;
+   if (yy < 0)
+      yy = 0;
+   if (yy > h)
+      yy = h;
+   return py0 + pad_t + h - (int)yy;
+}
+
+void exlog_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+                const struct log_pt *p, int n, long from, long now, int px0,
+                int py0, int pw, int ph, int sc, long tz_off, int hilite,
+                const unsigned char *band, long bucket)
+{
+   struct log_win w;
+   log_window(p, n, from, now, &w);
+   draw_frame(px, fb, px0, py0, pw, ph, UI_LOG_FRAME);
+   if (!w.n) {
+      draw_str(px, fb, px0 + (4 * sc), py0 + (ph / 2), sc, "NO DATA IN RANGE",
+               UI_MUTED);
+      return;
+   }
+   const int pad = LOG_PAD * sc;
+   int pad_t     = 0;
+   int pad_b     = 0;
+   log_pads(ph, sc, &pad_t, &pad_b);
+   /* ROUND HOURS WHEN THE SPAN IS SHORT ENOUGH FOR THEM TO MEAN SOMETHING,
+    * which is exactly when the exercise band is drawn -- both are the sub-day
+    * tabs. The step is the smallest of the usual divisions that still leaves
+    * about four lines on the plot, so six hours is cut at every second hour
+    * and a day at every sixth. */
+   long step = 0;
+   if (band) {
+      static const long cand[] = {3600,     2 * 3600,  3 * 3600,
+                                  6 * 3600, 12 * 3600, 86400};
+      const long want          = (w.tmax - w.tmin) / 5;
+      for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+         step = cand[i];
+         if (cand[i] >= want)
+            break;
+      }
+   }
+   log_chrome(px, fb, &w, px0, py0, pw, ph, sc, tz_off, pad, pad_t, pad_b,
+              step);
+
+   /* EACH SERIES GETS ITS OWN CEILING. Minutes of exercise and thousands of
+    * steps on one scale is not a comparison -- it is the step curve with a
+    * flat line under it -- so the two are drawn against separate axes and the
+    * axes are labelled in their series' own colour, which is what says which
+    * number belongs to which trace. */
+   long hi[2] = {0, 0};
+   int cnt[2] = {0, 0};
+   for (int i = 0; i < n; i++) {
+      if (p[i].t < from || p[i].t > now)
+         continue;
+      const int sx = (p[i].series == 1) ? 1 : 0;
+      cnt[sx]++;
+      if (p[i].v > hi[sx])
+         hi[sx] = p[i].v;
+   }
+   static const uint32_t excol[2] = {UI_EX_MOD, UI_MUTED};
+
+   /* THE EXERCISE BAND, on the 24 H tab: a strip below the data showing when a
+    * session was running and how hard, in the same blues the level wears
+    * everywhere else. It sits in the bottom inset rather than over the plot
+    * -- laid across the step trace it would read as a series of its own. */
+   if (band) {
+      const int by = py0 + ph - pad_b + (2 * sc);
+      const int bh = 8 * sc;
+      for (int i = 0; i < n; i++) {
+         if (!band[i] || p[i].t < from || p[i].t > now)
+            continue;
+         const int x0 = log_px(&w, p[i].t, px0, pw, pad);
+         const int x1 = log_px(&w, p[i].t + bucket, px0, pw, pad);
+         int bw       = x1 - x0;
+         if (bw < 1)
+            bw = 1;
+         fill_rect(px, fb, x0, by, bw, bh, ui_ex_color(band[i], UI_EX_LIGHT));
+      }
+   }
+
+   /* THE AXIS BOUNDS, each against the side it belongs to. The right-hand
+    * labels are pushed back by their own width so they end on the margin
+    * rather than running past the frame. */
+   {
+      char lab[24];
+      if (cnt[0] > 0) {
+         /* Series 0 only ever appears on the day-bucketed tabs -- the short
+          * spans draw exercise as a band instead -- so a point here is always
+          * one day's total, which the dates along the axis already say. */
+         (void)snprintf(lab, sizeof lab, "%ld MIN", hi[0]);
+         draw_str(px, fb, px0 + (4 * sc), py0 + (3 * sc), sc, lab, excol[0]);
+      }
+      if (cnt[1] > 0) {
+         /* THE BUCKET IS NAMED ONLY WHERE IT IS SURPRISING. On the spans
+          * drawn five minutes at a time, a bare "700 STEPS" against a spike
+          * reads as a running total or as a day's worth, so the window has to
+          * be spelt out. A day-bucketed tab needs no such note: a point there
+          * IS a day, which the date under it already says, and repeating it
+          * on the axis is a word that tells the reader nothing they are not
+          * looking straight at. */
+         if (band) {
+            char bw[12];
+            ex_bucket_word(bucket, bw, sizeof bw);
+            (void)snprintf(lab, sizeof lab, "%ld STEPS / %s", hi[1], bw);
+         } else {
+            (void)snprintf(lab, sizeof lab, "%ld STEPS", hi[1]);
+         }
+         const int lw = str_len(lab) * 6 * sc;
+         draw_str(px, fb, px0 + pw - (4 * sc) - lw, py0 + (3 * sc), sc, lab,
+                  excol[1]);
+      }
+   }
+
+   /* ONE PASS PER SERIES, so a trace joins only its own entries.
+    *
+    * EVERY POINT IS MARKED, AT THE GLUCOSE PLOT'S OWN MARKER SIZE.
+    *
+    * A plot of a measurement has to show where the measurements ARE; a bare
+    * line reads as something continuous rather than as a reading every five
+    * minutes. And the size is not a fresh decision: this app draws one kind
+    * of datapoint, and a step that was a different size from a glucose
+    * reading would say the two are different kinds of thing.
+    *
+    * render_glucose derives 3*sc/2, and plot_render draws a point carrying its
+    * own styling -- which every reading from a registered sensor does, i.e.
+    * all of them in practice -- one radius larger, then scales by the
+    * device's marker size over the default. So the mark a reader is actually
+    * comparing these against is (3*sc/2 + 1) * size / 2, and that expression
+    * is written out here rather than the number it currently comes to.
+    *
+    * AT THE DEFAULT SIZE, which is what a step count has: there is no device
+    * behind these points whose marker a user could have restyled, so they
+    * take MARK_SIZE_DEF. A sensor set to some other size will therefore draw
+    * larger or smaller dots than these -- correctly, since that setting
+    * exists to tell one sensor's trace from another's, and steps are neither.
+    *
+    * TWO SCALES, ONE FORMULA. `sc` here is this screen's and render_glucose's
+    * is the main screen's; they agree on the test phone and need not on a
+    * window short enough for the two fits to part company.
+    *
+    * Sizing them to the spacing instead was an invention: it made every tab's
+    * dots a different size, which is the one thing a shared visual vocabulary
+    * must not do. */
+   const int mr = (((3 * sc) / 2) + 1) * MARK_SIZE_DEF / 2;
+   for (int sx = 0; sx < 2; sx++) {
+      int prevx      = 0;
+      int prevy      = 0;
+      int have       = 0;
+      for (int i = 0; i < n; i++) {
+         if (((p[i].series == 1) ? 1 : 0) != sx || p[i].t < from ||
+             p[i].t > now)
+            continue;
+         const int cx = log_px(&w, p[i].t, px0, pw, pad);
+         const int cy = ex_py(p[i].v, hi[sx], py0, ph, pad_t, pad_b);
+         if (have) {
+            const int dx = cx - prevx;
+            const int dy = cy - prevy;
+            const int ax = dx < 0 ? -dx : dx;
+            const int ay = dy < 0 ? -dy : dy;
+            const int st = ax > ay ? ax : ay;
+            for (int k = 1; k <= st && st > 0; k++)
+               fill_rect(px, fb, prevx + ((dx * k) / st),
+                         prevy + ((dy * k) / st), sc, sc, excol[sx]);
+         }
+         fill_rect(px, fb, cx - mr, cy - mr, (2 * mr) + 1, (2 * mr) + 1,
+                   excol[sx]);
+         prevx = cx;
+         prevy = cy;
+         have  = 1;
+      }
+   }
+
+   /* SCRUB CURSOR: the same full-height rule and greyed marker the other
+    * plots use, each placed on its own series' axis.
+    *
+    * EVERY POINT AT THE PICKED INSTANT IS MARKED, not just the one the finger
+    * resolved to. The readout answers with BOTH series for a day -- that is
+    * the whole reason this plot carries two -- so highlighting only one of
+    * them left the reader matching a number against an unmarked curve, and
+    * the marked curve was whichever ex_pick happened to reach first. On the
+    * sub-day tabs there is only the step series, so this marks the one point
+    * there is. */
+   if (hilite >= 0 && hilite < n && p[hilite].t >= from &&
+       p[hilite].t <= now) {
+      const int cx = log_px(&w, p[hilite].t, px0, pw, pad);
+      fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, UI_LOG_CURSOR);
+      for (int i = 0; i < n; i++) {
+         if (p[i].t != p[hilite].t || p[i].t < from || p[i].t > now)
+            continue;
+         const int sx = (p[i].series == 1) ? 1 : 0;
+         const int cy = ex_py(p[i].v, hi[sx], py0, ph, pad_t, pad_b);
+         fill_rect(px, fb, cx - (3 * sc), cy - (3 * sc), 6 * sc, 6 * sc,
+                   UI_HILITE);
+      }
+   }
 }
 
 int ui_log_hit(const struct screen *m, int plot_x, int plot_y, int plot_w,
@@ -1213,9 +1736,11 @@ int ui_log_hit(const struct screen *m, int plot_x, int plot_y, int plot_w,
    struct log_pt pts[UI_LOG_PTS];
    long from = 0;
    int n     = 0;
-   if (m->scr == SCR_EXLOG)
-      n = ex_points(m, pts, UI_LOG_PTS, &from);
-   else if (m->scr == SCR_INSLOG)
+   if (m->scr == SCR_EXLOG) {
+      n = ex_points(m, pts, UI_LOG_PTS, &from, NULL, 0);
+      return ex_pick(pts, n, from, m->now, plot_x, plot_w, sc, x);
+   }
+   if (m->scr == SCR_INSLOG)
       n = ins_points(m, pts, UI_LOG_PTS, &from);
    else
       return -1;

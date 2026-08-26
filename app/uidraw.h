@@ -164,9 +164,36 @@ void fill_rect(uint32_t *px, const struct ANativeWindow_Buffer *buf, int x,
 /* ---- the menu row vocabulary, also uidraw.c's ------------------------ */
 const char *sensor_disp_name(int type);
 
+/* THE SCRUB READOUT EVERY PLOT DRAWS: `when` left-aligned at x, `unit` right
+ * -aligned at x+w, `val` centred between them. Each field is anchored to
+ * something fixed, so reading along a trace moves the value alone. */
+void log_scrub_row(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
+                   int y, int w, int lo, int hi, const char *when,
+                   const char *val, const char *unit);
+
+/* "STEPS", or "STEP " for exactly one -- the same width either way, because
+ * the readouts that print it keep fixed columns. */
+const char *ui_steps_word(long n);
+
 int menu_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int y,
                 int w, int sc, const char *label, uint32_t col, int action,
                 int ix);
+
+/* menu_button, with a BULLET drawn before the label in `mcol`: the button is
+ * asking to be pressed. The mark and the label are centred as one unit, so
+ * the two cannot collide however narrow the button is. */
+int menu_button_mark(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
+                     int y, int w, int sc, const char *label, uint32_t col,
+                     uint32_t mcol, int action, int ix);
+
+/* 1 when a weighing is DUE: none on record, or the most recent one is a day
+ * old or more. The WEIGHT buttons carry the bullet when it is. */
+int ui_weight_due(const struct screen *m);
+
+/* 1 when the once-daily SLOW dose is due: none on record, or the most recent
+ * one is a day old or more. FAST is deliberately not asked about -- see the
+ * definition. */
+int ui_slow_ins_due(const struct screen *m);
 
 void menu_head(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
                int lh, const char *name);
@@ -194,6 +221,15 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
  * reserve before calling. */
 void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
                int y, int sc, int lh, int page, int npages, int code);
+
+/* THE LARGEST TEXT SCALE at which `s` fits in `maxw`, never below `min`.
+ *
+ * INK, NOT CELLS. A string of n glyphs occupies n*6-1 columns, not n*6:
+ * draw_str emits no trailing gap after the last one. Measuring in whole cells
+ * over-counts by a cell and shrinks text a size earlier than it needs to --
+ * which is how a scrub readout came to use a smaller font for a three-digit
+ * value than for a two-digit one, with room to spare in both. */
+int fit_scale(const char *s, int maxw, int min, int max);
 
 uint32_t white_color(int g);
 /* The big number's colour for `g`, by the fixed medical range. */

@@ -14,7 +14,9 @@
 
 int ui_shortcut_code(int slot);
 /* MA_* action, or 0 if slot is out of range */
-const char *ui_shortcut_label(int slot, int abbrev);
+/* The name to draw, chosen by how many buttons share the row: 1 gives the
+ * full phrase, 2 the half form, 3 or more the shortest. */
+const char *ui_shortcut_label(int slot, int percol);
 /* The STABLE id a slot is stored as, and the inverse. The id belongs to the
  * domain (settings.h, enum shortcut_id); the code above belongs to this
  * renderer. Keeping them apart is what lets the touch codes be renumbered
@@ -22,6 +24,11 @@ const char *ui_shortcut_label(int slot, int abbrev);
 int ui_shortcut_id(int slot);
 int ui_shortcut_slot_by_id(int id);
 int ui_shortcut_sect(int slot);
+/* The slot drawn k-th in the ADD menu, top to bottom; -1 past the last. The
+ * main screen orders its pinned buttons by this so that a shortcut sits where
+ * the menu taught the user to expect it, whatever order the pins were
+ * ticked in. */
+int ui_shortcut_menu_nth(int k);
 /* How many slots there are to ask about. */
 int ui_shortcut_count(void);
 

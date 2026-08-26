@@ -11,7 +11,8 @@
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h"  /* sensor types, kinds, marker enum */
-#include "settings.h" /* SET_NCOLORS: crosschecked below */
+#include "settings.h"
+#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band plot.c shades */ /* SET_NCOLORS: crosschecked below */
 #include "style.h"
 #include "uiact.h"
 #include "uidraw.h"
@@ -105,6 +106,21 @@ static int pin_percol(int n)
    const int rows = pin_rows(n);
    const int pc   = (n + rows - 1) / rows;
    return pc < 1 ? 1 : pc;
+}
+
+/* Is this table entry pinned to the main screen?
+ *
+ * Pins are stored BY IDENTITY in a list that is a set, so the question is
+ * asked of the whole list rather than of one index -- and asking it slot-first
+ * is what lets both the count and the drawing walk ui_sc_tab in the same
+ * order. SC_NONE never names a table entry, so an empty pin slot cannot
+ * match. */
+static int pin_has(const struct ui_prefs *p, int id)
+{
+   for (int i = 0; i < SC_MAX; i++)
+      if (p->shortcut[i] == id)
+         return 1;
+   return 0;
 }
 
 /* The CGM that owns the big number, or NULL. Four places open-coded this same
@@ -685,14 +701,21 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * trend navigates away by accident. */
    if (scrub) {
       char ts[16];
-      /* 72, and the size is load-bearing. The scrub line carries a FOOD NAME
-       * as its unit field (up to eight characters) alongside the value, the
-       * date and the time; at 48 the compiler cannot prove the format fits,
-       * which this build treats as an error rather than letting the time be
-       * cut off the end. The alternative is shortening the name until it
-       * stops meaning anything. */
-      char line[72];
+      /* THE VALUE ALONE, in whatever form its kind is measured: the unit and
+       * the instant are separate fields with separate zones on the row, so
+       * this holds only the number. */
       char gv[12];
+      /* HOW WIDE THE VALUE FIELD IS, and it is per KIND rather than one width
+       * for all of them.
+       *
+       * The field is centred and the number right-aligned inside it, so every
+       * column of padding beyond what the value can actually need pushes the
+       * digits that far right of centre. A glucose reading in mg/dL is three
+       * digits at most; padding it out to hold a weight's five would sit it a
+       * full glyph off centre for the whole of its life on screen. So each
+       * kind declares the widest IT can be -- mmol/L needs a tenth, mg/dL
+       * does not -- and the digits straddle the middle in every case. */
+      int gvw = m->prefs.units ? 4 : 3;
       int ins = (m->plot.hist[m->plot.scrub].kind == KIND_INS);
       int wt  = (m->plot.hist[m->plot.scrub].kind == KIND_WT);
       int fd  = (m->plot.hist[m->plot.scrub].kind == KIND_FOOD);
@@ -709,7 +732,8 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
           * dose is rendered rather than printed: "0.5 U", not "500 U". */
          char iu[16];
          (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
-         (void)snprintf(gv, sizeof gv, "%s U", iu);
+         (void)snprintf(gv, sizeof gv, "%s", iu);
+         gvw = 5; /* "12.5", and thousandths can render "1.125" */
       } else if (wt) {
          /* Clamped so the format is provably bounded: the store's own range
           * (WT_MIN_G..WT_MAX_G) tops out at 400 kg / 882 lb, i.e. four digits
@@ -722,10 +746,13 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          if (t10 > 99999)
             t10 = 99999;
          (void)snprintf(gv, sizeof gv, "%d.%d", t10 / 10, t10 % 10);
+         gvw = 5; /* "150.5" */
       } else if (fd) {
-         /* Grams, as stored. FOOD_MAX_G is 20000, so five digits and the
-          * unit fit `gv` with room to spare. */
-         (void)snprintf(gv, sizeof gv, "%d G", m->plot.hist[m->plot.scrub].glu);
+         /* Grams, as stored. FOOD_MAX_G is 999, so three digits and the unit
+          * fit `gv` with room to spare -- and fit the value column below
+          * without widening it. */
+         (void)snprintf(gv, sizeof gv, "%d", m->plot.hist[m->plot.scrub].glu);
+         gvw = 3; /* FOOD_MAX_G is 999 */
       } else if (exr) {
          /* HOW LONG IT LASTED, which is the thing about a session that a
           * glance at the plot cannot give you: the rule shows roughly, this
@@ -733,13 +760,19 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
           * hours would round a 40-minute walk to nothing. A session with no
           * recorded end -- the app was killed, or it is still running -- has
           * no length to show, so the intensity carries the line alone. */
+         /* NO "EX " PREFIX: the unit column beside this one already carries
+          * LIGHT / MOD / HARD, so the letters would be saying a second time
+          * what the next field says once -- and they are two of the six
+          * columns the value field gets, which every other reading on the
+          * plot then has to be padded out to. */
          long mins = m->plot.hist[m->plot.scrub].src / 60;
          if (mins <= 0)
-            (void)snprintf(gv, sizeof gv, "EX");
+            (void)snprintf(gv, sizeof gv, "--");
          else if (mins > 9999)
-            (void)snprintf(gv, sizeof gv, "EX 9999M");
+            (void)snprintf(gv, sizeof gv, "9999");
          else
-            (void)snprintf(gv, sizeof gv, "EX %ldM", mins);
+            (void)snprintf(gv, sizeof gv, "%ld", mins);
+         gvw = 4; /* minutes, clamped at 9999 above */
       } else {
          fmt_glu(m->plot.hist[m->plot.scrub].glu, m->prefs.units, gv,
                  sizeof gv);
@@ -750,25 +783,29 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
        * week -- and at 30D it is useless immediately. */
       const char *unit = UI_LBL(m->prefs.units);
       if (ins) {
-         unit = (m->plot.hist[m->plot.scrub].src == INS_FAST) ? "FAST" : "SLOW";
+         unit = (m->plot.hist[m->plot.scrub].src == INS_FAST) ? "U FAST"
+                                                              : "U SLOW";
       } else if (wt) {
          unit = wt_unit_name(m->prefs.wunits);
       } else if (exr) {
          /* The user's own words for the three levels, the same ones the
           * button shows -- a scrub that said "2" would be asking the reader
           * to remember a scale nothing on screen defines. */
-         static const char *const exl[EX_MAX_LEVEL + 1] = {"", "LIGHT", "MOD",
-                                                           "HARD"};
+         static const char *const exl[EX_MAX_LEVEL + 1] = {
+             "MIN", "MIN LIGHT", "MIN MOD", "MIN HARD"};
          int lv = m->plot.hist[m->plot.scrub].glu;
-         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv] : "";
+         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv]
+                                                             : exl[0];
       } else if (fd) {
          /* THE FOOD'S NAME, TRUNCATED TO WHAT THE LINE HOLDS.
           *
           * A name is up to FOOD_NAME_MAX (20) characters and this readout
           * also carries a value, a date and a time inside a 48-byte line --
           * so a long name would push the time off the end, and the time is
-          * the part that says WHICH entry is being scrubbed. Cut to eight,
-          * which leaves every other field intact at the narrowest span.
+          * the part that says WHICH entry is being scrubbed. Cut to SIX, the
+          * width of the unit column this readout keeps -- see the layout
+          * below -- so a name can never widen the line and shift the fields
+          * after it.
           *
           * A copy, not a borrowed pointer: `unit` is used further down and
           * food_type_name's answer is only valid while the vocabulary is
@@ -781,11 +818,22 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          for (; nm[fi] && fi < (int)sizeof fname - 1; fi++)
             fname[fi] = nm[fi];
          fname[fi] = 0;
-         unit      = fname;
+         /* "G" AND THE NAME TOGETHER: the number is a quantity of grams OF
+          * something, and both halves of that belong on the unit's side of
+          * the reading. */
+         static char fu[16];
+         (void)snprintf(fu, sizeof fu, "G %s", fname);
+         unit = fu;
       }
+      /* WHEN IT HAPPENED, on the left. A bare HH:MM is ambiguous across days,
+       * so the multi-day spans put the date in front of it: M/DD ("7/21") at
+       * a month or more, where a weekday name tells you it was a Thursday but
+       * not WHICH one, and the weekday itself within a week, because "TUE
+       * 08:15" places a reading the way you actually remember it and there is
+       * only one Tuesday to confuse it with. */
+      char whenbuf[24];
+      const char *whenp = ts;
       if (m->plot.plot_hours >= 720) {
-         /* A MONTH-long span: a weekday name is ambiguous four times over,
-          * so name the actual date. */
          char dt[20];
          /* 12, not 8: gcc cannot prove the month is two digits, and this
           * build treats a possibly-truncating snprintf as an error. */
@@ -795,47 +843,48 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
           * leading zero, and the day as written. */
          int mon = ((dt[5] - '0') * 10) + (dt[6] - '0');
          (void)snprintf(md, sizeof md, "%d/%c%c", mon, dt[8], dt[9]);
-         (void)snprintf(line, sizeof line, "%s %s %s %s", gv, unit, md, ts);
+         (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", md, ts);
+         whenp = whenbuf;
       } else if (m->plot.plot_hours >= 72) {
-         /* Within a week, the weekday IS the clearer label -- "TUE 08:15"
-          * places a reading the way you actually remember it, and there is
-          * only one Tuesday to confuse it with. 1970-01-01 was a Thursday. */
+         /* 1970-01-01 was a Thursday. */
          static const char *const wd[7] = {"SUN", "MON", "TUE", "WED",
                                            "THU", "FRI", "SAT"};
          long z = (m->plot.hist[m->plot.scrub].t + m->tz_off) / 86400;
          int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0 = Sunday */
-         (void)snprintf(line, sizeof line, "%s %s %s %s", gv, unit, wd[wi], ts);
-      } else {
-         (void)snprintf(line, sizeof line, "%s %s  %s", gv, unit, ts);
+         (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
+         whenp = whenbuf;
       }
-      /* The unit is always shown -- it is what makes the number a
-       * measurement -- so the DATED spans need a little more room than
-       * double scale gives. Step the scale down only as far as the line
-       * actually needs, rather than dropping to a fixed smaller size:
-       * usually one notch, which reads as the same text, not a glitch. */
-      int tsc2 = 2 * sc;
-      while (tsc2 > sc && str_len(line) * 6 * tsc2 > cw - (4 * sc))
-         tsc2--;
-      int lw = str_len(line) * 6 * tsc2;
-      int lx = cx + ((cw - lw) / 2);
-      if (lx < cx + (2 * sc))
-         lx = cx + (2 * sc);
-      draw_str(px, fb, lx, y, tsc2, line, UI_TEXT);
+      /* THE APP'S ONE READOUT LAYOUT -- when, value, unit, each anchored so
+       * that sweeping the trace moves the number and nothing else. See
+       * log_scrub_row, which every plot in the app draws through.
+       *
+       * FULL DOUBLE SCALE, unconditionally. The old single centred string had
+       * to be stepped down a size on the dated spans to fit the date it had
+       * gained; with the fields anchored to the plot's two edges instead of
+       * packed end to end, the width they need is the width they occupy and
+       * nothing has to give. */
+      /* THE NUMBER IS RIGHT-ALIGNED IN A FIXED FIELD, and it is the field
+       * that is centred.
+       *
+       * Centring the digits themselves would move them every time the reading
+       * changed width: sweeping past 100 down to 90 slides the number half a
+       * glyph left, which under a finger reads as the row twitching rather
+       * than as the value falling. Padded to a constant width, the field's
+       * centre never moves and the units digit stays in its column, so what
+       * changes on screen is the digits and nothing else.
+       *
+       * The width is `gvw`, which each kind sets to what it can actually
+       * need; see where it is declared. */
+      char vpad[16];
+      (void)snprintf(vpad, sizeof vpad, "%*s", gvw, gv);
+      log_scrub_row(px, fb, cx + (2 * sc), y, cw - (4 * sc), sc, 2 * sc, whenp,
+                    vpad, unit);
    } else {
       int laby = y + ((rowh - (7 * sc)) / 2);
       for (int i = 0; i < UI_TABS; i++) {
          char lab[12];
-         /* ui_tab_hours holds small constants, but the compiler cannot prove
-          * it; clamp so the formatted width is provably bounded. */
          int th = ui_tab_hours[i];
-         if (th < 0)
-            th = 0;
-         if (th > 99999)
-            th = 99999;
-         if (th < 48)
-            (void)snprintf(lab, sizeof lab, "%dH", th);
-         else
-            (void)snprintf(lab, sizeof lab, "%dD", th / 24);
+         ui_span_label(th, lab, sizeof lab);
          int lw   = str_len(lab) * 6 * sc;
          int tabx = cx + (i * colw);
          draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, lab,
@@ -1075,6 +1124,47 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
                (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, np, m->now,
                m->plot.plot_hours, pcfg, white_color,
                scrub ? m->plot.scrub : -1, UI_HILITE, m->tz_off);
+
+   /* THE RANGE'S OWN EDGES, NAMED.
+    *
+    * plot.c draws a faint band between 70 and 180 and a thin line along each
+    * edge, and until now nothing said what those two lines were. They are the
+    * numbers the whole screen is about -- the alarm thresholds are set
+    * against them and the TIR figure counts against them -- so a reader who
+    * does not already know them is looking at two anonymous rules.
+    *
+    * IN THE READING'S OWN UNITS, through fmt_glu, so the pair says 3.9 and
+    * 10.0 to somebody whose app is set to mmol/L. The band itself is fixed in
+    * mg/dL (stats.h owns the one definition); only its label converts.
+    *
+    * THE HEIGHT COMES FROM plot_point_xy, which is the renderer's OWN mapping
+    * exported for exactly this -- recomputing glu_to_y here would be a second
+    * copy of the axis, and a label a pixel off the line it names is worse
+    * than no label.
+    *
+    * SMALL AND DIM, sitting just above its line at the left margin: the trace
+    * is what the plot is for, and these are a legend for it. Same grey as the
+    * date ticks along the bottom, which are the plot's other annotation.
+    *
+    * FONT_NOTE, the size the app keeps for marks inside a plot -- see the
+    * ladder in font.h. It lands within a pixel of the W and F glyphs beside
+    * it, which is what a legend for this plot should read as. */
+   {
+      static const int edge[2] = {TIR_HIGH_MGDL, TIR_LOW_MGDL};
+      const int lsc            = FONT_NOTE(sc) < 1 ? 1 : FONT_NOTE(sc);
+      for (int i = 0; i < 2; i++) {
+         char lab[12];
+         int ex = 0;
+         int ey = 0;
+         if (!plot_point_xy((struct plot_rect){plot_x, plot_y, plot_w, ph},
+                            (struct plot_pt){m->now, edge[i], 0, 0, 0, 0, 0},
+                            m->now, m->plot.plot_hours, pcfg, &ex, &ey))
+            continue;
+         fmt_glu(edge[i], m->prefs.units, lab, sizeof lab);
+         draw_str(px, fb, plot_x + (2 * lsc), ey - (8 * lsc), lsc, lab,
+                  UI_DISCLAIM);
+      }
+   }
    /* THE IN-RANGE STREAK, upper right, inside the plot.
     *
     * Drawn only while the streak is running -- 0 means the newest reading is
@@ -1391,7 +1481,7 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * zone is the whole band right of the table's ink, so the surrounding
     * space is pressable too -- a bare glyph is a poor target one-handed. */
    {
-      int psc = 3 * sc;
+      int psc = FONT_HUGE(sc);
       int pw  = 6 * psc;
       int ph  = 7 * psc;
       int pxx = cx + cw - pw - (2 * sc);
@@ -1403,9 +1493,13 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * would shape the rows around buttons that are never drawn: four stored
        * pins one of which is unknown would reserve two rows and fill them 2+1,
        * leaving a hole where the missing button would have been. */
+      /* COUNTED BY WALKING THE TABLE, which is the same walk the drawing
+       * loop below makes. Counting the pin list instead would disagree with
+       * it if a stored list ever held one id twice -- the budget would
+       * reserve a button the loop draws once. */
       int nsc = 0;
-      for (int i = 0; i < SC_MAX; i++)
-         if (ui_shortcut_slot_by_id(m->prefs.shortcut[i]) >= 0)
+      for (int slot = 0; slot < ui_shortcut_count(); slot++)
+         if (pin_has(&m->prefs, ui_shortcut_id(slot)))
             nsc++;
       /* The packing rule and its one definition are pin_rows / pin_percol
        * above -- the same answer the height budget was derived from. */
@@ -1482,24 +1576,50 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
          int bwid   = (availw - ((percol - 1) * sgap)) / percol;
          if (bwid > 6 * sc) { /* narrower than this and nothing can be read */
             int slotn = 0;    /* how many pins have been PLACED, not scanned */
-            for (int i = 0; i < SC_MAX; i++) {
-               int slot = ui_shortcut_slot_by_id(m->prefs.shortcut[i]);
-               if (slot < 0)
-                  continue; /* a pin this build does not offer */
-               /* COUNTED ON PLACEMENT, never on the loop index. A pin this
-                * build does not offer is skipped above, so `i` and the
-                * button's position part company the moment one appears -- and
-                * the row would break where the gap was rather than after
+            /* IN THE ADD MENU'S ORDER, NOT THE ORDER THEY WERE PINNED.
+             *
+             * The pin list is chronological -- it is a set, kept dense, in
+             * whatever sequence the boxes happened to be ticked -- so walking
+             * it laid the buttons out differently on two phones holding the
+             * same four pins, and MOVED them when one was unpinned and
+             * re-pinned. A control that logs a medication must be in the same
+             * place every time it is looked for, and the place a user learns
+             * it from is the menu they pinned it in. So iterate the TABLE and
+             * draw the entries that are pinned, which makes the order a
+             * property of the build rather than of the tapping history.
+             *
+             * ui_shortcut_menu_nth is that order, and it lives beside the ADD
+             * menu's own drawing so the two cannot drift apart. */
+            for (int k = 0; k < ui_shortcut_count(); k++) {
+               const int slot = ui_shortcut_menu_nth(k);
+               if (slot < 0 || !pin_has(&m->prefs, ui_shortcut_id(slot)))
+                  continue;
+               /* COUNTED ON PLACEMENT, never on the loop index: the table
+                * holds entries that are not pinned, so `slot` and the
+                * button's position part company at the first one skipped --
+                * and the row would break where the gap was rather than after
                 * percol buttons. */
                int r = slotn / percol;
                int c = slotn % percol;
                slotn++;
                int bx          = rowl + (c * (bwid + sgap));
                int code        = ui_shortcut_code(slot);
-               const char *lbl = ui_shortcut_label(slot, nsc > 1);
-               if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc))
-                  lbl = ui_shortcut_label(slot, 1);
-               if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc))
+               /* THE NAME FOR THIS ROW'S WIDTH, then shorter forms if even
+                * that will not fit -- a narrow screen can defeat any of them.
+                * The font never shrinks: a half-word on a button that logs a
+                * medication is worse than no word. */
+               /* THE BULLET'S WIDTH IS RESERVED BEFORE THE NAME IS PICKED
+                * -- 5*sc of dot and a 6*sc cell of gap. Choosing the label
+                * against the bare button and then drawing a mark beside it
+                * would spend width the fit had already promised to the
+                * words. */
+               const int due = (code == MA_WT_OPEN && ui_weight_due(m))
+                               || (code == MA_INS_SLOW && ui_slow_ins_due(m));
+               const int mark = due ? 11 * sc : 0;
+               const char *lbl = ui_shortcut_label(slot, percol);
+               if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc) - mark)
+                  lbl = ui_shortcut_label(slot, 3);
+               if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc) - mark)
                   lbl = "";
                /* EXERCISE IS NOT A LABEL. Pinned here it must show the
                 * level it is on, in the colour that encodes it, with the
@@ -1511,6 +1631,13 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                       fb, h, bx, pyy - (2 * sc) + (r * rowpitch), bwid, sc,
                       m->food.ex_level, m->food.ex_remaining, EX_SETTLE_S, lbl,
                       UI_TEXT_DIM);
+               /* THE SAME BULLET THE ADD MENU DRAWS, off the same test: the
+                * pinned copy of a button and the one in the menu must never
+                * disagree about what they are saying. */
+               else if (mark)
+                  (void)menu_button_mark(
+                      fb, h, bx, pyy - (2 * sc) + (r * rowpitch), bwid, sc, lbl,
+                      UI_TEXT_DIM, UI_MARK_WT, code, 0);
                else
                   (void)menu_button(fb, h, bx, pyy - (2 * sc) + (r * rowpitch),
                                     bwid, sc, lbl, UI_TEXT_DIM, code, 0);

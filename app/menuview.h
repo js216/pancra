@@ -27,8 +27,20 @@
 #ifndef MENUVIEW_H
 #define MENUVIEW_H
 
-/* Runtime permissions requested at once. */
-#define NPERMS 3
+/* THE RUNTIME PERMISSIONS, and each one's index in perm[].
+ *
+ * One order, used three times: menu.c requests and checks them in it,
+ * ui_perm_lbl names them in it, and the PERMISSIONS screen lists them in it.
+ * The indices are NAMED because they are not interchangeable -- PERM_STEPS is
+ * the only optional one, needed just while step counting is switched on, and
+ * a bare 3 in the test that knows that would be a number nothing explains. */
+enum {
+   PERM_BT_SCAN = 0,
+   PERM_BT_CONN = 1,
+   PERM_NOTIFY  = 2,
+   PERM_STEPS   = 3,
+   NPERMS       = 4 /* how many there are; the size of perm[] */
+};
 
 struct menu_view {
    /* WHICH DEVICE the menus are acting on (its permanent id, -1 = none) and

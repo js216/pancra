@@ -60,7 +60,7 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * respond. In landscape that meant no pairing code, no calibration value and
     * no plot max could be entered at all. */
    int sc  = ui_fit_scale(fb->width, fb->height, 30);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -98,7 +98,7 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
    }
    shown[k]     = '_';
    shown[k + 1] = 0;
-   int dsc      = 2 * sc;
+   int dsc      = FONT_TITLE(sc);
    int percol   = fb->width / (6 * dsc); /* characters that fit on one line */
    if (percol < 8)
       percol = 8;
@@ -189,7 +189,7 @@ void render_keypad(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * respond. In landscape that meant no pairing code, no calibration value and
     * no plot max could be entered at all. */
    int sc  = ui_fit_scale(fb->width, fb->height, 30);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);

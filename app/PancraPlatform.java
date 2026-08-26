@@ -117,6 +117,72 @@ public final class PancraPlatform {
         PancraService.requestNoBatteryOpt(ctx);
     }
 
+    /* ---- STEP COUNTING ----
+     *
+     * TYPE_STEP_COUNTER is a HARDWARE counter maintained on the sensor hub:
+     * it keeps counting while the phone sleeps and the application processor
+     * is never woken to look at an accelerometer. All this class does is hold
+     * the newest value it has been handed; native differences two of them a
+     * window apart (see steps.h).
+     *
+     * BATCHED BY FIVE MINUTES. The third argument to registerListener is a
+     * max-report LATENCY: the hub accumulates events and delivers them in one
+     * batch at most that often, so a walk costs a handful of wakeups an hour
+     * instead of one per step. The delay argument is only a hint about
+     * sampling rate and is the slowest on offer.
+     *
+     * The listener is registered ONCE while the feature is on and torn down
+     * when it is off -- there is nothing to poll, and polling a counter that
+     * is already free would cost more than reading it does. */
+    private static android.hardware.SensorManager stepMgr;
+    private static android.hardware.SensorEventListener stepLis;
+    private static volatile long stepCum = -1;
+
+    public static void stepsListen(Context ctx, boolean on) {
+        try {
+            if (!on) {
+                if (stepMgr != null && stepLis != null)
+                    stepMgr.unregisterListener(stepLis);
+                stepLis = null;
+                /* NOT reset to -1: the count is still valid, and clearing it
+                 * would make the next enable throw away one window for no
+                 * reason. The counter is the hardware's; we only cached it. */
+                return;
+            }
+            if (stepLis != null) return;   /* already listening */
+            stepMgr = ctx.getSystemService(android.hardware.SensorManager.class);
+            if (stepMgr == null) return;
+            android.hardware.Sensor s = stepMgr.getDefaultSensor(
+                android.hardware.Sensor.TYPE_STEP_COUNTER);
+            if (s == null) return;         /* no such hardware: stays at -1 */
+            android.hardware.SensorEventListener l =
+                new android.hardware.SensorEventListener() {
+                    public void onSensorChanged(android.hardware.SensorEvent e) {
+                        if (e.values != null && e.values.length > 0)
+                            stepCum = (long) e.values[0];
+                    }
+                    public void onAccuracyChanged(android.hardware.Sensor s, int a) { }
+                };
+            /* REMEMBERED ONLY IF IT TOOK. registerListener REFUSES by
+             * returning false -- it does not throw -- and the commonest
+             * refusal is the one that happens on the very first call: the
+             * feature is switched on, this runs, and the permission dialog it
+             * triggered has not been answered yet. Storing the listener
+             * regardless made the "already listening" guard above permanent,
+             * so granting the permission changed nothing until the app was
+             * restarted. */
+            if (!stepMgr.registerListener(l, s,
+                                          android.hardware.SensorManager.SENSOR_DELAY_NORMAL,
+                                          5 * 60 * 1000000))
+                return;
+            stepLis = l;
+        } catch (Throwable t) { Log.i(TAG, "steps: " + t); stepLis = null; }
+    }
+
+    /* The counter's newest total, or -1 when nothing has arrived: no sensor,
+     * no permission, or simply not moved since the listener came up. */
+    public static long stepsCount() { return stepCum; }
+
     /* Push the live glucose + a 3H plot bitmap into the ongoing notification
      * (shown on the lock screen / shade). Called from native each reading. */
     public static void showGlucose(Context ctx, String title, String text,

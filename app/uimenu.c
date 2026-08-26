@@ -39,7 +39,7 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * on the screen smaller. Three quarters of a blank line between rows still
     * reads as a calm block. */
    int sc  = ui_fit_scale(fb->width, fb->height, 15);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc; /* generous pitch: a blank line between rows */
    /* THREE QUARTERS of a blank line between submenu rows -- see the budget
     * above for what forced it and why it is whitespace that gave way. */
@@ -59,9 +59,15 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * exactly the screen the others are entered from. */
    y += 3 * lh;
 
-   /* Five submenu rows -- DISPLAY / DEVICES / ALARM / PERMISSIONS / REMOTE --
-    * spaced apart so the doors read as one calm block.
-    * (The alarm settings live on their own submenu now, render_alarm.)
+   /* DISPLAY / ALARM / PERMISSIONS / STEP COUNTING / DEVICES / REMOTE, spaced
+    * apart so the doors read as one calm block.
+    *
+    * THE ORDER IS HOW OFTEN A ROW IS THE REASON SOMEBODY CAME HERE. The three
+    * that decide whether the app can do its job at all -- what it shows, how
+    * it shouts, and what the OS is letting it do -- come first, because a
+    * missed alarm is what sends a user to this screen. What it additionally
+    * collects, and the hardware and server it talks to, follow.
+    * (The alarm settings live on their own submenu, render_alarm.)
     *
     * NO ELLIPSIS on any of them. "DISPLAY ..." was the only row carrying one,
     * and it said nothing the row did not: every entry here is a door, so an
@@ -74,6 +80,56 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * count, so the common question ("is everything still connected?") is
     * answered without opening it. */
    menu_row(fb, h, y, sc, lh, "DISPLAY", "", UI_TEXT, MA_DISPLAY_OPEN, 0);
+   y += rowpitch;
+   menu_row(fb, h, y, sc, lh, "ALARM", "", UI_TEXT, MA_ALARM_OPEN, 0);
+   /* HOW THE MAIN ALARM WOULD REACH YOU, and nothing else: speaker, vibrate,
+    * in two fixed equally spaced cells, each symbol always in its own place
+    * with an empty cell when that output is off.
+    *
+    * THE ALARM'S OUTPUTS ONLY. Two speakers side by side, one for the alarm
+    * and one for the nudge, is a puzzle rather than a legend -- nothing on
+    * the row says which is which, so a muted alarm beside an unmuted nudge
+    * reads as "sound is on". The alarm is the alert worth knowing about at a
+    * glance; the nudge, the stale-data alarm and the new-datapoint dot are
+    * all one tap away behind this row, and none of them answers the question
+    * this row exists to answer -- if it goes off, will I hear it?
+    *
+    * RIGHT-ALIGNED ON THE SECOND CELL: 6*sc of pitch and 5*sc of glyph, so
+    * 11*sc back from rx puts the vibrate symbol's last column on the margin
+    * every other row's value ends at. */
+   {
+      int iax = rx - (11 * sc);
+      if (m->prefs.sound_on)
+         draw_icon(px, fb, iax, y, sc, icon_speaker, UI_MUTED);
+      if (m->prefs.vib_on)
+         draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
+   }
+   y += rowpitch;
+   /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
+    * is granted, red CHECK otherwise -- opening the full submenu. */
+   {
+      /* WHAT THE APP NEEDS FOR THE JOB IT HAS BEEN GIVEN. The CGM
+       * permissions are needed always; the step counter's is needed only
+       * while step counting is switched on, so a user who has never wanted it
+       * is not shown a standing red CHECK for a permission that would buy
+       * them nothing. */
+      int ok = 1;
+      for (int i = 0; i < NPERMS; i++)
+         if (!m->sys.perm[i] && (i != PERM_STEPS || m->food.steps_on))
+            ok = 0;
+      ok = ok && m->sys.batt_ok && !m->sys.bg_restricted;
+      menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
+               ok ? UI_OK : UI_DANGER, MA_PERMS_OPEN, 0);
+      y += rowpitch;
+   }
+   /* THE ROW IS THE SWITCH. Every other entry on this screen is a door, and
+    * this one is not -- there is exactly one thing to decide about step
+    * counting and a whole submenu to hold it would be a screen with one
+    * control on it. The PLOT has its own way in, from the ADD menu, because
+    * looking at the data and deciding whether to collect it are different
+    * errands. */
+   menu_row(fb, h, y, sc, lh, "STEP COUNTING", m->food.steps_on ? "ON" : "OFF",
+            m->food.steps_on ? UI_OK : UI_MUTED, MA_STEPS_TOGGLE, 0);
    y += rowpitch;
    {
       int nlive = 0;
@@ -102,40 +158,6 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
       menu_row(fb, h, y, sc, lh, "DEVICES", dv,
                (nlive > 0 && nconn == nlive) ? UI_OK : UI_FAINT,
                MA_DEVICES_OPEN, 0);
-      y += rowpitch;
-   }
-   menu_row(fb, h, y, sc, lh, "ALARM", "", UI_TEXT, MA_ALARM_OPEN, 0);
-   /* The row's "value" is the SAME icon language the main screen's threshold
-    * row uses -- speaker / phone / slashed circle / dot -- in the SAME fixed,
-    * equally spaced cells (6*sc pitch, right-aligned), each symbol always in
-    * its own place with an empty cell when that alert is off.
-    *
-    * THE ALARM'S OUTPUTS ONLY, and the dot. Two speakers side by side, one
-    * for the alarm and one for the nudge, is a puzzle rather than a legend --
-    * nothing on the row says which is which, so a muted alarm beside an
-    * unmuted nudge reads as "sound is on". The alarm is the alert worth
-    * knowing about at a glance; the nudge's own settings are one tap away
-    * behind this row. The main screen makes the same choice for the same
-    * reason. */
-   {
-      int iax = rx - (23 * sc);
-      if (m->prefs.sound_on)
-         draw_icon(px, fb, iax, y, sc, icon_speaker, UI_MUTED);
-      if (m->prefs.vib_on)
-         draw_icon(px, fb, iax + (6 * sc), y, sc, icon_vibrate, UI_MUTED);
-      if (m->prefs.disc)
-         draw_icon(px, fb, iax + (12 * sc), y, sc, icon_nolink, UI_MUTED);
-      if (m->prefs.newdata_mode)
-         draw_icon(px, fb, iax + (18 * sc), y, sc, icon_dot, UI_MUTED);
-   }
-   y += rowpitch;
-   /* PERMISSIONS: one summary row -- green OK when everything a CGM needs
-    * is granted, red CHECK otherwise -- opening the full submenu. */
-   {
-      int ok = m->sys.perm[0] && m->sys.perm[1] && m->sys.perm[2] &&
-               m->sys.batt_ok && !m->sys.bg_restricted;
-      menu_row(fb, h, y, sc, lh, "PERMISSIONS", ok ? "OK" : "CHECK",
-               ok ? UI_OK : UI_DANGER, MA_PERMS_OPEN, 0);
       y += rowpitch;
    }
    /* REMOTE: the value is the push state -- and, when ON, the age of the
@@ -277,7 +299,7 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * that 26 buys; 25 buys 400 and is NOT enough. Re-measure this number
     * whenever a row is added -- it is not a round guess. */
    int sc  = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -346,7 +368,7 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 16);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -400,7 +422,7 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -493,7 +515,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * (one at the title, one between LAST SYNC and LAST STATUS) clipped 3584
     * glyph cells at 828x1792 until this followed them. */
    int sc  = ui_fit_scale(fb->width, fb->height, 28);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -659,28 +681,47 @@ enum sc_sect {
  * different questions and change on different schedules: the id is a file
  * format and may never move, the code is an implementation detail of the
  * dispatcher and has already been renumbered once. */
+/* THREE WIDTHS, THREE NAMES.
+ *
+ * A button that owns a whole row can say "VIEW EXERCISE LOG"; one of three
+ * across can barely say "EX LOG". Carrying only those two extremes meant a
+ * button at HALF width -- the common case on the main screen, two to a row --
+ * had to use the three-across form and wasted half its width saying "EXER".
+ *
+ * So the name is chosen by how many share the row, and the middle column is
+ * the one that was missing. Each entry states all three rather than deriving
+ * them, because where a phrase can be cut is a fact about the phrase.
+ *
+ * NO TWO ENTRIES MAY SHARE A NAME WITHIN A COLUMN, and that is not a matter
+ * of taste. LOG WEIGHT and VIEW WEIGHT LOG are pinnable side by side, so a
+ * half column that abbreviated both to "WEIGHT" put two identical buttons on
+ * the main screen -- one of which opens a table and the other of which starts
+ * recording a weight. Every VIEW entry therefore keeps the word LOG at every
+ * width, which is the thing that distinguishes it from the action that fills
+ * that log. Check all three columns when adding a row. */
 static const struct {
    int id;
    int code;
-   const char *full;
-   const char *abbrev;
+   const char *full;   /* alone on the row */
+   const char *half;   /* two across */
+   const char *third;  /* three across */
    int sect; /* SC_SECT_LOG or SC_SECT_VIEW -- which group it renders in */
 } ui_sc_tab[] = {
-    {SC_INS_FAST, MA_INS_FAST,     "FAST INSULIN",      "FAST",     SC_SECT_LOG },
-    {SC_INS_SLOW, MA_INS_SLOW,     "SLOW INSULIN",      "SLOW",     SC_SECT_LOG },
-    {SC_WEIGHT,   MA_WT_OPEN,      "WEIGHT",            "WEIGHT",   SC_SECT_LOG },
-    {SC_FOOD,     MA_FOOD_OPEN,    "FOOD",              "FOOD",     SC_SECT_LOG },
+    {SC_INS_FAST, MA_INS_FAST,     "FAST INSULIN",      "FAST INS",  "FAST",     SC_SECT_LOG },
+    {SC_INS_SLOW, MA_INS_SLOW,     "SLOW INSULIN",      "SLOW INS",  "SLOW",     SC_SECT_LOG },
+    {SC_WEIGHT,   MA_WT_OPEN,      "WEIGHT",            "WEIGHT",    "WEIGHT",   SC_SECT_LOG },
+    {SC_FOOD,     MA_FOOD_OPEN,    "FOOD",              "FOOD",      "FOOD",     SC_SECT_LOG },
     /* LAST IN ITS SECTION, and the odd one: every button above opens a form
      * and is finished when that form is confirmed, while this one records by
      * being LEFT ALONE. It is in this table so it can be PINNED like the
      * rest; what it cannot share is the drawing, because its level, colour
      * and countdown are not a label -- see ui_exercise_button, which both the
      * menu below and the main screen call. */
-    {SC_EXERCISE, MA_EXERCISE,     "EXERCISE",          "EXER",     SC_SECT_LOG },
-    {SC_INSLOG,   MA_INSLOG_OPEN,  "VIEW INSULIN LOG",  "INS LOG",  SC_SECT_VIEW},
-    {SC_WTLOG,    MA_WTLOG_OPEN,   "VIEW WEIGHT LOG",   "WT LOG",   SC_SECT_VIEW},
-    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",     "FOOD LOG", SC_SECT_VIEW},
-    {SC_EXLOG,    MA_EXLOG_OPEN,   "VIEW EXERCISE LOG", "EX LOG",   SC_SECT_VIEW},
+    {SC_EXERCISE, MA_EXERCISE,     "EXERCISE",          "EXERCISE",  "EXER",     SC_SECT_LOG },
+    {SC_INSLOG,   MA_INSLOG_OPEN,  "VIEW INSULIN LOG",  "INSULIN LOG",  "INS LOG",  SC_SECT_VIEW},
+    {SC_WTLOG,    MA_WTLOG_OPEN,   "VIEW WEIGHT LOG",   "WEIGHT LOG",   "WT LOG",   SC_SECT_VIEW},
+    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",     "FOOD LOG",     "FOOD LOG", SC_SECT_VIEW},
+    {SC_EXLOG,    MA_EXLOG_OPEN,   "VIEW EXERCISE LOG", "EXERCISE LOG", "EX LOG",   SC_SECT_VIEW},
 };
 
 #define UI_SC_N ((int)(sizeof ui_sc_tab / sizeof ui_sc_tab[0]))
@@ -690,11 +731,18 @@ int ui_shortcut_code(int slot)
    return (slot >= 0 && slot < UI_SC_N) ? ui_sc_tab[slot].code : 0;
 }
 
-const char *ui_shortcut_label(int slot, int abbrev)
+const char *ui_shortcut_label(int slot, int percol)
 {
    if (slot < 0 || slot >= UI_SC_N)
       return "";
-   return abbrev ? ui_sc_tab[slot].abbrev : ui_sc_tab[slot].full;
+   /* BY HOW MANY SHARE THE ROW. Anything past three is not a width this app
+    * lays out, and clamping rather than indexing past the end is what keeps a
+    * future four-across from reading a neighbour's name. */
+   if (percol >= 3)
+      return ui_sc_tab[slot].third;
+   if (percol == 2)
+      return ui_sc_tab[slot].half;
+   return ui_sc_tab[slot].full;
 }
 
 int ui_shortcut_id(int slot)
@@ -707,6 +755,31 @@ int ui_shortcut_id(int slot)
 int ui_shortcut_sect(int slot)
 {
    return (slot >= 0 && slot < UI_SC_N) ? ui_sc_tab[slot].sect : SC_SECT_LOG;
+}
+
+/* THE SLOT DRAWN k-TH IN THE ADD MENU, top to bottom; -1 once k runs past
+ * the last one.
+ *
+ * The ADD menu draws its two sections in turn, each ascending, so menu order
+ * is section-major rather than plain table order. It is the ORDER THE USER
+ * LEARNS the buttons in, which is why the main screen lays its pinned
+ * shortcuts out by it -- and stating it once here, beside the loops that
+ * render those sections, is what keeps the two screens agreeing when an entry
+ * is added to the table in the middle of a section or at its end. */
+int ui_shortcut_menu_nth(int k)
+{
+   static const int order[] = {SC_SECT_LOG, SC_SECT_VIEW};
+   int seen                 = 0;
+   if (k < 0)
+      return -1;
+   for (unsigned s = 0; s < sizeof order / sizeof order[0]; s++)
+      for (int i = 0; i < UI_SC_N; i++) {
+         if (ui_sc_tab[i].sect != order[s])
+            continue;
+         if (seen++ == k)
+            return i;
+      }
+   return -1;
 }
 
 int ui_shortcut_slot_by_id(int id)
@@ -739,7 +812,7 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* 26 rows. What that has to cover is worked out where `gap` is chosen
     * below; the font is not what gives way when it gets tight. */
    int sc  = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -826,9 +899,17 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (code == MA_EXERCISE)
          y = ui_exercise_button(fb, h, x, y, lbw, sc, m->food.ex_level,
                                 m->food.ex_remaining, EX_SETTLE_S,
-                                ui_shortcut_label(i, 0), UI_TEXT);
+                                ui_shortcut_label(i, 1), UI_TEXT);
+      /* WEIGHT WEARS A BULLET when a day has gone by without one. The prompt
+       * belongs on the button rather than anywhere else on the screen because
+       * the button is what answers it: seeing the mark and acting on it is
+       * one tap, with nothing to read in between. */
+      else if ((code == MA_WT_OPEN && ui_weight_due(m))
+               || (code == MA_INS_SLOW && ui_slow_ins_due(m)))
+         y = menu_button_mark(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1),
+                              UI_TEXT, UI_MARK_WT, code, 0);
       else
-         y = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0), UI_TEXT,
+         y = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1), UI_TEXT,
                          code, 0);
       /* The box shares the button's top and bottom edge (they are the same
        * height), and its TARGET is the whole column cell -- this one sits
@@ -873,7 +954,7 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (ui_shortcut_sect(i) != SC_SECT_VIEW)
          continue;
       int on = sc_on(m, i);
-      int ny = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 0),
+      int ny = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1),
                            UI_TEXT, ui_shortcut_code(i), 0);
       /* cbx and the same target rectangle the LOG boxes use, so the whole
        * PIN column sits on one axis under its header rather than stepping
@@ -907,7 +988,7 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * buttons, and a size row previewing the CURRENT shape+colour at each size.
     * All selections update in place; the title-row X returns to the device. */
    int sc  = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -1075,26 +1156,29 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    if (gvsc < sc)
       sc = gvsc;
    static const char *lines[] = {
-       "PANCRA reads your CGM",
-       "sensor over Bluetooth and",
-       "warns you of highs and lows.",
+       "PANCRA READS YOUR CGM",
+       "SENSOR OVER BLUETOOTH AND",
+       "WARNS YOU OF HIGHS AND LOWS.",
        "",
        "IT ASKS FOR:",
        "",
-       "BLUETOOTH  find + connect",
-       "           to the sensor",
-       "NOTIFY     alert you to",
-       "           highs and lows",
-       "BATTERY    keep reading in",
-       "           the background",
+       "BLUETOOTH  FIND + CONNECT",
+       "           TO THE SENSOR",
+       "NOTIFY     ALERT YOU TO",
+       "           HIGHS AND LOWS",
+       "BATTERY    KEEP READING IN",
+       "           THE BACKGROUND",
        "",
-       /* Was "never leaves this phone" -- no longer true since the
-        * REMOTE push exists. Still two lines: this screen's row budget
-        * is exact (see above), one more line re-clips the disclaimer. */
-       "Data stays on this phone",
-       "unless you enable REMOTE.",
+       /* The step counter's permission is deliberately absent: it is asked
+        * for only if the user switches step counting on, and a glucose app
+        * naming activity data at first run has no visible reason to.
+        *
+        * TWO LINES, because this screen's row budget is exact (see above)
+        * and a third clips the disclaimer off the bottom. */
+       "DATA STAYS ON THIS PHONE",
+       "UNLESS YOU ENABLE REMOTE.",
    };
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 12 * sc;
    int x   = 6 * sc;
    int y   = fb->height / 12;
@@ -1106,7 +1190,7 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    }
    y += 2 * lh;
    const char *lbl = "CONTINUE";
-   int bsc         = 2 * sc;
+   int bsc         = FONT_TITLE(sc);
    int lw          = str_len(lbl) * 6 * bsc;
    int gh          = 7 * bsc;
    int padx        = 6 * bsc;
@@ -1120,11 +1204,11 @@ void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
 
    /* disclaimer, dim, at the foot of the screen */
    static const char *disc[] = {
-       "Not a medical device, and",
-       "not affiliated with Dexcom.",
-       "For awareness only, not for",
-       "treatment or hypoglycemia",
-       "decisions.",
+       "NOT A MEDICAL DEVICE, AND",
+       "NOT AFFILIATED WITH DEXCOM.",
+       "FOR AWARENESS ONLY, NOT FOR",
+       "TREATMENT OR HYPOGLYCEMIA",
+       "DECISIONS.",
    };
    y += bh + (3 * lh);
    for (int i = 0; i < (int)(sizeof disc / sizeof disc[0]); i++) {

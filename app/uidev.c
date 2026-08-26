@@ -193,7 +193,7 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* Bounded by height as well as width -- see ui_devices_scale, which is
     * derived from the SAME expression ui_sensor_capacity uses. */
    int sc  = ui_devices_scale(fb->width, fb->height);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int gh  = 7 * sc; /* a label glyph is 7 rows tall */
    int x   = 4 * sc;
@@ -350,7 +350,7 @@ void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -368,7 +368,12 @@ void render_perms(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * spacing. */
    y += 3 * lh;
 
-   for (int i = 0; i < 3; i++) {
+   /* EVERY PERMISSION THE APP ASKS FOR, so this screen answers the question
+    * it exists to answer. Bounded by NPERMS rather than by a count written
+    * here: a permission added to menu.c's list must appear on the screen that
+    * says what has been granted, and a literal is how one comes to be
+    * requested, denied, and never mentioned. */
+   for (int i = 0; i < NPERMS; i++) {
       int g = m->sys.perm[i];
       menu_row(fb, h, y, sc, lh, ui_perm_lbl[i], g ? "GRANTED" : "DENIED",
                g ? UI_OK : UI_DANGER, MA_PERM, i);
@@ -899,7 +904,7 @@ void render_sensor(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * ride on a row that already exists (see the PAIRING state folded into
     * SESSION below). */
    int sc  = ui_fit_scale(fb->width, fb->height, 31);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 14 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -953,7 +958,7 @@ void render_cal(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * buffer on 16:9 phones, so the one destructive action was unreachable
     * exactly when every attribute row was populated. */
    int sc  = ui_fit_scale(fb->width, fb->height, 25);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -1005,7 +1010,7 @@ void render_rescale(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -1076,7 +1081,7 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = 2 * sc;
+   int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
    int rx       = fb->width - (4 * sc);
@@ -1096,9 +1101,9 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (m->dev.sensors[i].old)
          idxs[nold++] = i;
    if (nold <= 0) {
-      draw_str(px, fb, x, y, sc, "None yet. Disconnected", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "NONE YET. DISCONNECTED", UI_MUTED);
       y += lh;
-      draw_str(px, fb, x, y, sc, "devices appear here.", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "DEVICES APPEAR HERE.", UI_MUTED);
       return;
    }
 
@@ -1173,7 +1178,7 @@ void render_devlist(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * bottom in landscape -- and render_forget records no close target, so
     * it became a dead end with no way back. */
    int sc  = ui_fit_scale(fb->width, fb->height, 26);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -1193,10 +1198,10 @@ void render_devlist(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y += 2 * lh;
 
    if (m->dev.ndev <= 0) {
-      draw_str(px, fb, x, y, sc, "Searching for sensors...", UI_MUTED);
+      draw_str(px, fb, x, y, sc, "SEARCHING FOR SENSORS...", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "Nearest first -- tap yours:", UI_MUTED);
+   draw_str(px, fb, x, y, sc, "NEAREST FIRST -- TAP YOURS:", UI_MUTED);
    y += 2 * lh;
 
    /* selection sort by RSSI, strongest first (the model owns index -> device)
@@ -1238,7 +1243,7 @@ void render_meterhelp(struct ANativeWindow_Buffer *fb, const struct screen *m,
    uint32_t *px = fb->bits;
    (void)m;
    int sc  = ui_fit_scale(fb->width, fb->height, 20);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);
@@ -1279,7 +1284,7 @@ void render_senstype(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * bottom in landscape -- and render_forget records no close target, so
     * it became a dead end with no way back. */
    int sc  = ui_fit_scale(fb->width, fb->height, 20);
-   int tsc = 2 * sc;
+   int tsc = FONT_TITLE(sc);
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int rx  = fb->width - (4 * sc);

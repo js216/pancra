@@ -476,6 +476,47 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    /* Markers may paint only inside the frame; a capped reading sits on the
     * boundary gridline and would otherwise spill past it. */
 
+   /* THE EXERCISE BANDS, BEFORE EVERY GLYPH ON THE PLOT.
+    *
+    * A session is a STRETCH OF TIME, not an instant. A letter with a rule
+    * trailing off it says so only to a reader who already knows the
+    * convention; a filled band in the level's own blue says it at a glance,
+    * and it is what the EXERCISE LOG's own plot draws -- so exercise looks
+    * the same wherever the app shows it.
+    *
+    * UNDERNEATH, because a meal or a dose logged DURING a session shares this
+    * row and a band painted over it would bury it. Drawn first, every marker
+    * lands on top and stays legible.
+    *
+    * A SESSION THAT STARTED BEFORE THE WINDOW still shows the part that is
+    * inside it: `dt0` is clamped to the span rather than the whole record
+    * being dropped, which is what a letter anchored to its start had to do.
+    */
+   for (int i = 0; i < npts; i++) {
+      if (pts[i].hidden || pts[i].marker != PLOT_MARK_E)
+         continue;
+      long dt0 = now - pts[i].t;    /* the start, counting backwards */
+      long dt1 = dt0 - pts[i].span; /* the end, likewise */
+      if (dt1 < 0)
+         dt1 = 0; /* running, or a clock that moved: clamp to the right edge */
+      if (dt1 > span || dt0 < 0)
+         continue; /* wholly before the window, or not yet begun */
+      if (dt0 > span)
+         dt0 = span;
+      const int bx0    = t_to_x(dt0, x, w, span, t_margin);
+      const int bx1    = t_to_x(dt1, x, w, span, t_margin);
+      const int by     = glu_to_y(pts[i].glu, y, h, glu_max);
+      const uint32_t c = pts[i].col ? pts[i].col : color(pts[i].glu);
+      int bh           = radius;
+      if (bh < 2)
+         bh = 2;
+      if (bh > rmax)
+         bh = (int)rmax;
+      for (int gx = bx0; gx <= bx1; gx++)
+         for (int gy = by - bh; gy <= by + bh; gy++)
+            putc_clipped(cl, fb, stride, fbw, fbh, gx, gy, c);
+   }
+
    /* one dot per in-window reading; the highlighted one drawn last, on top */
    int hx = -1;
    int hy = -1;
@@ -494,6 +535,8 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
          hy = py;
          continue;
       }
+      if (pts[i].marker == PLOT_MARK_E)
+         continue; /* already drawn, as a band, above */
       /* An explicit colour means the point carries its own styling (a meter
        * reading, or a second sensor); otherwise fall back to the value-based
        * palette the caller supplied. Styled points are drawn a little larger
@@ -512,32 +555,6 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
          rr = 1;
       if (rr > rmax)
          rr = rmax;
-      /* THE RULE THAT GIVES A POINT A LENGTH, drawn UNDER the glyph so the
-       * letter stays readable where the two meet.
-       *
-       * The span ends earlier in `dt` terms than the point begins -- dt counts
-       * backwards from now -- so the end is to the RIGHT, and a span reaching
-       * into the future (a session still running, measured against a clock
-       * that has moved on) clamps to dt = 0, the right edge, rather than
-       * wrapping round.
-       *
-       * TOO SHORT AND IT IS NOT DRAWN. Under about two glyph widths the rule
-       * is a smudge on the letter's shoulder that says less than the letter
-       * alone; the threshold is in PIXELS, not seconds, so a ten-minute
-       * session shows a rule on a 3 h plot and correctly shows none on a
-       * 30 d one, where it would be a single pixel claiming to be a duration.
-       */
-      if (pts[i].span > 0) {
-         long dt_end = dt - pts[i].span;
-         if (dt_end < 0)
-            dt_end = 0;
-         int ex     = t_to_x(dt_end, x, w, span, t_margin);
-         int from   = px + (int)rr + 1;
-         int min_px = (int)(4 * rr);
-         if (ex - px > min_px)
-            for (int gx = from; gx <= ex; gx++)
-               putc_clipped(cl, fb, stride, fbw, fbh, gx, py, c);
-      }
       mark(cl, fb, stride, fbw, fbh, px, py, (int)rr, pts[i].marker, c);
    }
    if (hx >= 0) {
