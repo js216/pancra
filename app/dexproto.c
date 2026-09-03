@@ -480,6 +480,33 @@ void driver_on_connected(int link)
  * time. dc->fails is kept only for logging the current streak. */
 #define MAX_FAILS 15 /* connect-but-no-stream cap; pause to stop hammering */
 
+/* HOW LONG A LINK STAYS OFF THE AIR AFTER A DISCONNECT.
+ *
+ * AFTER IT DELIVERED: the sensor has said everything it has to say for this
+ * cadence, and the next reading is ~5 minutes away. It goes on advertising
+ * briefly, so an immediate redial is not a passive wait at all -- it is a
+ * connect that succeeds, streams nothing, and drops. Twenty seconds is past
+ * the tail of that advertising and nowhere near the next cadence.
+ *
+ * AFTER IT DID NOT: back off, and further each time. A run of failures is
+ * either the sensor out of range, busy with the reader, or refusing us -- and
+ * in every one of those cases dialling harder is the wrong answer. Doubling
+ * from 5 s, capped, so a genuine blip recovers in seconds while a real fault
+ * settles into one attempt a minute instead of one a second. */
+#define DEX_COOLDOWN_S  20
+#define DEX_BACKOFF_S    5
+#define DEX_BACKOFF_MAX 60
+
+static long dex_retry_delay(int did_stream, int fails)
+{
+   if (did_stream)
+      return DEX_COOLDOWN_S;
+   long d = DEX_BACKOFF_S;
+   for (int i = 1; i < fails && d < DEX_BACKOFF_MAX; i++)
+      d *= 2;
+   return d > DEX_BACKOFF_MAX ? DEX_BACKOFF_MAX : d;
+}
+
 void driver_on_disconnected(int link, int status)
 {
    /* SELECT AND LOCK AS ONE SCOPE: which context an operation runs on is
@@ -503,6 +530,10 @@ void driver_on_disconnected(int link, int status)
    if (did_stream) {
       dc->fails     = 0;
       dc->authfails = 0;
+      /* DATA ARRIVED, so whatever we concluded about the pairing was wrong or
+       * has been put right. This is the only thing that clears it: nothing
+       * short of a delivered reading proves the link can authenticate. */
+      dc->subfails = 0;
    } else {
       dc->fails++;
       /* Authenticated (reached auth/cert/keychal) but never dc->str.streamed.
@@ -520,6 +551,37 @@ void driver_on_disconnected(int link, int status)
        * sensor is unusable for the rest of its wear. A genuinely stale key
        * fails the tokenHash instead, which is handled at once where it is
        * proven. */
+      /* AUTHENTICATED, THEN DIED AT SUBSCRIBE: THE BLE BOND IS GONE.
+       *
+       * TWO DIFFERENT KEYS, and this is the one place their difference
+       * matters. The Dexcom key is ours and the sensor proves it holds it --
+       * reaching P_SUB2 at all means the AuthChallenge verified. The BLE
+       * bond is the link's, and only the control and data characteristics
+       * need it: that is why SUB1 and the whole auth exchange succeed and
+       * the very next subscribe is refused.
+       *
+       * NO WRITE ERROR EVER ARRIVES to say so. The refusal makes Android ask
+       * to pair, the sensor answers by hanging up, and the disconnect beats
+       * the write callback -- so this shape, repeated, IS the report.
+       *
+       * DISCARDING THE DEXCOM KEY IS THE REMEDY even though that key is
+       * sound: skipping the J-PAKE rounds is precisely what stops the sensor
+       * offering to bond, because the rounds are how a collector announces
+       * itself as new. Re-running them is the only path back that does not
+       * need the applicator. The pairing CODE is what makes this safe to do;
+       * without one there is nothing to re-pair with. */
+      /* A STREAK OF THESE MEANS THE BOND REPAIR IS NOT TAKING. The remedy is
+       * the certificate exchange, driven by the sensor's own bond byte where
+       * AuthStatus is handled; this only counts, so the log says plainly
+       * whether that repair is working rather than leaving a silent loop. */
+      if (was == P_SUB2)
+         dc->subfails++;
+      else
+         dc->subfails = 0;
+      if (dc->subfails == 3)
+         LOGI("!! %d authenticated connects died at subscribe -- the bond "
+              "repair is not taking; re-adding the sensor may be needed",
+              dc->subfails);
       if (dc->have_key && !dc->chal_ok &&
           (was == P_AUTH || was == P_CERT || was == P_KEYCHAL) &&
           ++dc->authfails >= 3) {
@@ -548,10 +610,14 @@ void driver_on_disconnected(int link, int status)
            dc->fails);
       drv_status("CONNECTION ERROR");
    } else if (dc->have_key || dc->g_codelen > 0) {
+      /* ARMED, BUT NOT YET. driver_retry_tick dials when the cooldown is up;
+       * see dex_retry_delay for why a disconnect is not a cue to redial. */
+      long mono = 0;
+      long d    = dex_retry_delay(did_stream, dc->fails);
+      dc->retry_after_mono = mono_try(&mono) == MONO_GET_OK ? mono + d : 0;
       drv_status(dc->have_key ? "WAITING" : "RE-PAIRING");
-      LOGI("reconnect on link %d (fail streak %d, was=%s)", dc->link, dc->fails,
-           dex_phase_name(was));
-      drv_connect(dc->link, dc->g_mac);
+      LOGI("link %d: next attempt in %lds (fail streak %d, was=%s)", dc->link,
+           d, dc->fails, dex_phase_name(was));
    } else {
       LOGI("no key/code -- not reconnecting (was=%s)", dex_phase_name(was));
       drv_status("CONNECTION ERROR");
@@ -663,6 +729,9 @@ void driver_kick(int link)
        * and every cycle re-shows CONNECTION ERROR with no reconnect. */
       dc->fails     = 0;
       dc->authfails = 0;
+      /* AND THE COOLDOWN. A kick is a deliberate "try now", so it must not be
+       * held back by a pending backoff. */
+      dc->retry_after_mono = 0;
       LOGI("driver_kick: forcing a fresh reconnect on link %d", dc->link);
       drv_connect(dc->link, dc->g_mac);
    }
@@ -808,6 +877,29 @@ int driver_calibrate(int link, int mg_dl, int sensor_id, unsigned gen)
    drv_write(dc->link, U_CTRL, m, 7, 0);
    driver_leave();
    return 1;
+}
+
+/* Dial any link whose cooldown has run out. Called from the watchdog sweep,
+ * which is the app's one periodic pass over the links and already runs on
+ * both the activity's timer and the service's tick. */
+void driver_retry_tick(void)
+{
+   long mono = 0;
+   if (mono_try(&mono) != MONO_GET_OK)
+      return; /* no clock to judge a deadline by: leave the links alone */
+   for (int l = 0; l < LINK_MAX; l++) {
+      if (!dex_link_ok(l))
+         continue;
+      struct dex_ctx *dc = driver_enter(l);
+      if (dc->phase == P_IDLE && dc->retry_after_mono
+          && mono >= dc->retry_after_mono
+          && (dc->have_key || dc->g_codelen > 0)) {
+         dc->retry_after_mono = 0;
+         LOGI("link %d: cooldown over, dialling", l);
+         drv_connect(dc->link, dc->g_mac);
+      }
+      driver_leave();
+   }
 }
 
 void driver_on_written(int link, const char *uuid, int status)
@@ -1055,9 +1147,26 @@ static void notify_auth(struct dex_ctx *dc, const uint8_t *buf, int n)
          LOGI("!! AuthStatus without a verified AuthChallenge -- refusing");
          drv_status("AUTH FAILED");
          dc->phase = P_FAIL;
-      } else if (dc->rnd.did || auth != 1) {
-         /* establish/refresh the bond via the certificate exchange */
+      } else if (dc->rnd.did || auth != 1 || bond != 1) {
+         /* ESTABLISH OR REFRESH THE BOND, via the certificate exchange.
+          *
+          * THE SENSOR SAYS WHETHER WE ARE BONDED, and until now only `auth`
+          * was read: `bond` was decoded, logged and dropped. A sensor that
+          * had forgotten the BLE bond answered auth=01 bond=02, which this
+          * branch took for a bonded reconnect and sent straight to SUBSCRIBE
+          * -- where the control and data characteristics need an encrypted
+          * link there is no longer a key for. The subscribe is refused,
+          * Android asks to pair, the sensor hangs up, and the cycle repeats
+          * every five minutes with the app reporting nothing worse than a
+          * disconnect. Six readings were lost to it before the capture
+          * showed the bond byte had been saying so all along.
+          *
+          * The certificate exchange is what re-establishes the bond, and
+          * running it costs a bonded sensor nothing -- bond == 1 still goes
+          * straight through. */
          drv_status(dc->rnd.did ? "PAIRED" : "BONDING");
+         LOGI("   bond=%02x -> certificate exchange to (re)establish it",
+              bond);
          enter_cert(dc, 0);
       } else {
          LOGI("   bonded reconnect -> stream");

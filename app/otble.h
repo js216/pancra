@@ -26,9 +26,19 @@ void ot_drv_write(const uint8_t *data, int n);
 void ot_drv_subscribe(void);
 void ot_drv_disconnect(void);
 void ot_drv_status(const char *s);
+/* THE METER'S OWN CLOCK, read in the session handshake and reported once per
+ * walk, before any record. `rtc_naive` is the meter's clock face in the same
+ * units a record timestamp uses: seconds since 2000-01-01, no zone.
+ *
+ * Reported RAW, because only the host has a clock to measure it against: the
+ * difference between this face and the true instant it was read at IS the
+ * offset every record timestamp in the walk is expressed in. A walk whose
+ * handshake carries no readable clock simply never calls this. */
+void ot_drv_clock(long rtc_naive);
+
 /* One accepted reading. `naive` is the meter's own clock (seconds since
- * 2000-01-01 with no zone); the host converts it using the offset that was in
- * force at import and persists both. */
+ * 2000-01-01 with no zone); the host converts it -- by the offset ot_drv_clock
+ * measured, or by the device zone when there was none -- and persists both. */
 /* Returns 0 if the host REFUSED the record as implausible -- which for a
  * timestamp means the phone's own clock may be at fault, so the driver must
  * not persist its walk past it. Returns 1 when the record was accounted for,

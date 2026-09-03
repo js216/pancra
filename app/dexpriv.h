@@ -228,6 +228,18 @@ struct dex_ctx {
       unsigned gen;  /* the caller's queue generation for that write */
    } cal_tx;
 
+   /* WHEN THIS LINK MAY DIAL AGAIN, on the monotonic clock; 0 = at once.
+    *
+    * A disconnect is not an invitation to redial. The sensor ends its session
+    * the moment it has delivered, and it keeps advertising for a few seconds
+    * afterwards -- so a connect issued on the spot is accepted, finds nothing
+    * to stream, drops, and is issued again. That loop is what a capture shows
+    * as nine connects in seven seconds. Holding the next attempt until this
+    * instant is what turns the loop back into a cadence. */
+   long retry_after_mono;
+   /* Consecutive connects that authenticated and then died at SUBSCRIBE.
+    * The signature of a missing BLE bond; see driver_on_disconnected. */
+   int subfails;
    int fails;     /* consecutive connects that never streamed */
    int authfails; /* subset: failures after we reached auth/cert */
    struct dex_cal cal;

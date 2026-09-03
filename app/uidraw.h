@@ -188,6 +188,10 @@ int menu_button_mark(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
 
 /* 1 when a weighing is DUE: none on record, or the most recent one is a day
  * old or more. The WEIGHT buttons carry the bullet when it is. */
+/* How many registered, live CGMs the OS has no bond with -- see the
+ * definition. Nonzero is an error condition the user must act on. */
+int ui_unpaired_count(const struct screen *m);
+
 int ui_weight_due(const struct screen *m);
 
 /* 1 when the once-daily SLOW dose is due: none on record, or the most recent

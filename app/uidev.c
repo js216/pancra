@@ -206,6 +206,36 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
               0);
    y += 3 * lh; /* the DISPLAY menu's title gap -- the house style */
 
+   /* UNPAIRED SENSORS, FIRST AND IN RED.
+    *
+    * A sensor the OS has no bond with is not a row like the others: it will
+    * never deliver another reading, and the remedy is a tap only the user can
+    * make. It goes above the list rather than in it, because a red word in a
+    * column of ordinary rows is something to scan for, and this is the reason
+    * the person came to this screen -- the big number sent them, reading ERR.
+    *
+    * The row is the whole target and it opens that sensor's own menu, which
+    * is where RECONNECT lives: pressing it dials, the sensor asks to bond,
+    * and Android raises the pairing dialog while the user is looking at the
+    * phone rather than at some random moment they will miss. */
+   if (ui_unpaired_count(m) > 0) {
+      draw_str(px, fb, x, y, sc, "UNPAIRED DEVICES", UI_DANGER);
+      y += lh;
+      for (int i = 0; i < m->dev.nsensors; i++) {
+         const struct ui_sensor *u = &m->dev.sensors[i];
+         if (u->kind != KIND_CGM || u->old || u->bond != UI_BOND_NONE)
+            continue;
+         draw_str(px, fb, x + (2 * 6 * sc), y, sc, u->label, UI_DANGER);
+         draw_str(px, fb, rx - (str_len("RECONNECT") * 6 * sc), y, sc,
+                  "RECONNECT", UI_GO);
+         /* The INDEX, which is what MA_SENSOR carries everywhere else on this
+          * screen -- see the device rows below. */
+         add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_SENSOR, i);
+         y += lh;
+      }
+      y += lh; /* a blank line before the ordinary list */
+   }
+
    /* THE PRIMARY COLUMN'S GEOMETRY, settled before anything that has to keep
     * clear of it: the row values below stop short of it.
     *

@@ -60,6 +60,22 @@ struct meter_rt {
     * process. In memory only, like `stat` -- it describes an exchange. */
    int amb_n;    /* ambiguous records in the last import; 0 = none */
    long amb_alt; /* the rejected instant of the last such record */
+   /* WHAT THE METER'S OWN CLOCK READS, measured against the phone's: how many
+    * seconds east of UTC its clock face runs. That difference is the offset
+    * the meter's record timestamps are expressed in, whatever zone the meter
+    * is set to and whether or not it follows a DST change.
+    *
+    * `clock_t` is the instant the measurement was taken, so a later reader
+    * can tell how old it is, and `clock_ok` is 0 for a meter whose clock has
+    * not been read since the app started -- a walk whose handshake answers
+    * nothing readable leaves all three alone and converts by the device zone.
+    *
+    * In memory only, like `stat` and the ambiguity pair: it describes the
+    * meter as this run of the app has measured it, and the next sync measures
+    * it again. */
+   long clock_skew;
+   long clock_t;
+   int clock_ok;
 };
 
 /* ---- THE RUNTIME TABLE IS THIS FILE'S, AND SO IS ITS LOCK ---------------
@@ -145,6 +161,9 @@ int meter_rt_ambiguous(int id, long alt);
 /* A walk is starting: forget the previous import's ambiguities, so the count
  * always describes the import a reader is looking at. */
 int meter_rt_amb_clear(int id);
+/* The meter's own clock, measured against the phone's at instant `at`: `skew`
+ * is how many seconds east of UTC the meter's clock face runs. */
+int meter_rt_clock(int id, long skew, long at);
 
 /* Where the two files live. Call once, at startup, before loading. */
 void meter_store_paths(const char *index_path, const char *sync_path);

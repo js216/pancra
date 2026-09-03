@@ -212,6 +212,22 @@ int meter_rt_amb_clear(int id)
    return r != 0;
 }
 
+/* rt_find(id, 1): the clock is read in the handshake, which is the first
+ * exchange of a walk, so this can be the first thing said about a meter that
+ * has just connected for the very first time. */
+int meter_rt_clock(int id, long skew, long at)
+{
+   mutex_lock(&mrt_lk);
+   struct meter_rt *r = rt_find(id, 1);
+   if (r) {
+      r->clock_skew = skew;
+      r->clock_t    = at;
+      r->clock_ok   = 1;
+   }
+   mutex_unlock(&mrt_lk);
+   return r != 0;
+}
+
 int meter_rt_done(int id, long synced_mono)
 {
    mutex_lock(&mrt_lk);

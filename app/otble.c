@@ -161,9 +161,11 @@ static void send_cmd(const uint8_t *payload, int n)
  * (btsnoop 2026-07-19) -- read the meter clock (20 02) then the R-counter
  * (27 00). Nothing captured EVER sends the T-counter cold, so we replay the
  * same opening: a bare 0a0206 on a fresh link is unproven and may be refused.
- * We do not consume either response (records carry absolute timestamps and we
- * walk the T-index, not the R-index) -- the exchange exists to open the session
- * exactly as the meter expects. */
+ *
+ * The CLOCK response is consumed (see the P_TIME handler): a record carries a
+ * clock face and no zone, so the meter's own clock, read at an instant the
+ * phone knows, is the only thing that says how to convert one. The R-counter's
+ * value is not read -- the walk is over the T-index. */
 static void ask_time(void)
 {
    static const uint8_t cmd[2] = {0x20, 0x02};
@@ -463,14 +465,31 @@ void ot_on_notify(const uint8_t *buf, int n)
    const uint8_t *body = buf + 6;
    int blen            = total - 9; /* payload after the status byte */
 
-   /* Handshake responses (20 02, 27 00): value unused -- ack and step to the
-    * next command, exactly as the official app and xDrip do. A short or absent
-    * body is fine; we never read it. */
+   /* THE METER'S CLOCK, which is the offset every record timestamp in this
+    * walk is expressed in. The payload is the same field a record's timestamp
+    * is -- uint32 LE seconds since 2000-01-01 -- and the host measures it
+    * against its own clock (see meter.c).
+    *
+    * A BODY TOO SHORT TO HOLD ONE IS NOT AN ERROR. The handshake's first job
+    * is to open the session exactly as the meter expects, and it has done
+    * that by answering at all; the walk goes on and the host converts by the
+    * device zone instead. */
    if (phase == P_TIME) {
+      if (blen >= 4)
+         ot_drv_clock((long)((unsigned long)body[0] |
+                             ((unsigned long)body[1] << 8U) |
+                             ((unsigned long)body[2] << 16U) |
+                             ((unsigned long)body[3] << 24U)));
+      else
+         LOGW("meter: clock response is %d bytes, too short to read; this "
+              "walk converts by the device zone",
+              blen);
       send_ack();
       ask_rcount();
       return;
    }
+   /* The R-counter: acked and stepped past, its value unused, exactly as the
+    * official app and xDrip do. */
    if (phase == P_RCOUNT) {
       send_ack();
       ask_count();

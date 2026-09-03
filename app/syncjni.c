@@ -415,7 +415,12 @@ void syncjni_wire(JNIEnv *e, jobject activity)
       (*e)->ExceptionClear(e);
    (*e)->DeleteLocalRef(e, net);
    sync_set_http(jni_http);
-   syncjni_register_logs();
+   /* THE LOG REGISTRY IS NOT PUBLISHED HERE. Wiring runs before the data
+    * directory is known, so every path getter still answers "" -- and a
+    * registry of nine empty paths is one sync_set_logs refuses whole, which
+    * is the right answer to a list that names no files. Each entry point
+    * that needs the registry publishes it first, by which time the paths are
+    * real; see syncjni_run. */
 }
 
 jint syncjni_run(JNIEnv *e, jobject cls)
@@ -424,8 +429,10 @@ jint syncjni_run(JNIEnv *e, jobject cls)
    remote_config_get(&rc);
    (void)e;
    (void)cls;
-   syncjni_register_logs(); /* the paths are set after wiring, on first launch
-                             */
+   /* PUBLISHED HERE, not at wiring time: the data directory is set during
+    * startup, after the transport is wired, so this is the first point at
+    * which every log's path is a real one. */
+   syncjni_register_logs();
    if (!rc.uid) {
       sync_report(SYNC_NOT_PAIRED);
       return 0;

@@ -910,6 +910,27 @@ int menu_button_mark(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
  * routine has come round again. Anything shorter would light the mark up
  * again the same evening. NO ENTRIES AT ALL counts as due -- an empty log is
  * the longest gap there is, not an absence of one. */
+/* HOW MANY LIVE SENSORS THE PHONE HAS NO BOND WITH.
+ *
+ * A registered sensor we hold a key for, which the OS has no pairing record
+ * for, cannot be read: its control and data characteristics need an encrypted
+ * link. It is not out of range, not expired and not asleep -- it is one tap
+ * away from working, and only a person can give that tap, because Android
+ * will not bond without consent. So it is worth the loudest thing this screen
+ * can say. Retired devices are not counted: a bond nobody intends to use is
+ * not a fault. */
+int ui_unpaired_count(const struct screen *m)
+{
+   int n = 0;
+   if (!m)
+      return 0;
+   for (int i = 0; i < m->dev.nsensors; i++)
+      if (m->dev.sensors[i].kind == KIND_CGM && !m->dev.sensors[i].old
+          && m->dev.sensors[i].bond == UI_BOND_NONE)
+         n++;
+   return n;
+}
+
 int ui_weight_due(const struct screen *m)
 {
    if (!m || m->wt.nwt <= 0)

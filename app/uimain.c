@@ -294,7 +294,19 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
     * number is meaningless, so it (and its age below) blank out entirely
     * rather than showing a stale value from a disconnected sensor. Same
     * placeholder as stale. */
-   if (m->reading.stale || m->reading.glu < 0 || !m->reading.has_cgm) {
+   if (ui_unpaired_count(m) > 0) {
+      /* LOUDER THAN A DASH, BECAUSE IT IS NOT THE SAME THING.
+       *
+       * "---" means no reading, which happens for a dozen ordinary reasons --
+       * out of range, warmup, a sleeping phone -- and none of them is
+       * actionable. A sensor the OS has no bond with is different in kind:
+       * nothing will ever arrive again, and the fix is one tap the user has
+       * to be told to make. Red, and the same tap target that already opens
+       * DEVICES, where the unpaired list says which sensor and offers the
+       * RECONNECT that raises the pairing dialog. */
+      (void)snprintf(big, sizeof big, "ERR");
+      bigcol = UI_DANGER;
+   } else if (m->reading.stale || m->reading.glu < 0 || !m->reading.has_cgm) {
       (void)snprintf(big, sizeof big, "---");
       bigcol = UI_MUTED;
    } else {

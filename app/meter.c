@@ -137,11 +137,33 @@ static struct mutex mdis_lk = MUTEX_INIT;
 
 /* THE WALK'S OWN ORDER, which is the only evidence there is about which of a
  * repeated hour's two instants a fingerstick belongs to (meterlogic.h). Reset
- * where the walk position is -- beside ot_init in meter_sync_start -- and
+ * where the walk position is -- beside ot_init in meter_hook_connected -- and
  * carried by the binder thread that delivers the records, exactly like
  * otble.c's own walk state and under the same driver lock. One meter syncs at
  * a time (msess_claim), so one of these is enough. */
 static struct meter_seq g_mseq;
+
+/* HOW FAR THE METER'S CLOCK MAY SIT FROM THE PHONE'S and still be read as an
+ * offset. Real zones run UTC-12..UTC+14; the rest of the allowance is for a
+ * meter clock set by hand and a few minutes out. A difference past this is
+ * not an offset -- the likeliest cause is a handshake response that was not a
+ * clock at all -- and taking it as one would move every reading in the walk
+ * by that much. Such a measurement is refused and the walk converts by the
+ * device zone. */
+#define METER_SKEW_MAX_S (26L * 3600)
+
+/* THE METER'S CLOCK, AS MEASURED THIS WALK: how many seconds east of UTC its
+ * clock face runs. A record carries a clock face and no zone, so this is what
+ * turns one into an instant -- and because it is measured rather than assumed,
+ * it describes a meter left in another zone, or one that does not follow a
+ * DST change, without being told anything about zones.
+ *
+ * `g_mskew_ok` is 0 until the handshake reports a usable clock, which is
+ * before any record arrives, so a walk is wholly one conversion or wholly the
+ * other. Reset beside g_mseq in meter_hook_connected, and carried by the binder
+ * thread that delivers the records under the same driver lock. */
+static long g_mskew;
+static int g_mskew_ok;
 
 /* Un-arm: this meter has no connection outstanding, so the tick may arm it
  * again. The link keeps its METER ROUTING BIT -- see below. */
@@ -388,6 +410,12 @@ static int meter_hook_connected(int link)
     * repeated-hour record it has nothing to do with. The ambiguity count is
     * cleared with it so it always describes the import being looked at. */
    meter_seq_reset(&g_mseq);
+   /* The measured offset belongs to the walk that measured it: the meter
+    * answers with its clock before any record, so leaving the previous
+    * meter's -- or this meter's, from before the user moved it -- in place
+    * would convert this walk's records by a clock nobody read. */
+   g_mskew    = 0;
+   g_mskew_ok = 0;
    meter_rt_amb_clear(mid);
    /* Clear the DIS strings: they are process-global for a meter link, and a
     * sync that finishes before the reads land -- the common case, since
@@ -647,21 +675,54 @@ void ot_drv_status(const char *s)
    }
 }
 
+void ot_drv_clock(long rtc_naive)
+{
+   /* THE DIFFERENCE IS THE OFFSET. The meter answers with its clock face; the
+    * phone knows the instant it answered. What separates the two is exactly
+    * the offset the meter's clock is keeping -- its zone, plus however far
+    * the user has set it out -- and that is what every record timestamp in
+    * this walk is expressed in.
+    *
+    * Measured, not assumed, which is the whole point: nothing here needs to
+    * know which zone the meter is in, whether it observes DST, or whether it
+    * agrees with the phone about either. */
+   long now  = realtime_s();
+   long skew = rtc_naive + OT_EPOCH - now;
+   if (skew > METER_SKEW_MAX_S || skew < -METER_SKEW_MAX_S) {
+      LOGW("meter clock reads %ld, %ld s from this phone's: too far to be an "
+           "offset, converting this walk by the device zone",
+           rtc_naive + OT_EPOCH, skew);
+      return;
+   }
+   g_mskew    = skew;
+   g_mskew_ok = 1;
+   LOGI("meter clock is %ld s east of UTC (face %ld, phone %ld)", skew,
+        rtc_naive + OT_EPOCH, now);
+   meter_rt_clock(msess_src(), skew, now);
+}
+
 int ot_drv_reading(long naive, int mg_dl)
 {
    /* THE METER'S CLOCK IS A CLOCK FACE, not an instant: naive local time with
     * no zone on it, so something has to say which offset was in force when
     * the fingerstick was taken. Without that the reading lands 7-8 hours off,
-    * which is exactly the discrepancy the HCI capture showed; with the wrong
-    * one -- the offset at IMPORT rather than at the reading -- every record
-    * from the far side of a DST boundary lands an hour off instead.
+    * which is exactly the discrepancy the HCI capture showed.
     *
-    * And in the repeated hour of a fall-back there are TWO right answers, so
-    * this is not a conversion at all but a decision, taken across the walk
-    * rather than per record: see meterlogic.h. The walk's own order is the
-    * evidence; realtime_s() is passed only as an upper bound ("a fingerstick
-    * cannot have been taken after it was imported") and never as an ordering,
-    * because a wall-clock correction mid-walk would then reorder the log.
+    * THE OFFSET THE METER ITSELF IS KEEPING is the answer whenever the
+    * handshake could be read: ot_drv_clock measured it against this phone's
+    * clock a moment ago, and subtracting it names one instant. A meter left
+    * in the zone it was set in, carried to another, or not following a DST
+    * change is all the same case, and none of them needs a zone named.
+    *
+    * THE DEVICE ZONE IS THE FALLBACK, for a walk whose handshake carried no
+    * readable clock. It assumes the meter agrees with the phone about the
+    * zone, and in the repeated hour of a fall-back there are TWO right
+    * answers, so it is not a conversion at all but a decision taken across
+    * the walk rather than per record: see meterlogic.h. The walk's own order
+    * is the evidence; realtime_s() is passed only as an upper bound ("a
+    * fingerstick cannot have been taken after it was imported") and never as
+    * an ordering, because a wall-clock correction mid-walk would then reorder
+    * the log.
     *
     * The offset is stored alongside the raw value so a wrong conversion stays
     * repairable, and an undecidable one is recorded as such rather than
@@ -671,8 +732,16 @@ int ot_drv_reading(long naive, int mg_dl)
     * An implausible timestamp is exactly the kind that would force the next
     * ambiguous record to the wrong side. */
    struct meter_seq seq_before = g_mseq;
-   struct meter_stamp st =
-       meter_stamp_step(&g_mseq, naive + OT_EPOCH, realtime_s(), meter_zone, 0);
+   struct meter_stamp st;
+   if (g_mskew_ok) {
+      /* One instant, and nothing to decide: a measured offset leaves no
+       * repeated hour to choose a side of. */
+      long m = naive + OT_EPOCH - g_mskew;
+      st     = (struct meter_stamp){.t = m, .off = g_mskew, .t_alt = m};
+   } else {
+      st = meter_stamp_step(&g_mseq, naive + OT_EPOCH, realtime_s(), meter_zone,
+                            0);
+   }
    long tz = st.off;
    long t  = st.t;
    /* THE EXACT timestamp bound lives here, not in otble.c: this is the first

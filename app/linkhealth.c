@@ -49,6 +49,11 @@ void pancra_link_watchdog(void)
     * the retry belongs. It throttles itself and does nothing at all when
     * nothing is owed. */
    driver_bind_retry();
+   /* THE COOLDOWN'S ONLY DRIVER. A disconnect ARMS the next attempt rather
+    * than making it -- see dex_retry_delay -- so without this call a link
+    * that dropped never dials again on its own, and every cadence arrives
+    * late through the 400-second silence branch below instead. */
+   driver_retry_tick();
    long now = realtime_s();
    /* BOTH CLOCKS, READ ONCE, so every link in this sweep is judged against
     * the same instant. `ok` says whether the monotonic one answered at all;

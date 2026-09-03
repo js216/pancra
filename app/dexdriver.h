@@ -112,6 +112,12 @@ void driver_kick(int link);     /* force reconnect if stalled */
 void driver_on_connected(int link);
 void driver_on_disconnected(int link, int status);
 void driver_on_written(int link, const char *uuid, int status);
+
+/* Dial any link whose post-disconnect cooldown has expired. The watchdog
+ * sweep calls it; nothing else should. A disconnect no longer redials on the
+ * spot -- see dex_retry_delay -- so this is what makes the next attempt
+ * happen at all. */
+void driver_retry_tick(void);
 void driver_on_notify(int link, const char *uuid, const uint8_t *buf, int n);
 void driver_request_backfill(
     int link, long span_seconds); /* recover a gap ending at now */
