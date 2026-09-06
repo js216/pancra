@@ -16,6 +16,7 @@
 #include "sensors.h"
 #include "status.h" /* set_status: a change that was not saved must say so */
 #include "store.h"
+#include "ui.h"
 
 /* WHICH LINK the chosen sensor is on, for a calibration call, or -1 if this
  * slot may not be calibrated.

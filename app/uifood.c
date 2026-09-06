@@ -19,9 +19,9 @@
  * The
  * origin is written down on the way in -- see nav.h -- and read on the way
  * out. */
+#include "colors.h"
 #include "font.h" /* str_len: the page counter is centred on its width */
 #include "food.h"
-#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h" /* fmt_date: the instant, split into YEAR / MM-DD / HH:MM */

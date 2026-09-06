@@ -43,7 +43,6 @@ struct dex_egv {
    uint16_t predicted; /* predicted glucose, 10-bit */
 };
 
-
 /* Decode one 9-byte backfill/EGV record. */
 int dexdata_record(const uint8_t rec[9], struct dex_record *out);
 

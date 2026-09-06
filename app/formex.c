@@ -13,7 +13,9 @@
 #include "formsint.h"
 #include "keypad.h"
 #include "nav.h"
+#include "settings.h"
 #include "status.h"
+#include "steps.h"
 #include "uiact.h"
 #include "uifmt.h" /* UI_DAY_TABS: the plot spans */
 #include "uimodel.h"
@@ -51,7 +53,8 @@ struct ex_draft {
    struct ex_rec orig;
 };
 static struct ex_draft g_ex = {
-    0, EX_MIN_LEVEL, 0, -1, {0}, {0, 0, 0, 0}
+    0, EX_MIN_LEVEL, 0, -1, {0},
+        {0, 0, 0, 0}
 };
 
 /* ---- THE EXERCISE LOG AND ITS CORRECTION FORM ----------------------------
@@ -207,9 +210,9 @@ void forms_ex_edit(int i)
    g_ex.orig   = row;
    g_ex.edit   = i;
    g_ex.err[0] = 0; /* a refusal belongs to the edit that caused it */
-   g_ex.t     = row.t;
-   g_ex.level = row.level;
-   g_ex.dur   = row.dur;
+   g_ex.t      = row.t;
+   g_ex.level  = row.level;
+   g_ex.dur    = row.dur;
 }
 
 /* ---- WHAT THE FRAME ASKS OF THIS WORKFLOW ----------------------------
@@ -241,5 +244,5 @@ void form_ex_view(struct forms_view *out)
    out->ex_err     = g_ex.err;
    out->ex_orig    = g_ex.orig;
    out->exlog_page = g_exlog_page;
-   out->exlog_tab   = g_exlog_tab;
+   out->exlog_tab  = g_exlog_tab;
 }

@@ -16,9 +16,9 @@
  * rather than each drifting inside the screen family it belongs to.
  */
 
+#include "colors.h"
 #include "font.h"
 #include "ndk.h"
-#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h"
@@ -264,8 +264,8 @@ void render_pairconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
  * What it costs is worth spelling out: the applicator code is spent by the
  * sensor, not by the app, so stopping and starting again is retyping, not a
  * lost sensor. ---- */
-void render_pendcancel(struct ANativeWindow_Buffer *fb,
-                       const struct screen *m, struct hits *h)
+void render_pendcancel(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                       struct hits *h)
 {
    uint32_t *px = fb->bits;
    int sc       = ui_fit_scale(fb->width, fb->height, 22);

@@ -215,8 +215,7 @@ bool alarm_stranded(int glu, long glu_t, long now, int lo, int hi)
 }
 
 enum alarm_level alarm_want_sustained(enum alarm_level zone, bool stale,
-                                      bool stranded,
-                                      enum alarm_level prev_want)
+                                      bool stranded, enum alarm_level prev_want)
 {
    if (zone != AL_NONE)
       return zone; /* fresh data, out of range: the zone rules decide */
@@ -275,7 +274,7 @@ void alarm_decide(enum alarm_level want, enum alarm_level prev_want,
    /* ARMED ONLY IF THERE IS SOMETHING TO SILENCE. With both outputs off the
     * announcement is silent, and latching `sounding` over it would swallow
     * the user's next tap as a silence gesture. */
-   o->sounding = alarm_audible(want, sound_on, vib_on);
+   o->sounding = (int)alarm_audible(want, sound_on, vib_on);
    o->acked    = 0;
 }
 

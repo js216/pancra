@@ -10,6 +10,7 @@
  */
 #include "pbkdf2.h"
 #include "hmac.h"
+#include <stdint.h>
 #include <string.h>
 
 /* ---- PBKDF2-HMAC-SHA256 ------------------------------------------------
@@ -51,15 +52,17 @@ enum pbkdf2_status pbkdf2_sha256(const uint8_t *pw, size_t pwn,
 
    uint32_t block = 1;
    while (n) {
-      uint8_t si[PBKDF2_SALT_MAX + 4], u[PBKDF2_HASH_LEN], t[PBKDF2_HASH_LEN];
+      uint8_t si[PBKDF2_SALT_MAX + 4];
+      uint8_t u[PBKDF2_HASH_LEN];
+      uint8_t t[PBKDF2_HASH_LEN];
       size_t k = saltn; /* NOT clamped any more: saltn <= PBKDF2_SALT_MAX was
                          * established above, so this fits by construction */
       if (saltn)        /* memcpy(_, NULL, 0) is undefined even when it copies
                          * nothing, and an empty salt is a legal ask */
          memcpy(si, salt, k);
-      si[k]     = (uint8_t)(block >> 24);
-      si[k + 1] = (uint8_t)(block >> 16);
-      si[k + 2] = (uint8_t)(block >> 8);
+      si[k]     = (uint8_t)(block >> 24U);
+      si[k + 1] = (uint8_t)(block >> 16U);
+      si[k + 2] = (uint8_t)(block >> 8U);
       si[k + 3] = (uint8_t)block;
       hmac_key_mac(&prf, si, k + 4, u);
       memcpy(t, u, PBKDF2_HASH_LEN);

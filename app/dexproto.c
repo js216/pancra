@@ -50,24 +50,15 @@
 const char *dex_phase_name(enum dex_phase p)
 {
    switch (p) {
-   case P_IDLE:
-      return "IDLE";
-   case P_SUB1:
-      return "SUB1";
-   case P_ROUNDS:
-      return "ROUNDS";
-   case P_AUTH:
-      return "AUTH";
-   case P_CERT:
-      return "CERT";
-   case P_KEYCHAL:
-      return "KEYCHAL";
-   case P_SUB2:
-      return "SUB2";
-   case P_STREAM:
-      return "STREAM";
-   case P_FAIL:
-      return "FAIL";
+      case P_IDLE: return "IDLE";
+      case P_SUB1: return "SUB1";
+      case P_ROUNDS: return "ROUNDS";
+      case P_AUTH: return "AUTH";
+      case P_CERT: return "CERT";
+      case P_KEYCHAL: return "KEYCHAL";
+      case P_SUB2: return "SUB2";
+      case P_STREAM: return "STREAM";
+      case P_FAIL: return "FAIL";
    }
    return "?";
 }
@@ -494,7 +485,7 @@ void driver_on_connected(int link)
  * from 5 s, capped, so a genuine blip recovers in seconds while a real fault
  * settles into one attempt a minute instead of one a second. */
 #define DEX_COOLDOWN_S  20
-#define DEX_BACKOFF_S    5
+#define DEX_BACKOFF_S   5
 #define DEX_BACKOFF_MAX 60
 
 static long dex_retry_delay(int did_stream, int fails)
@@ -612,8 +603,8 @@ void driver_on_disconnected(int link, int status)
    } else if (dc->have_key || dc->g_codelen > 0) {
       /* ARMED, BUT NOT YET. driver_retry_tick dials when the cooldown is up;
        * see dex_retry_delay for why a disconnect is not a cue to redial. */
-      long mono = 0;
-      long d    = dex_retry_delay(did_stream, dc->fails);
+      long mono            = 0;
+      long d               = dex_retry_delay(did_stream, dc->fails);
       dc->retry_after_mono = mono_try(&mono) == MONO_GET_OK ? mono + d : 0;
       drv_status(dc->have_key ? "WAITING" : "RE-PAIRING");
       LOGI("link %d: next attempt in %lds (fail streak %d, was=%s)", dc->link,
@@ -891,9 +882,8 @@ void driver_retry_tick(void)
       if (!dex_link_ok(l))
          continue;
       struct dex_ctx *dc = driver_enter(l);
-      if (dc->phase == P_IDLE && dc->retry_after_mono
-          && mono >= dc->retry_after_mono
-          && (dc->have_key || dc->g_codelen > 0)) {
+      if (dc->phase == P_IDLE && dc->retry_after_mono &&
+          mono >= dc->retry_after_mono && (dc->have_key || dc->g_codelen > 0)) {
          dc->retry_after_mono = 0;
          LOGI("link %d: cooldown over, dialling", l);
          drv_connect(dc->link, dc->g_mac);
@@ -1165,8 +1155,7 @@ static void notify_auth(struct dex_ctx *dc, const uint8_t *buf, int n)
           * running it costs a bonded sensor nothing -- bond == 1 still goes
           * straight through. */
          drv_status(dc->rnd.did ? "PAIRED" : "BONDING");
-         LOGI("   bond=%02x -> certificate exchange to (re)establish it",
-              bond);
+         LOGI("   bond=%02x -> certificate exchange to (re)establish it", bond);
          enter_cert(dc, 0);
       } else {
          LOGI("   bonded reconnect -> stream");
@@ -1237,11 +1226,11 @@ static void notify_stream(struct dex_ctx *dc, const char *uuid,
          /* mono_s(), NOT realtime_s(): this stamp is only ever used as the
           * base of an INTERVAL (see sens_project_clock), never as an instant
           * that is persisted or shown. */
-         dc->str.clock_m   = mono_s();
-         dc->str.state     = ev.state;
-         dc->str.age       = ev.age;
-         dc->str.glucose   = ev.glucose;
-         dc->str.trend     = (int)ev.trend;
+         dc->str.clock_m = mono_s();
+         dc->str.state   = ev.state;
+         dc->str.age     = ev.age;
+         dc->str.glucose = ev.glucose;
+         dc->str.trend   = (int)ev.trend;
          /* ABSENCE BECOMES ZERO HERE, once, rather than at each reader.
           *
           * The prediction is a 10-bit field whose 0x3ff (1023) means "no
@@ -1258,7 +1247,7 @@ static void notify_stream(struct dex_ctx *dc, const char *uuid,
           * conversion belongs at the one place the wire value enters. */
          dc->str.predicted =
              (ev.predicted > 0 && ev.predicted <= 400) ? ev.predicted : 0;
-         dc->str.seq       = ev.sequence;
+         dc->str.seq = ev.sequence;
          /* state is LOGGED on purpose: the warmup-phase value has never
           * been captured from a live sensor here, and it is the byte
           * that would let the UI say WARMUP from the sensor's own mouth

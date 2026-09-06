@@ -6,6 +6,7 @@
 #include "alarmlogic.h" /* AL_FRESH_S: one definition of "stale" */
 #include "blejni.h"
 #include "clock.h"
+#include "colors.h"
 #include "jbridge.h"
 #include "plot.h"
 #include "sensors.h"

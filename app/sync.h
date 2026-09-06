@@ -262,7 +262,6 @@ struct sync_prog {
    unsigned gen; /* which run these belong to */
 };
 
-
 /* The same state for a caller that only wants the two numbers. Kept because
  * every existing caller reads exactly this; it is one read of the word, so
  * the pair it returns is coherent for the same reason. */

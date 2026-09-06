@@ -511,7 +511,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
       if (bh < 2)
          bh = 2;
       if (bh > rmax)
-         bh = (int)rmax;
+         bh = rmax;
       for (int gx = bx0; gx <= bx1; gx++)
          for (int gy = by - bh; gy <= by + bh; gy++)
             putc_clipped(cl, fb, stride, fbw, fbh, gx, gy, c);

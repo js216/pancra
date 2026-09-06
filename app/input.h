@@ -43,7 +43,6 @@ int input_row_value(int action, int row, int *val);
  * to the same action in the just-rebuilt hit list. */
 void input_press_overlay(struct ANativeWindow_Buffer *buf);
 
-
 void input_arm_row(int action, int row);
 
 void press_cancel(void);

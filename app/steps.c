@@ -133,9 +133,9 @@ int steps_load(void)
       for (long i = 0; i < n; i++) {
          if (buf[i] == '\n') {
             struct step_rec r = {0, 0};
-            if (over)
+            if (over) {
                damaged = 1;
-            else if (llen > 0 && line[0] != '#') {
+            } else if (llen > 0 && line[0] != '#') {
                if (step_parse(line, line + llen, &r))
                   step_push(t, &r);
                else
@@ -175,9 +175,8 @@ int steps_append(long t, int n, long tz)
    len     = clampn(len, sizeof b);
    /* ONE OPERATION for the whole append, including the header on a new file:
     * see log_append. */
-   const int rc =
-       log_append(g_steps_path, g_steps_hdr, (int)sizeof g_steps_hdr - 1, b,
-                  len);
+   const int rc = log_append(g_steps_path, g_steps_hdr,
+                             (int)sizeof g_steps_hdr - 1, b, len);
    if (rc != LOG_OK)
       return rc; /* LOG_DAMAGED travels: the file may hold a partial row */
    struct step_rec r = {t, n};

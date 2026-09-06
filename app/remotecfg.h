@@ -82,5 +82,4 @@ enum load_result remote_load(void);
 
 int remote_server_valid(const char *s);
 
-
 #endif

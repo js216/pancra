@@ -108,23 +108,40 @@ static const uint8_t font_lower[26][7] = {
 };
 /* THE PUNCTUATION THAT HAD NO GLYPH. Every one of these drew as a blank
  * cell, so a string containing it silently lost a character. */
-static const uint8_t font_quote[7] = {0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '"' */
-static const uint8_t font_hash[7] = {0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A}; /* '#' */
-static const uint8_t font_dollar[7] = {0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04}; /* '$' */
-static const uint8_t font_amp[7] = {0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D}; /* '&' */
-static const uint8_t font_tick[7] = {0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '\'' */
-static const uint8_t font_star[7] = {0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00}; /* '*' */
-static const uint8_t font_semi[7] = {0x00, 0x04, 0x00, 0x00, 0x04, 0x04, 0x08}; /* ';' */
-static const uint8_t font_equals[7] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}; /* '=' */
-static const uint8_t font_lbrack[7] = {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}; /* '[' */
-static const uint8_t font_bslash[7] = {0x10, 0x10, 0x08, 0x04, 0x04, 0x02, 0x01}; /* '\\' */
-static const uint8_t font_rbrack[7] = {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}; /* ']' */
-static const uint8_t font_caret[7] = {0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00}; /* '^' */
-static const uint8_t font_grave[7] = {0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}; /* '`' */
-static const uint8_t font_lbrace[7] = {0x06, 0x04, 0x04, 0x08, 0x04, 0x04, 0x06}; /* '{' */
-static const uint8_t font_pipe[7] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}; /* '|' */
-static const uint8_t font_rbrace[7] = {0x0C, 0x04, 0x04, 0x02, 0x04, 0x04, 0x0C}; /* '}' */
-static const uint8_t font_tilde[7] = {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00}; /* '~' */
+static const uint8_t font_quote[7]  = {0x0A, 0x0A, 0x00, 0x00,
+                                       0x00, 0x00, 0x00}; /* '"' */
+static const uint8_t font_hash[7]   = {0x0A, 0x0A, 0x1F, 0x0A,
+                                       0x1F, 0x0A, 0x0A}; /* '#' */
+static const uint8_t font_dollar[7] = {0x04, 0x0F, 0x14, 0x0E,
+                                       0x05, 0x1E, 0x04}; /* '$' */
+static const uint8_t font_amp[7]    = {0x0C, 0x12, 0x14, 0x08,
+                                       0x15, 0x12, 0x0D}; /* '&' */
+static const uint8_t font_tick[7]   = {0x04, 0x04, 0x00, 0x00,
+                                       0x00, 0x00, 0x00}; /* '\'' */
+static const uint8_t font_star[7]   = {0x00, 0x04, 0x15, 0x0E,
+                                       0x15, 0x04, 0x00}; /* '*' */
+static const uint8_t font_semi[7]   = {0x00, 0x04, 0x00, 0x00,
+                                       0x04, 0x04, 0x08}; /* ';' */
+static const uint8_t font_equals[7] = {0x00, 0x00, 0x1F, 0x00,
+                                       0x1F, 0x00, 0x00}; /* '=' */
+static const uint8_t font_lbrack[7] = {0x0E, 0x08, 0x08, 0x08,
+                                       0x08, 0x08, 0x0E}; /* '[' */
+static const uint8_t font_bslash[7] = {0x10, 0x10, 0x08, 0x04,
+                                       0x04, 0x02, 0x01}; /* '\\' */
+static const uint8_t font_rbrack[7] = {0x0E, 0x02, 0x02, 0x02,
+                                       0x02, 0x02, 0x0E}; /* ']' */
+static const uint8_t font_caret[7]  = {0x04, 0x0A, 0x11, 0x00,
+                                       0x00, 0x00, 0x00}; /* '^' */
+static const uint8_t font_grave[7]  = {0x08, 0x04, 0x00, 0x00,
+                                       0x00, 0x00, 0x00}; /* '`' */
+static const uint8_t font_lbrace[7] = {0x06, 0x04, 0x04, 0x08,
+                                       0x04, 0x04, 0x06}; /* '{' */
+static const uint8_t font_pipe[7]   = {0x04, 0x04, 0x04, 0x04,
+                                       0x04, 0x04, 0x04}; /* '|' */
+static const uint8_t font_rbrace[7] = {0x0C, 0x04, 0x04, 0x02,
+                                       0x04, 0x04, 0x0C}; /* '}' */
+static const uint8_t font_tilde[7]  = {0x00, 0x00, 0x08, 0x15,
+                                       0x02, 0x00, 0x00}; /* '~' */
 
 /* EVERY VISIBLE ASCII CHARACTER, indexed by `c - ' '`.
  *
@@ -146,101 +163,106 @@ static const uint8_t font_tilde[7] = {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00};
  * their own text (the label editor does), which is a decision about the
  * text rather than about the alphabet. */
 static const uint8_t *const font_ascii['~' - ' ' + 1] = {
-    [' ' - ' '] = 0,  /* a blank cell, and the only one that is deliberate */
-    ['0' - ' '] = font_digit[0],
-    ['1' - ' '] = font_digit[1],
-    ['2' - ' '] = font_digit[2],
-    ['3' - ' '] = font_digit[3],
-    ['4' - ' '] = font_digit[4],
-    ['5' - ' '] = font_digit[5],
-    ['6' - ' '] = font_digit[6],
-    ['7' - ' '] = font_digit[7],
-    ['8' - ' '] = font_digit[8],
-    ['9' - ' '] = font_digit[9],
-    ['A' - ' '] = font_upper[0],
-    ['B' - ' '] = font_upper[1],
-    ['C' - ' '] = font_upper[2],
-    ['D' - ' '] = font_upper[3],
-    ['E' - ' '] = font_upper[4],
-    ['F' - ' '] = font_upper[5],
-    ['G' - ' '] = font_upper[6],
-    ['H' - ' '] = font_upper[7],
-    ['I' - ' '] = font_upper[8],
-    ['J' - ' '] = font_upper[9],
-    ['K' - ' '] = font_upper[10],
-    ['L' - ' '] = font_upper[11],
-    ['M' - ' '] = font_upper[12],
-    ['N' - ' '] = font_upper[13],
-    ['O' - ' '] = font_upper[14],
-    ['P' - ' '] = font_upper[15],
-    ['Q' - ' '] = font_upper[16],
-    ['R' - ' '] = font_upper[17],
-    ['S' - ' '] = font_upper[18],
-    ['T' - ' '] = font_upper[19],
-    ['U' - ' '] = font_upper[20],
-    ['V' - ' '] = font_upper[21],
-    ['W' - ' '] = font_upper[22],
-    ['X' - ' '] = font_upper[23],
-    ['Y' - ' '] = font_upper[24],
-    ['Z' - ' '] = font_upper[25],
-    ['a' - ' '] = font_lower[0],
-    ['b' - ' '] = font_lower[1],
-    ['c' - ' '] = font_lower[2],
-    ['d' - ' '] = font_lower[3],
-    ['e' - ' '] = font_lower[4],
-    ['f' - ' '] = font_lower[5],
-    ['g' - ' '] = font_lower[6],
-    ['h' - ' '] = font_lower[7],
-    ['i' - ' '] = font_lower[8],
-    ['j' - ' '] = font_lower[9],
-    ['k' - ' '] = font_lower[10],
-    ['l' - ' '] = font_lower[11],
-    ['m' - ' '] = font_lower[12],
-    ['n' - ' '] = font_lower[13],
-    ['o' - ' '] = font_lower[14],
-    ['p' - ' '] = font_lower[15],
-    ['q' - ' '] = font_lower[16],
-    ['r' - ' '] = font_lower[17],
-    ['s' - ' '] = font_lower[18],
-    ['t' - ' '] = font_lower[19],
-    ['u' - ' '] = font_lower[20],
-    ['v' - ' '] = font_lower[21],
-    ['w' - ' '] = font_lower[22],
-    ['x' - ' '] = font_lower[23],
-    ['y' - ' '] = font_lower[24],
-    ['z' - ' '] = font_lower[25],
-    ['!' - ' '] = font_bang,
-    ['"' - ' '] = font_quote,
-    ['#' - ' '] = font_hash,
-    ['$' - ' '] = font_dollar,
-    ['%' - ' '] = font_pct,
-    ['&' - ' '] = font_amp,
+    /* A blank cell, and the only one that is deliberate. Written as an offset
+     * from the table's base like every other row, so the indexing scheme reads
+     * the same all the way down -- the two sides being equal is exactly what
+     * makes this the first cell. */
+    // NOLINTNEXTLINE(misc-redundant-expression)
+    [' ' - ' ']  = 0,
+    ['0' - ' ']  = font_digit[0],
+    ['1' - ' ']  = font_digit[1],
+    ['2' - ' ']  = font_digit[2],
+    ['3' - ' ']  = font_digit[3],
+    ['4' - ' ']  = font_digit[4],
+    ['5' - ' ']  = font_digit[5],
+    ['6' - ' ']  = font_digit[6],
+    ['7' - ' ']  = font_digit[7],
+    ['8' - ' ']  = font_digit[8],
+    ['9' - ' ']  = font_digit[9],
+    ['A' - ' ']  = font_upper[0],
+    ['B' - ' ']  = font_upper[1],
+    ['C' - ' ']  = font_upper[2],
+    ['D' - ' ']  = font_upper[3],
+    ['E' - ' ']  = font_upper[4],
+    ['F' - ' ']  = font_upper[5],
+    ['G' - ' ']  = font_upper[6],
+    ['H' - ' ']  = font_upper[7],
+    ['I' - ' ']  = font_upper[8],
+    ['J' - ' ']  = font_upper[9],
+    ['K' - ' ']  = font_upper[10],
+    ['L' - ' ']  = font_upper[11],
+    ['M' - ' ']  = font_upper[12],
+    ['N' - ' ']  = font_upper[13],
+    ['O' - ' ']  = font_upper[14],
+    ['P' - ' ']  = font_upper[15],
+    ['Q' - ' ']  = font_upper[16],
+    ['R' - ' ']  = font_upper[17],
+    ['S' - ' ']  = font_upper[18],
+    ['T' - ' ']  = font_upper[19],
+    ['U' - ' ']  = font_upper[20],
+    ['V' - ' ']  = font_upper[21],
+    ['W' - ' ']  = font_upper[22],
+    ['X' - ' ']  = font_upper[23],
+    ['Y' - ' ']  = font_upper[24],
+    ['Z' - ' ']  = font_upper[25],
+    ['a' - ' ']  = font_lower[0],
+    ['b' - ' ']  = font_lower[1],
+    ['c' - ' ']  = font_lower[2],
+    ['d' - ' ']  = font_lower[3],
+    ['e' - ' ']  = font_lower[4],
+    ['f' - ' ']  = font_lower[5],
+    ['g' - ' ']  = font_lower[6],
+    ['h' - ' ']  = font_lower[7],
+    ['i' - ' ']  = font_lower[8],
+    ['j' - ' ']  = font_lower[9],
+    ['k' - ' ']  = font_lower[10],
+    ['l' - ' ']  = font_lower[11],
+    ['m' - ' ']  = font_lower[12],
+    ['n' - ' ']  = font_lower[13],
+    ['o' - ' ']  = font_lower[14],
+    ['p' - ' ']  = font_lower[15],
+    ['q' - ' ']  = font_lower[16],
+    ['r' - ' ']  = font_lower[17],
+    ['s' - ' ']  = font_lower[18],
+    ['t' - ' ']  = font_lower[19],
+    ['u' - ' ']  = font_lower[20],
+    ['v' - ' ']  = font_lower[21],
+    ['w' - ' ']  = font_lower[22],
+    ['x' - ' ']  = font_lower[23],
+    ['y' - ' ']  = font_lower[24],
+    ['z' - ' ']  = font_lower[25],
+    ['!' - ' ']  = font_bang,
+    ['"' - ' ']  = font_quote,
+    ['#' - ' ']  = font_hash,
+    ['$' - ' ']  = font_dollar,
+    ['%' - ' ']  = font_pct,
+    ['&' - ' ']  = font_amp,
     ['\'' - ' '] = font_tick,
-    ['(' - ' '] = font_lpar,
-    [')' - ' '] = font_rpar,
-    ['*' - ' '] = font_star,
-    ['+' - ' '] = font_plus,
-    [',' - ' '] = font_comma,
-    ['-' - ' '] = font_minus,
-    ['.' - ' '] = font_dot,
-    ['/' - ' '] = font_slash,
-    [':' - ' '] = font_colon,
-    [';' - ' '] = font_semi,
-    ['<' - ' '] = font_larrow,
-    ['=' - ' '] = font_equals,
-    ['>' - ' '] = font_rarrow,
-    ['?' - ' '] = font_quest,
-    ['@' - ' '] = font_at,
-    ['[' - ' '] = font_lbrack,
+    ['(' - ' ']  = font_lpar,
+    [')' - ' ']  = font_rpar,
+    ['*' - ' ']  = font_star,
+    ['+' - ' ']  = font_plus,
+    [',' - ' ']  = font_comma,
+    ['-' - ' ']  = font_minus,
+    ['.' - ' ']  = font_dot,
+    ['/' - ' ']  = font_slash,
+    [':' - ' ']  = font_colon,
+    [';' - ' ']  = font_semi,
+    ['<' - ' ']  = font_larrow,
+    ['=' - ' ']  = font_equals,
+    ['>' - ' ']  = font_rarrow,
+    ['?' - ' ']  = font_quest,
+    ['@' - ' ']  = font_at,
+    ['[' - ' ']  = font_lbrack,
     ['\\' - ' '] = font_bslash,
-    [']' - ' '] = font_rbrack,
-    ['^' - ' '] = font_caret,
-    ['_' - ' '] = font_uscore,
-    ['`' - ' '] = font_grave,
-    ['{' - ' '] = font_lbrace,
-    ['|' - ' '] = font_pipe,
-    ['}' - ' '] = font_rbrace,
-    ['~' - ' '] = font_tilde,
+    [']' - ' ']  = font_rbrack,
+    ['^' - ' ']  = font_caret,
+    ['_' - ' ']  = font_uscore,
+    ['`' - ' ']  = font_grave,
+    ['{' - ' ']  = font_lbrace,
+    ['|' - ' ']  = font_pipe,
+    ['}' - ' ']  = font_rbrace,
+    ['~' - ' ']  = font_tilde,
 };
 
 const uint8_t *glyph_for(char c)

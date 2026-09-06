@@ -7,7 +7,10 @@
  * libraries, and a hidden symbol is not one the linker can stand in for. */
 #pragma GCC visibility push(default)
 
-#include "stub_log.h"
+/* The declaration comes through this header rather than from log.h direct,
+ * which is the arrangement log.h itself documents: the stub has its own
+ * named entry point. NOLINT: include-cleaner sees only the indirection. */
+#include "stub_log.h" // NOLINT(misc-include-cleaner)
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...)
 {

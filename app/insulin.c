@@ -394,8 +394,7 @@ int insulin_load(void)
 
 /* Append one assertion. The log is only ever extended -- there is no rewrite
  * path left, so no crash window in which the file could be truncated. */
-static int ins_write_row(long id, int del, long t, int type, int milli,
-                         long tz)
+static int ins_write_row(long id, int del, long t, int type, int milli, long tz)
 {
    char b[96];
    /* THE DOSE AS A PERSON WRITES IT -- "20", "0.5", "16.5". The column has
@@ -403,8 +402,8 @@ static int ins_write_row(long id, int del, long t, int type, int milli,
     * show, which is why every row already in the file still reads. */
    char u[16];
    (void)ins_units_str(milli, u, sizeof u);
-   int n = snprintf(b, sizeof b, "%ld,%ld,%d,%ld,%d,%s,%ld\n", realtime_s(),
-                    id, del, t, type, u, tz);
+   int n = snprintf(b, sizeof b, "%ld,%ld,%d,%ld,%d,%s,%ld\n", realtime_s(), id,
+                    del, t, type, u, tz);
    n     = clampn(n, sizeof b);
    /* ONE OPERATION, header included: see log_append. */
    int rc = log_append(g_ins_path, g_ins_hdr, (int)sizeof g_ins_hdr - 1, b, n);

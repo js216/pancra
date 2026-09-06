@@ -14,6 +14,7 @@
  * driver lock.
  */
 #include "syncjni.h"
+#include "calib.h"
 #include "dexlibc.h" /* open/lseek: the state stamp */
 #include "exercise.h"
 #include "food.h"
@@ -23,7 +24,6 @@
 #include "logsload.h" /* pancra_logs_reload: a restore rewrote the files */
 #include "remotecfg.h"
 #include "sensors.h"
-#include "calib.h"
 #include "steps.h"
 #include "store.h"
 #include "sync.h"
@@ -339,9 +339,9 @@ void syncjni_register_logs(void)
  * Cheap either way: an open/lseek pair per file and a counter, no reading. */
 int64_t syncjni_state_stamp(void)
 {
-   const char *paths[] = {store_path(),   insulin_path(),     weight_path(),
-                          food_path(),    food_types_path(),  exercise_path(),
-                          sensors_path(), slots_path(),       steps_path(),
+   const char *paths[] = {store_path(),      insulin_path(),    weight_path(),
+                          food_path(),       food_types_path(), exercise_path(),
+                          sensors_path(),    slots_path(),      steps_path(),
                           cal_rescale_path()};
    int64_t total       = 0;
    for (int i = 0; i < (int)(sizeof paths / sizeof paths[0]); i++) {

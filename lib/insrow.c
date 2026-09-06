@@ -106,9 +106,9 @@ int ins_units_str(int milli, char *out, int cap)
        * person would write, and a reader that sees "0.500" learns nothing the
        * shorter form did not tell it. */
       char f[3];
-      f[0] = (char)('0' + (frac / 100));
-      f[1] = (char)('0' + ((frac / 10) % 10));
-      f[2] = (char)('0' + (frac % 10));
+      f[0]   = (char)('0' + (frac / 100));
+      f[1]   = (char)('0' + ((frac / 10) % 10));
+      f[2]   = (char)('0' + (frac % 10));
       int fl = 3;
       while (fl > 1 && f[fl - 1] == '0')
          fl--;

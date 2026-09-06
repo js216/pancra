@@ -604,9 +604,9 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
       /* THOUSANDTHS, carried through the plot point unchanged: the scrub
        * readout renders it with ins_units_str, so a half-unit dose reads
        * "0.5 U" there rather than being flattened on the way in. */
-      f->pts[nh].glu    = ir.milli;
-      f->pts[nh].src    = ir.type; /* the scrub shows "2U FAST" etc. */
-      f->pts[nh].kind   = KIND_INS;
+      f->pts[nh].glu  = ir.milli;
+      f->pts[nh].src  = ir.type; /* the scrub shows "2U FAST" etc. */
+      f->pts[nh].kind = KIND_INS;
       nh++;
    }
    /* Logged WEIGHTS ride along the same way, on the same bottom line, as a
@@ -939,16 +939,16 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    /* The exercise tail, copied for the same reason: exercise_button_tick can
     * commit a record from the SERVICE thread between frames, which reloads
     * it. */
-   m->food.nexlog        = ex_copy(f->exlog, NEX);
-   m->food.exlog         = f->exlog;
-   m->food.exlog_page    = f->fv.exlog_page;
-   m->food.exlog_tab     = f->fv.exlog_tab;
-   m->food.steps_on      = f->prefs.steps_on;
-   m->food.steps_live    = steps_live();
+   m->food.nexlog     = ex_copy(f->exlog, NEX);
+   m->food.exlog      = f->exlog;
+   m->food.exlog_page = f->fv.exlog_page;
+   m->food.exlog_tab  = f->fv.exlog_tab;
+   m->food.steps_on   = f->prefs.steps_on;
+   m->food.steps_live = steps_live();
    /* A COPY, into frame-owned storage, like every other log tail: the sampler
     * appends from a service tick while this frame is being drawn. */
-   m->food.nsteps        = steps_copy(f->steps, NSTEPS);
-   m->food.steps         = f->steps;
+   m->food.nsteps = steps_copy(f->steps, NSTEPS);
+   m->food.steps  = f->steps;
    /* THE RUNNING ROW, named by its position in the copy above. ex_copy keeps
     * the tail's order (oldest first), so the running session -- which is
     * always the newest row -- is the last one copied; the instant is compared
@@ -968,7 +968,7 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    str_snapshot(m->food.ex_err, sizeof m->food.ex_err, f->fv.ex_err);
    m->food.ex_orig_t     = f->fv.ex_orig.t;
    m->food.ex_orig_level = f->fv.ex_orig.level;
-   m->ins.ins_edit = (f->fv.ins_edit >= 0);
+   m->ins.ins_edit       = (f->fv.ins_edit >= 0);
    for (int k = 0; k < 2; k++) {
       m->ins.ins_marker[k] = f->prefs.ins_marker[k];
       m->ins.ins_color[k]  = f->prefs.ins_color[k];
@@ -1079,11 +1079,11 @@ void build_model(struct screen *m)
     * answers about what the user was typing. */
    forms_view_get(&f->fv);
 
-   *m        = (struct screen){0};
+   *m           = (struct screen){0};
    m->scr       = shell_gate() ? SCR_GATE : cur_screen();
    m->log_scrub = f->fv.log_scrub;
-   m->now    = now;
-   m->tz_off = tz_off_now();
+   m->now       = now;
+   m->tz_off    = tz_off_now();
 
    build_reading(f, m);
    build_plot(f, m);

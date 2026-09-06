@@ -201,7 +201,6 @@ struct sensor_slot {
  * snapshot (sensors_view_get above) rather than calling them in a loop, so no
  * caller has to hold a lock -- or know which one. */
 
-
 /* (THE INDEXED READS ARE NOT HERE. A count-then-index pair is two locked
  * questions about a moving table, and no production caller may ask them --
  * see app/sensorsint.h, which the registry's own tests include.)

@@ -10,6 +10,7 @@
  */
 #include "hkdf.h"
 #include "hmac.h"
+#include <stdint.h>
 #include <string.h>
 
 void hkdf_extract(const uint8_t *salt, size_t saltn, const uint8_t *ikm,

@@ -32,7 +32,6 @@ int ui_shortcut_menu_nth(int k);
 /* How many slots there are to ask about. */
 int ui_shortcut_count(void);
 
-
 /* ---- two questions the menus answer about a device -------------------
  *
  * uimenu.c's, and declared here rather than in the family's shared private

@@ -59,8 +59,8 @@
 #define NINS 256
 
 struct ins_rec {
-   long t;    /* dose instant, epoch seconds */
-   int type;  /* INS_SLOW / INS_FAST */
+   long t;   /* dose instant, epoch seconds */
+   int type; /* INS_SLOW / INS_FAST */
    /* THOUSANDTHS OF A UNIT, INS_MILLI_MIN..INS_MILLI_MAX -- 500 is half a
     * unit. Named `milli` and not `units` on purpose: the two are not the same
     * number, and a field called `units` holding 500 for a half-unit dose is
@@ -95,7 +95,7 @@ int insulin_load(void);
 /* Append one dose durably and mirror it into the tail. Returns 0 on success,
  * -1 when the write failed (the tail is then left untouched, so memory never
  * claims a dose the file does not have). Rejects out-of-range input. */
-int insulin_append(long t, int type, int units, long tz);
+int insulin_append(long t, int type, int milli, long tz);
 
 /* The units of the most recent dose of `type`, or 0 if none is known --
  * what the LOG INSULIN form pre-populates with. */
@@ -105,7 +105,7 @@ int insulin_last_units(int type);
  * APPENDING an assertion against its id -- the file is never rewritten. 0 on
  * success, -1 when nothing matches or the write failed. Matching is by
  * CONTENT, so a stale tail index can never touch the wrong dose. */
-int insulin_update(const struct ins_rec *orig, long t, int type, int units,
+int insulin_update(const struct ins_rec *orig, long t, int type, int milli,
                    long tz);
 int insulin_delete(const struct ins_rec *orig);
 
@@ -128,8 +128,8 @@ const char *insulin_type_name(int type); /* "SLOW" / "FAST" */
  *
  * `edit` is the index of the entry being edited, or < 0 for a new dose. */
 struct ins_form {
-   long t;   /* the dose's instant */
-   int type; /* INS_SLOW / INS_FAST */
+   long t;    /* the dose's instant */
+   int type;  /* INS_SLOW / INS_FAST */
    int milli; /* thousandths of a unit, like struct ins_rec's */
    int edit;
 };

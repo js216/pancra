@@ -79,7 +79,6 @@ struct jpoint { /* Jacobian; Z==0 => infinity */
 
 void p256_init(void); /* IDEMPOTENT: call from anywhere, as often as needed */
 
-
 /* scalars mod n (curve order) */
 void p256_sc_from_be(struct u256 *r,
                      const uint8_t be[32]); /* load + reduce mod n */

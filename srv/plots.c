@@ -234,7 +234,7 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
    /* The cast is ISO C's, not ours: uint8_t(*)[3] does not convert to
     * const uint8_t(*)[3] implicitly the way a plain pointer would. */
    return gif_encode(&ws->gw, out, cap, ws->img, IMG_W, IMG_H,
-                     (const uint8_t(*)[3])gray, 16);
+                     (const uint8_t (*)[3])gray, 16);
 }
 
 /* THE ONE WORKSPACE THE SERVER RENDERS INTO, and the buffer it encodes to.

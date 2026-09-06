@@ -403,8 +403,8 @@ enum load_result settings_load(void)
        g_p.ins_color[1],  g_p.ins_size[1],  g_p.statbar_val, g_p.lockscr_val,
        g_p.nudge_sound,   g_p.nudge_vib,    g_p.wunits,      g_p.shortcut[0],
        g_p.shortcut[1],   g_p.shortcut[2],  g_p.shortcut[3], g_p.shortcut[4],
-       g_p.shortcut[5],   g_p.shortcut[6],  g_p.shortcut[7],
-       g_p.shortcut[8],   g_p.best_streak_s, g_p.steps_on};
+       g_p.shortcut[5],   g_p.shortcut[6],  g_p.shortcut[7], g_p.shortcut[8],
+       g_p.best_streak_s, g_p.steps_on};
    /* VERSION 0 AND VERSION 1 SHARE THIS READER, and that is the migration:
     * v1 added the marker and changed nothing else, so a v0 file is read
     * field-for-field as it always was and is rewritten as v1 at the next

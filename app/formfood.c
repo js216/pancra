@@ -87,9 +87,9 @@ int form_food_action(int action, int ix)
        * WITH NOTHING LOGGED YET there is no last meal to offer, so the picker
        * is pushed on top exactly as before. The form must be BELOW it on the
        * path or the picker has nothing to return to (see above). */
-      const int nf              = food_count();
-      const struct food_rec lst = (nf > 0) ? food_at(nf - 1)
-                                           : (struct food_rec){0, 0, 0};
+      const int nf = food_count();
+      const struct food_rec lst =
+          (nf > 0) ? food_at(nf - 1) : (struct food_rec){0, 0, 0};
       nav_go(SCR_FOOD);
       if (lst.t > 0 && lst.type != FOOD_TYPE_NONE)
          forms_food_type_set(lst.type);

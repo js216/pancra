@@ -31,7 +31,7 @@
  * produces from those inputs. A peer that had it right would have agreed
  * about the first 8160 bytes and disagreed about every byte after, and there
  * was no return value, no log line and no assertion anywhere to say so. */
-#define HKDF_L_MAX (255 * HKDF_HASH_LEN) /* 8160 */
+#define HKDF_L_MAX (255UL * HKDF_HASH_LEN) /* 8160 */
 
 /* THE INFO CAPACITY, and why this construction has one when the RFC does not.
  *

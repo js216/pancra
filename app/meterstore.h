@@ -235,7 +235,6 @@ int meter_index_save(int id, int idx);
  */
 enum load_result meter_index_load(int id, int *out);
 
-
 #ifdef APP_FAULTS
 /* HELD OPEN ON DEMAND, twice inside meter_sync_save: once between the two
  * halves of a row, and once between the finished render and the write.

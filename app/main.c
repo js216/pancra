@@ -58,7 +58,7 @@
 #include "sesscache.h"
 #include "settings.h"
 #include "shell.h"
-#include "stategen.h"   /* state.gen: one generation, for a backup */
+#include "stategen.h" /* state.gen: one generation, for a backup */
 #include "stats.h"
 #include "status.h"
 #include "steps.h"
@@ -1543,7 +1543,6 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * orientation and screen size, so a rotation does not come through here:
     * this runs on a genuine (re)launch and nowhere else. */
    nav_home();
-
 
    /* Window flags are per-window, so this must run on every onCreate -- not
     * just the first -- and only once settings_load() has supplied the user's

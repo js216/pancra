@@ -30,7 +30,7 @@
 #include <stdint.h>
 
 /* Layout constants owned by the UI (not the shell). */
-#define UI_COLS   33         /* character columns the layout targets */
+#define UI_COLS 33 /* character columns the layout targets */
 /* Sensor trace colours the picker offers; crosschecked against SET_NCOLORS
  * where the palette is defined. */
 #define UI_NCOLORS 7
@@ -150,8 +150,7 @@ int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
  * receives the window's start. */
 #define UI_INS_SERIES 2
 extern const uint32_t ui_ins_col[UI_INS_SERIES];
-int ins_points(const struct screen *m, struct log_pt *out, int cap,
-               long *from);
+int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from);
 long exday_from_of(int tab, long now, long oldest_ex, long oldest_step);
 long ex_day_floor(long t, long tz_off);
 
@@ -211,6 +210,5 @@ void render_wtdel(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
 void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
                   const struct ui_prefs *prefs, long now, long tz_off,
                   int scrub, struct hits *h);
-
 
 #endif

@@ -415,10 +415,10 @@ int on_input(int fd, int events, void *data)
                    * press that lands on nothing still starts clean. */
                   if (action == AMOTION_EVENT_ACTION_DOWN)
                      g_log_series = -1;
-                  int pick = ui_log_hit(
-                      &sm, g_hits.box[i].x, g_hits.box[i].y, g_hits.box[i].w,
-                      g_hits.box[i].h, g_hits.box[i].arg, tx, ty,
-                      &g_log_series);
+                  int pick =
+                      ui_log_hit(&sm, g_hits.box[i].x, g_hits.box[i].y,
+                                 g_hits.box[i].w, g_hits.box[i].h,
+                                 g_hits.box[i].arg, tx, ty, &g_log_series);
                   if (pick >= 0) {
                      forms_set_log_scrub(pick);
                      g_log_scrubbing = 1;

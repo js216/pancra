@@ -351,8 +351,8 @@ struct ui_wtview {
    long wt_orig_t, wt_orig_g;
    long wt_t;
    int nwt, wt_page;
-   int wt_edit;  /* 1 = the form is EDITING an entry, not logging a new one */
-   int wt_tab;   /* index into ui_wt_days: the plot's span */
+   int wt_edit; /* 1 = the form is EDITING an entry, not logging a new one */
+   int wt_tab;  /* index into ui_wt_days: the plot's span */
    int wt_tenths;
 };
 
@@ -405,9 +405,9 @@ struct ui_foodview {
    int steps_on, steps_live;
    const struct step_rec *steps;
    int nsteps;
-   long ex_t;         /* the instant the form holds */
-   long ex_form_dur;  /* the duration it holds, SECONDS, 0 = not known */
-   int ex_edit;       /* 1 = correcting an existing entry */
+   long ex_t;        /* the instant the form holds */
+   long ex_form_dur; /* the duration it holds, SECONDS, 0 = not known */
+   int ex_edit;      /* 1 = correcting an existing entry */
    /* 1 = the row being corrected is the session running right now, so its
     * length is not settled: the MINUTES row reads ACTIVE and is not a
     * control. See exercise_row_running. */

@@ -150,9 +150,9 @@ enum ui_menu {
    MA_FOODTYPE_PICK, /* picker: ix = the vocabulary index chosen */
    MA_FOODTYPE_NEW,  /* picker: type a food this list does not have yet */
    MA_FOODTYPE_BACK, /* picker: leave without choosing */
-   MA_FOODPAGE, /* food picker: go to page ix */
-   MA_FOOD_CONFIRM, /* LOG FOOD: append the entry */
-   MA_FOOD_DISCARD, /* LOG FOOD: leave without logging */
+   MA_FOODPAGE,      /* food picker: go to page ix */
+   MA_FOOD_CONFIRM,  /* LOG FOOD: append the entry */
+   MA_FOOD_DISCARD,  /* LOG FOOD: leave without logging */
    /* LOG FOOD fields, mirroring MA_WT_EDIT; ix picks one: 0 type, 1 grams,
     * 2 time, 3 date, 4 year. */
    MA_FOOD_EDIT,
@@ -175,9 +175,9 @@ enum ui_menu {
    MA_EXLOG_BACK,
    MA_EXLOG_PAGE,
    MA_STEPS_TOGGLE, /* turn step counting on or off */
-   MA_EXLOG_EDIT, /* a row: open that entry in the form; ix = tail index */
-   MA_EX_CONFIRM, /* EDIT EXERCISE: rewrite the entry */
-   MA_EX_DISCARD, /* EDIT EXERCISE: leave it as it was */
+   MA_EXLOG_EDIT,   /* a row: open that entry in the form; ix = tail index */
+   MA_EX_CONFIRM,   /* EDIT EXERCISE: rewrite the entry */
+   MA_EX_DISCARD,   /* EDIT EXERCISE: leave it as it was */
    /* EDIT EXERCISE fields; ix picks one: 0 level, 1 time, 2 date, 3 year.
     * LEVEL is not a keypad -- it cycles 1-2-3, the same three values the ADD
     * button offers, so there is one way to say "moderate" rather than two. */

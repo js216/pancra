@@ -16,10 +16,12 @@
  * (main.c) should perform. No globals, no callbacks -- so every screen builds
  * and runs on the host against a malloc'd buffer (see test/uitest.c, which
  * renders each screen to a PPM and checks its hit-targets with no phone). */
+#include "colors.h"
 #include "ndk.h"
 #include "ui.h"
 #include "uiact.h"
 #include "uidraw.h"
+#include "uifmt.h"
 #include "uimodel.h"
 #include "uipriv.h"
 #include <stdint.h>

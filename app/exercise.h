@@ -223,7 +223,6 @@ int ex_remaining(const struct ex_pending *p, long mono_now);
 /* The caller wrote the record: clear the arming, keep the level showing. */
 void ex_committed(struct ex_pending *p);
 
-
 /* ---- THE LIVE BUTTON, WHICH IS NOT A FORM --------------------------
  *
  * The three functions below wrap ONE process-wide pending value, because the

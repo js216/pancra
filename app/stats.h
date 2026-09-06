@@ -74,7 +74,6 @@ int stat_window(int days, int *tir, int *avg);
 #define TIR_LOW_MGDL  70
 #define TIR_HIGH_MGDL 180
 
-
 /* SEED THE BUCKETS FROM THE READINGS LOG, and say what happened.
  *
  * LOAD_OK      the whole log was read; the windows below are a summary of it.
@@ -87,7 +86,6 @@ int stat_window(int days, int *tir, int *avg);
  *              looking at. The caller reports the degradation; the figures
  *              stay blank rather than plausible. */
 enum load_result stat_load(const char *readings_path);
-
 
 /* ============ THROW THE BUCKETS AWAY AND REBUILD THEM FROM THE LOG =========
  *

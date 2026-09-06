@@ -65,7 +65,6 @@ enum dex_phase {
    P_FAIL      /* terminal: this connection is over */
 };
 
-
 /* Per-sensor driver state.
  *
  * Everything the pairing/auth/stream state machine touches lives here rather

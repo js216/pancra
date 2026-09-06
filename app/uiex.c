@@ -23,9 +23,9 @@
  * (ui_ex_color). A keypad would accept 0, 4 and 97, all of which
  * exercise_update refuses -- so it would be a control whose whole job is to
  * collect answers that get rejected. */
+#include "colors.h"
 #include "exercise.h"
-#include "font.h"  /* str_len: the page counter is centred on its width */
-#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
+#include "font.h" /* str_len: the page counter is centred on its width */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h" /* fmt_date: the instant, split into YEAR / MM-DD / HH:MM */
@@ -341,8 +341,8 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    unsigned char band[UI_LOG_PTS];
    const int by_min = ui_exday_hours[tab] > 0 && ui_exday_hours[tab] <= 24;
    long from        = 0;
-   int npt = ex_points(m, pts, UI_LOG_PTS, &from, by_min ? band : NULL,
-                       UI_LOG_PTS);
+   int npt =
+       ex_points(m, pts, UI_LOG_PTS, &from, by_min ? band : NULL, UI_LOG_PTS);
 
    /* Span tabs -- OR the scrub readout, the same swap the weight trend and
     * the glucose plot both make: while a finger is down the tab row becomes
@@ -452,4 +452,3 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
  * moment it is switched on rather than at launch, because a glucose app
  * asking for activity data on first run has no visible reason to.
  */
-

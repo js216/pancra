@@ -55,7 +55,7 @@
  * OLD ROWS NEED NO MIGRATION. A legacy "20" is a decimal that happens to have
  * no fraction, so it reads as 20000 through the same parser -- the column's
  * meaning did not change, only the set of values it can express. */
-#define INS_MILLI 1000
+#define INS_MILLI     1000
 #define INS_UNITS_MAX 99
 /* 0 is not a dose; anything above zero is one, down to the last place the
  * format carries. Three digits of units is not a dose anybody takes. */

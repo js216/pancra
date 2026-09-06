@@ -106,7 +106,6 @@ enum gcm_status {
    GCM_ERR_TAG      /* unseal only: the tag did not verify */
 };
 
-
 /* GCM_OK, or a status with NEITHER `ct` NOR `tag` TOUCHED.
  *
  * ct may alias pt. tag is written separately, never appended.

@@ -2,10 +2,13 @@
 // uilog.c --- The dose and weight logs, and their forms (see uipriv.h)
 // Copyright 2026 Jakob Kastelic
 
+#include "colors.h"
+#include "exercise.h"
 #include "font.h"
 #include "insrow.h"  /* INS_*: what a dose row can say */
 #include "insulin.h" /* struct ins_rec + INS_* for the INSULIN LOG table */
 #include "ndk.h"
+#include "steps.h"
 #include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "ui.h"
 #include "uiact.h"
@@ -609,7 +612,7 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
        * across a month all fall at a similar clock time and would repeat one
        * hour. Two days is the crossover -- past it a tick can no longer be
        * told from its neighbours by time of day alone. */
-      const int byday = (w.tmax - w.tmin) > 2 * 86400;
+      const int byday = (w.tmax - w.tmin) > 2L * 86400;
       const int off   = byday ? 5 : 11;
       str_snapshot(md, sizeof md, (str_len(dt) > off) ? dt + off : "");
       if (str_len(md) > 5)
@@ -790,7 +793,7 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
        * "on / enabled" everywhere else in this app, and a readout is
        * neither. */
       /* Right-aligned in a fixed field so the digits keep their columns as
-        * the finger moves; see the main plot's readout, which explains why. */
+       * the finger moves; see the main plot's readout, which explains why. */
       (void)snprintf(line, sizeof line, "%5s", wv);
       log_scrub_row(px, fb, x, plot_top - trow, fb->width - (2 * x), sc, 2 * sc,
                     when, line, wt_unit_name(prefs->wunits));
@@ -846,8 +849,7 @@ const char *const ui_exday_tab_lbl[UI_EXDAY_TABS] = {"6H", "24H", "1M", "3M",
                                                      "ALL"};
 
 const int ui_day_days[UI_DAY_TABS]            = {7, 14, 30, 90, 0};
-const char *const ui_day_tab_lbl[UI_DAY_TABS] = {"1W", "2W", "1M", "3M",
-                                                 "ALL"};
+const char *const ui_day_tab_lbl[UI_DAY_TABS] = {"1W", "2W", "1M", "3M", "ALL"};
 
 #define LOG_PAD 4
 
@@ -1095,9 +1097,8 @@ static void log_chrome(uint32_t *px, const struct ANativeWindow_Buffer *fb,
 {
    const uint32_t grid = UI_LOG_GRID;
    for (int i = 1; i < 4; i++)
-      fill_rect(px, fb, px0 + 1,
-                py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4), pw - 2, 1,
-                grid);
+      fill_rect(px, fb, px0 + 1, py0 + pad_t + (((ph - pad_t - pad_b) * i) / 4),
+                pw - 2, 1, grid);
    /* WHERE THE VERTICAL DIVISIONS FALL.
     *
     * `step` > 0 puts them on ROUND INSTANTS -- a whole number of hours in
@@ -1114,8 +1115,8 @@ static void log_chrome(uint32_t *px, const struct ANativeWindow_Buffer *fb,
    const int nticks = 4; /* 3 interior + the right edge; see the label loop */
    const int half   = (5 * 6 * sc) / 2; /* a 5-glyph label's half-width */
    for (int i = 1; i <= nticks; i++) {
-      long tt;
-      int gx;
+      long tt = 0;
+      int gx  = 0;
       if (step > 0) {
          /* The i-th round instant at or after the window's left edge. */
          long t0 = (((w->tmin + tz_off) / step) * step) - tz_off;
@@ -1148,7 +1149,7 @@ static void log_chrome(uint32_t *px, const struct ANativeWindow_Buffer *fb,
        * across a month all fall at a similar clock time and would repeat one
        * hour. Two days is the crossover -- past it a tick can no longer be
        * told from its neighbours by time of day alone. */
-      const int byday = (w->tmax - w->tmin) > 2 * 86400;
+      const int byday = (w->tmax - w->tmin) > 2L * 86400;
       const int off   = byday ? 5 : 11;
       str_snapshot(md, sizeof md, (str_len(dt) > off) ? dt + off : "");
       if (str_len(md) > 5)
@@ -1236,9 +1237,9 @@ void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
             const int cy = log_py(&w, cu->v, py0, ph, pad_t, pad_b);
             if (!have && pv && pv->t < from) {
                prevx = log_px(&w, from, px0, pw, pad);
-               prevy = log_py(&w, log_cross(pv, cu, from), py0, ph, pad_t,
-                              pad_b);
-               have  = 1;
+               prevy =
+                   log_py(&w, log_cross(pv, cu, from), py0, ph, pad_t, pad_b);
+               have = 1;
             }
             if (have)
                log_seg(px, fb, prevx, prevy, cx, cy, sc, col[s]);
@@ -1265,8 +1266,7 @@ void log_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
     * itself redrawn larger in UI_HILITE grey -- the same "coloured normally,
     * grey when picked" pair the weight trend and the glucose plot use, so all
     * three read the same way. */
-   if (hilite >= 0 && hilite < n && p[hilite].t >= from &&
-       p[hilite].t <= now) {
+   if (hilite >= 0 && hilite < n && p[hilite].t >= from && p[hilite].t <= now) {
       const int cx = log_px(&w, p[hilite].t, px0, pw, pad);
       const int cy = log_py(&w, p[hilite].v, py0, ph, pad_t, pad_b);
       fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, UI_LOG_CURSOR);
@@ -1301,8 +1301,8 @@ int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
       /* THOUSANDTHS on the axis, so a 0.5 U dose sits half a unit up rather
        * than being rounded to nothing. The bound labels render through
        * ins_units_str, so the axis still reads in units. */
-      out[n].v                = d->milli;
-      out[n].series           = (d->type == INS_FAST) ? 1 : 0;
+      out[n].v      = d->milli;
+      out[n].series = (d->type == INS_FAST) ? 1 : 0;
       n++;
    }
    return n;
@@ -1404,9 +1404,8 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
    /* ---- A DAY OR LESS: bucketed steps, exercise as a band ---- */
    if (ui_exday_hours[tab] > 0 && ui_exday_hours[tab] <= 24) {
       const long width = ex_bucket_for(ui_exday_hours[tab]);
-      const long start =
-          ex_floor(m->now - ((long)ui_exday_hours[tab] * 3600), width,
-                   m->tz_off);
+      const long start = ex_floor(m->now - ((long)ui_exday_hours[tab] * 3600),
+                                  width, m->tz_off);
       long n = ((ex_floor(m->now, width, m->tz_off) - start) / width) + 1;
       if (n < 1)
          n = 1;
@@ -1468,12 +1467,12 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
    /* HALF THE ARRAY EACH. Two series live in one array, so the day count is
     * bounded by half the capacity rather than all of it. */
    const int half = cap / 2;
-   const long f   = exday_from_of(tab, m->now,
-                                  (m->food.nexlog > 0) ? m->food.exlog[0].t : 0,
-                                  (m->food.nsteps > 0) ? m->food.steps[0].t : 0);
-   long d0        = ex_floor(f, 86400, m->tz_off);
-   const long d1  = ex_floor(m->now, 86400, m->tz_off);
-   long n         = ((d1 - d0) / 86400) + 1;
+   const long f =
+       exday_from_of(tab, m->now, (m->food.nexlog > 0) ? m->food.exlog[0].t : 0,
+                     (m->food.nsteps > 0) ? m->food.steps[0].t : 0);
+   long d0       = ex_floor(f, 86400, m->tz_off);
+   const long d1 = ex_floor(m->now, 86400, m->tz_off);
+   long n        = ((d1 - d0) / 86400) + 1;
    if (n < 1)
       n = 1;
    if (n > half) {
@@ -1500,15 +1499,15 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
       const long secs = ex_secs_of(m, i);
       if (secs <= 0)
          continue;
-      const long k = (ex_floor(m->food.exlog[i].t, 86400, m->tz_off) - d0)
-                     / 86400;
+      const long k =
+          (ex_floor(m->food.exlog[i].t, 86400, m->tz_off) - d0) / 86400;
       if (k < 0 || k >= n)
          continue; /* outside the span, which also drops a mistyped year */
       out[k].v += secs / 60;
    }
    for (int i = 0; i < m->food.nsteps; i++) {
-      const long k = (ex_floor(m->food.steps[i].t, 86400, m->tz_off) - d0)
-                     / 86400;
+      const long k =
+          (ex_floor(m->food.steps[i].t, 86400, m->tz_off) - d0) / 86400;
       if (k >= 0 && k < n)
          out[n + k].v += m->food.steps[i].n;
    }
@@ -1560,8 +1559,8 @@ void exlog_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
     * and a day at every sixth. */
    long step = 0;
    if (band) {
-      static const long cand[] = {3600,     2 * 3600,  3 * 3600,
-                                  6 * 3600, 12 * 3600, 86400};
+      static const long cand[] = {3600,      2L * 3600,  3L * 3600,
+                                  6L * 3600, 12L * 3600, 86400};
       const long want          = (w.tmax - w.tmin) / 5;
       for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
          step = cand[i];
@@ -1673,9 +1672,9 @@ void exlog_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
     * must not do. */
    const int mr = (((3 * sc) / 2) + 1) * MARK_SIZE_DEF / 2;
    for (int sx = 0; sx < 2; sx++) {
-      int prevx      = 0;
-      int prevy      = 0;
-      int have       = 0;
+      int prevx = 0;
+      int prevy = 0;
+      int have  = 0;
       for (int i = 0; i < n; i++) {
          if (((p[i].series == 1) ? 1 : 0) != sx || p[i].t < from ||
              p[i].t > now)
@@ -1710,8 +1709,7 @@ void exlog_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
     * the marked curve was whichever ex_pick happened to reach first. On the
     * sub-day tabs there is only the step series, so this marks the one point
     * there is. */
-   if (hilite >= 0 && hilite < n && p[hilite].t >= from &&
-       p[hilite].t <= now) {
+   if (hilite >= 0 && hilite < n && p[hilite].t >= from && p[hilite].t <= now) {
       const int cx = log_px(&w, p[hilite].t, px0, pw, pad);
       fill_rect(px, fb, cx, py0 + 1, 1, ph - 2, UI_LOG_CURSOR);
       for (int i = 0; i < n; i++) {

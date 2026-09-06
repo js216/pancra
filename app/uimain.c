@@ -2,15 +2,15 @@
 // uimain.c --- The main screen (see uipriv.h)
 // Copyright 2026 Jakob Kastelic
 
-#include "alarmlogic.h" /* AL_ENTRY_MAX: the alarm keypads' ceiling */
-#include "exercise.h"   /* EX_SETTLE_S: the pinned button draws its countdown */
+#include "colors.h"
+#include "exercise.h" /* EX_SETTLE_S: the pinned button draws its countdown */
 #include "font.h"
 #include "food.h"
 #include "insrow.h"  /* INS_SLOW / INS_FAST: which kind a dose row names */
 #include "insulin.h" /* struct ins_rec: the doses the INSULIN LOG table draws */
 #include "ndk.h"
 #include "plot.h"
-#include "sensors.h"  /* sensor types, kinds, marker enum */
+#include "sensors.h" /* sensor types, kinds, marker enum */
 #include "settings.h"
 #include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band plot.c shades */ /* SET_NCOLORS: crosschecked below */
 #include "style.h"
@@ -806,8 +806,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          static const char *const exl[EX_MAX_LEVEL + 1] = {
              "MIN", "MIN LIGHT", "MIN MOD", "MIN HARD"};
          int lv = m->plot.hist[m->plot.scrub].glu;
-         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv]
-                                                             : exl[0];
+         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv] : exl[0];
       } else if (fd) {
          /* THE FOOD'S NAME, TRUNCATED TO WHAT THE LINE HOLDS.
           *
@@ -1614,8 +1613,8 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                int r = slotn / percol;
                int c = slotn % percol;
                slotn++;
-               int bx          = rowl + (c * (bwid + sgap));
-               int code        = ui_shortcut_code(slot);
+               int bx   = rowl + (c * (bwid + sgap));
+               int code = ui_shortcut_code(slot);
                /* THE NAME FOR THIS ROW'S WIDTH, then shorter forms if even
                 * that will not fit -- a narrow screen can defeat any of them.
                 * The font never shrinks: a half-word on a button that logs a
@@ -1625,9 +1624,9 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                 * against the bare button and then drawing a mark beside it
                 * would spend width the fit had already promised to the
                 * words. */
-               const int due = (code == MA_WT_OPEN && ui_weight_due(m))
-                               || (code == MA_INS_SLOW && ui_slow_ins_due(m));
-               const int mark = due ? 11 * sc : 0;
+               const int due   = (code == MA_WT_OPEN && ui_weight_due(m)) ||
+                                 (code == MA_INS_SLOW && ui_slow_ins_due(m));
+               const int mark  = due ? 11 * sc : 0;
                const char *lbl = ui_shortcut_label(slot, percol);
                if (((str_len(lbl) * 6) - 1) * sc > bwid - (4 * sc) - mark)
                   lbl = ui_shortcut_label(slot, 3);

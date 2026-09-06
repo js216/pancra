@@ -79,6 +79,15 @@ long *form_ex_duration(void);
  * refusal says); each of these is the one line that follows a number the
  * keypad has already judged. */
 void form_wt_set_tenths(int tenths);
+/* TAKE THE TYPED WEIGHT, and say whether the keypad is finished with it.
+ *
+ * 1 when it is: the one-number log wrote the weigh-in, or an edit put the
+ * number in the draft its form is still showing. Either way the keypad closes
+ * and returns to the screen it was opened with.
+ *
+ * 0 when the write was refused. The entry is not in the log, so the keypad
+ * must stay on screen saying so. */
+int form_wt_take_tenths(int tenths);
 /* THOUSANDTHS of a unit -- the keypad has already bounded it; this is the
  * assignment that follows. */
 void form_ins_set_units(int milli);

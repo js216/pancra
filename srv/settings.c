@@ -99,9 +99,9 @@ static int tz_canonical(const char *s, int *out)
        * fifteen cannot overflow a long -- the membership scan
        * would refuse them all on its own. No end-to-end case can distinguish
        * this line from its absence. It stays because it is what makes the
-       * FUNCTION safe rather than the buffer: widen tz[] to 24 bytes for any reason, and
-       * without this line the accumulator overflows on input a stranger
-       * chooses. */
+       * FUNCTION safe rather than the buffer: widen tz[] to 24 bytes for any
+       * reason, and without this line the accumulator overflows on input a
+       * stranger chooses. */
       if (++nd > 4)
          return 0;
       v = (v * 10) + (*p - '0');

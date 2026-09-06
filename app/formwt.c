@@ -25,8 +25,23 @@
  * screen, not between screens -- and each of these belongs to exactly one
  * screen, which is why they live with that screen's controller rather than
  * in a struct four workflows can reach. */
-static int g_wtlog_page;    /* which page of the WEIGHT LOG table is showing */
-static int g_wt_tab;        /* which span of the weight plot */
+static int g_wtlog_page; /* which page of the WEIGHT LOG table is showing */
+static int g_wt_tab;     /* which span of the weight plot */
+
+/* WHERE LOGGING A WEIGHT WAS STARTED FROM, and whether the keypad on screen is
+ * that one-number entry.
+ *
+ * The screen to return to is RECORDED WHEN THE FLOW OPENS, never worked out on
+ * the way back: the doors into this action are the ADD menu and the pinned
+ * main-screen button, and a fixed exit sends half of them somewhere the user
+ * never was.
+ *
+ * `g_wt_quick` separates the two keypads that edit the same number. Logging is
+ * one number and the keypad's OK writes it; editing an existing weigh-in has a
+ * date, a time and a DELETE beside it, so there the keypad only fills in the
+ * draft and returns to the form. */
+static enum ui_screen g_wt_from;
+static int g_wt_quick;
 
 struct wt_draft {
    struct wt_form f;
@@ -86,35 +101,27 @@ int form_wt_action(int action, int ix)
        * from the new one, and starting from zero would make every entry a
        * full retype. */
       wt_draft_new(&g_wt, &sp);
-      /* STRAIGHT TO THE KEYPAD, not to the form. Logging a weight is one
+      /* THE KEYPAD IS THE WHOLE SCREEN FOR THIS ENTRY. Logging a weight is one
        * number, and every door into this action -- the ADD menu button, the
-       * pinned main-screen button -- already says which number. The form in
-       * between existed only to be tapped once, on the row this opens.
-       *
-       * BUT THE FORM STILL GOES ON THE PATH, because that is what makes the
-       * way out work. OK and X both land on the keypad's return screen,
-       * and nav_go
-       * RETURNS to a screen already on the path rather than pushing a second
-       * copy -- so the keypad pops and the form's own CANCEL goes back to
-       * whatever opened the flow. Skipping the push instead put a screen
-       * BELOW the keypad that was not on the path, and the two exits chased
-       * each other: LOG WEIGHT returned to WEIGHT, WEIGHT returned to LOG
-       * WEIGHT, and nothing reached the main screen. The user has to be able
-       * to leave. It is not rendered on the way in -- the keypad opens on
-       * top of it in the same tap. */
-      nav_go(SCR_WEIGHT);
+       * pinned main-screen button -- already says which number. Both ways off
+       * the keypad go straight back to the door: OK writes the weigh-in (see
+       * form_wt_take_tenths) and X abandons it, and neither needs a screen in
+       * between to confirm what the digits already said. */
+      g_wt_from  = cur_screen();
+      g_wt_quick = 1;
       nav_go(SCR_KEYPAD);
-      forms_kp_open(KP_WEIGHT, SCR_WEIGHT);
+      forms_kp_open(KP_WEIGHT, g_wt_from);
    } else if (action == MA_WTLOG_EDIT) {
       /* A row in the table opens that entry in the EDIT WEIGHT form. Keep a
        * COPY as the rewrite's match key -- see g_wt.orig. */
       int i = ix;
       if (i >= 0 && i < wt_count()) {
          wt_draft_edit(&g_wt, i, &sp);
+         g_wt_quick = 0;
          nav_go(SCR_WEIGHT);
       }
    } else if (action == MA_WTTAB) {
-      g_wt_tab   = ix;
+      g_wt_tab = ix;
       /* THE PICKED POINT IS DROPPED WITH THE SPAN: its index is into the
        * old window's entries, so keeping it would move the readout. */
       forms_set_log_scrub(-1);
@@ -167,11 +174,14 @@ int form_wt_action(int action, int ix)
       enum keypad_mode wm = kp_weight_field(ix);
       if (wm == KP_NONE)
          return 0;
+      g_wt_quick = 0;
       nav_go(SCR_KEYPAD);
       forms_kp_open(wm, SCR_WEIGHT);
    } else if (action == MA_WT_CONFIRM) {
-      /* The one write, on the explicit CONFIRM only (the calibration rule).
-       */
+      /* THE WRITE FOR AN ENTRY THAT HAS A FORM: an edit, whose date, time and
+       * DELETE all have to be settled before anything is rewritten. The
+       * one-number log has no form and is written from the keypad instead --
+       * form_wt_take_tenths. */
       if (cur_screen() == SCR_WEIGHT) {
          long g = wt_from_tenths(g_wt.f.tenths, sp.wunits);
          int rc = -1;
@@ -237,11 +247,45 @@ long *form_wt_instant(void)
 }
 
 /* TENTHS OF THE DISPLAY UNIT, which is what the field holds and what the
- * keypad round-trips: the conversion to grams happens once, on CONFIRM. The
- * keypad has already decided this is a number of the right shape. */
+ * keypad round-trips: the conversion to grams happens once, where the entry is
+ * written. The keypad has already decided this is a number of the right
+ * shape. */
 void form_wt_set_tenths(int tenths)
 {
    g_wt.f.tenths = tenths;
+}
+
+int form_wt_take_tenths(int tenths)
+{
+   struct prefs sp;
+   settings_get(&sp);
+   form_wt_set_tenths(tenths);
+   /* AN EDIT IS STILL A FORM. Its date, its time and its DELETE are on the
+    * WEIGHT screen, so a typed number joins the draft and the rest of the
+    * entry carries on there. */
+   if (!g_wt_quick)
+      return 1;
+   /* THE INSTANT IS READ WHEN OK IS PRESSED. The draft opens with a time so
+    * the field holds one, but a weigh-in belongs to the moment it is entered,
+    * and everything the user spends on the keypad sits between the two.
+    *
+    * The offset is the one in force AT THAT INSTANT, which for a stamp taken
+    * now is the offset now -- form_zone is asked anyway, so the rule reads the
+    * same here as on the edit path, where the instant can be any date. */
+   long t   = realtime_s();
+   long g   = wt_from_tenths(g_wt.f.tenths, sp.wunits);
+   long wtz = form_zone(0, t);
+   if (g <= 0 || weight_append(t, g, wtz) != 0) {
+      /* REFUSED VISIBLY, and the keypad stays up so the retry is one press. A
+       * weight the user believes recorded but is not is a silent hole in the
+       * only copy of that number. */
+      return 0;
+   }
+   LOGI("weight logged: %ld g at %ld", g, t);
+   set_status("WEIGHT LOGGED");
+   wt_draft_done(&g_wt);
+   g_wt_quick = 0;
+   return 1;
 }
 
 void form_wt_view(struct forms_view *out)

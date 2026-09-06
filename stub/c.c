@@ -7,6 +7,17 @@
  * names referenced by the freestanding native build. */
 /* EXPORTED: these are link-time stand-ins for the device's own libraries,
  * and a hidden symbol is not one the linker can stand in for. */
+
+/* NOLINTBEGIN(misc-include-cleaner, misc-use-internal-linkage)
+ *
+ * Both checks describe an ordinary translation unit, and this is not one.
+ *
+ * The names below are DEFINED HERE ONLY SO THE LINKER FINDS THEM, and they
+ * are resolved to bionic on the device; internal linkage would hide the one
+ * thing the file exists to publish. And the declarations they must match are
+ * written out above rather than included, because the app is built
+ * freestanding with its own size_t -- pulling in the host's <stdlib.h> and
+ * <string.h> here makes every signature a conflicting type. */
 #pragma GCC visibility push(default)
 
 #define STUB(name)                                                             \
@@ -125,3 +136,4 @@ int strncmp(const char *a, const char *b, size_t n)
 }
 
 #pragma GCC visibility pop
+/* NOLINTEND(misc-include-cleaner, misc-use-internal-linkage) */

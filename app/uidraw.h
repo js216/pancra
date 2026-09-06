@@ -144,7 +144,6 @@ int draw_title_fit(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
 uint32_t ui_text_on(uint32_t bg);
 uint32_t ui_ex_color(int level, uint32_t rest_col);
 
-
 int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
                        int y, int w, int sc, int level, int remaining,
                        int settle_s, const char *name, uint32_t rest_col);

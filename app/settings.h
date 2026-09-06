@@ -149,7 +149,6 @@ enum shortcut_id {
    SC_ID_LAST  = SC_STEPSLOG /* the largest id this build defines */
 };
 
-
 /* Point this module at the data directory; the five filenames live here. */
 /* 1 when every path this module persists to fitted; 0 when one did
  * not, and then NONE of them is usable -- see data_path in util.h. */
@@ -159,7 +158,6 @@ int settings_paths(const char *dir);
  * not to upload. The other three files this module owns are private to it. */
 
 /* The alarm and settings files, for the corruption tests (see settings.c). */
-
 
 /* "low high nudge_low nudge_high\n". The nudge pair was appended, so files
  * written before it exist with two fields only -- those load the alarm pair
@@ -237,7 +235,6 @@ int settings_pinned(int id);
  * positionally and the parse stops at the first missing one, so appending a
  * field keeps older config files loadable (the new field keeps its default). */
 enum load_result settings_load(void);
-
 
 /* (THE OTHER FOUR FILES ARE NOT HERE. The device information, the alarm
  * thresholds, the pairing code and the remote credentials each have their own

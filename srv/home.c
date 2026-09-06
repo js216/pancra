@@ -635,8 +635,7 @@ void h_units(struct req *r, int64_t owner)
       stamp_local(d[i].t, tz, when, sizeof when);
       char iu[16];
       (void)ins_units_str(d[i].milli, iu, sizeof iu);
-      sb_add(&s, "%s %4s  %s\n", when, iu,
-             d[i].type == 1 ? "fast" : "slow");
+      sb_add(&s, "%s %4s  %s\n", when, iu, d[i].type == 1 ? "fast" : "slow");
    }
    sb_add(&s, "</pre>\n");
    sub_page(r, "Units", s.p ? s.p : "");

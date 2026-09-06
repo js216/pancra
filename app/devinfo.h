@@ -25,7 +25,6 @@ enum { SET_DIS_MODEL = 0, SET_DIS_FW = 1, SET_DIS_MFR = 2 };
 
 int info_set(int which, const char *val);
 
-
 /* Read the file back into the live state at startup. */
 enum load_result info_load(void);
 

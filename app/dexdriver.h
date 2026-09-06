@@ -386,7 +386,6 @@ PANCRA_MUST_USE enum bind_mac driver_bind_mac(int link, const char *mac);
  * would. */
 void driver_bind_retry(void);
 
-
 /* This LINK's session. Same reasoning as driver_cal_of, and the same
  * contract: `*out` is zeroed first, 1 means it was filled from the link. */
 PANCRA_MUST_USE int driver_session_of(int link, struct dex_session *out);

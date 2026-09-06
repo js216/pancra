@@ -10,7 +10,6 @@
 #ifndef PANCRA_UIKEYPAD_H
 #define PANCRA_UIKEYPAD_H
 
-
 /* (The per-mode slot-count wrapper is gone. It was a function wrapping
  * kp_slots(enum keypad_mode) -- a published interface with exactly ONE
  * caller, inside uikeypad.c itself, whose only effect was to launder a

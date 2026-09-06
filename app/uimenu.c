@@ -3,10 +3,12 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "uimenu.h"
+#include "colors.h"
 #include "exercise.h"
 #include "font.h"
 #include "insrow.h"  /* INS_SLOW / INS_FAST: which kind a dose row names */
 #include "insulin.h" /* struct ins_rec: the doses the INSULIN LOG table draws */
+#include "menuview.h"
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h"  /* sensor types, kinds, marker enum */
@@ -597,7 +599,8 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
          (void)snprintf(st, sizeof st, "%s AGO", ago);
          /* Fresh is green; a link that has not been acknowledged in over
           * ten minutes is amber, because that is a backlog building up. */
-         scol = (m->now - m->sync.remote_last_ok <= 600) ? UI_OK : UI_SYNC_STALE;
+         scol =
+             (m->now - m->sync.remote_last_ok <= 600) ? UI_OK : UI_SYNC_STALE;
       } else {
          (void)snprintf(st, sizeof st, "NEVER");
          scol = UI_SYNC_STALE;
@@ -627,8 +630,10 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * switch over an enum is checked by the compiler (see syncstat.c). */
       uint32_t rcol = UI_FAINT; /* nothing has been attempted yet */
       switch (sync_outcome_severity(m->sync.remote_outcome)) {
-         case SYNC_SEV_GOOD: rcol = UI_OK; break;      /* green */
-         case SYNC_SEV_WARN: rcol = UI_SYNC_WARN; break; /* amber: yours to fix */
+         case SYNC_SEV_GOOD: rcol = UI_OK; break; /* green */
+         case SYNC_SEV_WARN:
+            rcol = UI_SYNC_WARN;
+            break; /* amber: yours to fix */
          case SYNC_SEV_BAD:
             rcol = UI_SYNC_ERR;
             break; /* red, as the keypad
@@ -671,10 +676,7 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
 /* The two groups the shortcut buttons are drawn in: the ones that record
  * something, and the ones that open a log of what was recorded. */
-enum sc_sect {
-   SC_SECT_LOG,
-   SC_SECT_VIEW
-};
+enum sc_sect { SC_SECT_LOG, SC_SECT_VIEW };
 
 /* `id` is what settings.c stores (settings.h, enum shortcut_id) and `code` is
  * the touch code this build happens to use. Two columns, because they answer
@@ -702,26 +704,30 @@ enum sc_sect {
 static const struct {
    int id;
    int code;
-   const char *full;   /* alone on the row */
-   const char *half;   /* two across */
-   const char *third;  /* three across */
+   const char *full;  /* alone on the row */
+   const char *half;  /* two across */
+   const char *third; /* three across */
    int sect; /* SC_SECT_LOG or SC_SECT_VIEW -- which group it renders in */
 } ui_sc_tab[] = {
-    {SC_INS_FAST, MA_INS_FAST,     "FAST INSULIN",      "FAST INS",  "FAST",     SC_SECT_LOG },
-    {SC_INS_SLOW, MA_INS_SLOW,     "SLOW INSULIN",      "SLOW INS",  "SLOW",     SC_SECT_LOG },
-    {SC_WEIGHT,   MA_WT_OPEN,      "WEIGHT",            "WEIGHT",    "WEIGHT",   SC_SECT_LOG },
-    {SC_FOOD,     MA_FOOD_OPEN,    "FOOD",              "FOOD",      "FOOD",     SC_SECT_LOG },
+    {SC_INS_FAST, MA_INS_FAST,     "FAST INSULIN",      "FAST INS",     "FAST",     SC_SECT_LOG},
+    {SC_INS_SLOW, MA_INS_SLOW,     "SLOW INSULIN",      "SLOW INS",     "SLOW",     SC_SECT_LOG},
+    {SC_WEIGHT,   MA_WT_OPEN,      "WEIGHT",            "WEIGHT",       "WEIGHT",   SC_SECT_LOG},
+    {SC_FOOD,     MA_FOOD_OPEN,    "FOOD",              "FOOD",         "FOOD",     SC_SECT_LOG},
     /* LAST IN ITS SECTION, and the odd one: every button above opens a form
      * and is finished when that form is confirmed, while this one records by
      * being LEFT ALONE. It is in this table so it can be PINNED like the
      * rest; what it cannot share is the drawing, because its level, colour
      * and countdown are not a label -- see ui_exercise_button, which both the
      * menu below and the main screen call. */
-    {SC_EXERCISE, MA_EXERCISE,     "EXERCISE",          "EXERCISE",  "EXER",     SC_SECT_LOG },
-    {SC_INSLOG,   MA_INSLOG_OPEN,  "VIEW INSULIN LOG",  "INSULIN LOG",  "INS LOG",  SC_SECT_VIEW},
-    {SC_WTLOG,    MA_WTLOG_OPEN,   "VIEW WEIGHT LOG",   "WEIGHT LOG",   "WT LOG",   SC_SECT_VIEW},
-    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",     "FOOD LOG",     "FOOD LOG", SC_SECT_VIEW},
-    {SC_EXLOG,    MA_EXLOG_OPEN,   "VIEW EXERCISE LOG", "EXERCISE LOG", "EX LOG",   SC_SECT_VIEW},
+    {SC_EXERCISE, MA_EXERCISE,     "EXERCISE",          "EXERCISE",     "EXER",     SC_SECT_LOG},
+    {SC_INSLOG,   MA_INSLOG_OPEN,  "VIEW INSULIN LOG",  "INSULIN LOG",  "INS LOG",
+     SC_SECT_VIEW                                                                              },
+    {SC_WTLOG,    MA_WTLOG_OPEN,   "VIEW WEIGHT LOG",   "WEIGHT LOG",   "WT LOG",
+     SC_SECT_VIEW                                                                              },
+    {SC_FOODLOG,  MA_FOODLOG_OPEN, "VIEW FOOD LOG",     "FOOD LOG",     "FOOD LOG",
+     SC_SECT_VIEW                                                                              },
+    {SC_EXLOG,    MA_EXLOG_OPEN,   "VIEW EXERCISE LOG", "EXERCISE LOG", "EX LOG",
+     SC_SECT_VIEW                                                                              },
 };
 
 #define UI_SC_N ((int)(sizeof ui_sc_tab / sizeof ui_sc_tab[0]))
@@ -904,8 +910,8 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * belongs on the button rather than anywhere else on the screen because
        * the button is what answers it: seeing the mark and acting on it is
        * one tap, with nothing to read in between. */
-      else if ((code == MA_WT_OPEN && ui_weight_due(m))
-               || (code == MA_INS_SLOW && ui_slow_ins_due(m)))
+      else if ((code == MA_WT_OPEN && ui_weight_due(m)) ||
+               (code == MA_INS_SLOW && ui_slow_ins_due(m)))
          y = menu_button_mark(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1),
                               UI_TEXT, UI_MARK_WT, code, 0);
       else

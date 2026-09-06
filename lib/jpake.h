@@ -141,7 +141,6 @@ enum jpake_phase {
    JPAKE_PHASE_DONE    /* all three accepted, once each: a key can be derived */
 };
 
-
 int jpake_poisoned(const struct jpake *p);
 
 #endif

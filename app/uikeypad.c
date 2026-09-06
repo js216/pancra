@@ -10,10 +10,10 @@
 
 #include "uikeypad.h"
 #include "alarmlogic.h" /* AL_ENTRY_MAX: the alarm keypads' ceiling */
+#include "colors.h"
 #include "font.h"
 #include "keypad.h" /* what each mode IS: slots, title, dot, unit */
 #include "ndk.h"
-#include "style.h" /* the colour roles: UI_TEXT, UI_MUTED, ... */
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h"

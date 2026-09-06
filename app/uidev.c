@@ -2,7 +2,9 @@
 // uidev.c --- Devices, and the screens reached from one (see uipriv.h)
 // Copyright 2026 Jakob Kastelic
 
+#include "colors.h"
 #include "font.h"
+#include "menuview.h"
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h" /* sensor types, kinds, marker enum */

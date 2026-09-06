@@ -24,5 +24,4 @@ int code_set(const char *digits);
 
 enum load_result code_load(void);
 
-
 #endif

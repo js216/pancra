@@ -161,7 +161,6 @@ void forms_kp_text(char *out, int cap);
  * workflows it orders rather than in the menu. */
 int forms_action(int action, int ix);
 
-
 /* The odds and ends the menus set. */
 void forms_set_label_field(int field);
 void forms_set_markpick(int ins_type);
@@ -239,7 +238,7 @@ struct forms_view {
    int foodtype_page, foodlog_page, exlog_page;
    int exlog_tab, inslog_tab; /* the two daily plots' spans */
    int log_scrub;             /* the bar/point under the finger, or -1 */
-   int scrub; /* the glucose plot cursor, -1 = none */
+   int scrub;                 /* the glucose plot cursor, -1 = none */
    /* the odds and ends */
    int label_field;
    int rescale_entry;

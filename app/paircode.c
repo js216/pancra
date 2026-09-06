@@ -11,7 +11,6 @@
  */
 #include "paircode.h"
 #include "loadresult.h" /* the four answers a stored file can give */
-#include "log.h"
 #include "setpriv.h"
 #include "settings.h" /* struct prefs: the aggregate the engine holds */
 #include "util.h"

@@ -389,7 +389,6 @@ struct link_pred pred_unpack(unsigned long long word);
  * cancel one that is already justified. */
 bool alarm_stranded(int glu, long glu_t, long now, int lo, int hi);
 
-
 /* What should sound, given that an alarm may ALREADY be sounding.
  *
  * alarm_stranded on its own was too strong in two directions, both found by
@@ -546,7 +545,6 @@ int cal_entry_mgdl(const char *digits, int n, int units);
  * and a HIGH past the sensor's 400 scale above any -- so both are legitimate
  * user choices, unlike the stepper-era [AL_MIN, AL_MAX] clamp. */
 #define AL_ENTRY_MAX 999
-
 
 /* THE LEVEL TO AIM FOR, INCLUDING THE IMMINENT-HYPO OVERRIDE.
  *

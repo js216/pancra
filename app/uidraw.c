@@ -5,11 +5,12 @@
 #include "uidraw.h"
 #include "alarmlogic.h" /* AL_ENTRY_MAX: the ceiling a threshold row shows */
 #include "civil.h"      /* civil_ymd: ONE days-to-civil conversion */
-#include "exercise.h"   /* EX_MAX_LEVEL: the button draws its own level */
+#include "colors.h"
+#include "exercise.h" /* EX_MAX_LEVEL: the button draws its own level */
 #include "font.h"
+#include "insrow.h"
 #include "ndk.h"
 #include "sensors.h"
-#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: one definition of the range */ /* sensor types, kinds, marker enum */
 #include "style.h"
 #include "uiact.h"
 #include "uifmt.h"
@@ -371,8 +372,8 @@ static int run_w(const char *s, int sc)
 
 /* THE LARGEST SCALE ALL THREE FIELDS FIT AT, with a glyph cell of air on
  * either side of the middle one. */
-static int scrub_fit(const char *when, const char *val, const char *unit,
-                     int w, int lo, int hi)
+static int scrub_fit(const char *when, const char *val, const char *unit, int w,
+                     int lo, int hi)
 {
    for (int k = hi; k > lo; k--)
       if (run_w(when, k) + run_w(val, k) + run_w(unit, k) + (2 * 6 * k) <= w)
@@ -431,10 +432,10 @@ const char *ui_steps_word(long n)
 uint32_t ui_ex_color(int level, uint32_t rest_col)
 {
    static const uint32_t exc[EX_MAX_LEVEL + 1] = {
-       0,          /* unused: level 0 takes rest_col */
+       0,           /* unused: level 0 takes rest_col */
        UI_EX_LIGHT, /* 1 */
        UI_EX_MOD,   /* 2 */
-       UI_EX_HARD  /* 3: ABGR, so these deepen towards saturated blue */
+       UI_EX_HARD   /* 3: ABGR, so these deepen towards saturated blue */
    };
    if (level < EX_MIN_LEVEL || level > EX_MAX_LEVEL)
       return rest_col;
@@ -925,8 +926,8 @@ int ui_unpaired_count(const struct screen *m)
    if (!m)
       return 0;
    for (int i = 0; i < m->dev.nsensors; i++)
-      if (m->dev.sensors[i].kind == KIND_CGM && !m->dev.sensors[i].old
-          && m->dev.sensors[i].bond == UI_BOND_NONE)
+      if (m->dev.sensors[i].kind == KIND_CGM && !m->dev.sensors[i].old &&
+          m->dev.sensors[i].bond == UI_BOND_NONE)
          n++;
    return n;
 }
@@ -1026,8 +1027,8 @@ static uint32_t on_color(uint32_t bg)
 {
    /* 0xAABBGGRR, so the channels come out in this order. */
    const unsigned r = bg & 0xFFU;
-   const unsigned g = (bg >> 8) & 0xFFU;
-   const unsigned b = (bg >> 16) & 0xFFU;
+   const unsigned g = (bg >> 8U) & 0xFFU;
+   const unsigned b = (bg >> 16U) & 0xFFU;
    const unsigned l = ((2126U * r) + (7152U * g) + (722U * b)) / 10000U;
    return l > 140U ? UI_BLACK : UI_TEXT;
 }
@@ -1099,9 +1100,11 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * able to see from across a room. Vibration, the disconnect alarm and the
     * new-datapoint beep have their own rows in the ALARM submenu, which this
     * word opens. */
-   const char *name = m->prefs.sound_on      ? "ALARM"
-                      : m->prefs.nudge_sound ? "NUDGE"
-                                             : "SILENT";
+   const char *name = "SILENT";
+   if (m->prefs.sound_on)
+      name = "ALARM";
+   else if (m->prefs.nudge_sound)
+      name = "NUDGE";
 
    /* THE NUMBER FIELD IS SIZED BY THE UNIT, NOT BY THE VALUES IN IT.
     *
@@ -1111,7 +1114,7 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * gained or lost a digit -- and the numbers are right-aligned in the
     * field, so with the width fixed the ones, tens and hundreds each keep one
     * column for good, whatever is typed. */
-   const int vw    = (m->prefs.units ? 4 : 3) * cwid;
+   const int vw = (m->prefs.units ? 4 : 3) * cwid;
    /* THE WORD'S OWN WIDTH, not the widest of the three. Padding ALARM out to
     * SILENT's six characters would leave a blank column after it and make the
     * first gap read wider than the other three, which is the one thing this
@@ -1141,7 +1144,7 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int total = namew;
    for (int i = 0; i < 4; i++)
       total += cellw[i];
-   int g             = ((rx1 - lx0) + sc - total) / 4;
+   int g = ((rx1 - lx0) + sc - total) / 4;
    /* THE FLOOR IS A COLLISION GUARD, NOT A LOOK. The row's outer edges are
     * GIVEN -- it aligns with the plot above it -- so the gap is whatever is
     * left over, and a floor of a whole character was clamping it UP on a
@@ -1238,19 +1241,21 @@ void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
    const int tsc = FONT_TITLE(sc);
    /* Two character cells per button, so the single-glyph ones line up with
     * the doubles and every target is the same size. */
-   const int bw  = 12 * tsc;
-   const int hy  = y - (3 * sc);
-   const int hh  = lh + (7 * sc);
+   const int bw = 12 * tsc;
+   const int hy = y - (3 * sc);
+   const int hh = lh + (7 * sc);
+
    struct {
       const uint8_t *ic;
       int cx; /* cell's left edge */
       int to; /* the page it goes to */
    } b[4] = {
-       {icon_pg_first, x, 0},
-       {icon_pg_prev, x + bw, page - 1},
-       {icon_pg_next, rx - (2 * bw), page + 1},
-       {icon_pg_last, rx - bw, npages - 1},
+       {icon_pg_first, x,             0         },
+       {icon_pg_prev,  x + bw,        page - 1  },
+       {icon_pg_next,  rx - (2 * bw), page + 1  },
+       {icon_pg_last,  rx - bw,       npages - 1},
    };
+
    for (int i = 0; i < 4; i++) {
       /* A destination outside the range, or the page already showing, is a
        * button with nothing to do -- which is exactly when it greys. */
@@ -1372,8 +1377,7 @@ void ui_span_label(int hours, char *out, int n)
       (void)snprintf(out, (size_t)n, "%dD", hours / 24);
 }
 
-const char *const ui_perm_lbl[] = {"BT SCAN", "BT CONNECT", "NOTIFY",
-                                   "STEPS"};
+const char *const ui_perm_lbl[] = {"BT SCAN", "BT CONNECT", "NOTIFY", "STEPS"};
 
 /* App-Standby bucket -> short label. */
 
@@ -1389,12 +1393,12 @@ void fmt_rescale_pct(int pm, char *out, int n)
 uint32_t glu_color(int g)
 {
    if (g < 50)
-      return UI_GLU_LOW;  /* under 50 */
+      return UI_GLU_LOW; /* under 50 */
    if (g < 70)
       return UI_GLU_SOFT; /* 50..70   */
    if (g < 180)
-      return UI_GLU_MID;  /* 70..180  */
-   return UI_GLU_HIGH; /* over 180 */
+      return UI_GLU_MID; /* 70..180  */
+   return UI_GLU_HIGH;   /* over 180 */
 }
 
 int thresh_off(int mgdl, int ishigh)

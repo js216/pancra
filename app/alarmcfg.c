@@ -12,7 +12,6 @@
 #include "alarmcfg.h"
 #include "alarmlogic.h" /* AL_ENTRY_MAX: the load bound = the keypad's */
 #include "loadresult.h" /* the four answers a stored file can give */
-#include "log.h"
 #include "setpriv.h"
 #include "settings.h" /* struct prefs: the aggregate the engine holds */
 #include "thread.h"   /* the lock this module's state sits behind */

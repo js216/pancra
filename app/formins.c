@@ -17,8 +17,8 @@
 #include "nav.h"
 #include "shell.h"
 #include "status.h"
-#include "uifmt.h" /* UI_DAY_TABS: the plot spans */
 #include "uiact.h"
+#include "uifmt.h" /* UI_DAY_TABS: the plot spans */
 #include "uimodel.h"
 
 /* Which page of the DOSE table is showing. See formwt.c on why paging lives

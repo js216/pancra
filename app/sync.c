@@ -782,4 +782,3 @@ int sync_run(void)
    sync_ctx_end();
    return rc;
 }
-

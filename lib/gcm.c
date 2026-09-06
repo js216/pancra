@@ -14,28 +14,29 @@
 #include "gcm.h"
 #include "aes.h"
 #include "ct.h"
+#include <stdint.h>
 #include <string.h>
 
 /* THE BOUNDS, CHECKED BY THE COMPILER RATHER THAN BY THE COMMENT ABOVE THEM.
  * gcm.h explains each; these are the arithmetic identities that explanation
  * rests on, so that editing one constant and not the others cannot compile. */
-_Static_assert(GCM_PT_MAX == GCM_CTR_BLOCKS_MAX * 16ull,
+_Static_assert(GCM_PT_MAX == GCM_CTR_BLOCKS_MAX * 16ULL,
                "the plaintext bound must BE the 32-bit counter's block "
                "capacity, not merely resemble it");
-_Static_assert(GCM_PT_MAX * 8ull == (1ull << 39) - 256ull,
+_Static_assert(GCM_PT_MAX * 8ULL == (1ULL << 39U) - 256ULL,
                "the plaintext bound in bytes must equal SP 800-38D 5.2.1.1's "
                "len(P) <= 2^39 - 256 bits");
-_Static_assert(GCM_AAD_MAX == UINT64_MAX / 8ull,
+_Static_assert(GCM_AAD_MAX == UINT64_MAX / 8ULL,
                "the AAD bound must be the largest byte count whose bit count "
                "still fits GHASH's 64-bit length field");
 /* And the counter walk gcm.h describes, so the claim that 2^32 - 2 blocks
  * never wrap -- and that one more block lands on 0 and two more on the tag
  * mask -- is a compile-time fact and not a story. */
-_Static_assert((uint32_t)(1ull + GCM_CTR_BLOCKS_MAX) == 0xFFFFFFFFu,
+_Static_assert((uint32_t)(1ULL + GCM_CTR_BLOCKS_MAX) == 0xFFFFFFFFU,
                "the last legal data block must use the last counter value");
-_Static_assert((uint32_t)(1ull + GCM_CTR_BLOCKS_MAX + 1) == 0u,
+_Static_assert((uint32_t)(1ULL + GCM_CTR_BLOCKS_MAX + 1) == 0U,
                "one block past the bound must be where the counter wraps");
-_Static_assert((uint32_t)(1ull + GCM_CTR_BLOCKS_MAX + 2) == 1u,
+_Static_assert((uint32_t)(1ULL + GCM_CTR_BLOCKS_MAX + 2) == 1U,
                "two blocks past the bound must collide with J0, the tag mask");
 
 /* ---- GHASH ------------------------------------------------------------
@@ -86,17 +87,17 @@ static void gf_mul(uint8_t x[16], const uint8_t y[16])
       /* Normalised to exactly 0 or 1 by the shift, because ct_mask64 negates
        * its argument to build the mask and would select neither operand for a
        * 2. `i` is a loop counter, not a secret, so indexing by it is fine. */
-      const uint64_t bit = (uint64_t)(x[i / 8] >> (7 - (i % 8))) & 1u;
+      const uint64_t bit = (uint64_t)(x[i / 8] >> (unsigned)(7 - (i % 8))) & 1U;
       const uint64_t bm  = ct_mask64(bit);
       for (int j = 0; j < 16; j++)
          z[j] ^= (uint8_t)(v[j] & bm);
       /* v = v >> 1, and if a 1 fell off the end, reduce. The shift itself was
        * always data independent; it is the reduction that told on H. */
-      const uint64_t lsb = (uint64_t)v[15] & 1u;
+      const uint64_t lsb = (uint64_t)v[15] & 1U;
       for (int j = 15; j > 0; j--)
-         v[j] = (uint8_t)((v[j] >> 1) | ((v[j - 1] & 1) << 7));
-      v[0] >>= 1;
-      v[0] ^= (uint8_t)(0xe1u & ct_mask64(lsb));
+         v[j] = (uint8_t)(((unsigned)v[j] >> 1U) | ((v[j - 1] & 1U) << 7U));
+      v[0] >>= 1U;
+      v[0] ^= (uint8_t)(0xe1U & ct_mask64(lsb));
    }
    memcpy(x, z, 16);
 }
@@ -125,8 +126,8 @@ static void ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data,
 static void be64(uint8_t out[8], uint64_t v)
 {
    for (int i = 7; i >= 0; i--) {
-      out[i] = (uint8_t)(v & 0xff);
-      v >>= 8;
+      out[i] = (uint8_t)(v & 0xffU);
+      v >>= 8U;
    }
 }
 
@@ -143,7 +144,8 @@ static void be64(uint8_t out[8], uint64_t v)
 static void gctr(const uint8_t key[16], const uint8_t iv[12], uint32_t ctr,
                  const uint8_t *in, uint8_t *out, size_t n)
 {
-   uint8_t blk[16], ks[16];
+   uint8_t blk[16];
+   uint8_t ks[16];
    /* THE SCHEDULE IS EXPANDED ONCE, not once per block. It always could have
     * been; it matters now because lib/aes.c computes its S-box rather than
     * reading a table, so the 40 evaluations a schedule costs are no longer
@@ -152,9 +154,9 @@ static void gctr(const uint8_t key[16], const uint8_t iv[12], uint32_t ctr,
    aes128_init(&ctx, key);
    memcpy(blk, iv, 12);
    while (n) {
-      blk[12] = (uint8_t)(ctr >> 24);
-      blk[13] = (uint8_t)(ctr >> 16);
-      blk[14] = (uint8_t)(ctr >> 8);
+      blk[12] = (uint8_t)(ctr >> 24U);
+      blk[13] = (uint8_t)(ctr >> 16U);
+      blk[14] = (uint8_t)(ctr >> 8U);
       blk[15] = (uint8_t)ctr;
       aes128_encrypt_ctx(&ctx, blk, ks);
       size_t take = n < 16 ? n : 16;
@@ -172,7 +174,10 @@ static void gcm_tag(const uint8_t key[16], const uint8_t iv[12],
                     const uint8_t *aad, size_t aadn, const uint8_t *ct,
                     size_t ctn, uint8_t tag[16])
 {
-   uint8_t h[16] = {0}, zero[16] = {0}, y[16] = {0}, len[16];
+   uint8_t h[16]    = {0};
+   uint8_t zero[16] = {0};
+   uint8_t y[16]    = {0};
+   uint8_t len[16];
    aes128_encrypt(key, zero, h);
    ghash(y, h, aad, aadn);
    ghash(y, h, ct, ctn);

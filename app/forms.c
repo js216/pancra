@@ -666,7 +666,16 @@ int kp_commit_number(void)
             shell_ui_dirty();
             return COMMIT_STAY; /* stay: the cleared entry is the feedback */
          }
-         form_wt_set_tenths(tenths);
+         /* THE NUMBER GOES TO THE WORKFLOW, which knows whether it completes
+          * the entry: a new weigh-in is written here and the keypad returns
+          * to whatever opened it, while an edit joins the draft the WEIGHT
+          * form is still showing. */
+         if (!form_wt_take_tenths(tenths)) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "WRITE FAILED");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
          g_kp.len = 0;
          keypad_close();
       }
@@ -678,7 +687,7 @@ int kp_commit_number(void)
           * shape and the same reasoning; this one carries THREE decimal
           * places because the record already holds a 0.7. */
          int milli = 0;
-         int scale = 0;   /* 0 = before the point, then 1..3 places consumed */
+         int scale = 0; /* 0 = before the point, then 1..3 places consumed */
          int dot   = 0;
          int bad   = 0;
          for (int i = 0; i < g_kp.len; i++) {

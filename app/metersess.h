@@ -122,5 +122,4 @@ void msess_bind(int src, const char *mac);
 void msess_idle_set(int link, long when);
 void msess_idle_copy(long *out, int n);
 
-
 #endif

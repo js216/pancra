@@ -41,6 +41,4 @@
 #error "app/sensorsint.h: include app/sensors.h first"
 #endif
 
-
-
 #endif

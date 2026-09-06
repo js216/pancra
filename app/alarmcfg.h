@@ -22,8 +22,6 @@
 int alarm_set_thresholds(int alarm_low, int alarm_high, int nudge_low,
                          int nudge_high);
 
-
 enum load_result alarm_load(void);
-
 
 #endif

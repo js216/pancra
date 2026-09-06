@@ -70,7 +70,6 @@ void set_job_stamp(struct save_job *j, const char *path, unsigned *written,
  * newer bytes it would have overwritten are the ones that should be there. */
 int set_write_job(const struct save_job *j);
 
-
 /* Change one field and persist it, rolling the field back if the write fails
  * and nothing newer landed meanwhile. SETTINGS_OK / SETTINGS_UNSAVED. */
 int set_int_field(int *field, int val, render_fn render);

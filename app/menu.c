@@ -37,6 +37,7 @@
 #include "uimenu.h"
 #include "uimodel.h"
 #include "util.h"
+#include <stdio.h>
 
 /* EXPORT DATA menu state (session-only; the defaults are the whole point:
  * everything, all time). Range 0 = 30 D, 1 = 1 Y, 2 = ALL. */
@@ -377,9 +378,9 @@ static int devlist_menu_action(int action, int ix)
             char full[24];
             (void)snprintf(full, sizeof full, "%d PINS MAX", SC_MAX);
             set_status(full);
-         }
-         else if (pr != SETTINGS_OK)
+         } else if (pr != SETTINGS_OK) {
             set_status("PIN NOT SAVED");
+         }
       }
    } else if (action == MA_DEVPAGE) {
       g_dev_page = ix;
