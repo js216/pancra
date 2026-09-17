@@ -3,6 +3,7 @@
 // Copyright 2026 Jakob Kastelic
 
 #include "uimenu.h"
+#include "alarmlogic.h" /* ND_MODE_N: how many labels the mode row has */
 #include "colors.h"
 #include "exercise.h"
 #include "font.h"
@@ -12,7 +13,7 @@
 #include "ndk.h"
 #include "plot.h"
 #include "sensors.h"  /* sensor types, kinds, marker enum */
-#include "settings.h" /* SET_NCOLORS: crosschecked below */
+#include "settings.h" /* SET_NCOLORS: checked against the palette below */
 #include "style.h"
 #include "syncstat.h"
 #include "uiact.h"
@@ -141,7 +142,7 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
             nlive++;
             nconn += (m->dev.sensors[i].connected != 0);
          }
-      /* Bounded by MAX_SLOTS in practice, but the compiler only sees an int:
+      /* Bounded by the rows a frame carries, but the compiler only sees an int:
        * clamp so the format cannot be truncated. BOTH ENDS -- only the upper
        * one was clamped, and gcc's range for the value was therefore
        * [INT_MIN, 99], which is 11 characters, not 2. It said so at -O1 (the
@@ -198,9 +199,16 @@ void render_settings(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * every portrait phone keeps the full gap AND its font size. Measured
     * against the button's real height (25*sc, see menu_button). */
    {
+      /* STEPPED DOWN AS FAR AS IT TAKES, not once. A single step leaves the
+       * button below the surface on the windows where two lines of air is still
+       * one too many (1080x784, 1080x1048, 1080x1312, 1200x1568, 1440x1856):
+       * menu_button's frame then does not fit, draw_frame drops the whole
+       * outline, and the label is drawn with no box around it. */
       int air = 3 * lh;
-      if (y + air + (25 * sc) > fb->height)
-         air = 2 * lh;
+      while (air > 0 && y + air + (25 * sc) > fb->height)
+         air -= lh;
+      if (air < 0)
+         air = 0;
       y += air;
    }
    menu_button(fb, h, x, y, fb->width - (2 * x), sc, "EXPORT DATA", UI_TEXT,
@@ -254,6 +262,7 @@ const char *dev_state_abbrev(const char *st, char *out, int n)
    } tab[] = {
        /* CGM */
        {"CONFIRM PAIRING", "PAIR"},
+       {"PAIRING",         "PAIR"},
        {"CONNECTED",       "CONN"},
        {"WAITING",         "WAIT"},
        {"WARMUP",          "WARM"},
@@ -359,7 +368,7 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
             m->prefs.nudge_vib ? UI_OK : UI_TEXT, MA_NUDGE_VIB, 0);
    y += 2 * lh;
    menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
-            ui_newdata_lbl[(unsigned)m->prefs.newdata_mode % 3U],
+            ui_newdata_lbl[(unsigned)m->prefs.newdata_mode % (unsigned)ND_MODE_N],
             m->prefs.newdata_mode ? UI_OK : UI_TEXT, MA_NEWDATA, 0);
 }
 
@@ -399,8 +408,13 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
    /* The one acting control. With every section unticked there is nothing
     * to build, so the button greys out and records no target. */
-   int any = m->sys.exp_glu || m->sys.exp_dev || m->sys.exp_ins;
-   int bw  = fb->width - (2 * x);
+   /* ALL FOUR SECTIONS, matching what the handler actually builds. A section
+    * missing from this test is a ticked checkbox over the words NOTHING
+    * SELECTED, with no target recorded -- the screen contradicting itself and
+    * that section unexportable on its own. */
+   int any =
+       m->sys.exp_glu || m->sys.exp_dev || m->sys.exp_ins || m->sys.exp_wt;
+   int bw = fb->width - (2 * x);
    if (any)
       menu_button(fb, h, x, y, bw, sc, "EXPORT", UI_OK, MA_EXP_GO, 0);
    else
@@ -412,8 +426,12 @@ void render_export(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * method that could not be resolved), and the next tap usually works. */
    if (m->sys.exp_failed) {
       y += 2 * lh;
-      draw_str(px, fb, x, y, sc, "EXPORT DID NOT START -- TRY AGAIN",
-               UI_DANGER);
+      /* WRAPPED, because it is 33 characters and ink starts at 4*sc: the
+       * layout guarantees 33 COLUMNS of width, so the last character of a
+       * 33-character line drawn at the margin falls outside it. */
+      draw_str(px, fb, x, y, sc, "EXPORT DID NOT START", UI_DANGER);
+      y += lh;
+      draw_str(px, fb, x, y, sc, "-- TRY AGAIN", UI_DANGER);
    }
 }
 
@@ -660,9 +678,21 @@ void render_remote(struct ANativeWindow_Buffer *fb, const struct screen *m,
          fill = 0;
       if (fill > bar_w - (2 * sc))
          fill = bar_w - (2 * sc);
-      for (int by = y + sc; by < y + bar_h - sc; by++)
-         for (int bxx = bar_x + sc; bxx < bar_x + sc + fill; bxx++)
-            px[(by * fb->stride) + bxx] = UI_OK;
+      /* THROUGH THE PRIMITIVE, like every other painted pixel in this UI. A
+       * loop of its own here writes with neither the bounds test nor the NULL
+       * test uidraw.c's three leaves all carry -- and the frame drawn on the
+       * line above clips and returns while this would write anyway, past the
+       * end of the surface on a short enough one. It also counts what it
+       * cannot draw, which is how a bar off the bottom of the screen becomes
+       * something the log says rather than something nobody sees. */
+      /* AND NOTHING IS ASKED FOR AT ZERO WIDTH. fill_rect counts a rectangle it
+       * cannot draw, and a sync that has just started is at nought per mille --
+       * so calling it anyway reports one clipped unit on a screen where nothing
+       * is off-screen, at every sync, which is a false reading in the one
+       * instrument that says a layout overflowed. The two sibling bars on the
+       * main screen guard the same way. */
+      if (fill > 0)
+         fill_rect(px, fb, bar_x + sc, y + sc, fill, bar_h - (2 * sc), UI_OK);
       y += bar_h + lh;
       char pctxt[16];
       (void)snprintf(pctxt, sizeof pctxt, "%d%%", m->sync.sync_permille / 10);

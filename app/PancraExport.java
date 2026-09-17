@@ -19,9 +19,10 @@
  * below.
  *
  * The bytes, the durability rule and the naming grammar are NOT here -- they
- * are in ExportSnapshot and ExportPolicy, which the host JVM tests
- * (`make exportjavatest`). What is here is the part that genuinely needs
- * Android: a files directory, a content:// URI and a chooser. */
+ * are in ExportSnapshot and ExportPolicy, neither of which touches an Android
+ * type -- so both run under a plain host JVM. What is here is the part that
+ * genuinely needs Android: a files directory, a content:// URI and a
+ * chooser. */
 package com.jk.pancra;
 
 import android.content.Context;

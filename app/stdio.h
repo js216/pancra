@@ -22,14 +22,14 @@
  * were added -- every %ld against an int64_t, which is invisible on LP64 (the
  * two are the same type) and wrong on any machine where they are not. The
  * real bionic header carries the same attributes, so this is a mirror of the
- * declaration rather than a decoration on it. `make -f test/Makefile
- * wirecheck` compiles the protocol units for three other data models, and
- * these attributes are what give that compile anything to say. The macros
+ * declaration rather than a decoration on it. Compiling the protocol units
+ * for another data model is what makes these attributes say anything at
+ * all -- on LP64 the mismatches they catch are invisible. The macros
  * themselves are lib/compiler.h, so a compiler without the GNU extension
  * still parses this header. */
 int snprintf(char *s, size_t n, const char *fmt, ...) PANCRA_PRINTF(3, 4);
 
-/* Only used by the host-side self-test harnesses (..._TEST builds); the app
+/* Only used by host-side builds (..._TEST); the app
  * itself calls nothing but snprintf. */
 int printf(const char *fmt, ...) PANCRA_PRINTF(1, 2);
 int sscanf(const char *s, const char *fmt, ...) PANCRA_SCANF(2, 3);

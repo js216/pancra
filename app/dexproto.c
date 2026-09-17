@@ -376,13 +376,13 @@ void driver_init(void)
     * SKIPPING LINK_METER would be treating that constant as though it named a
     * link a meter permanently owns -- an idiom main.c and dexble.c both
     * record replacing with a per-link fact, because the link a meter occupies
-    * is whatever the allocator gave it. driver_free_cgm_link allocates by that
-    * dynamic table, and at cold start nothing is armed and no link is flagged
-    * as a meter, so link 1 is an ordinary free link and a CGM can be given it.
-    * Skip it and that sensor begins every process unpaired -- verbatim the
-    * failure above, live for one link. There is nothing to protect anyway:
-    * a link that never held a CGM has no files and loads nothing. The files
-    * are the fact; the constant was a guess. */
+    * is whatever the allocator gave it. driver_free_cgm_link_in allocates by
+    * that dynamic table, and at cold start nothing is armed and no link is
+    * flagged as a meter, so link 1 is an ordinary free link and a CGM can be
+    * given it. Skip it and that sensor begins every process unpaired --
+    * verbatim the failure above, live for one link. There is nothing to protect
+    * anyway: a link that never held a CGM has no files and loads nothing. The
+    * files are the fact; the constant was a guess. */
    driver_each_ctx(init_ctx);
 }
 
@@ -942,10 +942,10 @@ void driver_on_written(int link, const char *uuid, int status)
                 * the device; anyone holding those bytes can impersonate this
                 * phone to that sensor for the rest of its wear without ever
                 * knowing the pairing code. Comparing the two sides' keys by
-                * eye during bring-up is what tempts one into it; the test
-                * suite does that comparison instead (drivertest asserts
-                * drv_key_save gets the sensor's key), so nothing is lost by
-                * saying only that it happened. */
+                * eye during bring-up is what tempts one into it. Whether
+                * drv_key_save receives the sensor's key is checkable without
+                * printing it, so nothing is lost by saying only that it
+                * happened. */
                LOGI("   shared key derived (16 bytes, not logged)");
                if (drv_key_save(dc->link, dc->shared_key) != 0) {
                   LOGI("!! shared key persistence failed");
@@ -1073,10 +1073,8 @@ static void notify_auth(struct dex_ctx *dc, const uint8_t *buf, int n)
        * Replying unconditionally was also a chosen-plaintext oracle: the
        * peer picks buf[9..16] and gets AES-ECB(key, c||c)[:8] back.
        *
-       * This check existed in test/dexsession.c, a file no build target
-       * ever compiled -- so it protected nothing. That file is now deleted
-       * and the check lives here, exercised by test_driver.c's spoofed-peer
-       * and skipped-AuthChallenge cases. */
+       * The check belongs HERE, on the path that runs: written anywhere a
+       * build does not compile, it protects nothing. */
       uint8_t expect[8];
       dexcom_dex8(dc->shared_key, dc->token, expect);
       if (memcmp(expect, buf + 1, 8) != 0) {

@@ -17,8 +17,8 @@ final class NetPolicy {
      * function of a Throwable: the host test constructs the real exception
      * types and checks the answer, with no phone and no network.
      *
-     * The numbers mirror enum sync_net_fail in app/syncstat.h, which is where
-     * they become an outcome; `make javacheck` compares the two lists.
+     * The numbers mirror enum sync_net_fail in app/syncstat.h, which is
+     * where they become an outcome. The two lists must stay identical.
      */
     static final int NET_OK = 0;
     static final int NET_DNS = 1;

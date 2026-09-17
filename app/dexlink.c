@@ -13,7 +13,7 @@
  * this lock rather than lending the lock out.
  *
  * WHAT THE SPLIT PRESERVES, because it would be a regression to lose any of
- * it (see test/app/test_driver.c, which pins all four):
+ * these four:
  *
  *   - RECURSIVE-LOCK OWNERSHIP. driver_route_* take the lock and call into
  *     the protocol unit with it held; the protocol unit takes it again
@@ -82,12 +82,12 @@ static struct rmutex driver_lk = RMUTEX_INIT;
 
 /* THE DRIVER'S LOCK, private to this file.
  *
- * It was public, then it was in a private header six modules included, and
- * both amounted to the same thing: other files reasoning about when the
- * driver's state is safe to touch. One redundant lock() left above a call
- * that took it internally is what once held it for the life of the process,
- * with every GATT callback spinning and the phone looking perfectly
- * connected while it never produced another reading.
+ * NOT REACHABLE FROM ANOTHER FILE, whether by an exported symbol or a private
+ * header six modules include -- both amount to the same thing: other files
+ * reasoning about when the driver's state is safe to touch. One redundant
+ * lock() above a call that takes it internally holds this lock for the life of
+ * the process, with every GATT callback spinning and the phone looking
+ * perfectly connected while it never produces another reading.
  *
  * Everything that needed it now names an operation instead: the routing of a
  * callback (driver_route_*), a link's role and arming (driver_link_*), the
@@ -108,19 +108,30 @@ static void driver_unlock(void)
    rmutex_unlock(&driver_lk);
 }
 
+/* The same lock every operation in this file takes; this pair only declines to
+ * wait for it, and is not a link-validating enter. */
+int driver_try_enter(void)
+{
+   return rmutex_trylock(&driver_lk);
+}
+
+void driver_try_leave(void)
+{
+   driver_unlock();
+}
+
 /* IS THIS A LINK THIS DRIVER HAS?
  *
  * Asked BEFORE the lock, by every public entry point, so an operation going
  * nowhere never contends for it -- and so the refusal is visibly outside the
- * critical section. test/app/lockorder.py reads these functions looking for a
- * `return` between an acquire and its release, and it is right to: three such
- * returns once held the driver lock for the life of the process.
+ * critical section. A `return` between an acquire and its release is the
+ * shape to watch for: three such returns once held the driver lock for the
+ * life of the process.
  *
  * ASKING IS THE POINT. Clamping an out-of-range link to LINK_CGM applies a
  * malformed callback -- and the link comes from Java, indexed by whatever the
  * framework handed back -- to the PRIMARY sensor's context, the one context
- * whose corruption cannot be undone without re-pairing. See the bad-link
- * section of test/app/test_driver.c. */
+ * whose corruption cannot be undone without re-pairing. */
 int dex_link_ok(int link)
 {
    return link >= 0 && link < LINK_MAX;
@@ -201,8 +212,8 @@ void driver_snapshot(struct dex_session sess[LINK_MAX], int cal_link,
     * output, so an entry is always written. driver_session_of would take the
     * lock again per link (harmless -- it is recursive) to answer a question
     * this loop has already answered, and driver_enter inside a driver_lock()
-    * is the exact shape lockcheck refuses, because ONE misplaced pairing of
-    * it held the driver's lock for the life of the process. */
+    * is the shape to avoid: ONE misplaced pairing of it held the driver's
+    * lock for the life of the process. */
    if (sess)
       for (int l = 0; l < LINK_MAX; l++) {
          g_dctx[l].link = l; /* idempotent; see the field's comment */
@@ -397,7 +408,18 @@ int driver_link_claim(const char *mac, int reserve)
     * refer to. */
    int freen = 0;
    for (int l = LINK_CGM + 1; l < LINK_MAX; l++) {
-      if (g_link_armed[l][0])
+      /* COUNTED OVER THE SET A CGM CAN ACTUALLY USE, which is what makes the
+       * reserve mean anything. driver_free_cgm_link_in skips a link that is
+       * armed OR still routed to the meter parser, and meter_unarm_link leaves
+       * the routing bit set -- so a link in that state is one no CGM can take.
+       * Counting it as free lets this reserve pass on a pool the CGMs cannot
+       * use, and the top-down pick below can then land on the link a CGM's rank
+       * resolves to.
+       *
+       * The PICK is deliberately not narrowed the same way: a meter-routed link
+       * with no arm behind it is free for a METER to take again, and refusing
+       * it here would strand it. */
+      if (g_link_armed[l][0] || g_link_meter[l])
          continue;
       struct dex_session ls;
       /* the context directly, under the hold above -- see driver_snapshot */
@@ -406,8 +428,24 @@ int driver_link_claim(const char *mac, int reserve)
       if (!ls.mac[0])
          freen++;
    }
+   /* FROM THE TOP DOWN, and that is what keeps a meter off the link a CGM is
+    * about to use.
+    *
+    * A CGM's link comes from driver_free_cgm_link_in, which counts free links
+    * UPWARD from LINK_CGM: rank 0 is the lowest free one. Searching upward here
+    * too, both allocators name the same link whenever more links are free than
+    * there are CGMs waiting -- and a CGM's link is only RESOLVED, never armed,
+    * so nothing stops a meter advert on a binder thread from taking it between
+    * the resolve and the connect. The CGM then connects on a link a meter has
+    * armed, seizing its GATT client, and the pairing's driver_forget erases
+    * that link's key file.
+    *
+    * Opposite ends make the two allocations disjoint by construction. They can
+    * only meet when exactly ONE link is free, and then `freen` is 1 while
+    * `reserve` counts at least the CGM that is waiting, so the test above has
+    * already refused. */
    if (freen > reserve) {
-      for (int l = LINK_CGM + 1; l < LINK_MAX && link < 0; l++) {
+      for (int l = LINK_MAX - 1; l > LINK_CGM && link < 0; l--) {
          if (g_link_armed[l][0])
             continue; /* another meter holds it */
          struct dex_session ls;
@@ -722,13 +760,16 @@ int driver_link_of_identity_in(const struct dex_session *sess,
    if (!sess || !identity || !identity[0])
       return -1;
    int found = -1;
-   /* EVERY link, including a meter's. drv_connect stamps the address into the
-    * link's session whichever kind of device it is, so one lookup binds both
-    * -- and reserving a link for "the meter" is exactly what stopped a second
-    * and third meter from ever holding a connection of their own.
+   /* EVERY link -- but this finds only CGMs, and that is not a shortcoming to
+    * be fixed by widening it. The session's address is written by the Dexcom
+    * handshake; drv_connect does not write it, so a METER's link carries no
+    * address here and never matches. A meter's link is found in the ARM
+    * table instead (meter_link_of_mac), which is where a meter's identity
+    * actually lives. Widening this to "bind both" is how device_retire came
+    * to tear down a free CGM link when a meter is disconnected.
     *
-    * No save/restore any more: driver_session_of names the link it reads, so
-    * this walk leaves the ambient selection exactly as it found it. */
+    * NO SAVE AND RESTORE AROUND IT: driver_session_of names the link it reads,
+    * so this walk leaves the ambient selection exactly as it found it. */
    for (int l = 0; l < LINK_MAX && found < 0; l++)
       if (sess[l].mac[0] && strcmp(sess[l].mac, identity) == 0)
          found = l;

@@ -208,7 +208,7 @@ int set_write_job(const struct save_job *j)
     * passes nearly every time. A property that a mutant survives is not
     * covered.
     *
-    * So the test installs a hook here and BLOCKS one thread inside the
+    * So a hook here can BLOCK one thread inside the
     * window while another completes a newer save, which makes the ordering
     * exact rather than lucky. With no hook installed this is a plain yield,
     * which the two-thread hammer case wants. Nothing that ships defines
@@ -357,7 +357,7 @@ int settings_paths(const char *dir)
  * them would put the secret that authenticates us TO the server inside the
  * server's own database. The other three are nobody else's business. */
 
-/* The alarm and settings files by name, for the tests that simulate a
+/* The alarm and settings files by name, for callers that simulate a
  * CORRUPTED one -- the loaders' behaviour on garbage is half of what settings
  * persistence has to get right, and it cannot be checked without writing the
  * bytes. Read-only, like every path here: they are set once, by

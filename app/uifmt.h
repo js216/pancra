@@ -19,7 +19,7 @@
 #ifndef PANCRA_UIFMT_H
 #define PANCRA_UIFMT_H
 
-#include "sensors.h" /* MAX_SLOTS: UI_MAX_SLOTS mirrors it */
+#include "sensors.h" /* MAX_SLOTS: the capacity this window is not */
 #include <stdint.h>
 
 /* OS bond states, mirroring android.bluetooth.BluetoothDevice's own constants
@@ -34,18 +34,59 @@
 #define UI_BOND_BONDED  12
 
 /* ---- sensor presentation (shared by the list, the detail screen, the plot) */
-#define UI_MAX_SLOTS MAX_SLOTS
+/* HOW MANY RETIRED DEVICES ONE FRAME FILLS, which is NOT how many are held.
+ *
+ * A retired device is drawn on exactly two screens: the paged OLD DEVICES
+ * list, and its own detail screen. So a frame fills every LIVE device and
+ * only the page of retired ones a screen is actually showing. Filling all of
+ * them instead ties 336 bytes of copying per device to every draw, for rows
+ * nothing can display.
+ *
+ * The renderer caps its rows-per-page at this so the window the model filled
+ * and the window the screen paints are the same one. */
+/* EIGHT, because that is what the shortest supported screen can draw. The
+ * model fills this many retired devices and the list draws exactly them, so
+ * the window that was filled and the page that is painted are the same set by
+ * construction -- derive the page size from screen height instead and a short
+ * screen pages past devices the model never filled. Measured across
+ * 1080x1920 (the tightest at 8 rows), 720x1600, 1080x2400/2280, 1440x2560,
+ * 720x1280, 540x1200, 480x1920 and 540x2340. */
+#define UI_OLD_PAGE 8
+
+/* HOW MANY DEVICE ROWS ONE FRAME CARRIES, which is a window and not the
+ * registry's capacity (MAX_SLOTS, in the thousands -- a lifetime of sensors).
+ * A frame fills every LIVE device, the one page of retired devices the OLD
+ * DEVICES list is showing, and the selected device if it is a retired one
+ * outside that page. Nothing else is drawn, so nothing else is built.
+ *
+ * UI_LIVE_MAX is the one judgement here: how many devices can be in service
+ * at once. The phone holds LINK_MAX bonds, and this screen shows a page of
+ * about ten rows, so sixty-four in service is far past anything reachable --
+ * and past it the frame says so in the log rather than dropping rows
+ * quietly. The SLOTS row prints the registry's own totals either way, so the
+ * count a user sees is never this window's. */
+#define UI_LIVE_MAX  64
+#define UI_MAX_SLOTS (UI_LIVE_MAX + UI_OLD_PAGE + 1)
 /* Refuse to render a sensor list shorter than this rather than silently
  * truncating it, so a cramped screen is a visible error, not a quiet lie. */
 #define UI_MIN_SLOTS 3
 
+/* HOW MANY UNPAIRED DEVICES THE WARNING BLOCK LISTS. It sits above the device
+ * list and is drawn only when something is unpaired, so it is not part of
+ * UI_DEV_ABOVE -- reserving for it would tax every ordinary screen. Instead
+ * the list gives up exactly the rows it used, and this bounds how many that
+ * can be. Nothing is hidden by the cap: an unpaired device is live, so it has
+ * an ordinary row in the list below with the same target. */
+#define UI_UNPAIRED_MAX 4
+
 /* Rows the DEVICES screen consumes ABOVE (and below) the device entries:
- * title (2), the five-line primary-box explainer plus its trailing air (~3),
+ * title (3 -- the heading, its close X and the air under them), the five-line
+ * primary-box explainer plus its trailing air (~3),
  * the blank row under it (1), the armed-pairing "PENDING..." row (1), the
  * page-nav row (1), the blank line above OLD DEVICES (1), the "OLD DEVICES (n)"
- * row (1), the blank line below it (1), the separator before the button (1) and
- * the ADD NEW DEVICE button itself (25*sc, i.e. ~1.6 rows -> 2). Keep in step
- * with render_devices.
+ * row (1), the blank line below it (1), the SLOTS/LINKS capacity row (1), the
+ * separator before the button (1) and the ADD NEW DEVICE button itself
+ * (25*sc, i.e. ~1.6 rows -> 2). Keep in step with render_devices.
  *
  * The explainer is five glyph lines at gh + 2*sc each, which is under three
  * 16*sc rows -- counted as 3, rounding UP, because rounding down here is
@@ -60,13 +101,13 @@
  * list has its own screen, so render_settings' four submenu rows and EXPORT
  * DATA are no part of it.)
  *
- * Exported deliberately. Private to the renderer, with test/uitest.c carrying
- * its own literal for the same quantity, the two drift apart silently -- and
- * adding rows to render_devices without bumping
+ * Exported deliberately. Private to the renderer, with anything else
+ * carrying its own literal for the same quantity, the two drift apart
+ * silently -- and adding rows to render_devices without bumping
  * this is exactly the mistake that leaves device rows and their tap targets
  * below the bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_DEV_ABOVE 14
+#define UI_DEV_ABOVE 15
 
 /* AIR BETWEEN DEVICE ROWS. The list packed rows at the bare 16*sc line height,
  * which ran the devices together -- each row already carries a label, a plot
@@ -102,6 +143,13 @@ int ui_devices_scale(int w, int h);
  * Every full-screen menu must size itself through this. */
 int ui_fit_scale(int w, int h, int rows);
 
+/* 1 when `rows` lines cannot fit this surface even at the smallest scale --
+ * the question ui_fit_scale's floor cannot answer, because it hands back 1
+ * rather than 0. A screen that spends many rows and ends on a control asks this
+ * before laying anything out: past the bottom edge the control is drawn nowhere
+ * and cannot be tapped, and nothing on screen says so. */
+int ui_screen_too_short(int w, int h, int rows);
+
 int ui_sensor_capacity(int w, int h);
 
 /* Spans the WEIGHT LOG plot offers, in DAYS; 0 is "everything". Exported so
@@ -115,9 +163,9 @@ extern const int ui_tab_hours[UI_TABS];
 /* A SPAN TAB'S NAME, into `out`: hours below two days, whole days above.
  *
  * ONE DEFINITION, because two charts offer these same six spans and the rule
- * written out twice drifted -- the glucose plot named the 24-hour tab "24H"
- * while the step plot named the very same span "1D", so the two screens
- * disagreed about what one tab was called. */
+ * written out twice drifts: one plot names the 24-hour tab "24H" and the other
+ * names the very same span "1D", so two screens disagree about what one tab is
+ * called. */
 void ui_span_label(int hours, char *out, int n);
 
 #define UI_WT_TABS 5

@@ -132,9 +132,10 @@ int form_food_action(int action, int ix)
        * food_delete matches on, and it is the only thing a second YES can
        * act upon -- clearing it here would leave the user on a populated
        * form whose next CONFIRM appends a duplicate rather than retrying.
-       * That is items 136-138's rule, in a form written after them. */
+       * Every delete confirmation in this app keeps its target for that
+       * reason. */
       if (food_delete(&g_food.orig) != 0) {
-         set_status("FOOD NOT DELETED");
+         set_status_refused("FOOD NOT DELETED");
          nav_go(SCR_FOOD);
       } else {
          /* THE WHOLE DRAFT GOES, not just its `edit` flag.
@@ -194,9 +195,9 @@ int form_food_action(int action, int ix)
        * something useful about and stays put; food_append remains the
        * authority on the bounds, and its refusal is reported the same way. */
       if (g_food.type == FOOD_TYPE_NONE) {
-         set_status("CHOOSE A FOOD FIRST");
+         set_status_refused("CHOOSE A FOOD FIRST");
       } else if (g_food.g < FOOD_MIN_G) {
-         set_status("ENTER HOW MANY GRAMS");
+         set_status_refused("ENTER HOW MANY GRAMS");
       } else if (g_food.edit >= 0
                      ? food_update(&g_food.orig, g_food.t, g_food.type,
                                    g_food.g, form_zone(0, g_food.t)) != 0
@@ -205,7 +206,7 @@ int form_food_action(int action, int ix)
          /* PERSISTENCE FAILED, SO THE FORM STAYS. Navigating away here would
           * discard a draft whose write did not happen -- the failure items
           * 136-138 are about, in a form written after them. */
-         set_status("FOOD NOT SAVED");
+         set_status_refused("FOOD NOT SAVED");
       } else {
          nav_back();
       }
@@ -221,7 +222,7 @@ int form_food_action(int action, int ix)
        * press retries it -- and a silent return would leave the user looking
        * at a lit button they have just pressed to turn off. */
       if (exercise_button_press(realtime_s(), mono_s()) == EX_PRESS_FAILED)
-         set_status("EXERCISE END NOT SAVED");
+         set_status_refused("EXERCISE END NOT SAVED");
    } else if (action == MA_FOOD_DISCARD) {
       /* Leave the entry form without logging. The draft is left alone
        * deliberately: nothing has been written, and the next MA_FOOD_OPEN

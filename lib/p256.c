@@ -41,11 +41,10 @@
  * standard unsigned trick -- a sum that wrapped is smaller than either
  * operand -- and nothing below tests a secret and jumps.
  *
- * THE FALLBACK IS EXERCISED, not merely present: `make -f test/Makefile
- * p256portable` builds the curve's own vectors and its constant-time
- * assertions with P256_NO_INT128 defined, so both cores are held to the same
- * answers and the same operation counts. A fallback nothing runs is a
- * fallback that does not work.
+ * THE FALLBACK MUST BE EXERCISED, not merely present: building the curve's
+ * own vectors and its constant-time assertions with P256_NO_INT128 defined
+ * holds both cores to the same answers and the same operation counts. A
+ * fallback nothing runs is a fallback that does not work.
  *
  * P256_NO_INT128 forces the portable path on a compiler that has the
  * extension. That is what makes the two comparable at all: without it the
@@ -124,11 +123,11 @@ static void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
  * A routine that says it is constant-time and has no way to be caught lying is
  * worth very little: the transformations below are the kind that a later edit
  * undoes by accident -- one early return put back for speed and the property
- * is gone with nothing failing. So the limb-level primitives count themselves
- * when P256_COUNT is defined, and test/srv/cttest.c drives the public entry
- * points with scalars chosen to differ in exactly the ways that show up here
- * (leading zeros, Hamming weight, small values) and asserts that the count is
- * IDENTICAL. That is not a timing measurement -- it cannot see a
+ * is gone with nothing failing. So the limb-level primitives count
+ * themselves when P256_COUNT is defined: drive the public entry points with
+ * scalars chosen to differ in exactly the ways that show up here (leading
+ * zeros, Hamming weight, small values) and the count must be IDENTICAL. That
+ * is not a timing measurement -- it cannot see a
  * data-dependent memory access or a variable-latency instruction -- but every
  * leak this file has had was a branch that did fewer limb operations, and
  * this sees those exactly.
@@ -498,7 +497,7 @@ static void fast_reduce(struct u256 *out, const struct u256 *lo,
     * As two `while` loops their trip counts are a direct readout of the
     * product's magnitude, and this is the hottest such site in the file --
     * every field multiply in every ladder step passes through here. Measured
-    * over 200 signatures plus the 4000 boundary products in p256_selftest,
+    * over 200 signatures plus 4000 boundary products,
     * `top` lands in [-4, 4] and each loop would run at most 4 times: a cost
     * varying by up to eight 4-limb add/subtracts with the operands.
     *
@@ -518,7 +517,8 @@ static void fast_reduce(struct u256 *out, const struct u256 *lo,
     *   enough to reach V < p; eight is the margin.
     *
     * Both phases end with top == 0 and r < p, which is the unique canonical
-    * residue -- the same answer the loops produced, which is what p256_selftest
+    * residue -- the same answer an unbounded loop produces, which is what a
+    * boundary sweep
     * checks against the long division in mod512. */
    for (int i = 0; i < 5; i++) {
       struct u256 t;
@@ -815,10 +815,10 @@ void p256_padd(struct jpoint *r, const struct jpoint *P_,
  *
  * EVERY ITERATION DOES THE SAME WORK. The addition happens on a zero bit too
  * and its result is thrown away by a masked select rather than by an `if`, so
- * the cost of a scalar multiplication no longer depends on the scalar in any
- * way this file can express: not on its leading zeros (jdouble's infinity
- * shortcut went first), and now not on its Hamming weight either. The count
- * that test/srv/cttest.c asserts is one number for every scalar it tries.
+ * the cost of a scalar multiplication does not depend on the scalar in any way
+ * this file can express: not on its leading zeros -- jdouble has no infinity
+ * shortcut -- and not on its Hamming weight. The operation count is one number
+ * for every scalar.
  *
  * That last step is only sound because p256_padd is itself branch-free. An
  * always-add over a branching p256_padd moves the leak rather than closing

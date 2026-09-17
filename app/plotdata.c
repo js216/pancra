@@ -35,7 +35,7 @@
  * rescale clamp). So a severe high was stored, alarmed on and counted in
  * time-in-range, then silently missing from the 30- and 90-day plots -- the
  * reading you would most want to see, absent from the view you would open to
- * see it. `make crosscheck` now fails the build if the two drift apart again.
+ * see it. Keep this in step with the ceiling store.h admits.
  * 768 rather than 751 keeps the bitmap a whole number of bytes; it costs
  * 24 kB. */
 #define PCELL_GLU 768
@@ -65,9 +65,9 @@ static long plot_log_size(const char *path)
 }
 
 /* THE WIDEST PROVENANCE ID THAT CAN EXIST, and it is not a guess: struct
- * reading stores `src` in sixteen bits (store.h), so sensor_mint refuses to
- * issue an id past 0xFFFF rather than let 65536 alias legacy id 0 and
- * reattribute a reading to a different physical device (sensors.c, "An id
+ * reading stores `src` in sixteen bits (store.h), so sensor_mint bounds
+ * every id it issues well inside that rather than let 65536 alias legacy id 0
+ * and reattribute a reading to a different physical device (sensors.c, "An id
  * must fit the 16-bit `src` field"). A wider number in this column therefore
  * did not come from this app, and cannot name anything on this phone.
  *
@@ -94,14 +94,14 @@ static long plot_log_size(const char *path)
  *      90-day glucose plots are drawn from.
  *
  *   2. Even with the arithmetic made safe, A BOUND ON THE WRONG SIDE OF A
- *      NARROWING CAST IS NOT A BOUND. The kind column was already
- *      "normalised" here, with a comment saying so -- but the comparison
- *      `n == KIND_BGM` ran on an `int` the parse had already wrapped, and
- *      4294967297 wraps to exactly 1, which IS KIND_BGM. So the single input
- *      that column's normalisation existed to stop walked straight through
- *      it: the row drew as a fingerstick nobody took. The same digits in the
- *      source column wrapped to 1 and borrowed device slot 1's colour and
- *      name. Both are measured in test/plottest.c; both were live.
+ *      NARROWING CAST IS NOT A BOUND. Normalising the kind column by comparing
+ *      `n == KIND_BGM` on an `int` the parse has already wrapped lets the one
+ *      input that normalisation exists to stop walk straight through it:
+ *      4294967297 wraps to exactly 1, which IS KIND_BGM, so the row draws as a
+ *      fingerstick nobody took. The same digits in the source column wrap to 1
+ *      and borrow device slot 1's colour and name. Both are reachable from a
+ *      hand-edited or spliced file, which is why both are bounded on the wide
+ *      side, before anything narrows.
  *
  * So: read every column through csvcur.h's bounded reader, keep the value in
  * a `long` while it is checked, and cast only after. A field with more digits

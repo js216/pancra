@@ -14,9 +14,9 @@ final class ServicePolicy {
      * An interface rather than the real MediaPlayer so the policy below is
      * executable on a host JVM. The policy is the whole point: it is what
      * stands between a user and a LOOPING alarm-usage player that nothing can
-     * silence. Guaranteed only by javacheck grepping Alarm.java for the word
-     * "release", it is satisfied by a dead call, a call in the wrong order,
-     * or a call skipped by an earlier throw. */
+     * silence. Alarm.java must release the player on every path out: a dead
+     * call, a call in the wrong order, or one skipped by an earlier throw all
+     * leave it looping. */
     interface Player {
         void stop() throws Throwable;
         void release() throws Throwable;
@@ -274,6 +274,6 @@ final class ServicePolicy {
      * types and checks the answer, with no phone and no network.
      *
      * The numbers mirror enum sync_net_fail in app/syncstat.h, which is where
-     * they become an outcome; `make javacheck` compares the two lists.
+     * they become an outcome. The two lists must stay identical.
      */
 }

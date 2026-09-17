@@ -261,7 +261,13 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* THREE COLUMNS, and the header spaces them to where the rows put them:
     * the instant is 16 characters, the level word and its number take 11 with
     * the padding below, and the length follows. */
-   draw_str(px, fb, x, y, sc, "TIME              LEVEL      MIN", UI_MUTED);
+   /* MIN OVER ITS OWN COLUMN, at the margin. A fixed column offset for it has
+    * to be wide enough for ACTIVE, and 29 columns of instant and level plus six
+    * of word is 35 -- past the 33 the layout targets, so on a screen where the
+    * width is what bounds the scale (1440x3200) the word is cut off with
+    * nothing to say it was. */
+   draw_str(px, fb, x, y, sc, "TIME              LEVEL", UI_MUTED);
+   draw_str(px, fb, rx - (str_len("MIN") * 6 * sc), y, sc, "MIN", UI_MUTED);
    y += lh;
 
    int avail = nav_y - y;
@@ -282,11 +288,8 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       const struct ex_rec *e = &m->food.exlog[ti];
       char when[20];
       char row[56];
-      char lvl[16];
       char durp[12];
       fmt_date(e->t, m->tz_off, when, sizeof when);
-      (void)snprintf(lvl, sizeof lvl, "%s %d", ex_level_word(e->level),
-                     e->level);
       /* HOW LONG IT LASTED, and the running session is not a number.
        *
        * Its length is `now` minus a start that is still moving, so printing
@@ -309,7 +312,40 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
          (void)snprintf(durp, sizeof durp, "%ld", durm);
       else
          (void)snprintf(durp, sizeof durp, "--");
-      (void)snprintf(row, sizeof row, "%s  %-11s", when, lvl);
+      /* THE LEVEL IS CLIPPED TO WHAT THE MIN COLUMN LEAVES. Both are drawn on
+       * one line -- the instant and the level from the left margin, the length
+       * right-aligned at the right -- so the only thing that keeps them apart
+       * is the room actually between them. A fixed column width cannot: the
+       * scale comes from a floor divide, so the gap in whole character cells
+       * varies with the geometry, and at 828x1792 and 1440x3200 a padded level
+       * reaches under ACTIVE and the two overprint. */
+      int lvlroom =
+          ((rx - (str_len(durp) * 6 * sc)) - (x + (18 * 6 * sc))) / (6 * sc);
+      if (lvlroom < 0)
+         lvlroom = 0;
+      if (lvlroom > 11)
+         lvlroom = 11;
+      /* THE WORD GIVES WAY, NEVER THE NUMBER. The number is what the shortcut
+       * button shows and what the file holds, so it is the half that has to
+       * match the record; the word is only there to make a column of bare 1s
+       * and 3s readable. Clipping the pair as one string cuts from the right
+       * and takes the number first, which is the wrong end. */
+      int wordroom = lvlroom - 2; /* the space and the digit */
+      if (wordroom < 0)
+         wordroom = 0;
+      /* AND A CUT WORD SAYS IT WAS CUT. draw_str drops what does not fit
+       * without a mark, so "MODERATE" arriving as "MODERA" reads as a word this
+       * app uses rather than one it shortened. A trailing '>' costs the column
+       * it replaces and makes the difference visible -- the same reason
+       * draw_title_fit steps a title down a size rather than letting it run off
+       * the edge. */
+      const char *word = ex_level_word(e->level);
+      char lvlw[16];
+      if (str_len(word) > wordroom && wordroom >= 2)
+         (void)snprintf(lvlw, sizeof lvlw, "%.*s>", wordroom - 1, word);
+      else
+         (void)snprintf(lvlw, sizeof lvlw, "%.*s", wordroom, word);
+      (void)snprintf(row, sizeof row, "%s  %s %d", when, lvlw, e->level);
       /* THE WHOLE ROW IN ITS LEVEL'S COLOUR. A log of exercise is read for
        * its shape -- when the hard days were -- and the colour is what makes
        * that visible in a column of near-identical timestamps. */
@@ -317,10 +353,11 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       /* THE LENGTH IS DRAWN SEPARATELY so ACTIVE can carry its own colour --
        * the running session is the one row here whose state, not just its
        * value, is worth seeing from across the table. Every other row keeps
-       * the level colour the rest of its line has. Placed at the column the
-       * header names: 16 for the instant, 2 of gap, 11 for the padded level.
-       */
-      draw_str(px, fb, x + (29 * 6 * sc), y, sc, durp,
+       * the level colour the rest of its line has. RIGHT-ALIGNED AT THE MARGIN,
+       * under the header's own MIN: the longest value here is ACTIVE, and a
+       * column offset wide enough for it runs past the width the layout
+       * targets. */
+      draw_str(px, fb, rx - (str_len(durp) * 6 * sc), y, sc, durp,
                running ? UI_BUSY : ui_ex_color(e->level, UI_TEXT_DIM));
       /* THE WHOLE ROW is the target, carrying the TAIL INDEX -- which the
        * dispatcher immediately turns into a copy of the row itself, because

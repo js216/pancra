@@ -259,9 +259,9 @@ void public_origin_init(void);
 const char *public_origin(void);
 
 /* 1 when `s` is a plausible host[:port] -- letters, digits, dot, hyphen, and at
- * most one colon before a numeric port. Exposed for the test: the whole value
- * of the function above is that a bad value cannot get in, and that is a claim
- * worth executing rather than reading. */
+ * most one colon before a numeric port. Exposed so it can be checked: the whole
+ * value of the function above is that a bad value cannot get in, and that is a
+ * claim worth executing rather than reading. */
 int origin_ok(const char *s);
 
 #endif

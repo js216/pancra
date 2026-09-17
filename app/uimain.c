@@ -12,7 +12,7 @@
 #include "plot.h"
 #include "sensors.h" /* sensor types, kinds, marker enum */
 #include "settings.h"
-#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band plot.c shades */ /* SET_NCOLORS: crosschecked below */
+#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band plot.c shades */
 #include "style.h"
 #include "uiact.h"
 #include "uidraw.h"
@@ -129,7 +129,8 @@ static int pin_has(const struct ui_prefs *p, int id)
 static const struct ui_sensor *primary_cgm(const struct screen *m)
 {
    for (int k = 0; k < m->dev.nsensors; k++)
-      if (m->dev.sensors[k].primary && m->dev.sensors[k].kind == KIND_CGM)
+      if (m->dev.sensors[k].primary && m->dev.sensors[k].have_rec &&
+          m->dev.sensors[k].kind == KIND_CGM)
          return &m->dev.sensors[k];
    return 0;
 }
@@ -980,23 +981,14 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int plot_x = cx + (2 * sc);
    int plot_y = y;
    int plot_w = cw - (4 * sc);
-   /* Must EQUAL store.h's NHIST: the shell sends up to NHIST points, and this
-    * static cap clamps how many the plot draws. If it were smaller, the plot
-    * would truncate the oldest in-window points even when the shell holds a
-    * full 7 days -- the same shrinking-7D bug NHIST's sizing fixes. the
-    * renderer is intentionally decoupled from store.h, so the Makefile
-    * `crosscheck` target greps both and fails the build if they ever drift
-    * apart. */
-#define UI_PLOT_GLU 5040
-   /* ...PLUS the insulin doses, which the shell appends AFTER the glucose
-    * points in the SAME m->plot.hist array (build_model sizes it NHIST + NINS).
-    * Capping at the glucose figure alone silently dropped every dose whose
-    * index landed past it: with the history full -- the steady state after
-    * a fortnight -- that is ALL of them, and before that the NEWEST ones,
-    * so a dose logged minutes ago was missing from the plot while older
-    * ones still showed. NINS comes from insulin.h (already included by
-    * ui.h); only the glucose half is a literal, so the Makefile's
-    * crosscheck can keep it in step with store.h's NHIST. */
+   /* WHAT THE PLOT WILL DRAW is UI_PLOT_MAX below, and it is derived rather
+    * than written down: PLOT_LONG_MAX for the glucose points a long span can
+    * return, plus NINS for the doses and NWT for the weights, which the shell
+    * appends after them in the SAME m->plot.hist array. Capping at the glucose
+    * figure alone drops every dose whose index lands past it -- with the
+    * history full, the steady state after a fortnight, that is all of them, and
+    * before that the newest ones, so a dose logged minutes ago is missing from
+    * the plot while older ones still show. */
 /* A LONG span returns up to PLOT_LONG_MAX points (plotdata.h), which is far
  * more than the live window holds. Sized for the LARGER of the two: too
  * small and the older half of a 30-day plot is silently cut off. */
@@ -1077,32 +1069,38 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          continue;
       }
       int matched = 0;
-      for (int k = 0; k < m->dev.nsensors; k++) {
-         /* Pre-registry legacy readings (src 0) match NO sensor and keep the
+      {
+         /* BY ID, NOT BY WALKING THE LIVE LIST. A reading is drawn in the
+          * colour of the sensor that produced it for as long as the reading
+          * is kept, and that outlives the device being live -- so the styling
+          * is looked up in a table keyed by id, which answers for retired
+          * devices and costs one index instead of a scan per point.
+          *
+          * Pre-registry legacy readings (src 0) name NO device and keep the
           * default value-based styling below.
           *
           * NOT ATTRIBUTED TO THE PRIMARY, however tempting: the primary flag
           * is mutable, so the moment a freshly paired G7 is made primary,
           * days of another sensor's legacy data would flip to the G7's colour
-          * and marker on the plot -- a provenance
-          * lie the append-only log exists to prevent. Unknown provenance is
-          * rendered as the neutral main trace, never as a live device. */
-         if (m->dev.sensors[k].id == m->plot.hist[i].src &&
-             m->plot.hist[i].src != 0) {
+          * and marker on the plot -- a provenance lie the append-only log
+          * exists to prevent. Unknown provenance is rendered as the neutral
+          * main trace, never as a live device. */
+         struct sensor_style st;
+         if (m->plot.hist[i].src != 0 &&
+             sensor_style_of(m->plot.hist[i].src, &st)) {
             matched       = 1;
-            pts[i].col    = ui_sensor_color(m->dev.sensors[k].color);
-            pts[i].marker = m->dev.sensors[k].marker; /* shape applies to ALL,
-                                                     including the primary */
-            pts[i].size = m->dev.sensors[k].size;
+            pts[i].col    = ui_sensor_color(st.color);
+            pts[i].marker = st.marker; /* shape applies to ALL, including the
+                                          primary */
+            pts[i].size = st.size;
             /* HIDE: drop this device's point entirely. */
-            if (m->dev.sensors[k].marker == MARK_HIDE)
+            if (st.marker == MARK_HIDE)
                pts[i].hidden = 1;
-            break;
          }
       }
-      /* A DISCONNECTED (old) device keeps its slot, so it is matched by the
-       * loop above and its historical trace stays in the device's own marker
-       * and colour -- consistent with what the DEVICES menu draws for a
+      /* A DISCONNECTED (old) device keeps its styling, so the lookup above
+       * answers for it and its historical trace stays in the device's own
+       * marker and colour -- consistent with what the DEVICES menu draws for a
        * retired slot. Only a
        * source with NO slot at all (re-minted under a new id, e.g. a firmware
        * bump) is a true orphan: draw it muted and crossed so it reads as
@@ -1397,8 +1395,8 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * The 24 above covers the band the '+' is DRAWN in. Its target is three
     * units taller than that at each edge, so a row whose glyph ends exactly at
     * the last pixel has a target reaching past it -- drawn on the screen,
-    * partly off it, and reported by uitest's geometry sweep as a target
-    * outside the buffer. It went unnoticed while this block also reserved
+    * partly off it, with a touch target outside the buffer. It went
+    * unnoticed while this block also reserved
     * 51 units for a banner it drew underneath: that slack was absorbing an
     * overhang nobody had budgeted. Removing the banner is what exposed it, at
     * 3120x1440 and 1600x720. */

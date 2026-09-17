@@ -63,19 +63,6 @@ int msess_claim(int link, int src, const char *mac, long now)
    return 1;
 }
 
-void msess_begin(int link, int src, long now)
-{
-   if (!link_ok(link))
-      return;
-   mutex_lock(&msess_lk);
-   g_link  = link;
-   g_busy  = 1;
-   g_start = now;
-   if (src > 0)
-      g_src = src;
-   mutex_unlock(&msess_lk);
-}
-
 int msess_end(int link, long idle_now)
 {
    if (!link_ok(link))
@@ -118,12 +105,22 @@ int msess_busy(void)
    return busy;
 }
 
-void msess_bind(int src, const char *mac)
+int msess_bind(int src, const char *mac)
 {
    mutex_lock(&msess_lk);
+   /* NOT WHILE AN EXCHANGE IS LIVE. `src` is what every record read off the
+    * wire is attributed to, so moving it under a running walk files one
+    * meter's fingersticks under another meter's id -- in an append-only log
+    * that is never rewritten. The test and the set are one critical section
+    * because the exchange starts on a binder thread (msess_claim). */
+   if (g_busy) {
+      mutex_unlock(&msess_lk);
+      return 0;
+   }
    g_src = src;
    str_snapshot(g_mac, (int)sizeof g_mac, mac ? mac : "");
    mutex_unlock(&msess_lk);
+   return 1;
 }
 
 void msess_idle_set(int link, long when)

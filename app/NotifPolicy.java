@@ -90,19 +90,27 @@ final class NotifPolicy {
      * correctly. Only a list of all of them can, so this is the list, and the
      * numbers exist nowhere else.
      *
-     * Here rather than in either class, because "here" is the file the host JVM
-     * compiles: a clash is then a thing boundaryjavatest can assert about
-     * rather than a thing two comments each half-know. */
+     * Here rather than in any of the classes that post, because a clash is then
+     * a property of ONE list rather than a thing several comments each
+     * half-know. Every class that posts takes its id from here; a bare literal
+     * anywhere else is outside the only check there is.
+     *
+     * BLE'S BOND PROMPT IS ONE OF THEM. It is not a safety notice, but it
+     * shares the manager and it cancels what it posts, so an id it shares with
+     * the monitoring-stopped warning means a re-pair silently replaces "the app
+     * is no longer monitoring", and the stopped-warning path's cancel takes the
+     * pairing prompt down mid-bond. */
     static final int NOTIF_SERVICE = 1; /* the foreground-service notification */
     static final int NOTIF_ALARM = 2;   /* a glucose alarm is sounding */
     static final int NOTIF_STOPPED = 3; /* the app is no longer monitoring */
+    static final int NOTIF_BOND = 4;    /* Ble: confirm/'progress of a pairing */
 
     /* Every id above, so a test can check them as a set. Adding an id without
      * adding it here is the mistake this is shaped to catch: the assertion is
      * over this array, so an id missing from it is an id nothing checks. */
     static int[] notifIds()
     {
-        return new int[] {NOTIF_SERVICE, NOTIF_ALARM, NOTIF_STOPPED};
+        return new int[] {NOTIF_SERVICE, NOTIF_ALARM, NOTIF_STOPPED, NOTIF_BOND};
     }
 
     /* 1 when no two ids collide. Trivial to compute and not trivial to get

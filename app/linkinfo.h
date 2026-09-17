@@ -49,7 +49,8 @@ int linkinfo_conn_rssi(void);
  * byte-by-byte from a binder thread, and a torn read is minted into a row
  * that is never rewritten. Process-global model/firmware (settings.h) are
  * shared by every link and are WRONG for provenance. */
-void linkinfo_dis(int link, char *model, int mcap, char *fw, int fcap);
+void linkinfo_dis(int link, char *model, int mcap, char *fw, int fcap, char *sn,
+                  int scap);
 void linkinfo_forget_dis(int link);
 
 /* Ask this link for the device-information strings again, if it is still

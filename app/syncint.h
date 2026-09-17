@@ -42,10 +42,10 @@
 
 /* SYNC.H FIRST, and this refuses to be included without it. It needs
  * sync_http_fn, SYNC_KEY_LEN and SYNC_MAX_LOGS -- and including sync.h from
- * here would make the module include itself, which `make inclusions` refuses
- * for a good reason: a cycle is two files neither of which can be read on its
- * own. Every file in the module includes sync.h first anyway, because the
- * interface is what it implements. */
+ * here would make the module include itself. That is a cycle, and cycles are
+ * refused for a good reason: a cycle is two files neither of which can be
+ * read on its own. Every file in the module includes sync.h first anyway,
+ * because the interface is what it implements. */
 #ifndef PANCRA_SYNC_H
 #error "include sync.h first: syncint.h is the seam behind that interface"
 #endif
@@ -56,7 +56,7 @@
 /* ONE LOG THIS PHONE SYNCS: what it is called on the wire, where it is on
  * disk, and whether its rows carry a bucket. Here rather than in sync.h
  * because it is not part of the interface -- a caller registers a log by name
- * and path (sync_add_log) and never sees this -- but BOTH halves of the module
+ * and path (sync_set_logs) and never sees this -- but BOTH halves of the module
  * need its shape: one decides which buckets the server lacks, the other opens
  * the file and reads them. */
 struct sync_log {

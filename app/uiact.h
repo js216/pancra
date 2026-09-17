@@ -52,16 +52,15 @@ enum {
 
 /* The codes ACT_MENU carries: one per control, and nothing else.
  *
- * These were bare literals shared by hand between the renderer and the
- * shell's menu_action(); then they were named, but kept hand-picked VALUES
- * with gaps reserved after seventeen of them, because a code like "sensor 3"
- * was MA_SENSOR + 3 and a run could grow into its neighbour. That is what the
- * ten deleted _Static_asserts guarded, and what turned "open sensor 8" into
- * "close the sensor screen" when MAX_SLOTS grew.
+ * A CODE IS A PLAIN TAG. The index a control carries lives in its own field
+ * (struct action above), so the list below is DENSE and unnumbered: adding one
+ * is appending a name, and no arithmetic can reach a different control.
  *
- * The index lives in its own field now (struct action above), so a code is a
- * plain TAG: the list below is DENSE and unnumbered, adding one is appending
- * a name, and there is no arithmetic that could reach a different control.
+ * THE ALTERNATIVE, AND WHY NOT: hand-picked values with gaps reserved after
+ * each run, so that "sensor 3" is MA_SENSOR + 3. A run then grows into its
+ * neighbour the moment MAX_SLOTS does, and "open sensor 8" dispatches as "close
+ * the sensor screen" -- a hazard that needs an assertion per run to hold it
+ * back, where a separate index field needs none.
  * Where a comment says "ix = ...", that is the second field, not an offset.
  *
  * NOT PERSISTED. Pinned shortcuts are stored as SC_* ids (settings.h) exactly
@@ -80,7 +79,7 @@ enum ui_menu {
    MA_UNITS,
    MA_DISC,
    MA_SCREEN,
-   MA_NEWDATA,      /* cycle the new-datapoint alert: OFF/BEEP/CHIRP */
+   MA_NEWDATA,      /* cycle the new-datapoint alert: OFF/BEEP/CHIRP/MORSE */
    MA_METERSCAN,    /* start scanning from the OneTouch instructions screen */
    MA_INS_FAST,     /* ADD menu: LOG FAST INSULIN (type preset) */
    MA_INS_SLOW,     /* ADD menu: LOG SLOW INSULIN (type preset) */
@@ -191,7 +190,6 @@ enum ui_menu {
    MA_PERM, /* ix = permission index */
    MA_BATTERY,
    MA_BGEXEC,
-   MA_PAIR_CODE,
    MA_PLOTMAX,
    MA_REMOTE_OPEN,   /* settings: open the REMOTE submenu */
    MA_REMOTE_TOGGLE, /* remote menu: enable/disable the push */
@@ -211,15 +209,12 @@ enum ui_menu {
    MA_ADDSENSOR,
    MA_PRIMARY,
    MA_MARKER,
-   MA_COLOR,
    MA_LABEL,
    MA_CAL_OPEN,
    MA_SYNC,
    MA_FORGET, /* opens the confirmation screen; does not act */
    MA_FORGET_YES,
    MA_FORGET_NO,
-   MA_SIZE, /* cycle marker size */
-   MA_CAL_REFRESH,
    MA_CAL_ENTER,
    MA_CAL_BACK,
    MA_CAL_REPLACE,    /* pending-cal screen: enter a new value (supersedes) */
@@ -234,12 +229,15 @@ enum ui_menu {
    MA_PAIR_YES,       /* pairing confirmation: commit to the picked device */
    MA_PAIR_NO,        /* pairing confirmation: back to the device list */
    MA_ADD_OPEN,       /* main-screen '+': open the ADD menu */
-   MA_INS_OPEN,       /* ADD menu: open the LOG INSULIN form */
    MA_INS_TYPE,       /* LOG INSULIN: toggle SLOW / FAST */
    /* (LOG INSULIN takes its number through the keypad, so it has no +/-
-    * steppers and no codes for them. A code in this enum with no handler and
-    * no button is one a tap can carry that nothing will act on;
-    * `make -f test/Makefile actioncheck` refuses that shape.) */
+    * steppers and no codes for them.
+    *
+    * THE RULE RUNS BOTH WAYS. A code with no handler is one a tap can carry
+    * that nothing acts on; a code with a handler and no control is a branch
+    * nothing can reach, which is worse -- it reads as a live feature and is the
+    * first thing a later change wires to the wrong button. Neither kind belongs
+    * in this list.) */
    MA_INS_CONFIRM,  /* LOG INSULIN: append the dose */
    MA_INS_DISCARD,  /* LOG INSULIN: leave without logging */
    MA_WEAR,         /* device screen: toggle wear length 10 D / 15 D */
@@ -309,21 +307,49 @@ enum ui_menu {
  * a code is appending a name. Nothing persists them (see settings.h). */
 /* Up to this many touch targets per frame.
  *
- * Headroom is thinner than it looks: SCR_LABEL (the letter keypad) peaks at
- * 41 of these across the swept geometries, so seven more controls anywhere
- * on that screen is the ceiling. add_hit DROPS the excess, and a dropped box
- * is a control the user simply cannot tap -- drawn normally, dead to touch,
- * with nothing logged. That is the failure mode `overflow` below exists to
- * make loud; uitest asserts it stays clear at every screen and geometry. */
+ * Headroom is thinner than it looks: SCR_LABEL (the letter keypad) records
+ * one target per character in ui_label_chars plus the close band, DEL and OK
+ * -- 45 of these at every geometry, since the count does not depend on the
+ * scale. Three spare. add_hit DROPS the excess, and a dropped box is a control
+ * the user simply cannot tap: drawn normally, dead to touch. add_hit says so in
+ * the log the first time it happens in a process, and `overflow` below records
+ * it on the frame. uikeypad.c asserts its own share of this number at build
+ * time, so growing that alphabet cannot quietly spend the headroom. */
 #define UI_MAX_HITS 48
 
 /* Touch targets a paginated log screen spends on its OWN controls before any
- * row: the title/close band and the two pagination arrows, plus slack for a
- * per-screen extra (the weight log's span tabs). Rows are capped at
- * UI_MAX_HITS - UI_LOG_FIXED so a tall window cannot push a row -- or the
- * next-page arrow behind it -- past the budget and into add_hit's silent
- * drop. */
-#define UI_LOG_FIXED 12
+ * row. Rows are capped at UI_MAX_HITS - UI_LOG_FIXED so a tall window cannot
+ * push a row -- or a control behind it -- past the budget and into add_hit's
+ * silent drop.
+ *
+ * SIZED FROM THE WORST SCREEN, which is the EXERCISE LOG: its close band (1),
+ * the steps toggle (1), the four pager buttons, the five span tabs and the
+ * plot's scrub target come to TWELVE, and it is the only log screen that
+ * carries both a tab row and a scrub area. The insulin and weight logs spend
+ * eleven.
+ *
+ * THIRTEEN, NOT TWELVE, so the worst screen has one target spare. At twelve the
+ * exercise log records exactly UI_MAX_HITS on a tall enough window, and the
+ * next control added anywhere on it -- or a sixth span tab -- drops the tabs
+ * and the scrub target rather than a row, because the rows are recorded first.
+ */
+#define UI_LOG_FIXED 13
+
+/* WHAT THE DEVICES SCREEN SPENDS BESIDES ITS ROWS, and what one row costs.
+ *
+ * The list is the only screen whose row count is bounded by the REGISTRY
+ * rather than by its own layout, so it is the only one that can outgrow the
+ * hit table: back (1), the unpaired warnings (UI_UNPAIRED_MAX), the pending
+ * row (1), the four pager buttons, OLD DEVICES (1) and ADD NEW DEVICE (1).
+ * The SLOTS row records no target. A live CGM row costs TWO -- the row and
+ * its primary checkbox.
+ *
+ * ui_sensor_capacity divides the remainder by that, because a row past the
+ * table is drawn and dead, and the controls BELOW the list are added after
+ * it -- so the first things lost are the pager and ADD NEW DEVICE, and with
+ * no scrolling the pages behind them go with it. */
+#define UI_DEV_FIXED_HITS   12
+#define UI_DEV_HITS_PER_ROW 2
 
 /* THE PLOT'S CONFIGURATION FOR THIS FRAME, recorded with the targets.
  *
@@ -356,6 +382,12 @@ struct hits {
    /* Set once add_hit has had to drop a target. Never reset by add_hit --
     * ui_render clears it with n at the start of a frame -- so one drop
     * anywhere in a frame is still visible after the frame is built. */
+   /* SET WHEN A TARGET WAS DROPPED. Nothing branches on it -- add_hit is what
+    * reports the drop -- so this is a fact about the frame for anything that
+    * wants to assert on one, not a signal the renderer acts upon. */
+   /* 1 when this frame asked to record more targets than `box` holds. Read at
+    * the end of ui_render, which is the only place that knows WHICH screen did
+    * it -- add_hit itself has no idea what it is drawing. */
    int overflow;
 };
 

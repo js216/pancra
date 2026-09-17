@@ -30,6 +30,7 @@
 #include "uimodel.h"
 #include "weight.h"
 #include <stdint.h>
+#include <string.h> /* memset: the hidden-id bitmap */
 
 /* ---- act-on-RELEASE ----
  * A press only ARMS the control under the finger; the action fires on the
@@ -557,14 +558,38 @@ int on_input(int fd, int events, void *data)
              * pts[].hidden. Pull the (few) hidden-marker device ids in ONE
              * locked call, then flag matching points -- no per-point
              * registry lock. */
-            int hid[MAX_SLOTS];
+            /* ONE ARRAY, not one per call: this runs as a looper callback
+             * on the main thread, which cannot re-enter itself, and the
+             * registry's capacity is a lifetime of sensors -- a local would
+             * put that whole capacity in the frame of every touch. */
+            static int hid[MAX_SLOTS];
             int nhid = sensor_hidden_ids(hid, MAX_SLOTS);
-            for (int i = 0; nhid > 0 && i < np; i++)
-               for (int j = 0; j < nhid; j++)
-                  if (psrc[i] == hid[j]) {
+            /* ONE BIT PER HIDDEN ID, not a scan per point. Testing each
+             * point against the hidden list multiplies two bounds that both
+             * grow with the registry -- a long scrub carries tens of thousands
+             * of points, and the hidden list is bounded by the whole table --
+             * inside a touch handler on the main thread. A bitmap makes it one
+             * test per point.
+             *
+             * An id is 1..MAX_SLOTS, bounded where it is minted, so the bitmap
+             * covers every id that can exist; anything outside it is not
+             * hidden. */
+            static unsigned char hbits[(MAX_SLOTS / 8) + 1];
+            if (nhid > 0) {
+               memset(hbits, 0, sizeof hbits);
+               for (int j = 0; j < nhid; j++) {
+                  unsigned u = (unsigned)hid[j];
+                  if (u <= (unsigned)MAX_SLOTS)
+                     hbits[u >> 3U] =
+                         (unsigned char)(hbits[u >> 3U] | (1U << (u & 7U)));
+               }
+               for (int i = 0; i < np; i++) {
+                  unsigned u = (unsigned)psrc[i];
+                  if (u <= (unsigned)MAX_SLOTS &&
+                      (hbits[u >> 3U] & (1U << (u & 7U))) != 0U)
                      pts[i].hidden = 1;
-                     break;
-                  }
+               }
+            }
             /* Insulin doses ride along, in the SAME order the model
              * appends them, so the returned index maps onto m->plot.hist. */
             int np_glu = np;
@@ -583,9 +608,9 @@ int on_input(int fd, int events, void *data)
             }
             /* WEIGHTS, in the SAME order build_model appends them (glucose,
              * doses, weights) so the index plot_hit returns maps onto
-             * m->plot.hist. Missing here, they were drawn on the plot and could
-             * not be scrubbed: this array -- not the model's -- is what the
-             * hit test walks. They share the doses' y, so they fall inside
+             * m->plot.hist. THIS array, not the model's, is what the hit test
+             * walks, so a series missing here is drawn on the plot and cannot
+             * be scrubbed. They share the doses' y, so they fall inside
              * the same bottom band and the aiming rule below picks them up
              * without any extra case. */
             int nwt = wt_count();

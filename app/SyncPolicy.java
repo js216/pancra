@@ -48,11 +48,8 @@ final class SyncPolicy {
      * native one puts back the allocate-then-refuse behaviour this removes,
      * and a Java limit BELOW it refuses bodies the protocol considers legal,
      * which reads to the user as a server that will not sync and no reason
-     * given. So the Makefile's `javacheck` greps SYNC_BUF_MAX out of
-     * app/sync.h and fails the build if it disagrees with the constant
-     * below -- the same mechanical cross-check that already pins NET_* to
-     * enum sync_net_fail. There is one number; this is a copy the build
-     * refuses to let rot.
+     * given. The constant below is SYNC_BUF_MAX from app/sync.h: there is
+     * one number, and this is a copy of it that must not be allowed to rot.
      *
      * SYNC_BODY_MAX is CAP - 1 rather than CAP, and that off-by-one is the
      * native contract, not caution: jni_http refuses when
@@ -231,10 +228,10 @@ final class SyncPolicy {
      * java.io.InputStream and a clock reading, and neither of those is an
      * Android type. Leaving the loop next to HttpURLConnection would have
      * made every one of the cases below testable only on a phone, which in
-     * practice means untested; here `make boundaryjavatest` drives a stream
-     * that dribbles one byte at a time, a server that lies about its
-     * Content-Length, and a clock that runs backwards, on the host, with
-     * assertions on where the reading actually stopped.
+     * practice means untested; here a host JVM can drive a stream that
+     * dribbles one byte at a time, a server that lies about its
+     * Content-Length, and a clock that runs backwards, with assertions on
+     * where the reading actually stopped.
      *
      * What stays in PancraNet.syncHttp is the part that genuinely needs Android:
      * opening the connection, the connect/read idle timeouts, and the
@@ -375,9 +372,8 @@ final class SyncPolicy {
      *     through -- and a preserved PUT sent to a destination we did not
      *     sign for is worse than a mangled one, not better.
      *
-     * So: setInstanceFollowRedirects(false) in PancraNet.syncHttp -- `make
-     * javacheck` fails the build without it -- and then EVERY 3xx is a
-     * protocol failure here. Not the status, which native would publish as
+     * So: setInstanceFollowRedirects(false) in PancraNet.syncHttp, and then
+     * EVERY 3xx is a protocol failure here. Not the status, which native would publish as
      * the server's answer; a transport failure, meaning "the request did not
      * happen", which is exactly true.
      *

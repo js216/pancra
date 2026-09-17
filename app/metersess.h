@@ -47,11 +47,9 @@
  * TIME IS PASSED IN. Every stamp here is an INTERVAL -- how long has this
  * exchange run, how long has this link waited -- so callers pass mono_s().
  * The module has no clock of its own precisely so that a wall-clock stamp
- * cannot be smuggled in by including the wrong header; see clockcheck.
+ * cannot be smuggled in by including the wrong header.
  *
- * Pure otherwise: no globals but its own, no JNI, no files. test/app/
- * metersesstest.c runs the callback and watchdog paths against it on real
- * threads.
+ * Pure otherwise: no globals but its own, no JNI, no files.
  */
 #ifndef METERSESS_H
 #define METERSESS_H
@@ -86,10 +84,12 @@ void msess_get(struct msess *out);
  * against. */
 int msess_claim(int link, int src, const char *mac, long now);
 
-/* Take the session unconditionally, for the PAIRING path: the user is
- * standing there having just registered this meter, and the link was
- * allocated for it a line ago. */
-void msess_begin(int link, int src, long now);
+/* (THERE IS NO UNCONDITIONAL TAKE. A pairing looks like the one caller entitled
+ * to one -- the user has just registered this meter and is standing in front of
+ * it -- but the exchange it would seize belongs to a DIFFERENT meter whose
+ * records are being read right now, and taking it files them under the wrong
+ * id in a log nothing rewrites. Every entry to the session goes through
+ * msess_claim, which tests and sets together.) */
 
 /* The exchange this link owned is over, or the link died.
  *
@@ -113,8 +113,10 @@ int msess_drop(void);
 int msess_src(void);
 int msess_busy(void);
 /* Bind to a meter without claiming an exchange (the reconcile path, which
- * decides WHICH registered meter the runtime speaks for). */
-void msess_bind(int src, const char *mac);
+ * decides WHICH registered meter the runtime speaks for). 1 when bound, 0 when
+ * an exchange is live -- that exchange named its own source when it claimed,
+ * and every record it reads is attributed to it. */
+int msess_bind(int src, const char *mac);
 
 /* THE TEARDOWN-WAIT TABLE. `when` is mono_s() at the moment the close was
  * asked for, or 0 for "not waiting". The watchdog copies the whole table --

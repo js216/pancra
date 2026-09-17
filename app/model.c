@@ -14,6 +14,7 @@
 #include "forms.h"
 #include "insulin.h"
 #include "linkinfo.h" /* the per-link RSSI the frame shows */
+#include "log.h"      /* LOGW: when a frame cannot carry every live device */
 #include "menuview.h" /* the read-only menu snapshot the frame copies */
 #include "meter.h"
 #include "nav.h"
@@ -76,7 +77,94 @@ static void snap_drivers(struct frame_ctx *f);
  *   after the locked one with a release store, and the worst it can see is a
  *   message one update old. An old message is a fact; a deadlocked crash
  *   handler is no crash report at all. */
-static struct mutex g_status_lk    = MUTEX_INIT;
+static struct mutex g_status_lk = MUTEX_INIT;
+
+/* The last refusal, and whether it is still unseen. Written by whichever
+ * thread refused, read by the frame builder; a plain int and a buffer under
+ * the status lock, exactly like the status line itself. */
+static char g_refused[MAX_COLS + 1];
+
+/* HOW LONG A REFUSAL STAYS UP, IN SECONDS ON A MONOTONIC CLOCK.
+ *
+ * NOT IN FRAMES. Frames are not a clock: a single tap builds two or three,
+ * and the log-scrub path builds one per finger MOVE and throws it away
+ * undrawn -- so a frame count expires a message in a fraction of a second of
+ * dragging, or never at all while no activity is running to build one. A
+ * refusal raised by the service at 3 a.m. would then still be "current" when
+ * the app is opened at 8. */
+#define REFUSED_SECS 6
+
+/* AND HOW LONG BEFORE THE SAME ONE IS SHOWN AGAIN. Longer than the display,
+ * and that difference is the whole point: suppressing a repeat only WHILE the
+ * banner is up means the first repeat after it expires puts it straight back,
+ * and a refusal retried at 1 Hz -- which is what pairing_tick does with a
+ * standing arm -- is then on screen every second of every frame for the life
+ * of the process. Sixty seconds matches the throttle on the log line beside
+ * it (pair_fail_log). */
+#define REFUSED_REPEAT_SECS 60
+
+/* AND A CEILING ON AN UNBROKEN RUN, whatever the text. The per-text window
+ * above stops ONE refusal repeating; two DIFFERENT ones alternating faster
+ * than the display window would hand the banner back and forth and keep it up
+ * for ever, each of them "news". After this long continuously on screen it
+ * goes quiet for one display window, so the bottom line always comes back. */
+#define REFUSED_RUN_MAX_SECS 30
+static long g_refused_at;
+static char g_refused_last[MAX_COLS + 1];
+static long g_refused_last_at;
+static long g_refused_run;   /* when the current unbroken run began */
+static long g_refused_quiet; /* nothing is shown before this instant */
+
+void set_status_refused(const char *s)
+{
+   long now = mono_s();
+   mutex_lock(&g_status_lk);
+   /* THE SAME REFUSAL IS SHOWN ONCE PER REPEAT WINDOW, not once per display.
+    * A failed commit is RETRIED by pairing_tick every second while the arm
+    * stands, so a refusal that cannot clear -- no free link, a registry that
+    * did not load -- repeats for ever. Measured against the DISPLAY window it
+    * would simply re-arm the instant it expired; measured against a repeat
+    * window it says its piece, goes away, and says it again a minute later if
+    * it is still true. A DIFFERENT refusal is news and shows immediately. */
+   int same = g_refused_last[0] && strcmp(g_refused_last, s) == 0 &&
+              now - g_refused_last_at < REFUSED_REPEAT_SECS;
+   if (!same) {
+      (void)snprintf(g_refused, sizeof g_refused, "%s", s);
+      (void)snprintf(g_refused_last, sizeof g_refused_last, "%s", s);
+      g_refused_at      = now;
+      g_refused_last_at = now;
+   }
+   mutex_unlock(&g_status_lk);
+   set_status(s); /* the pre-reading screen still shows it inline */
+}
+
+/* Copy the standing refusal into the frame, or an empty string, and age it. */
+static void refused_take(char *out, int cap)
+{
+   long now = mono_s();
+   mutex_lock(&g_status_lk);
+   int up = g_refused[0] && now - g_refused_at < REFUSED_SECS &&
+            now >= g_refused_quiet;
+   if (up) {
+      (void)snprintf(out, (size_t)cap, "%s", g_refused);
+      if (!g_refused_run)
+         g_refused_run = now;
+      if (now - g_refused_run >= REFUSED_RUN_MAX_SECS) {
+         /* QUIET FOR AS LONG AS IT WAS UP. A shorter gap lets the run
+          * restart immediately and the bottom line is covered most of the
+          * time anyway; matching them bounds the banner at half, and the
+          * screen underneath is legible for a full half-minute at a
+          * stretch. */
+         g_refused_quiet = now + REFUSED_RUN_MAX_SECS;
+         g_refused_run   = 0;
+      }
+   } else {
+      out[0]        = 0;
+      g_refused_run = 0;
+   }
+   mutex_unlock(&g_status_lk);
+}
+
 static char g_status[MAX_COLS + 1] = "STARTING";
 /* THE SIGNAL-SAFE COPY, one atomic byte at a time.
  *
@@ -177,9 +265,41 @@ struct snap_slot {
  * in each signature rather than leaving it to be inferred. */
 struct frame_ctx {
    /* Taken by model_snapshot(), BEFORE the history lock (see there). */
-   struct snap_slot slot[MAX_SLOTS];
+   struct snap_slot slot[UI_MAX_SLOTS];
    int nslot;
+   int nlive; /* slots [0,nlive) are live; the rest are the retired page */
+   int nold;  /* retired devices in the REGISTRY, not in this frame */
+
+   /* The newest reading each row has in the display window, filled by one
+    * pass over the history before the rows are built. t == 0 means none. */
+   struct {
+      long t;
+      int glu, trend;
+   } newest[UI_MAX_SLOTS];
+
+   /* SLOTS THE REGISTRY HOLDS, which is what the capacity row reports. The
+    * three counts above describe the WINDOW this frame carries -- every live
+    * device plus one page of retired ones -- so none of them can answer "how
+    * full is the registry", and answering it with a window is how a capacity
+    * that is nearly spent reads as nearly empty. */
+   int nreg;
+   /* THE PAGE OF RETIRED DEVICES THIS FRAME FILLED, clamped to the list that
+    * exists. The renderer draws the window rather than re-deriving it, so the
+    * clamp has to happen ONCE, here, and be handed on: clamped independently
+    * on both sides, reviving a device off the last page leaves the model
+    * filling a page past the end while the screen clamps to the new last one
+    * and draws an empty list it still labels as a page. */
+   int old_page;
+   /* Retired devices in the frame that belong to the page being shown. The
+    * frame may carry ONE more -- the selected device, when it is retired and
+    * off that page -- so the list cannot just draw every retired row it
+    * finds. */
+   int nold_win;
+   /* The page size that window was built with -- what the screen last said it
+    * can draw. The list pages by the same number. */
+   int old_rows;
    struct dex_session sess[LINK_MAX];
+   int links_used; /* links spoken for, counted in snap_drivers: see there */
    struct dex_cal cal;
 
    /* Taken at the top of build_model(), under that lock. */
@@ -193,7 +313,7 @@ struct frame_ctx {
     * bounds so a table that grows cannot silently start truncating here. */
    struct ui_point pts[UI_PTS_MAX];
    struct ui_dev devs[UI_DEVS_MAX];
-   struct ui_sensor sens[MAX_SLOTS];
+   struct ui_sensor sens[UI_MAX_SLOTS];
    struct reading hist[NHIST];
    struct ins_rec inslog[NINS];
    struct wt_rec wtlog[NWT];
@@ -216,6 +336,32 @@ static struct frame_ctx g_frame;
  * orders is an unrecoverable hang, and it needs only a reading landing during
  * a 1 Hz repaint -- i.e. steady-state operation. Snapshotting here means the
  * main thread never holds one lock while waiting for the other. */
+/* ONE ROW OF THE FRAME'S REGISTRY SNAPSHOT, copied out of the published view.
+ * Strings are copied rather than pointed at: the frame outlives the reference
+ * the caller holds, and a row is read by the renderer long after. */
+static void snap_fill_slot(struct snap_slot *d, const struct sensor_view *vp,
+                           int src)
+{
+   const struct sensor_slot *sl = &vp->slot[src];
+   const struct sensor_rec *r   = vp->have_rec[src] ? &vp->rec[src] : 0;
+   d->id                        = sl->id;
+   d->marker                    = sl->marker;
+   d->color                     = sl->color;
+   d->primary                   = sl->primary;
+   d->size                      = sl->size;
+   d->wear_days                 = sl->wear_days;
+   d->old                       = sl->old;
+   str_snapshot(d->label, sizeof d->label, sl->label);
+   d->have_rec   = (r != 0);
+   d->type       = r ? r->type : 0;
+   d->paired     = r ? r->paired : 0;
+   d->activation = r ? r->activation : 0;
+   str_snapshot(d->mac, sizeof d->mac, r ? r->identity : "");
+   str_snapshot(d->serial, sizeof d->serial, r ? r->serial : "");
+   str_snapshot(d->model, sizeof d->model, r ? r->model : "");
+   str_snapshot(d->fw, sizeof d->fw, r ? r->fw : "");
+}
+
 static void snap_registry(struct frame_ctx *f)
 {
    /* ONE registry snapshot, taken by the registry itself. Assembled here out
@@ -223,30 +369,111 @@ static void snap_registry(struct frame_ctx *f)
     * instants: a binder thread minting a sensor moves them underneath the
     * loop -- which is the whole reason the frame snapshots the registry at
     * all. */
-   struct sensor_view v;
-   sensors_view_get(&v);
-   f->nslot = v.n < MAX_SLOTS ? v.n : MAX_SLOTS;
-   for (int i = 0; i < f->nslot; i++) {
-      const struct sensor_slot *sl = &v.slot[i];
-      const struct sensor_rec *r   = v.have_rec[i] ? &v.rec[i] : 0;
-      struct snap_slot *d          = &f->slot[i];
-      d->id                        = sl->id;
-      d->marker                    = sl->marker;
-      d->color                     = sl->color;
-      d->primary                   = sl->primary;
-      d->size                      = sl->size;
-      d->wear_days                 = sl->wear_days;
-      d->old                       = sl->old;
-      str_snapshot(d->label, sizeof d->label, sl->label);
-      d->have_rec   = (r != 0);
-      d->type       = r ? r->type : 0;
-      d->paired     = r ? r->paired : 0;
-      d->activation = r ? r->activation : 0;
-      str_snapshot(d->mac, sizeof d->mac, r ? r->identity : "");
-      str_snapshot(d->serial, sizeof d->serial, r ? r->serial : "");
-      str_snapshot(d->model, sizeof d->model, r ? r->model : "");
-      str_snapshot(d->fw, sizeof d->fw, r ? r->fw : "");
+   /* BY REFERENCE: one frame's picture, taken as the registry last
+    * published it rather than copied out of it on every draw. */
+   const struct sensor_view *vp = sensors_view_ref();
+   /* EVERY LIVE DEVICE, AND ONLY THE PAGE OF RETIRED ONES A SCREEN CAN SHOW.
+    *
+    * Live devices are counted, alarmed on and listed, so all of them are
+    * filled. A retired one is drawn on two screens only -- the paged OLD
+    * DEVICES list and its own detail screen -- so the frame fills the page
+    * that list is showing, plus the selected device if it happens to be a
+    * retired one outside that page.
+    *
+    * Filling every retired device instead makes each draw cost 336 bytes and
+    * a dozen string copies for every sensor ever owned, to produce rows no
+    * screen will look at. `nold` carries the true total for the count and the
+    * page arithmetic, so nothing is hidden by not being filled. */
+   f->nreg  = vp->n;
+   f->nlive = vp->n_live < UI_LIVE_MAX ? vp->n_live : UI_LIVE_MAX;
+   /* SAID WHEN IT CHANGES, not once per frame: this runs at 1 Hz, and a
+    * warning repeated every second buries the log it is trying to be found
+    * in. The main thread is the only frame builder, so the last count it
+    * complained about is an ordinary static. */
+   static int warned_live;
+   if (vp->n_live > UI_LIVE_MAX && warned_live != vp->n_live) {
+      warned_live = vp->n_live;
+      /* UNREACHABLE, not merely undrawn: a device the frame does not carry
+       * has no row, so it also has no detail screen, no rename and no
+       * disconnect. Say the stronger thing. */
+      LOGW("devices: %d in service and a frame carries %d -- the rest cannot "
+           "be seen OR opened this frame; disconnect the ones no longer worn",
+           vp->n_live, UI_LIVE_MAX);
    }
+   f->nold = vp->n - vp->n_live;
+   /* THE PAGE SIZE THE SCREEN SAID IT CAN DRAW (menuview.h). Filling
+    * UI_OLD_PAGE regardless would put rows in the frame that a short screen
+    * never paints -- and a device with no row has no tap target, so it could
+    * not be opened at all. */
+   int rows = f->mv.old_rows;
+   if (rows < 1)
+      rows = 1;
+   if (rows > UI_OLD_PAGE)
+      rows = UI_OLD_PAGE;
+   f->old_rows = rows;
+   int npages  = (f->nold + rows - 1) / rows;
+   if (npages < 1)
+      npages = 1;
+   f->old_page = f->mv.old_page;
+   if (f->old_page < 0)
+      f->old_page = 0;
+   if (f->old_page >= npages)
+      f->old_page = npages - 1;
+   int from = f->old_page * rows;
+   int n    = 0;
+   /* THREE GROUPS, IN THE ORDER THE SCREENS READ THEM: the devices in
+    * service, then exactly the page of retired ones OLD DEVICES is showing,
+    * then -- only if it is a retired device outside that page -- the selected
+    * one, which the per-device screen needs and the list must not draw.
+    *
+    * THE ORDER IS THE CONTRACT. render_olddev draws the frame's retired rows
+    * in sequence, so a selected device emitted among them would take a row
+    * the page owns: one device shown on a page it does not belong to, and the
+    * page's last device left with no row and no tap target. Kept last and
+    * counted separately, it can be carried without being listed. */
+   /* THE NEWEST LIVE DEVICES, not the oldest. The window is smaller than the
+    * registry's capacity, and a device the frame does not carry has no row, no
+    * detail screen, no rename and no primary checkbox -- so which end of the
+    * live list it takes decides which devices are reachable at all. Registry
+    * order is chronological, so counting from 0 keeps the FIRST ones and drops
+    * the sensor the user is wearing: a pairing that succeeds lands on a detail
+    * screen that says NO DEVICE. Counting back from n_live keeps the ones worn
+    * now. */
+   int lfrom = vp->n_live - f->nlive;
+   /* AND THE SELECTED DEVICE IS ALWAYS ONE OF THEM. A detail screen resolves
+    * its device by finding the id among the frame's rows, so a selected device
+    * outside the window draws the bare NO DEVICE screen. It takes the place of
+    * the OLDEST row in the window rather than being appended after it: every
+    * live row the frame carries is one the list paginates over, so an extra
+    * would be listed as a device on a page it does not belong to. */
+   int selive = -1;
+   for (int i = 0; i < lfrom; i++)
+      if (vp->slot[i].id == f->mv.sel_id) {
+         selive = i;
+         break;
+      }
+   for (int src = lfrom; src < vp->n_live && n < f->nlive; src++)
+      snap_fill_slot(&f->slot[n++], vp,
+                     (selive >= 0 && src == lfrom) ? selive : src);
+   f->nold_win = 0;
+   for (int k = from; k < from + rows; k++) {
+      int src = vp->n_live + k;
+      if (src >= vp->n || n >= UI_MAX_SLOTS)
+         break;
+      snap_fill_slot(&f->slot[n++], vp, src);
+      f->nold_win++;
+   }
+   for (int src = vp->n_live; src < vp->n && n < UI_MAX_SLOTS; src++) {
+      int k = src - vp->n_live;
+      if (k >= from && k < from + rows)
+         continue; /* already carried, as part of the page */
+      if (vp->slot[src].id != f->mv.sel_id)
+         continue;
+      snap_fill_slot(&f->slot[n++], vp, src);
+      break;
+   }
+   f->nslot = n;
+   sensors_view_put(vp);
 }
 
 /* THE ID OF THE ROW THE FRAME DREW, or -1.
@@ -285,16 +512,54 @@ static int snap_shell_link_for_slot(const struct frame_ctx *f, int idx)
 
 static void snap_drivers(struct frame_ctx *f)
 {
+   /* THE FRAME NEVER WAITS FOR THE DRIVER'S LOCK.
+    *
+    * A notification callback holds it across the meter index flush -- two
+    * fsyncs, a rename and a directory fsync -- and this runs on the MAIN
+    * thread, once per repaint and again for every MOVE event a scrubbing finger
+    * produces. Spinning there is tens of milliseconds of frozen UI per flush,
+    * which is the ANR shape thread.h is written against; it is also the one
+    * lock in that table exempted from the bounded-wait rule, on the premise
+    * that only a JNI call blocks under it.
+    *
+    * KEEPING LAST FRAME'S ANSWER is free, because that is what the fields
+    * already hold: `f` is the one static frame context, so declining to
+    * overwrite it leaves a driver picture that was true a second ago and is
+    * coherent across every link -- which is exactly what a repaint one tick
+    * later will correct. The same trade model_frame makes with the history
+    * lock, for the same reason.
+    *
+    * ONE HOLD FOR THE WHOLE SNAPSHOT, so every link is read at one instant and
+    * the several driver calls below cost one acquisition. */
+   if (!driver_try_enter())
+      return;
    /* One lock for the whole snapshot, so the frame sees all the links as they
     * were at one instant. Each read names its own link, so the snapshot no
     * longer moves the ambient selection and no longer has to put it back --
     * which it did by assuming LINK_CGM rather than by remembering. */
-   struct menu_view mv;
-   menu_view_get(&mv);
+   /* THE MENU COPY THE FRAME ALREADY HOLDS. model_snapshot takes it once, so
+    * reading it again here would be a second copy of main-thread state that
+    * the rest of the frame does not use. */
    /* ONE OPERATION, so the frame sees every link as it was at one instant --
     * and so this file does not reason about the driver's lock at all. */
-   int cal_link = link_for_sensor(mv.sel_id);
+   int cal_link = link_for_sensor(f->mv.sel_id);
    driver_snapshot(f->sess, cal_link, &f->cal);
+   /* HOW MANY LINKS ARE SPOKEN FOR, counted HERE and not while drawing.
+    *
+    * A link is taken when it carries a session, when it is armed for one, or
+    * when a meter holds it -- and the last two are only knowable by asking
+    * the driver, which takes the driver's lock. build_model runs with the
+    * HISTORY lock held, and the documented order is driver -> registry ->
+    * history (app/thread.h): asking there would take those two in the
+    * opposite order, which is the shape both of this app's freezes had.
+    *
+    * snap_drivers runs before the history lock is taken, so this is the one
+    * place the question is safe to ask. */
+   f->links_used = 0;
+   for (int l = 0; l < LINK_MAX; l++)
+      if (f->sess[l].mac[0] || driver_link_armed(l) || driver_link_is_meter(l))
+         f->links_used++;
+   driver_try_leave();
 }
 
 /* How many CGMs are registered. Above one, a reading whose link resolves to no
@@ -323,6 +588,7 @@ static void fill_sensor(struct frame_ctx *f, struct ui_sensor *u, int i,
    u->size =
        (sl->size >= 1 && sl->size <= MARK_SIZE_MAX) ? sl->size : MARK_SIZE_DEF;
    str_snapshot(u->label, sizeof u->label, sl->label);
+   u->have_rec = sl->have_rec;
    if (sl->have_rec) {
       u->type = sl->type;
       u->kind = sensor_kind(sl->type);
@@ -346,15 +612,38 @@ static void fill_sensor(struct frame_ctx *f, struct ui_sensor *u, int i,
     * for a G7 that is the BOND IDENTITY address, which is what the snapshot's
     * mac holds (a rotating RPA would never match a bond record). */
    u->bond = dexble_bond_state(sl->mac);
-   /* newest reading from this source, for the "last seen" column */
-   for (int k = 0; k < hist_count(); k++)
-      if (hist_at(k).src == (unsigned short)sl->id) {
-         u->last  = hist_at(k).t;
-         u->glu   = hist_at(k).glu;
-         u->trend = hist_at(k).trend;
-         break;
-      }
-   if (u->kind == KIND_CGM) {
+   /* The name Android knows it by, learned from its adverts. */
+   (void)pairing_adv_name(sl->mac, u->adv_name, (int)sizeof u->adv_name);
+   /* The newest reading from this source, found in the frame's single pass
+    * over the history (see build_devices) rather than by a walk per row. */
+   if (f->newest[i].t) {
+      u->last  = f->newest[i].t;
+      u->glu   = f->newest[i].glu;
+      u->trend = f->newest[i].trend;
+   }
+   /* WHAT THE "LAST SEEN" ROW SHOWS, and only that row. The walk above
+    * searches the display window, which is a few thousand rows deep; a device
+    * retired weeks ago has none of its readings left in it and reads "--"
+    * while the log on disk still holds every one.
+    *
+    * A FIELD OF ITS OWN, not a wider `last`. `last` decides whether a sensor
+    * is CONNECTED and whether it has ever reported at all (the PAIRING
+    * state), and both of those mean the LIVE tail: widening it would make a
+    * re-paired sensor with old history skip the state that says it has not
+    * been heard from yet. */
+   u->last_any = u->last ? u->last : store_src_last_seen(sl->id);
+   /* THREE CASES, NOT TWO, and the third is why. `kind` is zero-initialised
+    * and KIND_CGM is 0, so a slot whose provenance row did not load reads as
+    * a CGM -- and gating only the CGM arm sends it to the METER arm instead,
+    * which is just as wrong and disagrees with the renderer: the row would be
+    * filled with meter fields while every `kind == KIND_BGM` test in uidev.c
+    * still takes the CGM path, so a device with no provenance printed its
+    * sync state beside a reading age. With no provenance NEITHER arm's fields
+    * mean anything, so neither is run and the row stays as it was
+    * initialised. */
+   if (!u->have_rec) {
+      /* nothing known about this device beyond its slot */
+   } else if (u->kind == KIND_CGM) {
       /* Every CGM has its own link and its own driver context, so each row
        * reports that sensor's real session. Read from the pre-draw snapshot --
        * taking driver_lock() here would nest it inside the draw flag. */
@@ -425,13 +714,20 @@ static void fill_sensor(struct frame_ctx *f, struct ui_sensor *u, int i,
          str_snapshot(u->status, sizeof u->status, "CONFIRM PAIRING");
       else if (u->sess_state == SENSOR_STATE_ENDED)
          str_snapshot(u->status, sizeof u->status, "ENDED");
-      else if (u->sess_state == SENSOR_STATE_WARMUP ||
-               (u->sess_state == 0 && u->last == 0 &&
-                ((u->session_seconds > 0 &&
-                  u->session_seconds < SENSOR_WARMUP_S) ||
-                 (u->session_seconds == 0 && sl->paired > 0 &&
-                  now - sl->paired < SENSOR_WARMUP_S))))
+      /* WARMUP IS WHAT THE SENSOR SAID, never what the app guessed -- and the
+       * same test the list's countdown uses, so the two cannot disagree. */
+      else if (sensor_warming_now(u->sess_state, u->session_seconds))
          str_snapshot(u->status, sizeof u->status, "WARMUP");
+      /* NOTHING HAS EVER ARRIVED FROM THIS SENSOR: no state byte, no session
+       * clock, no reading. The app is still getting it onto the air -- finding
+       * it, bonding, and catching an advertisement -- and PAIRING is what that
+       * is. Reporting a warm-up here instead described the sensor's internal
+       * state on no evidence at all, and it was wrong exactly when it mattered
+       * most: a bond that had been attempted and lost read as a sensor quietly
+       * warming up, so the screen said "wait" when it meant "act". */
+      else if (u->sess_state == 0 && u->last == 0 && u->session_seconds == 0 &&
+               sl->paired > 0 && now - sl->paired < SENSOR_WARMUP_S)
+         str_snapshot(u->status, sizeof u->status, "PAIRING");
       else
          str_snapshot(u->status, sizeof u->status,
                       u->connected ? "CONNECTED" : "WAITING");
@@ -547,9 +843,8 @@ static void build_reading(struct frame_ctx *f, struct screen *m)
    /* A LIVE (non-old) CGM. Old/disconnected CGMs don't count -- with none
     * live the STATE/SESSION/PRED block and the big-number age blank out. */
    m->reading.has_cgm = 0;
-   for (int i = 0; i < f->nslot; i++)
-      if (f->slot[i].have_rec && !f->slot[i].old &&
-          sensor_kind(f->slot[i].type) == KIND_CGM) {
+   for (int i = 0; i < f->nlive; i++)
+      if (f->slot[i].have_rec && sensor_kind(f->slot[i].type) == KIND_CGM) {
          m->reading.has_cgm = 1;
          break;
       }
@@ -739,8 +1034,8 @@ static void build_sync(struct frame_ctx *f, struct screen *m)
     * the raw fraction steps; easing it toward the target gives a bar that
     * moves continuously without ever claiming more progress than was made
     * (it only ever approaches the true value, never passes it). Keeping the
-    * easing on this side leaves render_remote a pure function of the struct,
-    * which is what uitest depends on. */
+    * easing on this side leaves render_remote a pure function of the
+    * struct. */
    {
       int pdone  = 0;
       int ptotal = 0;
@@ -826,11 +1121,56 @@ static void build_devices(struct frame_ctx *f, struct screen *m)
    /* keypad: mode + the digits typed so far (copied so the pointer is stable)
     */
    /* configured sensors, plus which one a detail screen is showing */
-   /* Count from the SNAPSHOT, not the live slot_count(). Mixing the two means a
-    * concurrent sensor_forget can shrink slot_count() between this loop
+   /* Count from the SNAPSHOT, not the live registry. Mixing the two means a
+    * concurrent registry mutation can shrink the live count between this loop
     * bound and the snapshot it indexes, so the last row renders whatever the
     * previous frame left in `sens` -- a sensor the user just forgot,
     * reappearing for a frame. */
+   /* THE NEWEST READING PER DEVICE, IN ONE PASS AND ONE LOOKUP.
+    *
+    * The alternatives are both rows x NHIST, which at a full window is
+    * 73 x 5040 per frame under the history lock at 1 Hz: asking per row walks
+    * the whole history for every device that has nothing in it, and a retired
+    * device never does; probing the rows per reading is the same product
+    * spelled differently, and its early exit never fires because the retired
+    * rows never fill.
+    *
+    * So the rows are indexed BY ID first -- an id is 1..MAX_SLOTS, bounded
+    * where it is minted -- and the walk is one array read per reading. */
+   static short row_of_id[MAX_SLOTS + 1];
+   for (int i = 0; i < f->nslot; i++) {
+      f->newest[i].t     = 0;
+      f->newest[i].glu   = 0;
+      f->newest[i].trend = 0;
+      unsigned uid       = (unsigned)f->slot[i].id;
+      if (uid <= (unsigned)MAX_SLOTS)
+         row_of_id[uid] = (short)(i + 1); /* +1: 0 means "no row" */
+   }
+   int nh = hist_count();
+   for (int k = 0; k < nh; k++) {
+      struct reading r = hist_at(k);
+      /* A READING'S src is 16-bit and an ID stops at MAX_SLOTS, so a source
+       * past the table is one no slot can own -- a legacy or hand-edited
+       * row. It simply has no frame row to fill. */
+      unsigned uid = (unsigned)r.src;
+      if (uid > (unsigned)MAX_SLOTS)
+         continue;
+      int row = row_of_id[uid] - 1;
+      if (row < 0 || row >= f->nslot || f->newest[row].t)
+         continue; /* not a row of this frame, or already answered */
+      f->newest[row].t     = r.t;
+      f->newest[row].glu   = r.glu;
+      f->newest[row].trend = r.trend;
+   }
+   /* THE INDEX IS CLEARED BY ITS OWNER, not by clearing 64K every frame:
+    * only the ids this frame put in it can be set, so only those are taken
+    * out. Left behind, the next frame would read a row number from a device
+    * it is not carrying. */
+   for (int i = 0; i < f->nslot; i++) {
+      unsigned uid = (unsigned)f->slot[i].id;
+      if (uid <= (unsigned)MAX_SLOTS)
+         row_of_id[uid] = 0;
+   }
    for (int i = 0; i < f->nslot; i++)
       fill_sensor(f, &f->sens[i], i, now);
    m->dev.sensors  = f->sens;
@@ -983,18 +1323,40 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->sys.exp_ins       = f->mv.exp_ins;
    m->sys.exp_wt        = f->mv.exp_wt;
    m->sys.exp_failed    = f->mv.exp_failed;
-   m->dev.pend_type     = pairing_pending();
-   m->dev.old_page      = f->mv.old_page;
-   m->dev.dev_page      = f->mv.dev_page;
+   /* THE TWO CAPACITIES THAT CAN REFUSE A PAIRING, counted where both facts
+    * are already in hand. Slots are every device the app knows, live and
+    * retired; links are the radio connections, which only LIVE devices hold.
+    * They are different numbers because a retired device keeps its slot (its
+    * history stays readable) and gives its link back. */
+   m->dev.slots_used = f->nreg;
+   m->dev.slots_max  = MAX_SLOTS;
+   /* WHAT THE LIST CANNOT REACH. The frame's live window is smaller than the
+    * registry's capacity, so with more devices in service than it holds the
+    * screen is showing a subset and must say so -- an unsaid subset reads as
+    * the whole list. */
+   m->dev.nlive_all  = f->nreg - f->nold;
+   m->dev.links_used = f->links_used; /* counted in snap_drivers, not here */
+   m->dev.links_max  = LINK_MAX;
+   m->dev.pend_type  = pairing_pending();
+   m->dev.pend_since = pairing_pend_since();
+   m->dev.pend_seen  = pairing_candidates_waiting();
+   m->dev.old_page   = f->old_page;
+   m->dev.nold_win   = f->nold_win;
+   m->dev.old_rows   = f->old_rows;
+   /* The REGISTRY's retired count, not this frame's window: the frame
+    * fills one page of them, and the list still has to say how many
+    * there are and how many pages that is. */
+   m->dev.nold     = f->nold;
+   m->dev.dev_page = f->mv.dev_page;
    for (int i = 0; i < SC_MAX; i++)
       m->prefs.shortcut[i] = f->prefs.shortcut[i];
 
-   /* Must hold the LONGEST entry any keypad accepts, not just a PIN. The
-    * rename keypad caps at min(label-1, entry-1) = 11 characters, so an
-    * 8-byte buffer echoed only the first 7: the field froze while typing
-    * continued, DEL looked dead for four presses, and OK then saved a name the
-    * user had never seen. Sized from the snapshot's own buffer so it cannot
-    * drift again. */
+   /* Must hold the LONGEST entry any keypad accepts, not just a PIN -- the text
+    * keypad collects a sensor name, a server address and an account email
+    * through the same field. A buffer shorter than that echoes only its own
+    * length: the field freezes while typing continues, DEL looks dead for as
+    * many presses as were swallowed, and OK saves a value the user never saw.
+    * Sized from the snapshot's own buffer, so the two cannot drift. */
    int el = f->fv.entrylen < (int)sizeof f->entry - 1
                 ? f->fv.entrylen
                 : (int)sizeof f->entry - 1;
@@ -1034,6 +1396,7 @@ static void build_status(struct frame_ctx *f, struct screen *m)
     * byte loop against a concurrent snprintf reads whatever mixture the two
     * happen to produce. The lock is a leaf and nothing is called under it. */
    status_copy(m->status, (int)sizeof m->status);
+   refused_take(m->refused, (int)sizeof m->refused);
    m->dev.adv_total = pairing_adverts_seen();
 
    /* A COPY: the binder thread keeps rewriting the candidate list under the
@@ -1069,11 +1432,11 @@ void build_model(struct screen *m)
    remote_creds_get(&f->creds);
    f->now   = realtime_s();
    long now = f->now;
-   /* ONE copy of the menus' state for the whole frame (see menuview.h).
+   /* The menus' state was copied in model_snapshot, before the registry was
+    * sampled against it -- one copy for the whole frame (see menuview.h).
     * Reading the selected slot eight separate times while a frame is built
     * lets a tap arriving between two of them give one frame two different
     * answers about which sensor it is showing. */
-   menu_view_get(&f->mv);
    /* ...and one of the FORMS, for the same reason (see forms.h): fifteen
     * separate reads as the frame was built could give one frame two different
     * answers about what the user was typing. */
@@ -1183,6 +1546,13 @@ void set_status(const char *s)
  * driver -> registry -> history order. */
 void model_snapshot(void)
 {
+   /* THE MENUS FIRST, and for the whole frame. snap_registry needs to know
+    * which page of retired devices is showing and which device is selected
+    * before it decides what to fill, and build_model reads the same copy
+    * afterwards -- so the window that is filled and the window that is
+    * painted are chosen from one instant. Read separately they can disagree
+    * by a frame, and the disagreement looks like a page of blank rows. */
+   menu_view_get(&g_frame.mv);
    snap_drivers(&g_frame);
    snap_registry(&g_frame);
 }
@@ -1202,9 +1572,8 @@ int model_frame(struct screen *m)
     * thread behind a binder thread with a reading to deliver, for a frame
     * that is about to be built again anyway.
     *
-    * ONE EXIT, and not as a style preference: app/test/lockorder.py refuses a
-    * return taken while a lock is held, because a lock let go of by
-    * returning is never released. */
+    * ONE EXIT, and not as a style preference: a lock let go of by returning
+    * is never released. */
    model_snapshot();
    int got = store_trylock();
    if (got) {

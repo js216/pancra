@@ -29,7 +29,7 @@
  *   reduced accepted three encodings of every signature whose r or s falls
  *   below 2^256 - n -- two of which the signer never produced. Measured on
  *   this code before the check: (r, s), (r + n, s) and (r, s + n) all
- *   verified. test/srv/cryptotest.c pins all three.
+ *   verified.
  *
  *   d AND k ARE SCALARS, and reducing them turned "you supplied n" into "you
  *   supplied zero", reported one layer below where it happened.

@@ -30,7 +30,8 @@ int str_len(const char *s);
  * same kind: text that is fitted to a space rather than chosen. The big
  * number fills what the top of the main screen leaves it, the keypad's digits
  * fill their cells, a long title steps down until it fits (draw_title_fit),
- * and the plots' scrub readouts fit the width they are given (fit_scale).
+ * and the plots' scrub readouts are laid out against the width they are
+ * given.
  * Those are answers to "how much room is there", not choices from a
  * vocabulary, and naming them here would suggest they could be swapped. */
 #define FONT_NOTE(sc)  (((sc) * 2) / 3) /* in-plot marks: the 70/180 labels */

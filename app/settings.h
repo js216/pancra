@@ -6,27 +6,23 @@
 #define PANCRA_SETTINGS_H
 #include "loadresult.h" /* enum load_result: named below, before style.h */
 
-/* MAIN-SCREEN PINS: up to six ADD-menu actions pinned onto the main screen,
- * beside the big '+'. Stored by IDENTITY, not as positions in the ADD menu --
- * that menu's order is presentation and has changed before, and a stored
- * position would silently start launching a different action the next time a
- * button is inserted. SC_NONE = an empty slot. Kept dense (empties last) so
- * the main screen can just walk it.
+/* MAIN-SCREEN PINS: ADD-menu actions pinned onto the main screen beside the
+ * big '+'. Stored by IDENTITY, not as positions in the ADD menu -- that menu's
+ * order is presentation and has changed before, and a stored position would
+ * silently start launching a different action the next time a button is
+ * inserted. SC_NONE = an empty slot. Kept dense (empties last) so the main
+ * screen can just walk it.
  *
- * SIX, AND SIX IS A LAYOUT FACT. The main screen lays the pins out in at most
- * two rows of at most three: three or fewer take one row, four to six take
- * two. A seventh has nowhere to go that is still a fingertip wide on a narrow
- * phone, so the ceiling is the layout's and not an arbitrary round number --
- * raise them together or not at all.
+ * NINE, AND NINE IS A LAYOUT FACT: three rows of three. The main screen packs
+ * the pins two to a row up to six and three to a row above that (pin_percol in
+ * uimain.c), so this number and that rule are one fact -- a tenth pin has
+ * nowhere to go that is still a fingertip wide on a narrow phone. Raise them
+ * together or not at all.
  *
- * NINE, WHICH IS THREE ROWS OF THREE. It grew as space did: three in one row,
- * then six when the out-of-range banner moved off the bottom, then nine when
- * the ALARM and NUDGE rows became one. The main screen packs them two to a row
- * until there are more than six and three to a row after that, so this number
- * and that rule are the same fact -- see pin_percol in uimain.c.
- *
- * Files written before each rise hold fewer fields and load with the rest
- * empty; settings.c's positional format is what makes appending safe. */
+ * A file written when this number was smaller holds fewer fields and loads with
+ * the rest empty; settings.c's positional format is what makes appending
+ * safe -- and settings.c's best_streak_s index moves with SC_MAX, because the
+ * pins precede it. */
 #define SC_MAX 9
 
 /* THE PREFERENCES, READ-ONLY.
@@ -207,10 +203,10 @@ int settings_set_best_streak(int seconds);
  *
  * There is no way from here to move one of them. A public one-field setter
  * per threshold carries three unwritten obligations for the caller: hold the
- * alarm lock, check the pair is still ordered, and follow with alarm_save().
- * A caller meeting two of the three leaves a live threshold the next launch
- * would not have -- on the numbers that decide whether a hypo alarm can
- * fire.
+ * alarm lock, check the pair is still ordered, and follow with
+ * alarm_set_thresholds(). A caller meeting two of the three leaves a live
+ * threshold the next launch would not have -- on the numbers that decide
+ * whether a hypo alarm can fire.
  *
  * WHICH pair to move, and whether the move keeps them ordered, is the ALARM's
  * decision: it needs its own lock to read the partner and choose atomically.
@@ -245,9 +241,9 @@ enum load_result settings_load(void);
  *
  * THE RAW PER-FILE WRITES live in those headers beside the transactions they
  * belong to, because a caller who has one of these headers already has the
- * setter that should be used instead. `make settingscheck` refuses a
- * production call to a raw save: every setting is changed through a setter
- * that persists it and puts the stored value back if the write failed.) */
+ * setter that should be used instead. Production code may not call a raw
+ * save: every setting is changed through a setter that persists it and puts
+ * the stored value back if the write failed.) */
 /* How many sensor/marker colours exist. The table itself (UI_NCOLORS) is
  * private to the renderer, so settings_load cannot bound its stored colour
  * index against it directly. The shared name for that count -- and the marker
@@ -262,7 +258,7 @@ enum load_result settings_load(void);
 int shortcut_migrate(int stored);
 
 #ifdef APP_FAULTS
-/* ---- THE SAVE'S OWN WINDOW, OPENED BY A TEST ----------------
+/* ---- THE SAVE'S OWN WINDOW, OPENED ON DEMAND ----------------
  *
  * A save renders its bytes under set_lk and writes them with the lock
  * released, so a frame never waits for flash -- and that opens a window in

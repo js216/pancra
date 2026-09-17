@@ -42,7 +42,7 @@ int link_for_sensor(int id);
 /* The link a NEW sensor would take, with the count from that same snapshot. */
 int link_for_new_sensor(void);
 /* (The link searches moved to dexdriver.h -- driver_link_of_identity and
- * driver_free_cgm_link. A question about which link holds which session is
+ * driver_free_cgm_link_in. A question about which link holds which session is
  * the driver's, and asking it through this workflow header is what made the
  * meter runtime depend on the reconcile pass.) */
 

@@ -291,10 +291,9 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  *      PCert, verifies THAT, and copies it into p->r* and advances the phase
  *      only once the proof holds. Persistent state is never written from
  *      unverified bytes at all, so there is no window in which it is wrong --
- *      not even one a signal handler or another thread could observe. This is
- *      the primary fix and it is why the happy path is byte-for-byte the same
- *      protocol as before: the vectors in cryptotest and in JPAKE_TEST below
- *      are the evidence for that.
+ *      not even one a signal handler or another thread could observe. It costs
+ *      the happy path nothing: the bytes on the wire are the same protocol
+ *      either way, and only the order of verify-then-store changes.
  *
  *   2. A CRYPTOGRAPHIC FAILURE IS TERMINAL. A packet that was parsed and
  *      found wrong -- an off-curve point, a proof that does not hold, an
@@ -348,7 +347,7 @@ static int shared_key(const struct PCert *r2, const struct PCert *r3,
  * restart from round 1 -- and in EC-J-PAKE that is not a cheap retry, it is a
  * new set of ephemerals and a new set of round packets. No caller wants that
  * today: srv/pair.c calls pair_reset(), app/sync.c breaks out to
- * jpake_free(), srv/synccli.c exits, and app/dexproto.c goes to P_FAIL. The
+ * jpake_free(), and app/dexproto.c goes to P_FAIL. The
  * cost is paid entirely by a hypothetical future caller, and it buys the
  * guarantee that such a caller cannot reintroduce this bug by accident. */
 struct jpake {

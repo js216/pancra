@@ -70,7 +70,7 @@ void do_reconnect(int id)
        * is a device the user watched come back and that is disconnected
        * again at the next launch. Nothing else here would notice. */
       if (sensor_revive(id) != SENSOR_OK)
-         set_status("RECONNECT NOT SAVED");
+         set_status_refused("RECONNECT NOT SAVED");
       int prime = sensor_primary_id();
       store_lock();
       hist_refresh_current(prime);
@@ -78,7 +78,16 @@ void do_reconnect(int id)
       notify_mark();
    }
    sel_set_device(-1);
-   nav_back();
+   /* CLOSE WHAT THIS RAN FROM BY ASKING WHAT IS ON TOP, the same way
+    * device_retire does, and for the same reason: an expired device routes
+    * through a confirmation screen first, so the number of screens to pop
+    * differs by route. Popping once from the confirmation leaves the user on
+    * the detail screen with the selection just cleared, where render_sensor's
+    * range guard draws the bare NO DEVICE screen. */
+   if (cur_screen() == SCR_RECONF)
+      nav_back();
+   if (cur_screen() == SCR_SENSOR)
+      nav_back();
 }
 
 /* RETIRE A DEVICE: the app's most consequential destructive action, and the
@@ -129,7 +138,7 @@ void device_retire(int id)
        * left. BY ID: the snapshot above is where the index stops being
        * trusted. */
       if (sensor_retire(id) != SENSOR_OK) {
-         set_status("DISCONNECT NOT SAVED");
+         set_status_refused("DISCONNECT NOT SAVED");
          /* ...AND GO BACK, so the message is somewhere it can be READ. The
           * confirm screen draws no status line (only the main screen does),
           * so returning from here left the failure completely invisible: the
@@ -145,7 +154,17 @@ void device_retire(int id)
        * later call driver_forget() on that same link, destroying the
        * SURVIVING sensor's bond. */
       const struct sensor_rec *fr = sensor_rec_of(id, &frv) ? &frv : 0;
-      int flink                   = link_for_sensor(id);
+      /* A METER'S LINK IS FOUND IN THE ARM TABLE, NOT BY ADDRESS.
+       * link_for_sensor resolves through the driver session, which a meter
+       * never has (see meter_link_of_mac) -- so asked about one it returns
+       * whatever free CGM link the ranking lands on, and the teardown below
+       * would erase THAT sensor's key file while the meter's own link stayed
+       * armed for the life of the process. */
+      int flink = -1;
+      if (fr && sensor_kind(fr->type) == KIND_BGM)
+         flink = meter_link_of_mac(fr->identity);
+      else if (fr)
+         flink = link_for_sensor(id);
       /* BOTH bounds: flink indexes driver contexts and g_model_l below,
        * and the DIS block a few lines down already checks both. */
       if (fr && flink >= 0 && flink < LINK_MAX) {
@@ -198,8 +217,8 @@ void device_retire(int id)
           * clock, which is roughly 1.7e9 seconds ahead. `now - stamped` was
           * therefore hugely negative on every tick, the 3-minute bound never
           * expired, and the link the comment above promises to give back
-          * after METER_TEARDOWN_MAX was leaked for the life of the process.
-          * See clockcheck, which now knows this setter. */
+          * after METER_TEARDOWN_MAX was leaked for the life of the
+          * process. */
          if (fmeter)
             meter_link_idle(flink, mono_s());
       }

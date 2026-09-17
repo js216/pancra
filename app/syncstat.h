@@ -68,10 +68,10 @@ enum sync_severity {
 /* WHAT THE JAVA TRANSPORT SAW. Ble.syncHttp catches a Throwable and cannot
  * hand a C enum back across JNI, so it classifies the exception into one of
  * these and passes the number; the mapping to an outcome is the switch below,
- * in C, where it can be tested. These values are mirrored by
- * NetPolicy.NET_* and the two are compared by `make javacheck` -- a
- * renumbering on one side alone would silently turn a timeout into a DNS
- * failure on the screen. */
+ * in C, where it can be reasoned about. These values are mirrored by
+ * NetPolicy.NET_*, and the two must be kept identical -- a renumbering on one
+ * side alone would silently turn a timeout into a DNS failure on the
+ * screen. */
 enum sync_net_fail {
    SYNC_NET_OK = 0,
    SYNC_NET_DNS,

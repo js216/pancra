@@ -13,7 +13,7 @@
  *
  * They lived inside pancra_glucose (now reading.c), where nothing could reach
  * them: a review widened the value window to 0..100000 and the age bound to
- * 65535 and `make check` stayed green through both -- the second of those
+ * 65535 with nothing anywhere objecting -- the second of those
  * REINTRODUCING, verbatim, the 18-hour backdating bug whose fix is described
  * three lines above it. That is the same argument that put alarmlogic.c in
  * its own file, and it applies here for the same reason.

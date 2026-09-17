@@ -30,13 +30,12 @@
  * it is reachable only for the second or two it is switched on. At 5 a user
  * with two sensors and three meters was already at the ceiling.
  *
- * Not raised to MAX_SLOTS (10): the practical limit is the Bluetooth
+ * NOT raised to the registry's capacity: the practical limit is the Bluetooth
  * controller's simultaneous-connection count, which is around 7-8 on typical
  * phones, and asking for more than the controller can hold makes connects
  * fail rather than queue. 8 covers every realistic set-up; past that,
- * link_for_slot returns -1 and the caller says so rather than connecting on
- * another device's link. Ble.java's MAX_LINKS must match -- the Makefile's
- * crosscheck target fails the build if it does not. */
+ * link_for_sensor returns -1 and the caller says so rather than connecting on
+ * another device's link. Ble.java's MAX_LINKS must match this. */
 #define LINK_MAX 8
 
 /* ---- driver API (called by the transport layer) ---- */
@@ -101,6 +100,29 @@
  * wanted it. So the invariant is asserted instead -- a tick must not end
  * holding this. */
 int driver_held(void);
+
+/* TAKE THE DRIVER'S LOCK ONLY IF IT IS FREE, and give it back with
+ * driver_leave. 1 when the caller now holds it, 0 when a binder thread does.
+ *
+ * FOR THE FRAME BUILDER, and for nothing else. Every other caller reaches the
+ * driver through a named operation that takes the lock itself, which is what
+ * keeps this file's locking out of the rest of the app. The frame is the one
+ * caller that would rather have LAST second's answer than wait: a notification
+ * callback holds this lock across the meter index flush -- two fsyncs, a rename
+ * and a directory fsync -- and the main thread spinning on that for 10-100 ms,
+ * dozens of times a second during a plot scrub, is the ANR shape thread.h is
+ * written against.
+ *
+ * HOLDING IT ACROSS THE WHOLE SNAPSHOT is the point of exposing it rather than
+ * adding a trylock to each operation: every link is then read at ONE instant,
+ * which is what the frame needs, and the several reads cost one acquisition.
+ *
+ * Released by driver_try_leave. Not an `enter` in this interface's sense: it
+ * validates no link and hands back no context, because its caller reads the
+ * links through the ordinary operations below -- it only decides whether to
+ * wait for the lock those operations take. */
+int driver_try_enter(void);
+void driver_try_leave(void);
 
 void driver_init(void); /* jpake_init + load saved key */
 void driver_start(int link, const char *mac,

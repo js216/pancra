@@ -302,11 +302,11 @@ void start_scan(struct ANativeActivity *a)
    if (!scan_start_allowed(mono_s(), atomic_load(&g_scan_retry_after))) {
       int err = atomic_load(&g_scan_last_err);
       LOGI("start_scan: still backing off after scan failure %d", err);
-      set_status(scan_fail_text(err));
+      set_status_refused(scan_fail_text(err));
       return;
    }
    if (!has_ble_permissions(a)) {
-      set_status("NO PERMISSION");
+      set_status_refused("NO PERMISSION");
       return;
    }
    bind_scan_native(a->env);

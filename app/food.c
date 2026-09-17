@@ -556,7 +556,31 @@ static int slurp_lines(struct food_state *s, const char *path,
  * this runs on a service thread; never published as anything but a copy. */
 static struct food_state g_stage;
 
+/* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
+ *
+ * g_stage is a static -- the tail can be thousands of rows and this runs on a
+ * service thread with a small stack -- and TWO threads reach this loader: the
+ * SYNC WORKER through pancra_logs_reload after a restore, and the MAIN thread
+ * through the delete-and-reload path. Both reset it to empty and refill it, so
+ * without this the published tail can be a splice of two parses: rows
+ * duplicated or dropped until something reloads again. The publish itself is
+ * already one assignment under the tail lock; it is the FILL that races.
+ *
+ * A LEAF ABOVE THE TAIL LOCK: taken only here, and only ever with the tail lock
+ * nested inside it. No caller holds the tail lock across a load. */
+static struct mutex food_stage_lk = MUTEX_INIT;
+
+static int food_load_staged(void);
+
 int food_load(void)
+{
+   mutex_lock(&food_stage_lk);
+   int rc = food_load_staged();
+   mutex_unlock(&food_stage_lk);
+   return rc;
+}
+
+static int food_load_staged(void)
 {
    /* BUILT SEPARATELY, PUBLISHED AT ONCE. Nothing below touches
     * the live state until the assignment at the end, so a reader on the main

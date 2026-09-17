@@ -66,8 +66,8 @@ static void wt_draft_new(struct wt_draft *d, const struct prefs *sp)
    d->orig            = none;
    /* wt_form_open is weight.h's, and holds the rule this file must not
     * restate: a fresh form opens on the LAST logged weight, because a
-    * weigh-in moves by ounces and starting from zero would make every entry a
-    * full retype. weighttest pins it. */
+    * weigh-in moves by ounces and starting from zero would make every entry
+    * a full retype. */
    wt_form_open(&d->f, wt_newest().g, sp->wunits, realtime_s());
 }
 
@@ -148,7 +148,7 @@ int form_wt_action(int action, int ix)
          set_status("WEIGHT DELETED");
          fate = DRAFT_DONE;
       } else {
-         set_status("WEIGHT: DELETE FAILED");
+         set_status_refused("WEIGHT: DELETE FAILED");
       }
       if (fate == DRAFT_DONE) {
          wt_draft_done(&g_wt);
@@ -207,7 +207,7 @@ int form_wt_action(int action, int ix)
          } else {
             /* Refuse VISIBLY. A weight the user believes recorded but is not
              * is a silent hole in the only copy of that number. */
-            set_status("WEIGHT: WRITE FAILED");
+            set_status_refused("WEIGHT: WRITE FAILED");
          }
          shell_ui_dirty();
       }
@@ -225,7 +225,7 @@ int form_wt_action(int action, int ix)
        * than converting it. */
       if (settings_set_wunits((sp.wunits == WT_LB) ? WT_KG : WT_LB) !=
           SETTINGS_OK)
-         set_status("UNITS NOT SAVED");
+         set_status_refused("UNITS NOT SAVED");
    } else {
       return 0; /* not ours */
    }

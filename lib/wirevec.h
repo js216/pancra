@@ -4,7 +4,7 @@
  *
  * TWO IMPLEMENTATIONS, ONE WIRE.
  *
- * The phone (app/sync.c) and the server (srv/logs.c, srv/auth.c) implement
+ * The phone (app/sync.c) and the server (srv/logs.c, srv/authsig.c) implement
  * this protocol independently and on purpose: neither is a client library
  * generated from the other, and each is written against what the wire says
  * rather than against the other's code. That is a deliberate cost, and the
@@ -196,7 +196,7 @@ static const char wv_c_mac[] =
  * but one is truncated to 16 hex characters and the other is not, and a
  * reader who assumes they are unrelated numbers will not notice an
  * implementation that sends the wrong one. wv_c_bodyhash begins with
- * wv_a_hash16, and wiretest asserts exactly that. */
+ * wv_a_hash16, exactly. */
 
 /* ---- vector D: pairing, the parts that are not random -------------------
  *

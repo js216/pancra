@@ -11,8 +11,8 @@ package com.jk.pancra;
  * reader of any one would have 1300 lines to
  * exclude. Each is its own class now, package-private, with its own tests.
  *
- * PURE: no Android type appears here, which is what lets the host JVM run
- * every case (test/app/ScanPolicyTest.java). */
+ * PURE: no Android type appears here, which is what lets a host JVM run
+ * every case. */
 final class ScanPolicy {
     interface Attempt { void run() throws Throwable; }
 
@@ -192,8 +192,8 @@ final class ScanPolicy {
      *
      * An interface rather than the real MediaPlayer so the policy below is
      * executable on a host JVM. The policy is the whole point: it is what
-     * stands between a user and a LOOPING alarm-usage player that nothing can
-     * silence. Guaranteed only by javacheck grepping Alarm.java for the word
-     * "release", it is satisfied by a dead call, a call in the wrong order,
-     * or a call skipped by an earlier throw. */
+     * stands between a user and a LOOPING alarm-usage player that nothing
+     * can silence. Alarm.java must release the player on every path out: a
+     * dead call, a call in the wrong order, or one skipped by an earlier
+     * throw all leave it looping. */
 }

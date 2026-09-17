@@ -23,7 +23,7 @@
  *
  * So: one declaration, named wrapper operations for the two things the app
  * actually does with a timer, and the numbers asserted against the OFFICIAL
- * headers of the pinned NDK by `make ndkcheck` (app/sysabifacts.h). */
+ * headers of the pinned NDK (app/sysabifacts.h). */
 #ifndef PANCRA_SYSABI_H
 #define PANCRA_SYSABI_H
 

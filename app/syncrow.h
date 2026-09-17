@@ -9,12 +9,11 @@
  * of its arguments alone, which is why they can be tested and reasoned about
  * without a server anywhere near them.
  *
- * WHY THEY MOVED OUT OF app/sync.c. Two reasons, and the second is the real
- * one. The file was one line under the 2000-line ceiling `make sizecheck`
- * enforces, so the next behavioural fix in it -- there were three queued --
- * could not be written with the explanation it needed. And the split falls
- * where the module genuinely divides: everything here is about BYTES, while
- * everything left in sync.c is about a file, a socket or a decision. A
+ * WHY THEY ARE NOT IN app/sync.c. Two reasons, and the second is the real one.
+ * That file sits at the 2000-line ceiling this codebase holds files to, so a
+ * behavioural fix in it cannot be written with the explanation it needs. And
+ * the split falls where the module genuinely divides: everything here is about
+ * BYTES, while everything in sync.c is about a file, a socket or a decision. A
  * boundary drawn at "what has no state" is one that stays put.
  *
  * These are the bytes BOTH IMPLEMENTATIONS have to agree on -- srv/logs.c
@@ -36,7 +35,7 @@
  * server's half.
  *
  * It lived in sync.h, which is why syncrow.c had to include sync.h back and
- * the two modules formed an include cycle `make inclusions` refused. The
+ * the two modules formed an include cycle, which is not allowed. The
  * number belongs to the definition of a row, and that is here. */
 #define SYNC_ROW_MAX 512
 _Static_assert(SYNC_ROW_MAX == WV_LIMIT_ROW_MAX,

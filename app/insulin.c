@@ -311,7 +311,31 @@ static void ins_apply(struct ins_tail *t, const struct ins_assert *a)
  * thing that touches it, and never published as anything but a copy. */
 static struct ins_tail g_stage;
 
+/* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
+ *
+ * g_stage is a static -- the tail can be thousands of rows and this runs on a
+ * service thread with a small stack -- and TWO threads reach this loader: the
+ * SYNC WORKER through pancra_logs_reload after a restore, and the MAIN thread
+ * through the delete-and-reload path. Both reset it to empty and refill it, so
+ * without this the published tail can be a splice of two parses: rows
+ * duplicated or dropped until something reloads again. The publish itself is
+ * already one assignment under the tail lock; it is the FILL that races.
+ *
+ * A LEAF ABOVE THE TAIL LOCK: taken only here, and only ever with the tail lock
+ * nested inside it. No caller holds the tail lock across a load. */
+static struct mutex ins_stage_lk = MUTEX_INIT;
+
+static int insulin_load_staged(void);
+
 int insulin_load(void)
+{
+   mutex_lock(&ins_stage_lk);
+   int rc = insulin_load_staged();
+   mutex_unlock(&ins_stage_lk);
+   return rc;
+}
+
+static int insulin_load_staged(void)
 {
    struct ins_tail *t = &g_stage;
    t->n               = 0;

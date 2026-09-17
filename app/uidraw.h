@@ -2,11 +2,10 @@
 // uidraw.h --- turning a value into the characters that show it
 // Copyright 2026 Jakob Kastelic
 /*
- * DECLARED WHERE THEY ARE IMPLEMENTED (uidraw.c). These seven formatters
- * lived in uifmt.h, a header of presentation constants that had also
- * collected the helpers of three other renderers -- so a file that wanted one
- * number depended on all of them, and nothing in the module graph could tell
- * the pile from an interface.
+ * DECLARED WHERE THEY ARE IMPLEMENTED (uidraw.c). Collected instead into
+ * uifmt.h -- a header of presentation constants -- alongside the helpers of
+ * three other renderers, a file that wants one number depends on all of them,
+ * and nothing in the module graph can tell the pile from an interface.
  *
  * Pure functions of their arguments: no state, no screen, no allocation.
  * Every one writes into a caller's buffer of `n` bytes and always terminates.
@@ -46,10 +45,10 @@ void fmt_dur(long seconds, char *out, int n);
 
 /* ---- the framebuffer and hit-list primitives ------------------------
  *
- * Also uidraw.c's, and also declared in uipriv.h until the module graph
- * pointed out that a header the whole ui family shares was speaking for eight
- * modules at once. What is left there is the family's dispatch table -- the
- * render_* screens -- which is one contract; these are one module's. */
+ * Also uidraw.c's, and declared here rather than in uipriv.h: a header the
+ * whole ui family shares should speak for the family, not for eight modules at
+ * once. What uipriv.h holds is the family's dispatch table -- the render_*
+ * screens -- which is one contract; these are one module's. */
 /* WHAT add_hit ANSWERS: the slot it filled, or that it filled none.
  *
  * Not a zero-valued "OK" on purpose. Slot 0 is the first real box of every
@@ -64,16 +63,15 @@ void fmt_dur(long seconds, char *out, int n);
  * counter is bumped exactly as it would have been, and hit boxes are recorded
  * by the callers as usual. What is skipped is the writing.
  *
- * Two callers want that. The offline harness sweeps every screen at fourteen
- * real device geometries to prove that nothing lands off-screen and no touch
- * target is dropped -- assertions about WHERE things are, which do not need a
- * single pixel, and which cost sixteen seconds of memory traffic when they
- * are drawn anyway. And on the phone, ANativeWindow_lock can hand back a
- * buffer it failed to map, which a primitive that does not check writes
- * through.
+ * TWO THINGS WANT THAT. A layout can be checked without being painted: whether
+ * anything lands off-screen and whether every touch target was recorded are
+ * assertions about WHERE things are, and answering them off the phone costs
+ * only the geometry, not the memory traffic of filling a surface. And on the
+ * phone, ANativeWindow_lock can hand back a buffer it failed to map, which a
+ * primitive that does not check writes through.
  *
- * THE CLIP COUNT is what the tests read to say a glyph
- * was cut off, so it is computed before the pixels are skipped, not after. */
+ * THE CLIP COUNT IS THE ONLY RECORD that a glyph was cut off, so it is computed
+ * before the pixels are skipped, not after. */
 enum { UI_HIT_DROPPED = -1 };
 
 /* ---- A RECTANGLE IS ONE VALUE ----------------------------------------
@@ -224,15 +222,6 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
  * reserve before calling. */
 void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
                int y, int sc, int lh, int page, int npages, int code);
-
-/* THE LARGEST TEXT SCALE at which `s` fits in `maxw`, never below `min`.
- *
- * INK, NOT CELLS. A string of n glyphs occupies n*6-1 columns, not n*6:
- * draw_str emits no trailing gap after the last one. Measuring in whole cells
- * over-counts by a cell and shrinks text a size earlier than it needs to --
- * which is how a scrub readout came to use a smaller font for a three-digit
- * value than for a two-digit one, with room to spare in both. */
-int fit_scale(const char *s, int maxw, int min, int max);
 
 uint32_t white_color(int g);
 /* The big number's colour for `g`, by the fixed medical range. */

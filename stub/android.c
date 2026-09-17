@@ -16,9 +16,9 @@
  * set now, and it is the one production calls through.
  *
  * MOCK EVENT ACCESSORS ARE NOT HERE: returning one finger at the origin so
- * the host can link input.c is a TEST fixture, and it lives in
- * test/app/androidmock.c. A stub that ships in the build should not be
- * answering questions. */
+ * the host can link input.c is a TEST fixture, and belongs wherever the
+ * fixtures live. A stub that ships in the build should not be answering
+ * questions. */
 /* EXPORTED: these are link-time stand-ins for the device's own
  * libraries, and a hidden symbol is not one the linker can stand in for. */
 #pragma GCC visibility push(default)

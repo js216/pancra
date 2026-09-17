@@ -370,7 +370,7 @@ int calib_on_backfill(int sensor_id, long t, int mg_dl, int *applied_pm)
  * site. */
 int cal_r_load(void)
 {
-   cal_file_lock(); /* see calq_load: the read and the install are
+   cal_file_lock(); /* see calq_restore: the read and the install are
                      * one decision about what the file says */
    char b[96];
    int rd = cal_read_line(g_rescale_path, b, sizeof b);
@@ -389,14 +389,14 @@ int cal_r_load(void)
       return CALIB_UNSAVED;
    }
    cal_lock();
-   /* See calq_load: a file that could not be READ does not get to wipe a
+   /* See calq_restore: a file that could not be READ does not get to wipe a
     * factor that is scaling every reading from a sensor. */
    if (rd == READ_FAIL) {
       cal_unlock();
       cal_file_unlock();
       return CALIB_UNSAVED;
    }
-   g_resc_unsaved = 0; /* see calq_load: a load defines the state */
+   g_resc_unsaved = 0; /* see calq_restore: a load defines the state */
    g_r.pm         = 1000;
    g_r.id         = 0;
    g_r.t          = 0;
@@ -422,7 +422,7 @@ int cal_r_load(void)
        * long downtime has a stale fingerstick reference and must not silently
        * apply to a much-later reading.
        *
-       * The queue's reconciliation, with the same reasoning: see calq_load.
+       * The queue's reconciliation, with the same reasoning: see calq_restore.
        * The persisted stamp is wall-clock because nothing else survives a
        * reboot; what is LEFT of the window becomes this process's monotonic
        * deadline, and nothing running compares against pend_t again. */

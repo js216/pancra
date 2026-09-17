@@ -17,11 +17,12 @@
 #include "alarmlogic.h" /* AL_FRESH_S: one definition of "stale" */
 #include "clock.h"
 #include "dexlibc.h"
-#include "ingest.h"  /* STORE_GLU_MIN/MAX: what a stored reading may be */
-#include "log.h"     /* LOGI/LOGW: the ONE declaration */
-#include "sensors.h" /* KIND_CGM / KIND_BGM */
-#include "stats.h"   /* stat_add: recording a reading feeds the statistics */
-#include "thread.h"  /* the history lock lives with the history */
+#include "ingest.h"     /* STORE_GLU_MIN/MAX: what a stored reading may be */
+#include "log.h"        /* LOGI/LOGW: the ONE declaration */
+#include "readingrec.h" /* STORE_SRC_MAX / STORE_TREND_*: the field widths */
+#include "sensors.h"    /* KIND_CGM / KIND_BGM */
+#include "stats.h"      /* stat_add: recording a reading feeds the statistics */
+#include "thread.h"     /* the history lock lives with the history */
 #include "util.h"
 #include <stdatomic.h> /* the crash mirrors below: see store.h */
 #if __STDC_HOSTED__
@@ -174,6 +175,56 @@ struct reading hist_at(int i)
  *
  * The table is NEWEST FIRST, which is what makes each of these stop early:
  * the newest match is the first one found, and the oldest is the last. */
+/* THE NEWEST INSTANT EACH SOURCE HAS EVER WRITTEN, taken from the WHOLE log.
+ *
+ * hist_newest_t answers the same question about the in-memory tail, which is
+ * a display window a few thousand rows deep: a sensor last worn a month ago
+ * has nothing in it, and the row that should read "LAST SEEN <date>" reads
+ * "--" instead while the log on disk holds every one of its readings. The
+ * load already walks the whole file to build that tail, so this costs one
+ * compare per row and no extra read.
+ *
+ * DIRECT-INDEXED BY REGISTRY ID, which is dense: ids are handed out in order
+ * and never reused. The bound is the DEVICE COUNT this app is built to carry,
+ * not a screenful -- a sensor a fortnight is 26 ids a year, so 256 would run
+ * out in a decade and every device after that would silently lose its
+ * last-seen date. Sized from MAX_SLOTS, one longer because ids start at 1 --
+ * though an id is not a slot index and can climb past the slots in use (see
+ * the styling table's width in sensors.c). An id past the end degrades to a
+ * dash rather than
+ * to a wrong answer, which is what the bounds test below is for.
+ *
+ * CGM ROWS ONLY, like every other query beside it: a fingerstick is a
+ * different measurement, and a meter's own last-sync time is what its row
+ * shows (see meterstore.h). */
+#define SRC_LAST_MAX (MAX_SLOTS + 1)
+static long g_src_last[SRC_LAST_MAX];
+
+/* FORGOTTEN WHEN THE LOG IS RE-READ. These are maxima, so nothing lowers one:
+ * after a restore replaces readings.csv the table would keep a last-seen date
+ * from rows the file no longer holds, and the device screen would report it.
+ * store_load calls this before it re-reads. */
+void store_src_last_reset(void)
+{
+   for (int i = 0; i < SRC_LAST_MAX; i++)
+      g_src_last[i] = 0;
+}
+
+static void src_last_note(int src, long t, int kind)
+{
+   if (src < 0 || src >= SRC_LAST_MAX || kind == KIND_BGM)
+      return;
+   if (t > g_src_last[src])
+      g_src_last[src] = t;
+}
+
+long store_src_last_seen(int src)
+{
+   if (src < 0 || src >= SRC_LAST_MAX)
+      return 0;
+   return g_src_last[src];
+}
+
 long hist_newest_t(int src)
 {
    long t = 0;
@@ -592,6 +643,9 @@ static int store_load_chunk(struct load_ctx *c, char *buf);
 
 int store_load(int prime)
 {
+   /* The last-seen table is a set of maxima and this is a whole re-read:
+    * clear it, or a restore leaves dates from rows the file no longer has. */
+   store_src_last_reset();
    int fd = open(g_store_path, O_RDONLY, 0);
    if (fd < 0)
       return errno == ENOENT ? 0 : -1;
@@ -777,7 +831,21 @@ static int store_load_chunk(struct load_ctx *c, char *buf)
       long tr       = rdfield(&q, e, 0);
       long rssi     = rdfield(&q, e, &have_rssi);
       (void)rdfield(&q, e, 0); /* recv_lag: diagnostics only */
+      /* BOUNDED ON THE WIDE SIDE, before anything narrows it. struct reading
+       * holds `src` in sixteen bits and `trend` in a short, so a bound applied
+       * after the cast is no bound at all: 65537 wraps to 1 and this row is
+       * then attributed to device 1 -- in the DEVICES row's last reading, in
+       * hist_copy_src, which is the alarm's per-sensor sample, and in
+       * hist_newest_t, which suppresses that device's advert-driven reconnect
+       * for 300 s. An id that cannot name any device on this phone reads as 0,
+       * the unattributed trace, exactly as plot_store_row reads it: this is
+       * the second reader of the same file and it answers the same way.
+       * A trend outside the field is decoration, so it reads as flat. */
       long src = rdfield(&q, e, 0);
+      if (src < 0 || src > STORE_SRC_MAX)
+         src = 0;
+      if (tr < STORE_TREND_MIN || tr > STORE_TREND_MAX)
+         tr = 0;
       (void)rdfield(&q, e, 0); /* raw_time: kept for later re-conversion */
       (void)rdfield(&q, e, 0); /* tz_off:   ditto */
       /* ---- THE KIND IS EVIDENCE, NOT A DEFAULT -------------
@@ -820,6 +888,7 @@ static int store_load_chunk(struct load_ctx *c, char *buf)
          /* INTO THE STAGED TABLE, never the live one: nothing this function
           * does may be visible until the whole source has been read. */
          tab_insert(&c->tab, t, (int)glu, (int)tr, (int)src, (int)kind);
+         src_last_note((int)src, t, (int)kind);
          /* THE NEWEST ROW IN THE WHOLE FILE, not in this chunk. best_t used
           * to be a local reset on every chunk, so the last chunk that
           * happened to carry an RSSI won -- and the log is in ARRIVAL order,
@@ -878,6 +947,9 @@ struct reading_result store_record(const struct reading_event *ev, long gap)
     * one being added, and prev_glu would report the reading against itself. */
    r.prev_glu = hist_prev_glu(ev->t, ev->src, ev->t - gap);
    r.inserted = hist_insert(ev->t, ev->glu, ev->trend, ev->src, ev->kind);
+   /* Keep the whole-log answer current, so a device that later drops out
+    * of the display tail still has a last-seen time without a reload. */
+   src_last_note(ev->src, ev->t, ev->kind);
    /* ANYTHING THAT WAS KEPT, not HIST_NEW alone -- see store.h. Asked
     * through hist_kept() rather than as a truth value, which asks the
     * question it means rather than reading as "new". */

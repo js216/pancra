@@ -13,6 +13,7 @@
 #include "senslogic.h"
 #include "sensors.h"
 #include "sesscache.h" /* sess_flush: the tick persists the session clock */
+#include "status.h" /* set_status_refused: a sensor that could not be registered */
 #include "thread.h"
 #include "util.h"
 #include <string.h>
@@ -24,7 +25,7 @@
 static struct flight g_reconcile_flight = FLIGHT_INIT;
 
 /* (The link searches themselves are the DRIVER's: driver_link_of_identity
- * and driver_free_cgm_link. They are questions about links and sessions,
+ * and driver_free_cgm_link_in. They are questions about links and sessions,
  * which is the driver's state -- keeping them here made the meter runtime
  * include this file to ask one, and this file is a workflow that calls back
  * into the meter.) */
@@ -41,53 +42,66 @@ static struct flight g_reconcile_flight = FLIGHT_INIT;
  * adverts stopped resolving to a live link. Resolving by the session address
  * -- the one identity a shift cannot move -- removes the whole class.
  *
- * idx == slot_count() is a legitimate query ("the link a NEW sensor would
+ * An index one past the end is a legitimate query ("the link a NEW sensor would
  * take"), which is what free_cgm_link answers. */
 /* THE LINK FOR ONE ROW OF A SNAPSHOT ALREADY TAKEN. The index is only ever
- * an index INTO `v`, so it cannot go stale: it is read from the same instant
+ * an index INTO `vp`, so it cannot go stale: it is read from the same instant
  * as the walk that ranks it. Callers outside this file name a DEVICE
  * (link_for_sensor) or ask for a new one (link_for_new_sensor). */
 static int link_in_view(const struct sensor_view *vp, int idx)
 {
-   const struct sensor_view v = *vp;
-   /* The identity is copied out rather than reached for through a pointer:
-    * srec_push() shifts the records to keep them id-ordered, from a binder
-    * thread via ot_drv_done, so a retained pointer can be overwritten mid-use.
-    * This runs on a binder thread itself (jni_on_advert) while the main thread
-    * may be inside sensor_forget's shift-down, and its result is fed to
-    * dexble_pair -- a torn read here connects one sensor's address on
-    * another's link, using the wrong key file. */
-   char ident[24];
-   ident[0] = 0;
-   int have = 0;
-   if (idx >= 0 && idx < v.n && v.have_rec[idx]) {
-      str_snapshot(ident, sizeof ident, v.rec[idx].identity);
-      have = 1;
-   }
+   /* READ THROUGH THE POINTER, because a published view never changes: the
+    * caller holds a reference to it, and a registry mutation builds a NEW
+    * view and swaps it in rather than editing this one. srec_push's
+    * id-ordered shift and sensor_forget's shift-down both move the LIVE
+    * tables, which this function does not touch -- so the records here cannot
+    * move underneath the walk, and an index into `vp` stays the row it named.
+    *
+    * That is what makes it safe to run on a binder thread (jni_on_advert)
+    * while the main thread mutates the registry, and it is load-bearing: the
+    * answer feeds dexble_pair, where a torn read would connect one sensor's
+    * address on another's link, using the wrong key file. */
+   const char *ident = NULL;
+   if (idx >= 0 && idx < vp->n && vp->have_rec[idx])
+      ident = vp->rec[idx].identity;
    /* THE DRIVER'S STATE AS ONE INSTANT, taken through its own operation
     * rather than by holding its lock from here: every link lookup below reads
     * this copy, so they cannot disagree with each other, and this file no
     * longer reasons about somebody else's mutex. */
    struct dex_session sess[LINK_MAX];
    driver_snapshot(sess, -1, 0);
-   int link = have ? driver_link_of_identity_in(sess, ident) : -1;
+   int link = ident ? driver_link_of_identity_in(sess, ident) : -1;
    if (link < 0) {
       /* Not yet bound (no session on any link -- the normal state right after
        * a restart). Rank this slot among the OTHER unbound slots so each one
-       * claims a different free link.
+       * claims a different free link. Ranking by slot order means a device
+       * that IS bound never reaches here, so a forget cannot renumber a live
+       * one.
        *
-       * Every registered device is ranked, meters included: a meter needs a
-       * link of its own to hold a standing connect, because it is reachable
-       * only for the second or two it is switched on. Ranking by slot order
-       * means a device that IS bound never reaches here, so a forget cannot
-       * renumber a live one. */
+       * ONLY CGMs ARE RANKED, and the reason is what the ranking is counted
+       * AGAINST: driver_free_cgm_link_in walks the links a CGM could take,
+       * and it skips every link a meter holds (see there -- a meter's link
+       * carries no driver session, so it would otherwise read as free and a
+       * CGM allocated onto it would seize the meter's GATT client).
+       *
+       * A meter therefore costs that walk a link ALREADY. Counting it here as
+       * well spends it twice: the rank climbs past the end of a list the
+       * meter has itself shortened, and with three meters registered the walk
+       * runs off four idle links and answers "none free". A meter still gets
+       * a link of its own -- the meter runtime allocates it (meter.h), which
+       * is a different pool and not this one. */
+      /* THE LIVE PREFIX ONLY. The view puts live slots first, so the ranking
+       * stops at n_live rather than walking every device ever registered in
+       * order to skip them one at a time -- a retired device holds no link,
+       * which is why it was skipped here and why it is not reached now. */
       int rank = 0;
-      for (int i = 0; i < idx && i < v.n; i++) {
-         if (v.slot[i].old)
-            continue; /* retired: holds no link */
-         if (!v.have_rec[i])
+      int lim  = idx < vp->n_live ? idx : vp->n_live;
+      for (int i = 0; i < lim; i++) {
+         if (!vp->have_rec[i])
             continue;
-         if (driver_link_of_identity_in(sess, v.rec[i].identity) < 0)
+         if (sensor_kind(vp->rec[i].type) != KIND_CGM)
+            continue; /* its link comes from the meter runtime's pool */
+         if (driver_link_of_identity_in(sess, vp->rec[i].identity) < 0)
             rank++;
       }
       link = driver_free_cgm_link_in(sess, rank);
@@ -102,12 +116,15 @@ static int link_in_view(const struct sensor_view *vp, int idx)
  * device that had merely slid into the retired one's position. */
 int link_for_sensor(int id)
 {
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n; i++)
-      if (v.slot[i].id == id)
-         return link_in_view(&v, i);
-   return -1;
+   const struct sensor_view *vp = sensors_view_ref();
+   int link                     = -1;
+   for (int i = 0; i < vp->n; i++)
+      if (vp->slot[i].id == id) {
+         link = link_in_view(vp, i);
+         break;
+      }
+   sensors_view_put(vp);
+   return link;
 }
 
 /* THE LINK A NEW SENSOR WOULD TAKE: the same answer for an index one past the
@@ -115,9 +132,18 @@ int link_for_sensor(int id)
  * so no caller has to know that "one past the end" is the way to ask. */
 int link_for_new_sensor(void)
 {
-   struct sensor_view v;
-   sensors_view_get(&v);
-   return link_in_view(&v, v.n);
+   const struct sensor_view *vp = sensors_view_ref();
+   /* ONE PAST THE WHOLE TABLE, which is what makes the identity lookup in
+    * link_in_view come back empty -- that emptiness is the question being
+    * asked, "the link a device with no address yet would take". n_live is NOT
+    * one past the end: the retired devices sit at [n_live, n), so as soon as
+    * one exists that index names a real device and the answer becomes the
+    * link belonging to whichever device happens to sit there. The ranking is
+    * unaffected either way -- it stops at n_live for any index at or past
+    * it -- so this changes only whether an identity is found. */
+   int link = link_in_view(vp, vp->n);
+   sensors_view_put(vp);
+   return link;
 }
 
 void sensor_reconcile(void)
@@ -127,9 +153,12 @@ void sensor_reconcile(void)
    meter_sync_watchdog();
 
    /* Walk every CGM link so a newly bonded second sensor is registered too,
-    * not just whichever one happened to connect first. */
-   struct sens_slot_obs sobs[MAX_SLOTS];
-   int nsobs = 0;
+    * not just whichever one happened to connect first.
+    *
+    * ONE OBSERVATION PER LINK, which is what bounds this array: a row is
+    * pushed only for a slot that resolved to a link, and no two slots resolve
+    * to the same one -- a bound slot takes the link carrying its own address,
+    * and the unbound are ranked onto distinct free links. */
    /* THE DRIVER AS ONE INSTANT, then the registry under its own lock. Held by
     * hand the two become ONE critical section here; a snapshot gives what the
     * walk actually needs -- every link's session as it was at one moment --
@@ -139,17 +168,14 @@ void sensor_reconcile(void)
    long now = realtime_s();
    /* ot_drv_done mutates the registry from a binder thread (sensor_mint ->
     * srec_push), so this walk reads ONE snapshot. Held as a lock instead, it
-    * also spanned link_for_slot, which takes the DRIVER's lock: registry ->
+    * also spanned link_for_sensor, which takes the DRIVER's lock: registry ->
     * driver, the inverse of the documented order. A snapshot cannot invert
     * anything, because it is over. */
-   struct sensor_view rv;
-   sensors_view_get(&rv);
-   for (int i = 0; i < rv.n; i++) {
-      if (rv.slot[i].old) /* disconnected: no live session to reconcile */
+   const struct sensor_view *rv = sensors_view_ref();
+   for (int i = 0; i < rv->n_live; i++) {
+      if (!rv->have_rec[i] || sensor_kind(rv->rec[i].type) != KIND_CGM)
          continue;
-      if (!rv.have_rec[i] || sensor_kind(rv.rec[i].type) != KIND_CGM)
-         continue;
-      int l = link_in_view(&rv, i);
+      int l = link_in_view(rv, i);
       if (l < 0)
          continue;
       struct dex_session ls = sess[l];
@@ -176,32 +202,17 @@ void sensor_reconcile(void)
        * once: two rows stamped from two instants are two different answers
        * to "when was this clock read". */
       if (ls.have_reading)
-         sessc_put(rv.slot[i].id, &ls, now);
-      /* OBSERVE here, choose in sens_primary_pick -- including the "prefer the
-       * primary and stop at it" rule, which is pinned by senstest. */
-      sobs[nsobs].id     = rv.slot[i].id;
-      sobs[nsobs].old    = 0;
-      sobs[nsobs].is_cgm = 1;
-      sobs[nsobs].live =
-          ls.bonded && ls.mac[0] && !strcmp(ls.mac, rv.rec[i].identity);
-      sobs[nsobs].primary = rv.slot[i].primary;
-      nsobs++;
+         sessc_put(rv->slot[i].id, &ls, now);
    }
+   /* Released as soon as the walk is done: nothing below reads the registry
+    * again on this pass. */
+   sensors_view_put(rv);
    /* AND THEN THE FILE, at most once a minute (senslogic.h). AFTER the walk
     * above, so a session recorded on this tick can be written by this tick
     * rather than waiting for the next one; the rate limit is what keeps that
     * from becoming a write per tick. Losing up to a minute costs nothing --
     * the clock is projected forward from whatever instant was stored. */
    sess_flush(now);
-
-   /* THE PRIMARY, CHOSEN AND THEN NOT STAMPED ANYWHERE. This used
-    * to publish the answer as reading_set_src -- the ambient provenance the
-    * ingest path fell back to -- which is exactly the identity that outlived
-    * its sensor and mis-stamped a new one's first reading. The pick itself is
-    * still made and still pinned by senstest, because sens_primary_pick's
-    * "prefer the primary and stop at it" rule is what the SCREEN uses; what
-    * is gone is the global it fed. */
-   (void)sens_primary_pick(sobs, nsobs);
 
    /* Only a CGM is registered from a dex_session. Without this guard, adding a
     * meter would leave sel_add_type() on ONETOUCH and the next CGM to bond
@@ -228,24 +239,30 @@ void sensor_reconcile(void)
       have_meter =
           sensor_rec_of(meter_src(), &cur) && cur.type == SENSOR_ONETOUCH;
    }
-   struct sensor_view mv;
-   sensors_view_get(&mv);
-   for (int i = 0; i < mv.n && !have_meter; i++) {
-      if (mv.have_rec[i] && mv.rec[i].type == SENSOR_ONETOUCH) {
+   const struct sensor_view *mv = sensors_view_ref();
+   /* THE LIVE PREFIX. A retired meter is one the user took out of service,
+    * and binding it here would put it back into auto-sync behind their back;
+    * reviving it is what asks for that. */
+   for (int i = 0; i < mv->n_live && !have_meter; i++) {
+      if (mv->have_rec[i] && mv->rec[i].type == SENSOR_ONETOUCH) {
          /* The ADDRESS goes with the id. Without it the "is this our meter"
           * guard was empty after a restart and accepted ANY OneTouch in
           * range -- importing a stranger's readings under our sensor id. */
-         meter_bind(mv.slot[i].id, mv.rec[i].identity);
+         /* A REFUSAL NEEDS NO HANDLING: it means a sync is already running,
+          * and that sync bound its own source when it claimed. The next tick
+          * asks again. */
+         (void)meter_bind(mv->slot[i].id, mv->rec[i].identity);
          break;
       }
    }
+   sensors_view_put(mv);
 
    /* Find a CGM link carrying a live bonded session that NO slot claims yet --
     * that is the sensor which still needs registering.
     *
-    * NOT link_for_slot(slot_count()), "the link a new pairing would use":
+    * NOT link_for_new_sensor(), "the link a new pairing would use":
     * with address-based link resolution that is a guaranteed dead end.
-    * link_for_slot for an unregistered index returns a FREE link, and a free
+    * that answer for an unregistered index is a FREE link, and a free
     * link is by definition one with no session, so s.mac[0] is always 0 and
     * this entire block stops executing -- nothing minted or slotted, every
     * reading falling back to source id 0 ("pre-registry legacy") in a log
@@ -269,7 +286,7 @@ void sensor_reconcile(void)
        * activation is not part of the id-reuse key, so it is never corrected.
        */
       if (ls.mac[0] && ls.bonded && ls.have_reading &&
-          sensor_slot_by_mac(ls.mac) < 0) {
+          sensor_id_by_mac(ls.mac) < 0) {
          s      = ls;
          s_link = l;
       }
@@ -280,14 +297,18 @@ void sensor_reconcile(void)
        * keying only on (type, mac) let merely *browsing* the type picker
        * re-mint an already-registered sensor under the wrong type --
        * unrecoverable, since provenance rows are never rewritten. */
-      int idx               = sensor_slot_by_mac(s.mac);
+      /* AN ID, not a row: the question is only whether some slot already
+       * claims this address. An index would name a row nothing below reads,
+       * and `idx` further down is the row the claim RETURNS. */
+      int held              = sensor_id_by_mac(s.mac);
+      int idx               = -1;
       struct sens_obs so    = {0};
       struct sens_effect se = {0};
       so.is_cgm             = 1;
       so.has_mac            = 1;
       so.bonded             = s.bonded;
       so.have_reading       = s.have_reading;
-      so.claimed            = (idx >= 0);
+      so.claimed            = (held > 0);
       so.session_seconds    = (long)s.session_seconds;
       sens_link_eval(&so, realtime_s(), &se);
       if (se.mint) {
@@ -306,8 +327,10 @@ void sensor_reconcile(void)
           * row that is never rewritten. */
          char amodel[24] = {0};
          char afw[24]    = {0};
-         linkinfo_dis(s_link, amodel, sizeof amodel, afw, sizeof afw);
-         int id = sensor_mint(cgm_type, s.mac, "", amodel, afw, activation);
+         char asn[24]    = {0};
+         linkinfo_dis(s_link, amodel, sizeof amodel, afw, sizeof afw, asn,
+                      sizeof asn);
+         int id = sensor_mint(cgm_type, s.mac, asn, amodel, afw, activation);
          idx    = (id < 0) ? -1 : sensor_claim_slot(id, cgm_type, s.mac);
          /* THE ID, NOT THE ADDRESS. The registry id is this app's own name
           * for the device: it identifies no hardware, it means something to
@@ -322,6 +345,30 @@ void sensor_reconcile(void)
          else if (id >= 0)
             LOGI("sensor slots full (%d); dev %s not listed", MAX_SLOTS,
                  devtag(s.mac, dt));
+         /* A REFUSAL ON THE AUTOMATIC PATH IS STILL A REFUSAL, and this is the
+          * only place it can be said. A worn sensor that cannot be registered
+          * streams readings nothing can attribute: they are deferred rather
+          * than misfiled, so no record is damaged, but the user sees a device
+          * that never appears in the list and is told nothing at all. The
+          * manual path distinguishes the three causes the same way. */
+         if (id < 0) {
+            LOGW("sensor NOT registered: dev %s could not be minted",
+                 devtag(s.mac, dt));
+            /* THE THREE REASONS A MINT FAILS ARE THREE DIFFERENT MESSAGES, and
+             * two of them are a named file: a mint reads both registry tables
+             * and refuses while either is short. Neither is fixed by retrying,
+             * so neither may be reported as a storage fault. */
+            const char *why = "REGISTER FAILED: STORAGE?";
+            if (!sensors_slots_whole())
+               why = "SLOTS.CSV UNREADABLE: RESTART";
+            else if (!sensors_provenance_loaded())
+               why = "SENSORS.CSV UNREADABLE: RESTART";
+            set_status_refused(why);
+         } else if (idx < 0) {
+            set_status_refused(sensors_writable()
+                                   ? "LIST FULL: DISCONNECT ONE"
+                                   : "REGISTRY UNREADABLE: RESTART");
+         }
       }
       /* (NO AMBIENT PROVENANCE IS PUBLISHED HERE. A reading is stamped with
        * the sensor whose LINK it arrived on, resolved per reading, and a link
@@ -352,6 +399,7 @@ void sensor_reconcile(void)
    struct {
       char model[24];
       char fw[24];
+      char sn[24];
       long act;
       int id;
    } todo[LINK_MAX];
@@ -375,18 +423,22 @@ void sensor_reconcile(void)
        * corrected -- in an append-only file. */
       char lmodel[24] = {0};
       char lfw[24]    = {0};
-      linkinfo_dis(l, lmodel, sizeof lmodel, lfw, sizeof lfw);
+      char lsn[24]    = {0};
+      linkinfo_dis(l, lmodel, sizeof lmodel, lfw, sizeof lfw, lsn, sizeof lsn);
       /* Slot and provenance from ONE snapshot: read separately, a mint on a
        * binder thread between them gives an index into a shifted array. */
-      struct sensor_view cv;
-      sensors_view_get(&cv);
-      int si = -1;
-      for (int i = 0; i < cv.n && si < 0; i++)
-         if (cv.have_rec[i] && !strcmp(cv.rec[i].identity, ls.mac))
-            si = i;
-      int cur_id           = (si >= 0) ? cv.slot[si].id : 0;
-      struct sensor_rec cr = (si >= 0) ? cv.rec[si] : (struct sensor_rec){0};
-      int is_cgm           = si >= 0 && sensor_kind(cr.type) == KIND_CGM;
+      const struct sensor_view *cv = sensors_view_ref();
+      /* THE CGM AT THIS ADDRESS. This walk is over CGM links, so the kind is
+       * part of the question -- asked afterwards it would answer "none"
+       * whenever another kind held the lower slot for that address. */
+      int si               = sensors_view_find_mac_kind(cv, ls.mac, KIND_CGM);
+      int cur_id           = (si >= 0) ? cv->slot[si].id : 0;
+      struct sensor_rec cr = (si >= 0) ? cv->rec[si] : (struct sensor_rec){0};
+      /* Both facts are copies now, so the view is done with -- and this runs
+       * inside a per-link loop, where holding one would keep a version alive
+       * for every link walked. */
+      sensors_view_put(cv);
+      int is_cgm = si >= 0 && sensor_kind(cr.type) == KIND_CGM;
       /* DIS strings only when BOTH have landed -- the same rule the meter
        * path already enforces. They are separate serialized GATT ops and the
        * sensor commonly closes the cycle before all of them land; writing
@@ -402,9 +454,18 @@ void sensor_reconcile(void)
       so.claimed            = 1;
       so.registered         = is_cgm;
       so.have_dis           = lmodel[0] && lfw[0];
-      so.row_bare           = is_cgm && (!cr.model[0] || !cr.fw[0]);
-      so.row_no_act         = is_cgm && !cr.activation;
-      so.session_seconds    = (long)ls.session_seconds;
+      /* A ROW IS BARE IF ANY OF THE THREE IS MISSING AND CAN BE SUPPLIED --
+       * the serial included. Testing only model and firmware leaves every
+       * device registered before the serial was recorded permanently without
+       * one: its row is already complete by that test, so the pass that would
+       * write the serial never runs, and the SN line on its screen stays
+       * blank for ever. The `lsn[0]` half is what stops the opposite
+       * failure -- a sensor that reports no serial would otherwise make this
+       * row bare on every tick, for a value nothing can supply. */
+      so.row_bare =
+          is_cgm && (!cr.model[0] || !cr.fw[0] || (!cr.serial[0] && lsn[0]));
+      so.row_no_act      = is_cgm && !cr.activation;
+      so.session_seconds = (long)ls.session_seconds;
       sens_link_eval(&so, realtime_s(), &se);
       if (!se.complete_mfw && !se.complete_act)
          continue;
@@ -413,11 +474,15 @@ void sensor_reconcile(void)
                    se.complete_mfw ? lmodel : "");
       str_snapshot(todo[ntodo].fw, sizeof todo[ntodo].fw,
                    se.complete_mfw ? lfw : "");
+      /* The serial rides with the model and firmware: one DIS read answers
+       * all three. */
+      str_snapshot(todo[ntodo].sn, sizeof todo[ntodo].sn,
+                   se.complete_mfw ? lsn : "");
       todo[ntodo].act = se.activation;
       ntodo++;
    }
    for (int i = 0; i < ntodo; i++) {
-      if (sensor_complete(todo[i].id, "", todo[i].model, todo[i].fw,
+      if (sensor_complete(todo[i].id, todo[i].sn, todo[i].model, todo[i].fw,
                           todo[i].act) == 1)
          LOGI("sensor provenance completed: id %d (%s / %s, act %ld)",
               todo[i].id, todo[i].model, todo[i].fw, todo[i].act);

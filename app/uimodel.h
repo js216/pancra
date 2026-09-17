@@ -6,9 +6,23 @@
  *
  * The UI is a pure function of an immutable snapshot: the shell fills a
  * `struct screen` each frame (model.c), ui_render draws exactly that and
- * nothing else -- no globals, no callbacks -- and a tap is mapped back through
- * the hit table (uiact.h). So the whole UI is driven offline from test/app/:
- * feed a model, get a PPM; feed a tap, get an action.
+ * nothing else, and a tap is mapped back through the hit table (uiact.h).
+ * So the UI can be driven offline: feed a model, get a picture; feed a tap,
+ * get an action.
+ *
+ * THREE EXCEPTIONS, worth knowing before trusting a replay:
+ *
+ *   - the two plots ask the registry for a device's colour and marker through
+ *     sensor_style_of, a global keyed by id and not part of the frame;
+ *   - the DEVICES screen asks sensors_writable() and sensors_view_stale()
+ *     directly, so two of the four claimants on its line budget are decided
+ *     at render time rather than carried in the frame;
+ *   - render_olddev CALLS BACK into the menu state (menu_old_rows_set) to
+ *     report how many rows it can draw, which the NEXT frame pages by.
+ *
+ * All three are main-thread-only and read-once-per-render, so a frame is
+ * still internally consistent. What they cost is the replay property: the
+ * same struct does not necessarily produce the same picture twice.
  *
  * WHY A COPY AND NOT A VIEW. The registry and the driver sessions are mutated
  * from BINDER threads, and the lock order is driver -> registry -> history. A
@@ -41,9 +55,10 @@
  * The UI is a pure function of an immutable snapshot: the shell (main.c) fills
  * a `struct screen` each frame, ui_render() draws it and records the touch
  * targets into `struct hits`, and ui_hit() maps a later tap to the action the
- * shell should perform. No globals, no callbacks -- so the whole UI is driven
- * and checked offline from test/ (feed a model -> PNG; feed a tap -> action).
- */
+ * shell should perform, so the UI can be driven and checked offline (feed a
+ * model -> picture; feed a tap -> action). The one thing not carried in the
+ * struct is per-device plot styling, which the two plots read from the
+ * registry through sensor_style_of. */
 
 enum ui_screen {
    SCR_MAIN,
@@ -59,8 +74,7 @@ enum ui_screen {
    SCR_SENSTYPE,   /* pick a sensor type when adding */
    SCR_FORGET,     /* confirm forgetting a sensor */
    SCR_LABEL,      /* rename a sensor (letter keypad) */
-   SCR_MARKPICK,   /* marker-shape picker */
-   SCR_COLORPICK,  /* colour picker */
+   SCR_MARKPICK,   /* the combined marker-shape and colour picker */
    SCR_METERHELP,  /* OneTouch: how-to-connect + Scan button */
    SCR_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
    /* confirm giving up on an armed pairing: KEEP WAITING / STOP WAITING */
@@ -120,6 +134,11 @@ struct ui_sensor {
    long session_seconds; /* CGM session length */
    long wear_len;        /* nominal wear budget, seconds (0 for a meter) */
    long paired;          /* when this device was registered (warmup display) */
+   /* The newest instant this device ever wrote, from the WHOLE log rather
+    * than the in-memory tail -- what the LAST SEEN row shows, so a device
+    * whose readings have aged out of the window still names a date. Never
+    * used to decide whether anything is live: that is `last`. */
+   long last_any;
    long rssi_t;       /* wall-clock of the RSSI sample, for its "N M AGO" age */
    long meter_sync_t; /* meter only: when the app last synced it (vs last
                          datapoint) */
@@ -131,6 +150,12 @@ struct ui_sensor {
     * a state this build does not know rather than a value to reject. */
    int sess_state;
    int id, type, kind;
+   /* 1 when this device has a provenance row, and therefore when `type` and
+    * `kind` mean anything. Zero-initialised, `kind` reads as KIND_CGM -- the
+    * first of the enum -- so a row whose provenance did not load would draw a
+    * meter as a CGM and offer it the primary checkbox. Every control that
+    * branches on `kind` must test this first. */
+   int have_rec;
    int color, marker, primary, size;
    int old; /* 1 = DISCONNECTED: shown under OLD DEVICES, state EXPIRED, but
              * the SAME full per-device menu; excluded from the live list */
@@ -173,12 +198,21 @@ struct ui_sensor {
     * row says NOT SAVED until calib_tick's retry lands. See calib.h. */
    int cal_unsaved;
    int rescale_unsaved;
-   /* label must hold a full sensor_slot.label (sensors.h) -- at 12 it truncated
-    * the default meter name "ONETOUCH-AB:CD" to "ONETOUCH-AB", cutting off
-    * exactly the MAC tail that tells two meters apart. */
+   /* Wide enough for a full sensor_slot.label (sensors.h). Anything shorter
+    * cuts the tail off the default meter name "ONETOUCH-AB:CD" -- which is
+    * exactly the part of the address that tells two meters apart. */
    char label[20];
-   char status[12];
+   /* SIXTEEN, because the longest state this field carries is fifteen
+    * characters ("CONFIRM PAIRING") and it has to arrive whole: a value
+    * truncated here no longer matches its own row in dev_state_abbrev's table,
+    * so the abbreviation falls through to the generic one and that entry
+    * becomes unreachable. A field one character short of its longest value is
+    * a lookup that silently misses. */
+   char status[16];
    char mac[20], model[24], fw[24], serial[24], code[8];
+   /* What the OS Bluetooth list calls this device ("DXCMrb"), from its
+    * advertisements. Empty until one is heard. */
+   char adv_name[9];
 };
 
 struct ui_dev {
@@ -208,9 +242,9 @@ struct ui_stat {
  * Field names are unchanged, deliberately. Grouping and renaming at once would
  * have made every one of the ~800 call sites a place to introduce a silent
  * mistake -- and a silent mistake here is a number drawn from the wrong field,
- * which looks like a plausible reading. The grouping is the change; the names
- * stay so the move can be checked mechanically (and was: uitest renders
- * fourteen screens to PPM, and every one is byte-identical across it).
+ * which looks like a plausible reading. The grouping is the change; the
+ * names stay so the move can be checked mechanically -- rendering every
+ * screen before and after must give an identical picture.
  */
 
 /* The current reading and what the sensor says about itself. */
@@ -256,7 +290,7 @@ struct ui_prefs {
    int nudge_sound, nudge_vib; /* the nudge's OWN outputs, not the alarm's */
    int wunits;                 /* weight display unit: WT_KG / WT_LB */
    int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
-   int newdata_mode; /* ND_OFF / ND_BEEP / ND_CHIRP: what a new primary-CGM
+   int newdata_mode; /* an ND_* mode: what a new primary-CGM
                       * datapoint sounds like */
    /* status bar shows the value (vs icon); lock screen shows the notif */
    int statbar_val, lockscr_val;
@@ -307,8 +341,33 @@ struct ui_devview {
    /* An ARMED pairing awaiting its sensor: the SENSOR_* type, 0 = none. The
     * DEVICES screen shows it as a PENDING row whose tap asks whether to stop
     * waiting (MA_PEND_CANCEL), and SCR_PENDCANCEL names the type from here. */
+   /* Capacity, so a refusal to pair is visible BEFORE it happens. Slots
+    * count every registered device, live and retired; links count the radio
+    * connections, which only live devices hold. */
+   int slots_used, slots_max;
+   int links_used, links_max;
    int pend_type;
+   /* When that pairing was armed, and how many candidates are on the air for
+    * it. The elapsed time says the wait is real; the count says whether the
+    * app is waiting for a sensor to appear or for the user to choose between
+    * the ones that already have. */
+   long pend_since;
+   int pend_seen;
    int old_page; /* OLD DEVICES: which page of the list is showing */
+   /* How many of the frame's retired rows are that page. The frame can carry
+    * one further retired device -- the selected one, when it is off the page
+    * -- for the per-device screen, and the list must not draw it. */
+   int nold_win;
+   /* The page size the frame was built with. The list draws and pages by it,
+    * and tells the menu what it can really fit for the next frame. */
+   int old_rows;
+   /* Retired devices in the REGISTRY. `sensors` carries only the page
+    * being shown, so counting entries there would under-report. */
+   int nold;
+   /* Devices IN SERVICE in the registry. The frame carries the newest
+    * UI_LIVE_MAX of them, so a larger number here is the screen telling the
+    * user the list is a subset. */
+   int nlive_all;
    int dev_page; /* DEVICES: which page of the LIVE device list is showing */
    unsigned adv_total;
 };
@@ -439,8 +498,8 @@ struct ui_syncview {
    int sync_paired;            /* 1 once an app identity is stored */
    int sync_active;            /* 1 while a sync is in flight */
    int sync_permille;          /* 0..1000, ALREADY SMOOTHED by main.c so the
-                                * renderer stays a pure function of this struct
-                                * (uitest renders it deterministically) */
+                                * renderer stays a pure function of this
+                                * struct, and so draws deterministically */
    int remote_on, remote_port; /* remote push enabled; server TCP port */
 };
 
@@ -489,6 +548,11 @@ struct screen {
     * was the last live pointer left. 40 characters, which is more than the
     * widest thing set_status is given and more than any screen shows. */
    char status[40];
+   /* THE LAST REFUSAL, if one is still worth showing. Drawn as a banner over
+    * the bottom line of whatever screen is up, because `status` above is
+    * rendered on ONE screen -- the pre-reading main screen -- which a user
+    * stops seeing as soon as they own a device. Empty most of the time. */
+   char refused[34];
 
    struct ui_reading reading;
    struct ui_plotview plot;
@@ -522,10 +586,9 @@ struct screen {
  * level up from the array it is being copied into. */
 #define PLOT_COLS 768 /* x columns we ever draw into */
 /* 64: a 56-minute column holds roughly two dozen readings with two CGMs and
- * a meter, so this is headroom rather than a guess -- and plottest asserts
- * that no distinguishable reading is dropped, which is exactly what fails if
- * it is ever too small. It was 24, and dropped points wherever two sensors
- * overlapped. */
+ * a meter, so this is headroom rather than a guess. Too small and
+ * distinguishable readings are dropped wherever two sensors overlap -- two
+ * dozen is already past 24. */
 #define PLOT_PERCOL   64 /* distinct values kept per column */
 #define PLOT_LONG_MAX (PLOT_COLS * PLOT_PERCOL)
 

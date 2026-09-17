@@ -135,25 +135,6 @@ static int notify_update(void)
       g_notify_px[i] = UI_BLACK; /* true black, matching the app screen */
    static struct plot_pt pts[NHIST];
 
-   /* Per-device styling, SNAPSHOTTED before hist_lock: the plot must colour
-    * each source with the marker/colour the user chose, exactly like the
-    * main screen -- but the registry lock is taken BEFORE hist
-    * (driver->reg->hist), so resolve styles here, then apply them under
-    * hist_lock without nesting the two. */
-   struct notif_sty {
-      int id, marker, color, size;
-   };
-   static struct notif_sty sty[MAX_SLOTS];
-   int nsty = 0;
-   /* Every slot -- LIVE and OLD (disconnected) alike -- carries its own
-    * marker/colour, so one pass over the slots styles the whole plot the
-    * same way the main screen does. */
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n && nsty < (int)(sizeof sty / sizeof sty[0]); i++)
-      sty[nsty++] = (struct notif_sty){v.slot[i].id, v.slot[i].marker,
-                                       v.slot[i].color, v.slot[i].size};
-
    /* ONE SNAPSHOT, TAKEN UNDER THE STORE'S OWN LOCK. This walked
     * hist_count() and hist_at() with the lock taken by hand -- a count and an
     * indexed read of a table a binder thread appends to, coherent only for as
@@ -178,17 +159,20 @@ static int notify_update(void)
       uint32_t col = 0; /* (used for src 0 legacy and unmatched primary) */
       int sz       = MARK_SIZE_DEF;
       int hide     = 0;
-      int found    = 0;
-      for (int k = 0; k < nsty; k++)
-         if (sty[k].id == src) {
-            found = 1;
-            mk    = sty[k].marker;
-            col   = ui_sensor_color(sty[k].color);
-            sz    = sty[k].size;
-            if (sty[k].marker == MARK_HIDE)
-               hide = 1;
-            break;
-         }
+      /* THE STYLE MAP, INDEXED BY ID. It answers for every device the log has
+       * ever named -- live and disconnected alike -- in one array read, so
+       * the plot below costs a lookup per point rather than a walk over the
+       * registry per point. It takes no lock: the entries are plain ints
+       * written once per registry publish (sensors.h). */
+      struct sensor_style st;
+      int found = sensor_style_of(src, &st);
+      if (found) {
+         mk  = st.marker;
+         col = ui_sensor_color(st.color);
+         sz  = st.size;
+         if (st.marker == MARK_HIDE)
+            hide = 1;
+      }
       /* An unstyled fingerstick (or any forgotten source) still needs to be
        * a distinct MARKER, not a value-palette line vertex reading as CGM
        * data: give it the orphan look. src 0 is legacy CGM and keeps the

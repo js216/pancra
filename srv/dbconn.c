@@ -468,7 +468,7 @@ int db_durable_commit(struct db *d)
  * path and has nothing different to do about a rollback that did not work --
  * what matters is that the CONNECTION does not go on to serve another
  * request, and that is handled here rather than by asking each caller to
- * handle it. db_conn_poisoned() is for the tests, which do have something to
+ * handle it. db_conn_poisoned() is for callers that do have something to
  * say about it. */
 void db_durable_rollback(struct db *d)
 {
@@ -693,10 +693,10 @@ int db_in_transaction(struct db *d)
    return h && !sqlite3_get_autocommit(h);
 }
 
-/* ---- DETERMINISTIC FAULTS, for the test build only -------------------
+/* ---- DETERMINISTIC FAULTS, for a fault-injection build only ----------
  *
- * NOT COMPILED INTO A SHIPPING BINARY: the whole block is behind -DDB_FAULTS,
- * which only `make srvfault` sets (see the Makefile). It exists because the
+ * NOT COMPILED INTO A SHIPPING BINARY: the whole block is behind
+ * -DDB_FAULTS, which nothing that ships defines. It exists because the
  * rule this file enforces -- a statement that did not finish is not a result
  * -- is otherwise only testable through failures that are hard to cause on
  * demand. A busy writer and a corrupted page can be arranged; a prepare that

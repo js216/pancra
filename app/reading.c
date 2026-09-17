@@ -21,6 +21,7 @@
 #include "status.h" /* set_status: a reading that did NOT persist says so */
 #include "store.h"
 #include "tzoff.h"
+#include "uidraw.h" /* fmt_glu: MORSE keys the number the screen shows */
 
 /* Is this a usable glucose value?
  *
@@ -68,7 +69,7 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
     * a correction answers it wrong in both directions. */
    int has = driver_rssi_fresh(link);
    /* Mutate the shared history / current-reading state under the same guard
-    * the renderer holds (hist_history_lock), so a main-thread draw never
+    * the renderer holds (hist_lock), so a main-thread draw never
     * reads a half-shifted g_hist, torn stats, or a mismatched
     * g_cur_glu/g_cur_time. */
    /* Resolve the source BEFORE taking hist_lock: this reads the driver and
@@ -81,13 +82,31 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
        * reading of any new sensor always lands here.
        *
        * THE ONLY CASE WITH NO PROVENANCE TO WAIT FOR is an EMPTY registry: a
-       * fresh install, where 0 is the pre-registry legacy id and names
-       * nothing else. The threshold is >= 1, not > 1: with one sensor
-       * already registered, a second sensor's first reading was written to
-       * the append-only log carrying the FIRST sensor's id -- and if that
-       * sensor had reported within 150 s, hist_insert deduped it away
-       * entirely. Defer instead. */
-      if (sensor_live_cgm_count() >= 1) {
+       * fresh install, where 0 is the pre-registry legacy id and names nothing
+       * else. Any slot at all -- live or retired, CGM or meter -- and 0 is a
+       * value that already means something on this phone, so a reading stamped
+       * with it is misattributed rather than merely unattributed. The threshold
+       * is >= 1, not > 1: with one sensor registered, a second sensor's first
+       * reading carries the FIRST sensor's id, and if that sensor reported
+       * within 150 s hist_insert dedupes it away entirely.
+       *
+       * EVERY SLOT, not the live CGMs: a registry holding only a meter counts
+       * zero CGMs, so the first reading of a newly adopted sensor is written to
+       * the append-only log as pre-registry data. Deferring costs one reading,
+       * which the next 1 Hz reconcile registers and the sensor re-sends;
+       * stamping the wrong id costs a row nothing can correct. */
+      /* AND A REGISTRY THAT DID NOT LOAD IS NOT AN EMPTY ONE. Both counts
+       * below resolve a slot through its provenance row, so an unreadable
+       * slots.csv OR an unreadable sensors.csv makes every one of them
+       * unresolvable and the live-CGM count zero -- indistinguishable here
+       * from a fresh install. Stamping 0 in that state writes "pre-registry
+       * legacy" onto readings from a sensor the user owns, into a log that is
+       * never rewritten, for as long as the process runs: sensor_mint refuses
+       * while the gate is shut, so the state does not clear by itself. The
+       * reading is deferred instead, and the banner already says the file did
+       * not load. */
+      if (!sensors_writable() || !sensors_provenance_loaded() ||
+          sensor_slot_count() >= 1) {
          LOGI("glucose %d mg/dL from an unregistered link, deferred", mg_dl);
          return 0;
       }
@@ -216,11 +235,14 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
     * this point (and anything a previous outage lost) from the server's own
     * cursor. */
    if (hist_kept(got) && !rr.persisted)
-      set_status("READING: WRITE FAILED");
+      set_status_refused("READING: WRITE FAILED");
    LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
    /* NEW DATAPOINT alert: a genuinely new sample from the PRIMARY CGM only,
     * so a secondary sensor or a backfilled/duplicate reading stays silent.
+    *
+    * BEEP says a sample arrived, CHIRP adds which way it moved, MORSE keys
+    * the value itself.
     *
     * CHIRP pitches on the change since THIS sensor's own previous sample.
     * Never against another CGM's: with two sensors worn at once their
@@ -246,6 +268,20 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
           * is the plain BEEP pitch. */
          int delta = (prev_glu >= 0 && !rescale_started) ? mg_dl - prev_glu : 0;
          dexble_chirp(chirp_semitone10(delta));
+      } else if (nd == ND_MORSE) {
+         /* KEYED IN THE UNITS ON THE SCREEN, through the formatter the big
+          * number itself uses: what is heard and what is displayed are then
+          * one value, decimal point included, rather than two renderings of
+          * it that can disagree. A value the alphabet cannot spell is
+          * silent -- morse_encode refuses rather than keying part of a
+          * number. */
+         char txt[16];
+         char el[MORSE_MAX];
+         fmt_glu(mg_dl, sp.units, txt, sizeof txt);
+         if (morse_encode(txt, el, (int)sizeof el) > 0)
+            dexble_morse(el);
+         else
+            LOGI("morse: cannot key \"%s\"", txt);
       }
    }
 
@@ -259,9 +295,9 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
     * on its next snap_drivers() or watchdog tick.
     *
     * alarm_disc_reeval() on the 1 Hz main-thread timer already recomputes the
-    * zone from a consistent current_reading() and calls alarm_apply, so the
+    * zone from a consistent current_reading() and calls alarm_apply_ex, so the
     * alarm is raised within one second regardless -- immaterial against a
-    * 5-minute sample interval. Leaving alarm_apply to a single thread also
+    * 5-minute sample interval. Leaving alarm_apply_ex to a single thread also
     * removes the raise/silence ordering races entirely: every caller is now the
     * main thread. */
    /* Rendering is deferred to the main-thread 1 Hz timer (see on_main); just
@@ -321,7 +357,10 @@ int pancra_backfill(int link, int mg_dl, int trend, int age_s)
     * backfill arrives on the link of the sensor that buffered it. */
    int src = src_for_link(link);
    if (src < 0) {
-      if (sensor_live_cgm_count() >= 1) {
+      /* THE SAME GATE AS THE LIVE PATH, and for the same reason: any slot at
+       * all makes 0 a value that already names a device on this phone. */
+      if (!sensors_writable() || !sensors_provenance_loaded() ||
+          sensor_slot_count() >= 1) {
          LOGI("backfill %d mg/dL from an unregistered link, deferred", mg_dl);
          return 0;
       }
@@ -366,7 +405,7 @@ int pancra_backfill(int link, int mg_dl, int trend, int age_s)
    struct reading_result brr   = store_record(&bev, CHIRP_MAX_GAP_S);
    enum hist_insert_result got = brr.inserted;
    if (hist_kept(got) && !brr.persisted)
-      set_status("BACKFILL: WRITE FAILED");
+      set_status_refused("BACKFILL: WRITE FAILED");
    LOGI("backfill reading %d mg/dL age %d -> t=%ld", mg_dl, age_s, t);
    /* A gap recovered by backfill can be the newest reading (a missed live
     * cycle); re-evaluate the alarm and refresh the notification rather than

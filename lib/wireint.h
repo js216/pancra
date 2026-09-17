@@ -21,10 +21,9 @@
  * and they are the same 64 bits on every data model, so the same source is
  * correct on LP64 (aarch64-linux-android, the server targets), on LLP64, and
  * on ILP32 -- where `long` is 32 bits and a timestamp would have stopped
- * being representable in 2038 while the tests still passed. `make -f
- * test/Makefile wirecheck` COMPILES the protocol units for ILP32 for exactly
- * that reason: it is the only way to see a %ld that should have been a
- * PRIwire, since on LP64 the two are the same type and no warning is
+ * being representable in 2038 with nothing anywhere objecting. COMPILING the
+ * protocol units for ILP32 is the only way to see a %ld that should have been
+ * a PRIwire, since on LP64 the two are the same type and no warning is
  * possible.
  *
  * PRIwire / SCNwire ARE HERE RATHER THAN FROM <inttypes.h> because the app

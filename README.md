@@ -13,6 +13,10 @@ app pairs with. One binary and one sqlite file: no daemons, no runtime, and no
 proxy needed to *serve* -- it terminates TLS itself and speaks HTTP/1.1
 directly.
 
+<img src="screenshot.png" width="240"
+     alt="The main screen: the current reading, the plot behind it, and the
+          day's statistics">
+
 ## What it Does
 
 - **Several sensors at once, so sessions can overlap.** Start the replacement
@@ -26,7 +30,8 @@ directly.
   fingerstick, so Pancra holds a connection open for every registered meter and
   catches it without you touching the phone.
 - **You can hear the trend.** Each reading can chirp at a pitch that bends with
-  how fast you are moving, and which way.
+  how fast you are moving, and which way -- or key the number itself as 25 WPM
+  Morse, so you can read the screen without looking at it.
 - **Insulin and weight logs**, editable, with a weight trend plot.
 - **Optional sync to a server you run.** Nothing leaves the phone until you
   both switch it on and pair, and it stays off until then.

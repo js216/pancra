@@ -14,14 +14,14 @@
  * that merely asks the driver something -- the menus, the model, the alarm,
  * the reconciler, a dozen files -- was being handed the transport's own
  * contract as well: the GATT characteristic UUIDs, the key and address files,
- * the callbacks only dexble.c and the test harnesses implement. A header that
+ * the callbacks only dexble.c implements. A header that
  * declares both directions makes every reader decide which half applies to
  * them, and makes a change to the port look like a change to the API.
  *
  * WHO INCLUDES THIS: app/dexproto.c and app/dexlink.c (which call these),
  * app/dexble.c (which
- * implements them), and the test harnesses that stand in for the transport.
- * Nothing else -- and `make lockcheck` refuses it elsewhere.
+ * implements them), and anything standing in for the transport.
+ * Nothing else.
  *
  * Include app/dexdriver.h first: a link number means what it means there. */
 #ifndef PANCRA_DEXPORT_H
@@ -48,7 +48,10 @@
  * the byte ceiling it came from.
  *
  * A transport that can deliver more must raise this AND its own clamp
- * together; dexble.c has a _Static_assert tying the two, so they cannot drift.
+ * together, and they cannot drift because there is only one of them: the JNI
+ * notify path sizes its buffer from THIS constant and clamps the incoming array
+ * to it (jni_notify in dexble.c), and the driver's decoding array is sized from
+ * it too.
  *
  * THE DERIVED RECORD CEILING is what a decoding caller sizes its array from
  * (see notify_stream in app/dexproto.c). Sizing it smaller than the transport
@@ -64,7 +67,7 @@
 #define U_DATA  "f8083536-849e-531c-c594-30f1f86a4ea5"
 #define U_ROUND "f8083538-849e-531c-c594-30f1f86a4ea5"
 
-/* ---- provided BY the transport layer (dexble.c / test harness) ---- */
+/* ---- provided BY the transport layer (dexble.c) ---- */
 void drv_connect(int link, const char *mac);
 void drv_subscribe(int link, const char *uuid, int indicate);
 void drv_write(int link, const char *uuid, const uint8_t *data, int n,

@@ -16,7 +16,8 @@
  *
  * So: srv/posix.c is compiled with `-std=gnu11` and is the only translation
  * unit that is. Everything the server needs from beyond ISO C comes through
- * the declarations below, and the boundary is checked by `make stdcheck`.
+ * the declarations below, which is what makes the boundary checkable at all:
+ * a POSIX name used anywhere else fails to compile.
  *
  * WHAT IS ACTUALLY BEYOND ISO C, and why each one is here:
  *

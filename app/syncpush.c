@@ -195,9 +195,6 @@ enum dline digest_line(const char **p, char *name, int ncap, int64_t *count,
    return DLINE_ROW;
 }
 
-/* (push_bucket is gone: the window loop builds a bucket's canonical text and
- * PUTs it in place, so there is nothing left to hand to a helper.) */
-
 /* Every bucket this log has locally, with its hash, compared against what the
  * server reports. Buckets the server holds and we do not are pushed EMPTY,
  * which deletes them -- the app is authoritative, so "we no longer have it"
@@ -219,10 +216,10 @@ int sync_one_log(const struct sync_ctx *sx, int li)
     * not read about".
     *
     * Without this the refusal below could be argued for but not run: a real
-    * server never sends a malformed digest, and the parser cases in
-    * test/app/interoptest.c prove what digest_line ANSWERS, not what this
-    * caller does with the answer. Compiled out entirely unless APP_FAULTS is
-    * defined, which nothing that ships defines. */
+    * server never sends a malformed digest, and checking digest_line's own
+    * answer says nothing about what this caller does with it. Compiled out
+    * entirely unless APP_FAULTS is defined, which nothing that ships
+    * defines. */
    digest_fault(sx->rsp);
 
    /* Remote buckets, so we can spot ones we no longer hold. */

@@ -30,9 +30,9 @@
  * check by looking, which is the strongest form available without a reviewed
  * implementation.
  *
- * WHAT IS CHECKED, and how far it goes. test/srv/cryptotest.c evaluates all
- * 256 S-box inputs against the published table -- not a sample -- and then the
- * FIPS-197 C.1 vector, both entry points, and the NIST GCM vectors on top. In
+ * WHAT IS CHECKED, and how far it goes. All 256 S-box inputs are evaluated
+ * against the published table -- not a sample -- and then the FIPS-197 C.1
+ * vector, both entry points, and the NIST GCM vectors on top. In
  * migration the whole cipher was diffed against the table-driven version over
  * 200000 random (key, block) pairs, byte for byte, with no mismatch. A
  * computed S-box that is wrong for a single input is a cipher that is wrong

@@ -67,9 +67,8 @@ struct calq {
     * the IDENTITY of a calibration depend on the wall clock, so an NTP step
     * between the write and the reply would either lose a genuine answer or
     * (with a backward step and a re-queue) let two writes share a stamp. A
-    * counter cannot be corrected. It is deliberately NOT named g_cal_*_at: that
-    * shape is reserved for the deadlines below, and `make clockcheck` matches
-    * on it.
+    * counter cannot be corrected. It is deliberately NOT named g_cal_*_at:
+    * that shape is reserved for the deadlines below.
     *
     * g_calq_gen_next is the source of the numbers and only ever goes UP. The
     * live one is part of what a queue IS, so it is snapshotted and restored
@@ -150,14 +149,13 @@ typedef struct calq calq_undo;
 /* ---- THE PERSISTED QUEUE RECORD, WHICH IS ONE THING ---------------------
  *
  * The queued calibration and the LAST CAL record share one file and one line,
- * and they were under two different locks: the queue relied on the driver's
- * (every mutation is a `_locked` op the driver calls), while LAST CAL was
- * under cal_lk. calq_save read BOTH and wrote them as one line -- so a save
- * on the driver thread could serialise a queue from one instant beside a
- * last-resolved record from another, and calq_load could be halfway
- * through rewriting them.
+ * so they share one lock. Under two -- the driver's for the queue, since every
+ * mutation is a `_locked` op the driver calls, and cal_lk for LAST CAL --
+ * calq_save reads BOTH and writes them as one line: a save on the driver thread
+ * serialises a queue from one instant beside a last-resolved record from
+ * another, while calq_restore can be halfway through rewriting them.
  *
- * One lock covers both now: cal_lk, taken by the entry points below. The
+ * ONE LOCK COVERS BOTH: cal_lk, taken by the entry points below. The
  * helpers assume it is HELD -- which is also why none of them may call the
  * driver, since the documented order is driver_lk -> cal_lk and never the
  * reverse (see cal_q_attempt_locked, which does its driver work outside). */
@@ -332,7 +330,7 @@ void cal_q_attempt_locked(int link, int sensor_id)
     * CALL. The order is driver_lk -> cal_lk (this function already runs under
     * the driver's), so holding cal_lk across driver_cal_of, driver_cal_bounds
     * or driver_calibrate would be the one place in the app that takes them
-    * the other way round -- see test/app/lockorder.py, which checks. */
+    * the other way round. */
    cal_lock();
    int q_mgdl       = g_q.mgdl;
    int q_id         = g_q.id;

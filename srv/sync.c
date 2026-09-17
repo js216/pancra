@@ -108,15 +108,15 @@ void sync_private_umask(void)
  * Only ENOENT is absence now. Anything else is a question this program could
  * not ask, and a check that cannot ask must refuse rather than pass.
  *
- * ---- WHAT IS UNDER TEST, AND WHAT IS NOT ------------------------------
+ * ---- WHAT CAN BE STAGED, AND WHAT CANNOT -----------------------------
  *
- * The MODE arm is exercised by synctest.sh: a world-readable database and a
+ * The MODE arm is reachable from any caller: a world-readable database and a
  * data directory others can enter both refuse, by name.
  *
- * The OWNER arm is not, and cannot be from a test suite that does not run as
- * root: staging it needs a file this uid does not own, inside a tree it can
- * still traverse. It is the simplest of the three to read and the one whose
- * failure is loudest (it names both uids), which is the best that can be said.
+ * The OWNER arm is not, from a caller that does not run as root: staging it
+ * needs a file this uid does not own, inside a tree it can still traverse. It
+ * is the simplest of the three to read and the one whose failure is loudest
+ * (it names both uids), which is the best that can be said.
  *
  * The TYPE and EXAMINE arms are reachable in principle and not in practice,
  * because two earlier guards get there first: the certificate loader reports

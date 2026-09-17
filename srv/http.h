@@ -237,8 +237,8 @@ void http_method_not_allowed(const struct http_conn *c, unsigned allow);
  * "Connection: keep-alive", rather than keep-alive unless "close"). Answering
  * a 1.0 request with 1.1 keep-alive semantics is another way for two ends to
  * disagree about where the response stops. Nothing here speaks 1.0: the app
- * (app/sync.c through Ble.syncHttp), srv/synccli.c, curl and every test
- * generator send 1.1.
+ * (app/sync.c through Ble.syncHttp), curl and every generator that reaches
+ * this server send 1.1.
  *
  * ONE OPERATIONAL CONSEQUENCE, WRITTEN DOWN RATHER THAN DISCOVERED. If
  * PANCRA_FRONT is ever set to a `proxy:` front door, that proxy must speak

@@ -60,7 +60,7 @@ int ui_hit_idx(const struct hits *h, int x, int y);
 void ui_press_overlay(struct ANativeWindow_Buffer *fb, int x, int y, int w,
                       int h);
 /* Whole-frame dim to 13/16 intensity, applied by the shell AFTER ui_render
- * (so the offline harness still sees exact colours). This is what makes the
+ * (so a host build still sees exact colours). This is what makes the
  * pressed highlight visible on already-saturated foregrounds -- white text
  * and the green big number have no headroom at full intensity, so the
  * resting frame gives some up. */

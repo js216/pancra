@@ -238,11 +238,8 @@ final class ExportPolicy {
      * native one puts back the allocate-then-refuse behaviour this removes,
      * and a Java limit BELOW it refuses bodies the protocol considers legal,
      * which reads to the user as a server that will not sync and no reason
-     * given. So the Makefile's `javacheck` greps SYNC_BUF_MAX out of
-     * app/sync.h and fails the build if it disagrees with the constant
-     * below -- the same mechanical cross-check that already pins NET_* to
-     * enum sync_net_fail. There is one number; this is a copy the build
-     * refuses to let rot.
+     * given. The constant below is SYNC_BUF_MAX from app/sync.h: there is
+     * one number, and this is a copy of it that must not be allowed to rot.
      *
      * SYNC_BODY_MAX is CAP - 1 rather than CAP, and that off-by-one is the
      * native contract, not caution: jni_http refuses when

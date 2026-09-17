@@ -58,9 +58,9 @@
  *
  * NO ZONE DATABASE HERE. The zone is a callback: "what was the offset at this
  * instant". On the phone that is Android's TimeZone.getOffset through
- * tz_offset_at; in a test it is a fake zone with a transition where the test
- * wants one. This module therefore depends on nothing, is pure, and can be
- * driven over transitions that will not occur for months.
+ * tz_offset_at; off the phone it can be a fake zone with a transition
+ * wherever the caller wants one. This module therefore depends on nothing, is
+ * pure, and can be driven over transitions that will not occur for months.
  */
 #ifndef PANCRA_CIVIL_H
 #define PANCRA_CIVIL_H

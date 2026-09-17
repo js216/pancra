@@ -6,8 +6,9 @@
  * types/functions/constants it uses are mirrored here by hand (ABI-compatible
  * with <android/native_activity.h>, <android/looper.h>, <android/input.h>,
  * <android/native_window.h>). All the NDK constants live here, not scattered
- * through the sources. The host offline UI harness provides mock definitions of
- * the ANativeWindow_* functions (see test/). */
+ * through the sources. stub/android.c provides link-time stand-ins for the
+ * ANativeWindow_* functions, declared from this same header so the two cannot
+ * disagree. */
 #ifndef PANCRA_NDK_H
 #define PANCRA_NDK_H
 
@@ -143,9 +144,8 @@ struct ANativeActivityCallbacks {
 void ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                               size_t saved_size);
 
-/* WHAT ALL OF THE ABOVE CLAIMS, stated as numbers a compiler can check -- and
- * checked again against the official NDK headers by `make ndkcheck`. Last,
- * because it asserts about the declarations above it. */
+/* WHAT ALL OF THE ABOVE CLAIMS, stated as numbers a compiler can check.
+ * Last, because it asserts about the declarations above it. */
 #define NDKABI_DECLS 1
 #include "ndkabi.h"
 

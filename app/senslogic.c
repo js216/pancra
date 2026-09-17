@@ -100,20 +100,3 @@ void sens_link_eval(const struct sens_obs *o, long now, struct sens_effect *e)
       e->activation   = activation;
    }
 }
-
-int sens_primary_pick(const struct sens_slot_obs *slots, int n)
-{
-   int pick = -1;
-   if (!slots)
-      return -1;
-   for (int i = 0; i < n; i++) {
-      const struct sens_slot_obs *s = &slots[i];
-      if (s->old || !s->is_cgm || !s->live || s->id <= 0)
-         continue;
-      if (pick < 0 || s->primary)
-         pick = s->id;
-      if (s->primary)
-         break;
-   }
-   return pick;
-}

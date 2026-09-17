@@ -19,8 +19,7 @@
  * The split changes nothing about the design that matters: every renderer is
  * still a pure function of an immutable `struct screen`, still takes its
  * framebuffer and hit list as parameters, and still runs on the host against
- * a malloc'd buffer (test/uitest.c renders each screen to a PPM). Nothing
- * below is state.
+ * a malloc'd buffer. Nothing below is state.
  */
 #ifndef UIPRIV_H
 #define UIPRIV_H
@@ -31,17 +30,20 @@
 
 /* Layout constants owned by the UI (not the shell). */
 #define UI_COLS 33 /* character columns the layout targets */
-/* Sensor trace colours the picker offers; crosschecked against SET_NCOLORS
- * where the palette is defined. */
+/* Sensor trace colours the picker offers; keep equal to SET_NCOLORS where
+ * the palette is defined. */
 #define UI_NCOLORS 7
 
 #define UI_LBL(units) ((units) ? "MMOL/L" : "MG/DL")
 
-/* 720h = 30D on the right. 6H went: it sat between 3H and 12H without showing
- * anything either of them didn't. */
+/* Rows the refusal banner sizes itself for: the largest row count any screen
+ * passes ui_fit_scale, so the banner's one line is the shortest line the
+ * layout ever draws. Raise it when a screen asks for more. */
+#define UI_BANNER_ROWS 31
 
-/* Glyph cells discarded by clipping, bumped by the leaf primitives. See
- * ui_clip_reset in the renderer for why this is an instrument rather than
+/* Output discarded by clipping, bumped by the leaf primitives: glyph pixels
+ * that fell outside, and one per box or fill that did not fit at all. See the
+ * note on g_clipped in the renderer for why this is an instrument rather than
  * logic. */
 void ui_clip_bump(long n);
 
@@ -49,7 +51,7 @@ void ui_clip_bump(long n);
  * disc_min[] in alarm.c -- these are the labels for those values. */
 extern const char *const ui_orient_lbl[];
 extern const char *const ui_disc_lbl[];
-extern const char *const ui_newdata_lbl[]; /* ND_OFF / ND_BEEP / ND_CHIRP */
+extern const char *const ui_newdata_lbl[]; /* one per ND_*, ND_MODE_N long */
 extern const char *const ui_perm_lbl[];
 void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h);

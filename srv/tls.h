@@ -70,7 +70,7 @@ void tls_bye(struct tls_conn *c);
 
 /* The TLS 1.3 key schedule (RFC 8446 7.1). HKDF itself is a primitive and
  * lives in lib/hkdf.c; the "tls13 " label wrapper is TLS and lives in tls.c.
- * Declared here only so the test suite can pin both to RFC 8448's published
+ * Declared here only so both can be pinned to RFC 8448's published
  * handshake -- the one way to learn a key schedule is wrong without a peer
  * to disagree with you.
  *

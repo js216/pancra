@@ -77,14 +77,14 @@ int form_ex_action(int action, int ix)
    } else if (action == MA_EXLOG_PAGE) {
       /* THE PAGE COMES FROM THE HIT. pager_row works out where each of its
        * four buttons goes -- it is what knows the page count -- so there is
-       * no stepping or clamping to do here, and no way for the stored page
-       * to run past the end the way an unbounded ++ used to. */
+       * no stepping or clamping to do here, and no way for the stored page to
+       * run past the end -- which an unbounded ++ on this side would. */
       g_exlog_page = ix;
    } else if (action == MA_STEPS_TOGGLE) {
       struct prefs sp;
       settings_get(&sp);
       if (settings_set_steps_on(!sp.steps_on) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
       /* ASK ONLY WHEN SWITCHING ON, and only then: the counter needs
        * ACTIVITY_RECOGNITION from API 29, and a glucose app demanding activity
        * data at launch has no visible reason to. Requesting a permission
@@ -123,7 +123,7 @@ int form_ex_action(int action, int ix)
           * the keypad promises an edit that cannot survive. Say why rather
           * than opening a pad whose CONFIRM would be undone. */
          if (mode == KP_EX_DUR && exercise_row_running(&g_ex.orig)) {
-            set_status("EXERCISE STILL ACTIVE");
+            set_status_refused("EXERCISE STILL ACTIVE");
             mode = KP_NONE;
          }
          if (mode != KP_NONE) {
@@ -140,7 +140,7 @@ int form_ex_action(int action, int ix)
       /* THE TARGET SURVIVES A FAILED DELETE, for the reason form_food_action
        * spells out: g_ex.orig is the only thing a second YES can act on. */
       if (exercise_delete(&g_ex.orig) != 0) {
-         set_status("EXERCISE NOT DELETED");
+         set_status_refused("EXERCISE NOT DELETED");
          nav_go(SCR_EXEDIT);
       } else {
          /* The whole draft, for the reason form_food_action's delete spells
@@ -185,7 +185,8 @@ int form_ex_action(int action, int ix)
          }
          if (why) {
             /* THE DRAFT AND THE SCREEN BOTH SURVIVE, so a retry does not mean
-             * re-entering everything -- items 136-138's rule. */
+             * re-entering everything: a refused save is a message, not a
+             * reset. */
             str_snapshot(g_ex.err, sizeof g_ex.err, why);
          } else {
             g_ex.edit   = -1;

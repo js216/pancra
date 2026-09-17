@@ -109,13 +109,11 @@ struct meter_rt {
  *   idx_lk   the record-index file, which is a read-modify-write and was
  *            serialised only by the accident that its one writer runs under
  *            the driver's lock.
- * No path takes idx_lk with either of the other two held. `make lockcheck`
- * runs test/app/lockorder.py, which knows all three -- a leaf claim no tool
- * checks is a comment.
+ * No path takes idx_lk with either of the other two held.
  *
  * NOT a claim that this file calls nothing: meter_index_save asks the
  * registry which ids are still live (sensor_id_is_live), inside idx_lk. That
- * pair is in the checker's output, which is where a reader should look
+ * pair is the one to look at
  * rather than trusting this paragraph.
  *
  * 1 when the meter has a record and `out` was filled, 0 when it has none.

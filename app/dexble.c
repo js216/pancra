@@ -32,16 +32,18 @@
 #include "shell.h"  /* shell_service_tick: the heartbeat's one entry point */
 #include "status.h"
 #include "syncjni.h"
+#include "thread.h" /* bondmac_lk: the deferred bond address has one */
 #include "util.h"
 #include <jni.h>
 #include <jni_md.h>
 #include <stdint.h>
-/* NOT thread.h, <stdio.h> or <string.h>. All three were here for the bond
- * table -- its leaf mutex, the snprintf that copies an address into a slot,
- * the strcmp that looks one up -- and the table is in bondtable.c now. An
- * include kept for a reason that has moved out is worse than a missing one:
- * it is a claim, in the file's own include list, that this translation unit
- * still does something it no longer does. */
+#include <string.h> /* strcmp: the deferred bond checks the address */
+/* NO <stdio.h>: nothing in this file formats a string. An include list is a
+ * claim about what a translation unit does, so an entry with no user in the
+ * file is a false one.
+ *
+ * thread.h and <string.h> ARE here, for the deferred bond above: its own leaf
+ * mutex, and the strcmp that matches the address on the link. */
 
 static jclass g_ble;
 static jobject g_ctx;
@@ -55,9 +57,9 @@ static char g_keypath[256];
 static char g_macpath[256];
 
 /* Per-link key/MAC files. Several CGMs can be bonded at once, and each holds a
- * different shared key -- a single stelo.key would have the second sensor
- * silently overwrite the first's, dropping its bond. Link 0 keeps the historic
- * unsuffixed names so an existing install is not orphaned by this change. */
+ * different shared key -- with a single stelo.key the second sensor silently
+ * overwrites the first's and drops its bond. Link 0 uses the unsuffixed names,
+ * which is what an install made before the suffix existed has on disk. */
 static const char *link_path(char *out, int cap, const char *base, int link)
 {
    int i = 0;
@@ -76,7 +78,7 @@ static const char *link_path(char *out, int cap, const char *base, int link)
 static JavaVM *g_vm;       /* for a JNIEnv on any thread */
 static jclass g_alarm_cls; /* com.jk.pancra.Alarm */
 static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep, m_alarm_chirp,
-    m_alarm_nudge;
+    m_alarm_nudge, m_alarm_morse;
 
 /* a JNIEnv valid on the calling thread (main-loop touches and binder callbacks
  * both drive the alarm), attaching if necessary */
@@ -114,7 +116,7 @@ static JNIEnv *any_env(void)
 /* Returns 1 only if Java was actually reached.
  *
  * Returning void makes a failure to reach Alarm.trigger invisible -- and
- * alarm_apply has already committed the level as "announced", so its
+ * alarm_apply_ex has already committed the level as "announced", so its
  * idempotence check suppresses every later attempt and the hypo stays silent
  * for its whole duration. That is precisely the failure the staged try/catch
  * inside Alarm.java was written to eliminate, reintroduced one layer below
@@ -170,6 +172,35 @@ void dexble_chirp(int st10)
    (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_chirp, g_ctx, (jint)st10);
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
+}
+
+/* One keyed message (NEW DATAPOINT alert in MORSE mode). `elems` is the
+ * element string from morse_encode; Java owns the tempo. Best-effort, same as
+ * dexble_beep.
+ *
+ * NewStringUTF returns NULL with an exception PENDING on OOM, and any further
+ * JNI call on this thread would then be illegal -- so the throw is cleared
+ * here rather than left for whatever the binder thread does next. */
+void dexble_morse(const char *elems)
+{
+   JNIEnv *e = any_env();
+   jstring s;
+   if (!e || !g_alarm_cls || !m_alarm_morse) {
+      LOGI("morse: not wired (e=%p cls=%p m=%p)", (void *)e,
+           (void *)g_alarm_cls, (void *)m_alarm_morse);
+      return;
+   }
+   s = (*e)->NewStringUTF(e, elems);
+   if (!s) {
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
+      return;
+   }
+   LOGI("morse: fire %s", elems);
+   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_morse, g_ctx, s);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   (*e)->DeleteLocalRef(e, s);
 }
 
 /* One NUDGE (a threshold crossing on the wider, one-time band). `kind` is
@@ -257,13 +288,12 @@ void drv_connect(int link, const char *mac)
 
 /* The bond table lives in bondtable.c.
  *
- * It was here, in the middle of the JNI bridge, and that is why nothing
- * tested it: this file is one translation unit holding the whole bridge, so
- * linking it into a host suite means supplying a JavaVM. The table itself
- * needs none of that -- it is a fixed array, a lock, and two functions over
- * strings -- so it moved to a file that a host test CAN link, and
- * bondtabletest now runs a reader and a writer at it under ThreadSanitizer.
- * The race this lock exists for was, until then, argued rather than shown. */
+ * IT IS NOT IN THIS FILE. The bridge is one translation unit holding every
+ * native method and a JavaVM, so anything inside it can only be exercised with
+ * a JVM under it. The table needs none of that -- a fixed array, a lock, and
+ * two functions over strings -- so it lives in bondtable.c, where a plain host
+ * build can link it and run a reader and a writer at the lock this comment is
+ * about. */
 
 /* A BLUETOOTH ADDRESS, AS MUCH OF IT AS A LOG LINE NEEDS.
  *
@@ -296,6 +326,123 @@ static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
    char dt[DEVTAG_LEN];
    LOGI("bond: dev %s state=%d", devtag(m, dt), (int)state);
    (*e)->ReleaseStringUTFChars(e, mac, m);
+}
+
+/* THE BOND REQUEST THIS LINK OWES, held until the link is actually up.
+ *
+ * Asking the OS to bond at the moment the user commits puts the request out
+ * while there is no GATT connection to carry it: Android opens one of its
+ * own, the sensor will not complete pairing that way, and the attempt dies in
+ * under a second -- reported to the user as "couldn't pair, incorrect PIN or
+ * passkey", which names the one thing that was never involved. The bond that
+ * works is the one raised when the connection is up.
+ *
+ * So the request is DEFERRED to the connect callback rather than dropped: the
+ * point of asking explicitly is that the dialog belongs to the tap the user
+ * just made, and a prompt a few seconds later still does. What is lost is
+ * only the doomed first attempt and the message it produced.
+ *
+ * Written by the main thread at commit and read by the binder thread that
+ * delivers the connect.
+ *
+ * THE LINK AND THE ADDRESS ARE ONE REQUEST, under one lock. Published as an
+ * atomic link beside a plain buffer, a second commit rewrites the address in
+ * place while a binder thread is part-way through comparing it -- so the
+ * comparison runs against half of one address and half of another, and while
+ * the old terminator is overwritten and the new one not yet written there is
+ * briefly no terminator at all. Worse, the link NUMBER cannot tell two
+ * requests apart: a reader that matched the first commit's address could
+ * claim the second commit's arm for the same link and bond the wrong device.
+ * One mutex over both fields removes all three.
+ *
+ * A LEAF: nothing is called while it is held, and it is taken with no other
+ * lock held, so it cannot take part in any ordering. Listed in thread.h's
+ * table with the others -- NAMED bondmac_lk and not bond_lk, because
+ * bondtable.c already has a leaf by that name, and two leaves sharing one name
+ * is how that table comes to disagree with the code. */
+static struct mutex bondmac_lk = MUTEX_INIT;
+static char g_bond_mac[24];
+static int g_bond_link = -1; /* guarded by bondmac_lk, with the address */
+
+void dexble_bond_on_connect(int link, const char *mac)
+{
+   int dropped = -1;
+   mutex_lock(&bondmac_lk);
+   if (link < 0 || link >= LINK_MAX || !mac || !mac[0]) {
+      g_bond_link   = -1;
+      g_bond_mac[0] = 0;
+   } else {
+      /* THE LINK AND THE ADDRESS ARE SET TOGETHER, under one hold: they are
+       * one request, and a reader that could see the new link beside the old
+       * address would ask Android to bond the wrong device. */
+      /* ONE REQUEST AT A TIME, and replacing an unfired one is worth a line:
+       * the first sensor's dialog will not now belong to the tap that asked
+       * for it. Its bond still happens -- the sensor's own security request
+       * raises a prompt when it connects -- but later, and unannounced. */
+      /* A REQUEST IS REPLACED WHENEVER ONE WAS STANDING AND THIS IS NOT IT
+       * -- a different link, or the SAME link for a different address, which
+       * is the case a link-number comparison alone would miss. */
+      dropped = (g_bond_link >= 0 &&
+                 (g_bond_link != link || strcmp(g_bond_mac, mac) != 0))
+                    ? g_bond_link
+                    : -1;
+      str_snapshot(g_bond_mac, sizeof g_bond_mac, mac);
+      g_bond_link = link;
+   }
+   mutex_unlock(&bondmac_lk);
+   /* SAID WITH THE LOCK RELEASED. It is a leaf and nothing is called while it
+    * is held -- including this. Replacing an unfired request is worth a line:
+    * that sensor's dialog will no longer belong to the tap that asked for it.
+    * Its bond still happens, on the prompt its own security request raises
+    * when it connects, but later and unannounced. */
+   if (dropped >= 0)
+      LOGW("bond: request for link %d replaced before it fired; that "
+           "sensor's dialog will arrive on its own connect",
+           dropped);
+}
+
+/* Fire the deferred request if this link is the one that owes it AND the
+ * device that answered on it is the one the request was made for.
+ *
+ * THE ADDRESS IS CHECKED, NOT JUST THE LINK NUMBER. A pairing that is never
+ * completed -- the sensor never comes on the air, the user gives up -- leaves
+ * the request armed, and link numbers are reused. Firing on the link alone
+ * would then raise a pairing dialog for an abandoned sensor at whatever
+ * unrelated moment the next device connected there: exactly the "dialog
+ * arrives unannounced, long after the moment it belongs to" failure that
+ * asking explicitly exists to avoid.
+ *
+ * Matching the address makes the request self-expiring in the only way that
+ * matters -- it can fire ONLY while the intended sensor is on the link, which
+ * is when its bond should be asked for however long that takes.
+ *
+ * TEST, MATCH AND CLAIM ARE ONE CRITICAL SECTION, so a reconnect storm
+ * cannot ask twice for one commit and a second commit cannot be consumed by
+ * a reader that matched the first. */
+static void bond_if_owed(int link)
+{
+   struct dex_session s;
+   /* The driver is asked FIRST and its lock is released before this one is
+    * taken, so the two are never held together. */
+   if (!driver_session_of(link, &s) || !s.mac[0])
+      return;
+   /* TEST AND CLAIM IN ONE HOLD. Reading the request, matching it against the
+    * device on the link and consuming it are three steps that must not be
+    * separable: a second commit landing between them would be claimed by this
+    * one and bonded to the FIRST commit's address. The claim is what makes a
+    * reconnect storm ask only once. */
+   char want_mac[sizeof g_bond_mac];
+   mutex_lock(&bondmac_lk);
+   int owed =
+       g_bond_link == link && g_bond_mac[0] && strcmp(s.mac, g_bond_mac) == 0;
+   if (owed) {
+      str_snapshot(want_mac, sizeof want_mac, g_bond_mac);
+      g_bond_link = -1;
+   }
+   mutex_unlock(&bondmac_lk);
+   if (!owed)
+      return; /* somebody else is on this link: not this request's moment */
+   (void)dexble_create_bond(want_mac);
 }
 
 int dexble_create_bond(const char *mac)
@@ -452,12 +599,13 @@ static void dexble_devinfo_on(int link)
    JNIEnv *e = any_env();
    if (!e || !m_read)
       return;
-   static const char *uuids[3] = {
+   static const char *uuids[4] = {
        "00002a24-0000-1000-8000-00805f9b34fb", /* model number   */
        "00002a26-0000-1000-8000-00805f9b34fb", /* firmware rev.  */
        "00002a29-0000-1000-8000-00805f9b34fb", /* manufacturer   */
+       "00002a25-0000-1000-8000-00805f9b34fb", /* serial number  */
    };
-   for (int i = 0; i < 3; i++) {
+   for (int i = 0; i < (int)(sizeof uuids / sizeof uuids[0]); i++) {
       jstring u = (*e)->NewStringUTF(e, uuids[i]);
       if (!u) {
          if ((*e)->ExceptionCheck(e))
@@ -602,9 +750,8 @@ int drv_key_save(int link, const uint8_t key[16])
  *
  * THE DIRECTORY IS SYNCED, for the same reason atomic_replace does it: on
  * these filesystems the unlink is a directory operation, and a directory
- * entry is not durable until the directory is. `make -f test/Makefile
- * lockcheck` cannot see this one -- what pins it is drivertest, which asserts
- * that a clear whose unlink fails is REPORTED as a failure.
+ * entry is not durable until the directory is. A clear whose unlink fails is
+ * REPORTED as a failure rather than assumed to have worked.
  *
  * 0 = the credential is gone and the disk agrees; -1 = it may still be there.
  */
@@ -740,6 +887,8 @@ static void jni_connected(JNIEnv *e, jclass c, jint link)
    } else if (after == DRV_AFTER_RSSI) {
       ble_read_rssi(link);
    }
+   /* The link is up: a bond this commit deferred can go out now. */
+   bond_if_owed(link);
 }
 
 static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
@@ -1089,20 +1238,22 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
                                              "(Landroid/content/Context;IZZ)V");
    m_alarm_chirp   = (*e)->GetStaticMethodID(e, alarm_cls, "chirp",
                                              "(Landroid/content/Context;I)V");
+   m_alarm_morse   = (*e)->GetStaticMethodID(
+       e, alarm_cls, "morse", "(Landroid/content/Context;Ljava/lang/String;)V");
    /* A missed method id leaves a pending NoSuchMethodError, and ANY further
     * JNI call with one pending is illegal -- a VM abort under CheckJNI. The
     * caller goes on to load settings and build strings, so the throw would
     * surface far from here. dexble_register states this rule and obeys it;
-    * this function never did, and it now performs five lookups, any of which
+    * this function never did, and it performs six lookups, any of which
     * can miss if libpancra and classes.dex are ever out of step. Each id is
     * separately NULL-checked at every use site, so clearing is safe. */
    if ((*e)->ExceptionCheck(e)) {
       (*e)->ExceptionClear(e);
       LOGI("alarm class: a method id is missing (dex/so mismatch?)");
    }
-   LOGI("alarm class wired (trigger=%p silence=%p chirp=%p nudge=%p)",
+   LOGI("alarm class wired (trigger=%p silence=%p chirp=%p nudge=%p morse=%p)",
         (void *)m_alarm_trigger, (void *)m_alarm_silence, (void *)m_alarm_chirp,
-        (void *)m_alarm_nudge);
+        (void *)m_alarm_nudge, (void *)m_alarm_morse);
 }
 
 void dexble_pair(int link, const char *mac, const char *code)

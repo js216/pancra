@@ -33,7 +33,7 @@
  * connect.
  *
  * Pure: no globals, no clock, no JNI, no locks. main.c passes the state in
- * and acts on the result; test/metertest.c pins the behaviour.
+ * and acts on the result.
  */
 #ifndef METERLOGIC_H
 #define METERLOGIC_H
@@ -69,6 +69,11 @@ struct meter_tick {
  * The stranded check is skipped entirely while a sync is running -- a busy
  * runtime owns its links, and releasing one under it would tear down the
  * exchange this same tick may be about to time out properly. */
+/* A STAMPED LINK IS A STRANDED ONE, with no second test needed: every path that
+ * claims a link clears its stamp as it arms it (meter_alloc_link, and
+ * meter_link_set for the claim that follows), so a link somebody holds does not
+ * carry one. Case 2 above is armed and stamped by construction, which is why
+ * "is it armed" cannot be part of the question. */
 void meter_tick_eval(int busy, long start, const long *idle_since, int nlinks,
                      long now, struct meter_tick *out);
 

@@ -9,8 +9,7 @@
  *
  * So anything past the live window is read straight from readings.csv and
  * downsampled to what the screen can actually distinguish -- see plotdata.c.
- * No Android or JNI types here, so the whole thing builds and is tested on
- * the host (test/plottest.c). */
+ * No Android or JNI types here, so the whole thing builds on the host. */
 #ifndef PLOTDATA_H
 #define PLOTDATA_H
 
@@ -30,7 +29,7 @@ const struct ui_point *plot_source_from(const char *path, long now, int hours,
                                         int *n);
 
 /* Parse one readings.csv row into (t, glu, src, kind); 0 if it is not a
- * datapoint. Exposed for the test. */
+ * datapoint. Exposed so it can be asserted from outside. */
 int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind);
 
 #endif

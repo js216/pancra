@@ -183,7 +183,11 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, x, y, sc, "NOTHING LOGGED YET.", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "TIME              FOOD            G", UI_MUTED);
+   /* THE HEADER SITS OVER THE COLUMNS THE ROWS BELOW DRAW: 16 for the
+    * instant, 2 of gap, 11 for the padded name -- and the grams right-aligned
+    * at the margin, which is where its own column ends. */
+   draw_str(px, fb, x, y, sc, "TIME              FOOD", UI_MUTED);
+   draw_str(px, fb, rx - (str_len("G") * 6 * sc), y, sc, "G", UI_MUTED);
    y += lh;
 
    int avail = fb->height - y - (2 * lh);
@@ -204,14 +208,27 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       const struct food_rec *e = &m->food.log[ti];
       char when[20];
       char row[56];
+      char gp[8];
       fmt_date(e->t, m->tz_off, when, sizeof when);
       /* THE NAME, NOT THE ID. An entry whose type is missing renders as an
        * empty column rather than a number nobody can read -- food_type_name
        * answers "" for an id no type has, which is the honest look of a
        * record the vocabulary can no longer name. */
-      (void)snprintf(row, sizeof row, "%s  %-14s %4ld", when,
-                     food_type_name(e->type), e->g);
+      /* THE ROW IS BUDGETED TO THE 33 COLUMNS THE LAYOUT TARGETS, and the NAME
+       * is what gives way. fmt_date is 16 characters and a food name runs to
+       * FOOD_NAME_MAX (20), so a row that pads the name to its full width is
+       * 43 columns: draw_str clips silently past the edge, so the quantity --
+       * the one number a food log is read for -- is the part that disappears,
+       * and it disappears without a mark. Truncated with an explicit
+       * precision, the name loses its tail where the user can see it has one.
+       *
+       * THE GRAMS ARE DRAWN SEPARATELY, right-aligned at the margin, so their
+       * column cannot be pushed anywhere by the name beside them. */
+      (void)snprintf(row, sizeof row, "%s  %-11.11s", when,
+                     food_type_name(e->type));
       draw_str(px, fb, x, y, sc, row, UI_TEXT_DIM);
+      (void)snprintf(gp, sizeof gp, "%4ld", e->g);
+      draw_str(px, fb, rx - (str_len(gp) * 6 * sc), y, sc, gp, UI_TEXT_DIM);
       /* THE WHOLE ROW is the target, carrying the TAIL INDEX -- which the
        * dispatcher immediately turns into a copy of the row itself, because
        * an index is only good for as long as the tail is. */

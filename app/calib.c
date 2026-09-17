@@ -71,8 +71,8 @@
  * exactly where they were; 0 means "no deadline outstanding". None of them is
  * persisted and none of them can be: a monotonic clock counts from an
  * arbitrary origin and restarts with the kernel, so it is meaningless in a
- * file. The realtime stamps above are what crosses a restart, and calq_load /
- * rescale_load turn a persisted age back into one of these (see
+ * file. The realtime stamps above are what crosses a restart, and calq_restore
+ * / rescale_load turn a persisted age back into one of these (see
  * CLOCK_SKEW_TOL_S in calib.h for what they do with an age that is negative or
  * larger than the window).
  *

@@ -25,12 +25,11 @@
  *   does not depend on its value: not on its leading zeros, not on its
  *   Hamming weight, not on its magnitude.
  *
- *   THAT IS A STATEMENT ABOUT BRANCHES AND OPERATION COUNTS, and it is under
- *   test rather than asserted: p256.c counts its own limb operations under
- *   -DP256_COUNT and test/srv/cttest.c requires the count to be identical
- *   across scalars that differ in exactly the ways a branching implementation
- *   answers differently for. Built against one, that test fails five
- *   assertions.
+ *   THAT IS A STATEMENT ABOUT BRANCHES AND OPERATION COUNTS, and it is
+ *   measurable rather than merely asserted: p256.c counts its own limb
+ *   operations under -DP256_COUNT, and the count must be identical across
+ *   scalars that differ in exactly the ways a branching implementation
+ *   answers differently for.
  *
  *   IT IS NOT A CLAIM OF CONSTANT TIME ON YOUR PROCESSOR. A count cannot see
  *   an operand-dependent instruction latency or a branch the compiler
@@ -218,10 +217,10 @@ void p256_uncompressed(const struct jpoint *P, uint8_t out[65]); /* 04||X||Y */
 
 /* ---- THE CONSTANT-TIME REGRESSION HOOK ----------------------------------
  *
- * Defined only in a build that passes -DP256_COUNT, which is test/srv/cttest.c
- * and nothing else. p256.c's limb primitives increment it; the test drives the
- * public entry points with operands that differ in exactly the ways that used
- * to change the work done here, and asserts the count does not move.
+ * Defined only in a build that passes -DP256_COUNT, and nothing that ships
+ * does. p256.c's limb primitives increment it; drive the public entry points
+ * with operands that differ in exactly the ways that used to change the work
+ * done here, and the count must not move.
  *
  * A count is not a clock. It cannot see a data-dependent memory access or a
  * variable-latency instruction, and it is not evidence that this file is

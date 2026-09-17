@@ -4,18 +4,17 @@
 
 /* The alarm DECISION, split out from the alarm ACTUATION in alarm.c.
  *
- * Why this file exists: `make check` cannot fail on anything in the Android
- * shell -- it is
- * in no test binary -- and an adversarial review proved it by making
- * alarm_zone() return 0 unconditionally, which makes a glucose alarm
- * impossible under every input, with the whole gate still green. Across this
+ * Why this file exists: nothing in the Android shell can be exercised off
+ * the phone, and an adversarial review proved what that costs by making
+ * alarm_zone() return 0 unconditionally -- which makes a glucose alarm
+ * impossible under every input, with nothing anywhere objecting. Across this
  * codebase's review history the alarm path is where regressions concentrated,
  * precisely because nothing behavioural guarded it.
  *
  * These functions are pure: no globals, no clock, no JNI, no locks. main.c
- * passes the state in and actuates on the result; test/alarmtest.c pins the
- * behaviour. Keeping them pure is the point -- anything that reaches for a
- * global here puts the logic back out of reach of the gate. */
+ * passes the state in and actuates on the result. Keeping them pure is the
+ * point -- anything that reaches for a global here puts the logic back out of
+ * reach, decidable only on a phone. */
 #ifndef ALARMLOGIC_H
 #define ALARMLOGIC_H
 #include <stdbool.h> /* the yes/no observations are bool, not int */
@@ -38,13 +37,13 @@ struct reading;
  * AS BARE INTS, the alarm level, the nudge band, the nudge sound mode, the
  * action to take, Java's notification kind and a dozen yes/no observations
  * are one type, so the compiler accepts any of them wherever any other is
- * expected -- and three of the lists overlap numerically. `alarm_want(stale,
- * zone)` compiles; so does passing a Java kind back in as a level (AJ_HIGH ==
- * AL_LOW), or a nudge band as an alarm level (NG_HIGH == AL_HIGH by luck,
- * NG_LOW == AL_LOW by luck, and neither is a promise). The two-numbering
- * incident recorded under alarm_java_kind below -- where LOW and "nothing
- * sounding" were the same value and the low-glucose alarm could not fire -- is
- * the same defect one layer down.
+ * expected -- and three of the lists overlap numerically.
+ * `alarm_want_sustained(stale, zone)` compiles; so does passing a Java kind
+ * back in as a level (AJ_HIGH == AL_LOW), or a nudge band as an alarm level
+ * (NG_HIGH == AL_HIGH by luck, NG_LOW == AL_LOW by luck, and neither is a
+ * promise). The two-numbering incident recorded under alarm_java_kind below --
+ * where LOW and "nothing sounding" were the same value and the low-glucose
+ * alarm could not fire -- is the same defect one layer down.
  *
  * So each domain is its own enum, with an explicit member for "unknown"
  * where one exists, and the raw-int boundaries are exactly two: what is
@@ -57,7 +56,7 @@ struct reading;
 
 /* Internal alarm levels. These deliberately do NOT match Java's `kind` -- see
  * alarm_java_kind below, which is the only correct way to convert. AL_NONE
- * must stay 0 and every real level non-zero, because alarm_apply treats 0 as
+ * must stay 0 and every real level non-zero, because alarm_apply_ex treats 0 as
  * "nothing should be sounding". */
 enum alarm_level { AL_NONE = 0, AL_LOW = 1, AL_HIGH = 2, AL_STALE = 3 };
 
@@ -125,21 +124,25 @@ static inline bool data_fresh(long now, long stamp, long limit)
  *   ND_BEEP   one fixed tone per new primary-CGM sample
  *   ND_CHIRP  the same tone, pitch-bent by the change since that sensor's
  *             own previous sample
+ *   ND_MORSE  the value itself, keyed as Morse code
  * Values are PERSISTED (settings field 7, historically a 0/1 flag), so they
  * must not be renumbered. */
-enum nudge_mode { ND_OFF = 0, ND_BEEP = 1, ND_CHIRP = 2 };
+enum nudge_mode { ND_OFF = 0, ND_BEEP = 1, ND_CHIRP = 2, ND_MORSE = 3 };
+/* How many modes there are, for the one place a stored int indexes a label
+ * table. The count belongs to the enum, not to the row that draws it. */
+#define ND_MODE_N 4
 
 /* THE ONE PLACE A STORED NUMBER BECOMES THIS TYPE. settings.c reads field 7
  * out of a text file that a previous version wrote (as a 0/1 flag) and that
  * a person can edit; anything not on the list is ND_OFF, which is the safe
  * reading -- a mode nobody recognises must not silently sound something.
- * Pure, so alarmtest executes every branch of it. */
+ * Pure, so every branch of it is decidable on its own. */
 enum nudge_mode nudge_mode_of(int stored);
 
-/* THE CYCLE THE SETTINGS BUTTON PERFORMS: OFF -> BEEP -> CHIRP -> OFF. Here
- * rather than in settings.c, where it was `(mode + 1) % 3` -- arithmetic on a
- * domain that has none, and a wrong answer the day a fourth mode is added
- * anywhere but the end. */
+/* THE CYCLE THE SETTINGS BUTTON PERFORMS: OFF -> BEEP -> CHIRP -> MORSE ->
+ * OFF. Here rather than in settings.c, where it was `(mode + 1) % 3` --
+ * arithmetic on a domain that has none, and a wrong answer the day a mode is
+ * added anywhere but the end. */
 enum nudge_mode nudge_mode_next(enum nudge_mode m);
 
 /* CHIRP pitch mapping. The chirp is the beep's duration and starting pitch,
@@ -226,11 +229,42 @@ enum nudge_band nudge_fire(enum nudge_band nzone, bool alarming,
  * against -- gives 0, i.e. exactly the BEEP tone. Pure, so it is tested. */
 int chirp_semitone10(int delta_mgdl);
 
+/* ---- MORSE: the reading itself, keyed ----------------------------------
+ *
+ * BEEP says that a sample arrived and CHIRP adds which way it moved; MORSE
+ * says the number. It keys the value exactly as the screen writes it --
+ * mg/dL as whole digits, mmol/L with its decimal point -- so what is heard
+ * and what is displayed are one number, and a reading can be taken without
+ * looking at the phone at all.
+ *
+ * THE SPLIT IS THE CHIRP'S. This side owns the MAPPING, which is checkable
+ * off the phone; Alarm.java owns the tempo and the pitch, which are not.
+ * Here a message is a string of ELEMENTS: '.' is a dit, '-' a dah, and ' '
+ * the gap between two characters. Java turns those into a waveform, spacing
+ * them by the PARIS dit its own MORSE_WPM sets.
+ *
+ * Room for the longest thing fmt_glu can write ("-555.4": six characters at
+ * up to six elements plus a separator each) and the terminator. */
+#define MORSE_MAX 64
+
+/* Key `text` into `out` as that element string, returning how many elements
+ * were written -- or 0, with `out` left empty, if the text holds a character
+ * this cannot key or does not fit.
+ *
+ * REFUSE, never key part of it. The digits ARE the message here, so a
+ * message missing one is not a quieter version of the reading, it is a
+ * different reading: dropping the '.' out of "6.8" keys 68 mg/dL. Silence
+ * says nothing, and saying nothing is the honest answer to a value this
+ * cannot spell. The alphabet is the digits, '.' and '-', which is exactly
+ * what fmt_glu produces. */
+int morse_encode(const char *text, char *out, int n);
+
 /* Glucose zone RIGHT NOW: 0 in range, 1 low, 2 high. Derived, never latched.
  *
  * `glu < 0` means "no reading". Staleness returns 0 rather than the last
- * zone: a latched zone outranks the stale warning in alarm_want(), so a sensor
- * dropping out while low would otherwise mask the DISCONNECT alarm forever. */
+ * zone: a latched zone outranks the stale warning in alarm_want_sustained(), so
+ * a sensor dropping out while low would otherwise mask the DISCONNECT alarm
+ * forever. */
 enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi);
 
 /* HOW LONG THE USER HAS BEEN CONTINUOUSLY IN RANGE, in seconds, ending at the
@@ -257,7 +291,7 @@ enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi);
  * streak at the near side of the hole rather than spanning it.
  *
  * Pure, like everything else in this header: the caller passes the history
- * and the bounds, and alarmtest pins the behaviour. */
+ * and the bounds. */
 long alarm_streak_s(const struct reading *r, int n, int lo, int hi,
                     long gap_max);
 /* Combine two sensors' zone verdicts: LOW (1) anywhere outranks HIGH (2)
@@ -351,9 +385,9 @@ bool alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
  * truncated, because a wrapped stamp would read as an arrival time that never
  * happened -- on the one alarm the user cannot silence.
  *
- * These two are PURE, so alarmtest executes them: a round trip that loses a
- * field, or shifts by one bit, is the whole failure and is otherwise
- * invisible in a file no test can reach. */
+ * These two are PURE, which is what makes them checkable at all: a round
+ * trip that loses a field, or shifts by one bit, is the whole failure and is
+ * otherwise invisible. */
 #define PRED_MGDL_MAX 65535
 
 struct link_pred {
@@ -371,10 +405,10 @@ struct link_pred pred_unpack(unsigned long long word);
  * (11 min) so that a stale zone cannot mask the DISCONNECT alarm -- sound
  * reasoning, but it assumes the DISCONNECT alarm is there to take over. It is
  * OFF by default (g_disc == 0 => alarm_stale is unconditionally 0), so with a
- * sensor dropping out on a hypo the zone decayed to nothing, alarm_want
- * returned AL_NONE, and alarm_apply called dexble_alarm_silence() -- ACTIVELY
- * STOPPING a ringing hypo alarm after two missed CGM cycles, while the user
- * was still low and nothing knew otherwise.
+ * sensor dropping out on a hypo the zone decayed to nothing,
+ * alarm_want_sustained returned AL_NONE, and alarm_apply_ex called
+ * dexble_alarm_silence() -- ACTIVELY STOPPING a ringing hypo alarm after two
+ * missed CGM cycles, while the user was still low and nothing knew otherwise.
  *
  * The hand-off only works while every DISCONNECT threshold is longer than
  * AL_FRESH_S: a zone that is still fresh outranks AL_STALE, so a shorter
@@ -427,7 +461,7 @@ bool alarm_audible(enum alarm_level want, bool sound_on, bool vib_on);
  * THE TWO NUMBERINGS MUST NOT BE THE SAME ONE. Java's kind puts LOW at 0, but
  * the internal level needs 0 to mean "nothing should be sounding" -- and when
  * a single enum served both, a request to sound LOW produced 0 --
- * indistinguishable from silence. alarm_apply's own idempotence check then
+ * indistinguishable from silence. alarm_apply_ex's own idempotence check then
  * returned early and the LOW GLUCOSE ALARM COULD NEVER FIRE, while HIGH and
  * STALE worked normally, which is exactly the shape that hides from casual
  * testing. Keeping the two spaces separate and converting explicitly here is
@@ -435,20 +469,21 @@ bool alarm_audible(enum alarm_level want, bool sound_on, bool vib_on);
  *
  * ---- THE KIND IS A PROTOCOL, SO IT HAS NAMES ON BOTH SIDES -------------
  *
- * These three numbers cross a language boundary: C computes one and
- * hands it to Alarm.trigger, which decided what to SAY with a chain of
- * `kind == 2 ? ... : kind == 1 ? ... : "Glucose LOW"`. Two things were wrong
- * with that beyond its being unreadable. Nothing named the numbers on either
- * side, so the two lists agreed only by inspection and a renumbering here
- * would have relabelled a safety notification silently. And the chain was not
- * exhaustive: ANY unrecognised kind fell through to LOW, so a future fourth
- * alarm -- or a corrupted argument -- announces a hypoglycaemic emergency.
+ * These three numbers cross a language boundary: C computes one and hands it to
+ * Alarm.trigger, which decides what to SAY. Both sides NAME them -- AJ_* here,
+ * Alarm.KIND_* there -- and the values are stated once on each side, so a
+ * renumbering on one side is visible on the other. An edit to either list must
+ * be matched in the other.
  *
- * The names are AJ_* here and Alarm.KIND_* there, the values are stated once
- * on each side, and `make -f test/Makefile javacheck` compares them literally.
- * An edit to either list that the other does not match fails the build. */
+ * WHY NAMES AND NOT A CONDITIONAL CHAIN. Bare numbers agree only by inspection,
+ * so a renumbering here relabels a safety notification with nothing to catch
+ * it. And the Java side must be EXHAUSTIVE with a neutral default: a chain
+ * ending in "Glucose LOW" announces a hypoglycaemic emergency for any kind it
+ * does not recognise -- a fourth alarm added here, or a corrupted argument.
+ * Alarm.java's switch names its three and falls back to "Glucose alarm", which
+ * claims nothing about the direction. */
 enum java_kind {
-   AJ_NONE  = -1, /* not a level Java can sound: alarm_apply stays quiet */
+   AJ_NONE  = -1, /* not a level Java can sound: alarm_apply_ex stays quiet */
    AJ_LOW   = 0,
    AJ_HIGH  = 1,
    AJ_STALE = 2
@@ -458,9 +493,9 @@ enum java_kind {
  * the type stops; every caller converts here and nothing casts. */
 enum java_kind alarm_java_kind(enum alarm_level want);
 
-/* What alarm_apply should DO, given the level it computed and what is already
- * committed. Pure, so the sequences can be tested; main.c holds the state and
- * performs the actuation.
+/* What alarm_apply_ex should DO, given the level it computed and what is
+ * already committed. Pure, so the sequences can be tested; main.c holds the
+ * state and performs the actuation.
  *
  * `act` is one of: */
 enum alarm_act {
@@ -575,13 +610,13 @@ void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
 
 /* ================= THE ALARM ACTUATION WORKFLOW =====================
  *
- * The three pieces above -- sustain, override, decide -- were composed BY HAND
- * inside alarm.c's actuator, which is how the composition escaped the gate: a
- * pure copy of the override lived here and was tested, while the copy that
- * actually ran was a second one written out inline. Deleting the tested copy
- * would have failed alarmtest and changed nothing on the phone.
+ * THE COMPOSITION IS HERE TOO, not only the three pieces. Composed by hand
+ * inside alarm.c's actuator instead, the composition is the part nothing can
+ * look at: a pure copy of the override sits in this header while the copy that
+ * actually runs is a second one written out inline, and deleting the one here
+ * changes nothing on the phone.
  *
- * So the composition is here too, as one transition. The shell holds the
+ * So it is one transition, in this file. The shell holds the
  * state, hands it in with what it observed, and does what the effect says.
  *
  * State, not globals: `want` is the level last committed to Java, `acked`

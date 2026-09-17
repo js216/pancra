@@ -62,8 +62,9 @@ void tout_took(struct textout *t, int n)
    if (!t || t->bad)
       return;
    int room = t->cap - t->len;
-   /* n >= room is snprintf saying it TRUNCATED, which is the case the old
-    * hand-rolled loops treated as "stop here and write what we have". */
+   /* n >= room is snprintf saying it TRUNCATED, and a truncated field is a
+    * different value, not a shorter one: the whole render is refused rather
+    * than continued with what fitted. */
    if (n <= 0 || n >= room) {
       t->bad = 1;
       return;
@@ -87,10 +88,11 @@ void str_snapshot(char *dst, int cap, const char *src)
          dst[0] = 0;
       return;
    }
-   /* cap <= 0 skipped the copy loop and then wrote dst[0] anyway -- a
-    * one-byte overflow into a zero-length buffer. No caller passes 0 today
-    * (every one passes a sizeof), but this is the project's single string
-    * copy and it should not have a size at which it corrupts memory. */
+   /* NOTHING IS WRITTEN INTO NO ROOM. Without this the terminator below goes
+    * into dst[0] of a zero-length buffer -- a one-byte overflow. No caller
+    * passes 0 today (every one passes a sizeof), but this is the project's
+    * single string copy and it must not have a size at which it corrupts
+    * memory. */
    if (cap <= 0)
       return;
    int i = 0;
@@ -107,13 +109,12 @@ void str_snapshot(char *dst, int cap, const char *src)
 
 /* ---- DELIBERATE FAILURES, for the durability test only ----------------
  *
- * Behind -DAPP_FAULTS, which only `make durabilitytest` sets: nothing that
- * ships carries it. It exists because the failures this file's contract is
- * ABOUT cannot be arranged on demand -- a short write can (RLIMIT_FSIZE), but
- * an fsync that fails, a close that reports a deferred write error, or a
- * rename that fails after everything else succeeded are exactly the moments
- * where "the record is safe" stops being true, and they happen on a card
- * that is dying rather than in a test.
+ * Behind -DAPP_FAULTS, which nothing that ships defines. It exists because the
+ * failures this file's contract is ABOUT cannot be arranged on demand -- a
+ * short write can (RLIMIT_FSIZE), but an fsync that fails, a close that reports
+ * a deferred write error, or a rename that fails after everything else
+ * succeeded are exactly the moments where "the record is safe" stops being
+ * true, and they happen on a card that is dying rather than in a test.
  *
  * Each is armed by name through the environment (APP_FAIL_FSYNC=1 ...), so a
  * test arms one, runs a real append against a real file, and asks what the
@@ -178,10 +179,9 @@ _Thread_local void (*app_fault_publish_gap)(void);
  * restores, other logs, its own fixtures -- must not be charged against it. */
 static int fault_write_after(void)
 {
-   /* Not atomic, and it does not need to be: while the variable is unset this
-    * only READS `armed`, so the concurrent writers in durabilitytest (which
-    * never set it) race with nothing. Arming is done by a single-threaded
-    * test, before the thread that writes is started. */
+   /* Not atomic, and it does not need to be: while the variable is unset
+    * this only READS `armed`, so concurrent writers (which never set it) race
+    * with nothing. Arming happens before any writing thread starts. */
    static int armed;
    static long seen;
    const char *s = getenv("APP_FAIL_WRITE_AFTER");

@@ -39,6 +39,17 @@ void dexble_pair(int link, const char *mac, const char *code);
  * Ble.createBond for why auto-accepting the dialog is not available to us.
  * Returns 1 if the request went out (or the device was already bonded). */
 int dexble_create_bond(const char *mac);
+/* ASK FOR THAT BOND WHEN `link` NEXT CONNECTS, not now.
+ *
+ * The OS cannot complete a pairing that has no connection under it: asked at
+ * commit time the request dies in under a second and Android reports it as a
+ * wrong PIN, naming the one thing that was never involved. Deferring it to the
+ * connect keeps the prompt tied to the tap that asked for it -- a few seconds
+ * later -- and drops only the attempt that could not have worked.
+ *
+ * One request per call: the connect that fires it clears it, so a reconnect
+ * does not ask again. `link` < 0 cancels. */
+void dexble_bond_on_connect(int link, const char *mac);
 /* For the latest OS bond state seen for an address, include bondtable.h --
  * dexble_bond_state is declared there, beside the setter that feeds it. */
 void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */
@@ -65,6 +76,9 @@ void dexble_beep(void); /* one short NEW DATAPOINT beep */
 /* One NEW DATAPOINT chirp, pitch-bent by `st10` tenths of a semitone
  * (chirp_semitone10); 0 is the beep's own pitch. */
 void dexble_chirp(int st10);
+/* One NEW DATAPOINT message in MORSE mode. `elems` is the element string
+ * morse_encode produced: '.' a dit, '-' a dah, ' ' a character gap. */
+void dexble_morse(const char *elems);
 /* One NUDGE: a single two-note motif plus a short buzz, descending for a low
  * crossing and rising for a high one. `kind` is 0 low, 1 high; `sound` and
  * `vibrate` are the nudge's own outputs, independent of the alarm's. */

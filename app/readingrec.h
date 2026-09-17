@@ -24,10 +24,10 @@
 
 /* One reading in the display history.
  *
- * glu/trend are narrowed to 16 bits so `src` and `kind` fit in what was
- * padding: the struct stays 16 bytes, so g_hist costs exactly what it always
- * did (2100 x 16 B) despite carrying full attribution. Glucose fits in mg/dL
- * and trend10 in tenths-per-minute with room to spare. */
+ * glu/trend are narrowed to 16 bits so `src` and `kind` fit in the padding
+ * beside them: the struct is 16 bytes, so the history costs NHIST x 16 B
+ * (store.h) while carrying full attribution. Glucose fits in mg/dL and trend10
+ * in tenths-per-minute with room to spare. */
 struct reading {
    short glu, trend;
    /* Sensor id (see sensors.h); 0 = pre-registry legacy. 16 bits, NOT 8: ids
@@ -38,5 +38,14 @@ struct reading {
    unsigned char kind; /* KIND_CGM / KIND_BGM -- decides how it is plotted */
    long t;             /* canonical UTC epoch seconds */
 };
+
+/* THE WIDTH OF THE TWO NARROWED FIELDS, so a loader can bound a number BEFORE
+ * it casts. A bound applied after the cast is not a bound: 65537 wraps to 1
+ * and attributes the row to device 1. Named here, beside the fields, because
+ * both readers of readings.csv (hist_insert and plot_store_row) need the same
+ * ceiling and neither owns it. */
+#define STORE_SRC_MAX   0xFFFF
+#define STORE_TREND_MIN (-32768)
+#define STORE_TREND_MAX 32767
 
 #endif

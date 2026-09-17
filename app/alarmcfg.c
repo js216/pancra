@@ -22,11 +22,11 @@ int alarm_set_thresholds(int alarm_low, int alarm_high, int nudge_low,
                          int nudge_high)
 {
    /* ALL FOUR AT ONCE, AND PERSISTED HERE. Four one-field setters, storing
-    * without saving and leaving the ordering check and the alarm_save() to
-    * whoever calls them, are three separate obligations in a header, on the
-    * pair of numbers that decides whether a hypo alarm can fire. A caller
-    * that meets two of the three leaves the phone with a live threshold the
-    * next launch will not have.
+    * without saving and leaving the ordering check and the
+    * alarm_set_thresholds() to whoever calls them, are three separate
+    * obligations in a header, on the pair of numbers that decides whether a
+    * hypo alarm can fire. A caller that meets two of the three leaves the phone
+    * with a live threshold the next launch will not have.
     *
     * The ordering is still the ALARM's to decide (it needs its own lock to
     * read the partner and choose atomically); what is no longer possible is
@@ -103,9 +103,9 @@ static int parse_field(char **q, int *out)
 
 enum load_result alarm_load(void)
 {
-   /* 256, matching what alarm_save writes. The number is this file's own and
-    * has no other source: the alarm line is four small integers, and nothing
-    * about remote.cfg's growth bears on it. */
+   /* 256, matching what alarm_set_thresholds writes. The number is this file's
+    * own and has no other source: the alarm line is four small integers, and
+    * nothing about remote.cfg's growth bears on it. */
    char b[256];
    int n               = 0;
    enum load_result rr = read_file_exact(g_alarm_path, b, sizeof b, &n);

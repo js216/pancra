@@ -92,7 +92,7 @@ int weight_load(void);
 
 #ifdef APP_FAULTS
 /* CALLED BETWEEN A COMMITTED REWRITE AND ITS RE-READ, and nowhere else. The
- * app never defines APP_FAULTS; this exists so weighttest can make the log
+ * app never defines APP_FAULTS; this exists so the log can be made
  * unreadable at the one instant where "the file is right and memory is not"
  * is reachable at all. See wt_rewrite. */
 extern void (*weight_fault_before_reload)(void);

@@ -80,12 +80,16 @@
 #include <string.h>
 #include <time.h>
 
+/* HOW MANY ORPHANED DEVICES ONE LAUNCH RESTORES. Each costs two whole
+ * rewrites of slots.csv with their fsyncs, and the list is bounded by the
+ * history's distinct sources rather than by the slot table -- so a big
+ * restore is spread across launches instead of stalling the first one. */
+#define ORPHAN_PER_LAUNCH 32
+
 /* ---- app configuration constants (tunables collected here) ---- */
-#define SCR_MAX 16 /* touch hit-boxes tracked per drawn menu */
-/* (NPERMS is menuview.h's, which this file includes. It was declared here as
- * well, with its own copy of the count, and nothing used it -- so raising the
- * real one made the two disagree loudly rather than quietly, which is the
- * only good outcome available to a duplicated constant.) */
+/* (NPERMS is menuview.h's, which this file includes. One declaration, in the
+ * header the count belongs to: a second copy here is a number that can
+ * disagree with the real one.) */
 /* How long a teardown callback will wait for another thread to finish with
  * shared state before it stops waiting (thread.h, rule 5). Long enough that a
  * history append -- microseconds -- always completes; short enough that the
@@ -224,8 +228,8 @@ void shell_where(const char *label)
  * moments after boot, which is when this is set -- moved both at once: it
  * could end the DISCONNECT grace early and alarm over data that was simply
  * waiting for the first sync, or extend the grace and thereby disable that
- * alarm outright for the length of the skew. `make clockcheck` names this
- * variable so it cannot quietly go back to realtime_s(). */
+ * alarm outright for the length of the skew. This is a MONOTONIC stamp;
+ * realtime_s() is the wrong clock for it. */
 static long g_launch_mono;
 
 long shell_launch_mono(void)
@@ -302,11 +306,12 @@ static int g_inited; /* process-wide one-time init done (relaunch guard) */
  * big number, SCR_SETTINGS for the settings row -- so its X returns exactly
  * there. Recorded, never inferred (the recurring bug). */
 
-/* Map a sensor slot to its transport link. CGMs take LINK_CGM, then LINK_CGM2
- * and upward in slot order; meters take links from the SAME pool. Each link has
- * its
- * own GATT connection, operation queue and driver context, so sensors run
- * genuinely concurrently rather than taking turns. */
+/* Map a sensor slot to its transport link. A CGM with no session yet is RANKED
+ * among the other unbound CGMs and takes the free link at that rank, counting
+ * upward from LINK_CGM; meters draw from the SAME pool, downward from the top,
+ * so the two allocations cannot meet. Each link has its own GATT connection,
+ * operation queue and driver context, so sensors run genuinely concurrently
+ * rather than taking turns. */
 
 /* Reconcile the driver's live session against the permanent registry: mint an
  * id for a sensor we have not recorded yet, claim a slot for it, and remember
@@ -412,6 +417,15 @@ static void draw_impl(struct ANativeWindow *win, const struct screen *sm)
    ANativeWindow_setBuffersGeometry(win, 0, 0, WINDOW_FORMAT_RGBA_8888);
    if (ANativeWindow_lock(win, &buf, NULL) != 0)
       return;
+   /* A LOCK CAN SUCCEED AND HAND BACK A BUFFER IT FAILED TO MAP (uidraw.h).
+    * Every primitive in uidraw.c survives that on its own, but ui_dim and
+    * ui_press_overlay below walk the whole surface without going through one,
+    * so the guard belongs here as well -- once, for all three. Unlocked and
+    * posted rather than returned from, so the surface is not left held. */
+   if (!buf.bits) {
+      ANativeWindow_unlockAndPost(win);
+      return;
+   }
 
    /* Every screen is the pure UI: render the immutable frame model the caller
     * built and record the touch targets. The model is built by draw(), under
@@ -442,9 +456,9 @@ static void draw_impl(struct ANativeWindow *win, const struct screen *sm)
  * the end, a null loader or a pending exception from step two feeds steps
  * three through six -- an abort under CheckJNI -- and the four intermediate
  * local refs leak even when it works. Both are properties of a JNI sequence,
- * not of the
- * shell, and jbridgetest can drive them with a fake JNIEnv; nothing could
- * reach them while they were a static function in here. */
+ * not of the shell, which is why the sequence lives in jbridge.c behind
+ * jb_app_class: reachable, and drivable with a JNIEnv of the caller's choosing.
+ * A static function in here is reachable from nothing. */
 static jclass find_app_class(struct ANativeActivity *a, const char *name)
 {
    jclass cls = NULL;
@@ -550,10 +564,11 @@ void shell_service_tick(void)
     * there is no second place that can leave the sensor registered after the
     * feature is switched off -- see steps_pump. */
    steps_pump();
-   /* THE GENERATION STAMP a backup reads before and after it pulls (item
-    * 247). Here rather than only on the activity's timer for the usual
-    * reason: the writes it is stamping arrive on a binder thread with no
-    * activity alive, which is exactly when a backup is likely to be taken. */
+   /* THE GENERATION STAMP a backup reads before and after it pulls, so it can
+    * tell a snapshot taken across a write from one taken between two. Here
+    * rather than only on the activity's timer for the usual reason: the writes
+    * it is stamping arrive on a binder thread with no activity alive, which is
+    * exactly when a backup is likely to be taken. */
    stategen_tick();
    /* The settled exercise level, for the case the activity is gone -- which
     * is the case this control is designed around. See on_timer. */
@@ -819,7 +834,7 @@ static int on_timer(int fd, int events, void *data)
    if (scan_stop_pending() && g_act)
       stop_scan(g_act);
    {
-      /* Decision in scanlogic.c so `make check` can fail on it. */
+      /* Decision in scanlogic.c, which is pure and decidable on its own. */
       static long last_scan_retry;
       /* MONOTONIC: every field this decision compares is an interval -- how
        * long since the last retry, how long the radio-quiet hold has left --
@@ -938,8 +953,15 @@ static void on_resume(struct ANativeActivity *a)
       if (!mv.batt_ok)
          jb_request_battery(g_act);
    }
-   if (cur_screen() && live_window())
-      draw(live_window()); /* so the menu reflects the new state at once */
+   /* ANY SCREEN, AND THE MAIN ONE ABOVE ALL. Coming back from a pause -- a
+    * permission prompt, the OS bond dialog, another app taking the
+    * foreground -- resumes onto a surface still holding whatever was on it
+    * before, so the resume is what has to repaint it. SCR_MAIN is enum value
+    * 0, which makes "which screen is showing" the one test that cannot decide
+    * this: it reads as false for the screen the app spends nearly all of its
+    * life on, and that screen then comes back black. */
+   if (live_window())
+      draw(live_window()); /* so the screen reflects the new state at once */
 }
 
 static void on_pause(struct ANativeActivity *a)
@@ -1012,12 +1034,12 @@ static int init_java(struct ANativeActivity *activity, JNIEnv *env)
    jclass ble = find_app_class(activity, "com.jk.pancra.Ble");
    if (!ble) {
       LOGI("Ble class NOT found");
-      set_status("NO BLE CLASS!");
+      set_status_refused("NO BLE CLASS!");
       return 0;
    }
    if (!jb_bind(env, activity->clazz, ble)) {
       LOGI("Ble bind failed");
-      set_status("JNI BIND FAILED!");
+      set_status_refused("JNI BIND FAILED!");
       return 0;
    }
 
@@ -1025,7 +1047,7 @@ static int init_java(struct ANativeActivity *activity, JNIEnv *env)
     * registers itself (see pairing.h). */
    if (!pairing_register(env, jb_class())) {
       LOGI("RegisterNatives failed");
-      set_status("JNI REG FAILED!");
+      set_status_refused("JNI REG FAILED!");
       return 0;
    }
    /* (No remote* ids: the sync client's two entry points are registered
@@ -1050,7 +1072,7 @@ static int init_java(struct ANativeActivity *activity, JNIEnv *env)
     * degraded mode to fall back to. */
    if (!dexble_register(env, jb_class(), activity->clazz)) {
       LOGI("dexble_register failed");
-      set_status("BLE REG FAILED!");
+      set_status_refused("BLE REG FAILED!");
       return 0;
    }
 
@@ -1088,7 +1110,7 @@ static void recover_bonded_mac(struct ANativeActivity *activity, JNIEnv *env)
     *
     * It asks the OS bond list for a device whose name matches the
     * primary sensor's family prefix -- so running it before the registry
-    * is read leaves slot_count() at 0, the primary resolving to -1, and the
+    * is read leaves the registry empty, the primary resolving to -1, and the
     * prefix always "DX01". A G7-only user's bonded device would then never
     * be found and could never reconnect; a user with both would get
     * LINK_CGM locked onto the Stelo's address while the Stelo already owned
@@ -1207,7 +1229,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
          LOGW("startup: the data directory is too long to build every file "
               "path from (%s)",
               dir);
-         set_status("DATA PATH TOO LONG");
+         set_status_refused("DATA PATH TOO LONG");
       }
 
       /* WHAT THE STORAGE ACTUALLY GAVE BACK. Each loader answers absent /
@@ -1271,7 +1293,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
          LOGW("startup: a log could not be read whole (readings=%d, "
               "other=%d); what is shown is INCOMPLETE",
               lrc < 0, lost);
-         set_status("HISTORY INCOMPLETE");
+         set_status_refused("HISTORY INCOMPLETE");
       }
       /* MIGRATION: any source that has readings on the plot but no slot
        * (a device forgotten before slot-retention existed) becomes an OLD
@@ -1300,7 +1322,34 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
             if (!seen && no < NHIST)
                orphans[no++] = src;
          }
-         for (int j = 0; j < no; j++) {
+         /* BOUNDED PER LAUNCH. Each restoration below is a whole slots.csv
+          * render plus an atomic_replace and its fsync, twice -- and the
+          * orphan list is bounded by the DISTINCT SOURCES IN THE HISTORY,
+          * not by the slot table, so a large restore can present thousands.
+          * Doing them all at once is thousands of fsyncs before the first
+          * frame. They are recovered a batch at a time instead: the walk only
+          * ever visits devices the registry does not have, so the next launch
+          * continues exactly where this one stopped. */
+         int did = 0;
+         /* NOT AT ALL WHILE EITHER FILE IS SHORT.
+          *
+          * Unwritable: every claim below is refused and rolled back, so the
+          * walk spends its whole per-launch budget on failures and restores
+          * nothing -- and a partially-parsed slots.csv is exactly when a
+          * device LOOKS orphaned because its row was the one dropped.
+          *
+          * NO PROVENANCE: worse than useless. A row claimed with sensors.csv
+          * unread has no type, so nothing about it can be judged: the DEVICES
+          * list shows a bare label, every hot path skips it, and the per-device
+          * screen can offer no action for it. It arrives LIVE, which is the
+          * part that matters -- a device the user has not worn for months, back
+          * in the link ranking and counted against the link budget, from a walk
+          * the user did not ask for. Adopting an orphan is a judgement about
+          * what a device IS, so it waits until the file that says so has been
+          * read. */
+         if (!sensors_writable() || !sensors_provenance_loaded())
+            no = 0;
+         for (int j = 0; j < no && did < ORPHAN_PER_LAUNCH; j++) {
             int id = orphans[j];
             /* Is it already one of the user's devices, and if not, what was
              * it? Two questions the registry answers for itself. A slot that
@@ -1315,6 +1364,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
             str_snapshot(ident, sizeof ident, have ? rec.identity : "");
             if (known || !have)
                continue;
+            did++;
             /* RETIRED, through the registry's own operation: these devices are
              * being restored from the provenance file as OLD ones, and
              * sensor_retire is what "old" means (it also drops the primary
@@ -1328,8 +1378,10 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
              * sensor -- when what it actually is is history recovered from a
              * provenance file. If the second half will not persist, the
              * first is undone. */
-            if (sensor_claim_slot(id, type, ident) >= 0 &&
-                sensor_retire(id) != SENSOR_OK) {
+            int claimed = sensor_claim_slot(id, type, ident);
+            if (claimed < 0)
+               LOGW("restored device %d could not claim a slot", id);
+            if (claimed >= 0 && sensor_retire(id) != SENSOR_OK) {
                LOGW("restored device %d could not be marked old", id);
                /* THE CLAIM PERSISTED AND THE RETIREMENT DID NOT, so the slot
                 * is LIVE -- the alarm watches it and the big number can bind
@@ -1380,7 +1432,7 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
        * the history is whole, the correction applied to it is not. */
       if (calib_load() != CALIB_OK) {
          LOGW("startup: the calibration or rescale state could not be read");
-         set_status("CALIBRATION STATE LOST");
+         set_status_refused("CALIBRATION STATE LOST");
       }
       lr = load_worse(lr, code_load());
       /* DEGRADED STORAGE IS NOT A FIRST RUN, and this is where the two stop
@@ -1400,10 +1452,10 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
       if (lr == LOAD_ERROR) {
          LOGW("startup: saved data could NOT BE READ (%s)",
               load_result_name(lr));
-         set_status("SAVED DATA NOT READ");
+         set_status_refused("SAVED DATA NOT READ");
       } else if (lr == LOAD_CORRUPT) {
          LOGW("startup: saved data was INCOMPLETE (%s)", load_result_name(lr));
-         set_status("SAVED DATA INCOMPLETE");
+         set_status_refused("SAVED DATA INCOMPLETE");
       }
       /* ...and the orientation AFTER settings_load(), for the same reason:
        * a copy from before it is the default, so the phone would ignore the
@@ -1443,7 +1495,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     *
     * Re-arming it on each activity launch means opening the app to see why
     * the alarm is sounding silences it: the next heartbeat recomputes
-    * grace = 1, drops g_disc_alarmed, and alarm_apply issues a silence --
+    * grace = 1, drops g_disc_alarmed, and alarm_apply_ex issues a silence --
     * then refuses to re-raise for the whole threshold (up to 60 min) with
     * the sensor still dead. The service keeps running across activity
     * destruction, so the grace period must not restart with the UI. */
@@ -1464,11 +1516,11 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
    cctx.nhist  = hist_count_ptr();
    /* ---- AND WHETHER THE HANDLER IS ACTUALLY THERE ----------
     *
-    * This call was void and every signal() result inside it was dropped, so
-    * this line "installed crash reporting" whether or not any of it took.
-    * The failure that produces is invisible by construction: the app dies,
-    * there is no crash.log, and nothing anywhere says the handler was never
-    * installed -- which is the one fact that would explain the missing file.
+    * THE ANSWER IS READ. A void install that drops every signal() result
+    * "installs crash reporting" whether or not any of it took, and the failure
+    * that produces is invisible by construction: the app dies, there is no
+    * crash.log, and nothing anywhere says the handler was never installed --
+    * which is the one fact that would explain the missing file.
     *
     * PARTIAL COVERAGE IS KEPT AND NAMED. A handler that IS in place still
     * writes a report for its own signal; what the log says is which signals
@@ -1485,7 +1537,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
                  "will leave no crash.log",
                  crash_sig_of(b));
       if (!ci.installed)
-         set_status("NO CRASH REPORTING");
+         set_status_refused("NO CRASH REPORTING");
    }
 
    /* local timezone offset (seconds), for on-screen timestamps */
@@ -1536,7 +1588,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * service outlives the activity, so closing the app from the task switcher
     * destroys the activity while the PROCESS survives with nav still holding
     * whatever menu was open; reopening from the notification then re-enters
-    * here and lands back on it. Nothing was restored -- it was simply never
+    * here and lands back on it -- nothing restored it, it was simply never
     * left.
     *
     * SAFE ON EVERY onCreate because the manifest declares configChanges for

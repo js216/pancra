@@ -31,7 +31,7 @@ struct ANativeActivity;
  * launch grace early and announces a disconnected sensor over data that was
  * merely waiting for its first sync; backward extends the grace, and the
  * grace SUPPRESSES the alarm, so the user's DISCONNECT alarm is switched off
- * for as long as the skew lasts. See clock.h, and `make clockcheck`. */
+ * for as long as the skew lasts. See clock.h. */
 long shell_launch_mono(void);
 
 /* Something the SCREEN shows has changed: rebuild the text lines on the next

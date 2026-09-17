@@ -103,12 +103,12 @@ enum tls_clock {
 static enum tls_clock tls_mono_s(uint64_t *out)
 {
 #ifdef TLS_FAULTS
-   /* ---- A CLOCK THAT FAILS ON DEMAND, for the test build only ----------
+   /* ---- A CLOCK THAT FAILS ON DEMAND, fault-injection builds only ------
     *
     * NOT COMPILED INTO A SHIPPING BINARY: the whole block is behind
-    * -DTLS_FAULTS, which only the cryptotest recipe sets (see the Makefile),
-    * exactly as -DDB_FAULTS gates srv/db.c's injected prepare and commit
-    * failures and -DAPP_FAULTS gates the app's.
+    * -DTLS_FAULTS, which nothing that ships defines, exactly as -DDB_FAULTS
+    * gates srv/db.c's injected prepare and commit failures and -DAPP_FAULTS
+    * gates the app's.
     *
     * It exists because clock_gettime(CLOCK_MONOTONIC) does not fail on any
     * machine a test runs on, so the rule above -- refuse rather than read the

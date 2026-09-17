@@ -95,14 +95,12 @@ struct sync_ctx;
  *
  * THE FILE AND THE WIRE ARE UNAFFECTED: decimal digits either way, so a phone
  * parses its own stored rows and the server's answers identically. What the
- * types buy is that a 32-bit host is not a silent 2038 bug. `make -f
- * test/Makefile
- * wirecheck` compiles these units for ILP32 to prove it, and that compile is
- * the only thing that can SEE a leftover %ld -- on LP64, %ld and PRIwire are
- * the same three characters.
+ * types buy is that a 32-bit host is not a silent 2038 bug. Compiling these
+ * units for ILP32 is the only thing that can SEE a leftover %ld -- on LP64,
+ * %ld and PRIwire are the same three characters.
  *
- * The shipped artifact is still arm64-v8a alone (apkcheck.sh refuses a
- * package with any other ABI). That is a packaging fact now, not a
+ * The shipped artifact is arm64-v8a alone: the Makefile builds exactly one
+ * lib/<abi> directory into the package. That is a packaging fact, not a
  * correctness one. */
 
 /* WHAT THE WIRE ALLOWS, AND WHAT THIS PHONE HOLDS, are two different claims
@@ -134,10 +132,9 @@ _Static_assert(SYNC_KEY_LEN == 16, "the pairing key is 128 bits on this wire");
  * from the wire. These build the path or fail; they never truncate one, and a
  * truncated path is a DIFFERENT bucket, not a broken request.
  *
- * Exported because test/app/interoptest.c checks them against the paths the
- * route vectors name: the vectors are only worth anything if the shipping
- * code is what produces those bytes. Returns the length, or 0 if it would
- * not fit. */
+ * Exported so they can be checked against the paths the route vectors name:
+ * the vectors are only worth anything if the shipping code is what produces
+ * those bytes. Returns the length, or 0 if it would not fit. */
 int sync_path_bucket(char *out, size_t cap, const char *log, int64_t bucket);
 int sync_path_digest(char *out, size_t cap, const char *log);
 
@@ -154,9 +151,8 @@ int sync_path_digest(char *out, size_t cap, const char *log);
  * THE CONSTRUCTION AND THE LABELS ARE lib/pairtag.h's NOW: this
  * side and the server's had a copy each, four places for one twelve-line
  * rule. What is still independent -- deliberately -- is the VECTORS:
- * lib/wirevec.h pins the tags for one fixed key, and test/app/interoptest.c
- * holds the app's production path to them while test/srv/wiretest.c holds the
- * server's. */
+ * lib/wirevec.h pins the tags for one fixed key, and each side reaches them
+ * by its own production path. */
 
 /* THE EXACT BYTES THIS APP TAKES A REQUEST MAC OVER:
  *
@@ -185,7 +181,7 @@ int sync_signing_string(char *out, size_t cap, const char *method,
  * ordinary situations (a same-second restart, a clock correction) that the
  * old clock-and-counter nonce could not survive.
  *
- * Exported for the test, which is the only way to assert the invariant. */
+ * Exported so the invariant can be asserted from outside. */
 int sync_nonce(char *out, int cap);
 
 /* The transport, supplied by the caller: Java's HttpsURLConnection on the

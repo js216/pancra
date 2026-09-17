@@ -16,8 +16,7 @@
  * They share exactly what is below, and this header is the whole of it. It is
  * NOT a public header: app/dexdriver.h is what the rest of the app sees, and
  * nothing outside these two files may include this one -- the whole point of
- * the split is that the driver's state is not lent out. `make -f test/Makefile
- * inclusions` holds that line.
+ * the split is that the driver's state is not lent out.
  *
  * THE LOCK IS NOT HERE. It lives in dexlink.c, private to it, and everything
  * this header declares is either taken under it (driver_enter) or explicitly
@@ -159,14 +158,13 @@ struct dex_ctx {
        * negative result is cast
        * to uint32_t and added to an unsigned clock. See sens_project_clock in
        * senslogic.h for exactly what the two directions did to the screen.
-       * `make clockcheck` names this field so it cannot quietly go back to the
-       * wall clock. */
+       * This is a MONOTONIC stamp; the wall clock is the wrong one for it. */
       long clock_m;
       /* WHEN THE LAST KEPT READING ARRIVED, ON BOTH CLOCKS. The field comment
        * on struct dex_session::last_rx in dexdriver.h is the whole story: .wall
        * is the instant that reading's row carries, .mono is what the silence
-       * watchdog ages, and neither can do the other's job. `make clockcheck`
-       * names last_rx.mono so it cannot quietly go back to the wall clock. */
+       * watchdog ages, and neither can do the other's job. last_rx.mono is
+       * MONOTONIC; the wall clock is the wrong one for it. */
       struct live_stamp last_rx;
       uint8_t state; /* raw session-state byte from the latest 4e --
                               logged and surfaced; during warmup the sensor

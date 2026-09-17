@@ -5,9 +5,9 @@
 /* The same arrangement as app/ndkabi.h, and for the same reason: these
  * assertions name neither declaration set, so they can be compiled twice --
  * against our freestanding declarations in every app build, and against the
- * OFFICIAL <time.h> and <sys/timerfd.h> of the pinned NDK by `make ndkcheck`
- * (test/app/sysofficial.c). A number that is true of one and not the other is
- * a compile error naming the member or the constant.
+ * OFFICIAL <time.h> and <sys/timerfd.h> of the pinned NDK. A number that is
+ * true of one and not the other is a compile error naming the member or the
+ * constant.
  *
  * The official side maps its own constants onto these names before including
  * this file, so an assertion here is a statement about BOTH -- not about a

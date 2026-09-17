@@ -9,7 +9,9 @@
 #include "log.h"
 #include "sensors.h"
 #include "shell.h"
-#include "stats.h" /* stat_reload: a restore rewrote the readings log */
+#include "stats.h" /* stat_reload_prepare: a restore rewrote the readings log */
+#include "status.h" /* set_status: a short load on the restore path */
+#include "steps.h"  /* steps_load: steps.csv is restored like the rest */
 #include "store.h"
 #include "weight.h"
 
@@ -44,7 +46,14 @@
  * the same lock. */
 void pancra_logs_reload(void)
 {
-   sensors_load();
+   /* THE ANSWER IS NOT DISCARDED. This is the one path a MERGED slots.csv and
+    * a rewritten sensors.csv arrive on, so it is the likeliest place for
+    * either to come back short -- and a short load here silently turns the
+    * registry read-only, or blocks every new pairing, for the rest of the
+    * process. Startup says "HISTORY INCOMPLETE" for the same condition; a
+    * restore must not be quieter than a launch. */
+   if (sensors_load() < 0)
+      set_status_refused("REGISTRY INCOMPLETE");
    /* The primary BEFORE the history lock: registry -> history is the order,
     * and store_load needs the id to re-bind the big number. */
    int prime = sensor_primary_id();
@@ -55,7 +64,7 @@ void pancra_logs_reload(void)
     * hour is per-sensor, anchored on its activation), and the order is
     * driver -> registry -> history. Parsing under the history lock would take
     * the registry inside it -- the inversion behind two phone freezes in one
-    * day -- and test/app/lockorder.py refuses it. Publishing is a copy and
+    * day. Publishing is a copy and
     * two stores, no I/O and no other lock, so it belongs inside the very hold
     * store_load already takes: the restored history and the restored
     * statistics then become visible in the same instant, and no frame can
@@ -108,5 +117,12 @@ void pancra_logs_reload(void)
       LOGW("restore: the food log could not be re-read whole");
    if (exercise_load() < 0)
       LOGW("restore: the exercise log could not be re-read whole");
+   /* STEPS IS A RESTORED LOG TOO, and re-reading it is not optional for the
+    * same reason as the other four: syncjni_register_logs restores steps.csv,
+    * and without this the tail in memory is still the one read at launch. The
+    * EXERCISE LOG's step plot and the day's total then understate the record
+    * until the next relaunch, with nothing on screen to say so. */
+   if (steps_load() < 0)
+      LOGW("restore: the step log could not be re-read whole");
    shell_ui_dirty();
 }

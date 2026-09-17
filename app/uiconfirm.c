@@ -284,20 +284,64 @@ void render_pendcancel(struct ANativeWindow_Buffer *fb, const struct screen *m,
       return;
 
    int rx = fb->width - (4 * sc);
-   (void)draw_title_fit(px, fb, x, y, tsc, "STOP WAITING?", UI_TEXT,
+   /* THE SCREEN IS ABOUT THE PENDING PAIRING, and stopping it is one of the
+    * two things it offers -- so it is titled for the wait it reports on,
+    * not for the destructive half of itself. */
+   (void)draw_title_fit(px, fb, x, y, tsc, "CGM PENDING", UI_TEXT,
                         rx - x - (7 * tsc));
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT); /* close = keep */
    y += 2 * lh;
    draw_str(px, fb, x, y, sc, sensor_disp_name(m->dev.pend_type), UI_TEXT);
    y += 2 * lh;
+   /* THE CODE THAT WAS TYPED. This is the screen a pairing that is not
+    * happening gets questioned on, and a mistyped applicator code is the
+    * commonest reason for it: a sensor simply never answers a wrong one, so
+    * the wait looks identical to a sensor that is out of range. Nothing else
+    * on any screen shows the code back, which leaves reading it off the
+    * applicator again as the only way to check four digits. */
+   if (m->dev.code && m->dev.code[0]) {
+      char cl[24];
+      (void)snprintf(cl, sizeof cl, "CODE %s", m->dev.code);
+      draw_str(px, fb, x, y, sc, cl, UI_TEXT);
+      y += lh;
+   }
+   /* WHEN THE CODE WAS ENTERED, AND HOW LONG AGO. A wait with no elapsed time
+    * on it looks exactly like a wait that is not running, which is what sends
+    * a user back to re-enter a code that was already accepted. */
+   if (m->dev.pend_since > 0) {
+      char when[20];
+      char ago[12];
+      char wl[40];
+      fmt_date(m->dev.pend_since, m->tz_off, when, sizeof when);
+      fmt_ago(m->now, m->dev.pend_since, ago, sizeof ago);
+      (void)snprintf(wl, sizeof wl, "SINCE %s (%s)", when, ago);
+      draw_str(px, fb, x, y, sc, wl, UI_MUTED);
+      y += 2 * lh;
+   } else {
+      y += lh;
+   }
+   /* SEVERAL ON THE AIR IS A DIFFERENT WAIT: the app is not looking for a
+    * sensor, it is waiting for the user to say which one. */
+   static const char *const many[] = {
+       "SEVERAL SENSORS ARE ON THE",
+       "AIR AND THE APP WILL NOT",
+       "GUESS. PICK ONE IN DEVICES.",
+   };
    static const char *const note[] = {
        "THE APP IS WAITING FOR THIS",
        "SENSOR TO COME ON THE AIR,",
        "AND PAIRS IT WHEN IT DOES.",
    };
-   for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
-      draw_str(px, fb, x, y, sc, note[i], UI_MUTED);
-      y += lh;
+   if (m->dev.pend_seen >= 2) {
+      for (int i = 0; i < (int)(sizeof many / sizeof many[0]); i++) {
+         draw_str(px, fb, x, y, sc, many[i], UI_WARN);
+         y += lh;
+      }
+   } else {
+      for (int i = 0; i < (int)(sizeof note / sizeof note[0]); i++) {
+         draw_str(px, fb, x, y, sc, note[i], UI_MUTED);
+         y += lh;
+      }
    }
    y += lh;
    draw_str(px, fb, x, y, sc, "STOPPING MEANS TYPING THE", UI_MUTED);

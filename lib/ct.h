@@ -67,10 +67,10 @@ void ct_wipe(void *p, size_t n);
  * They are `static inline` in the header deliberately, for two reasons. Every
  * caller sits inside a loop that runs thousands of times per handshake, so a
  * function call per limb would cost more than the branch it replaces. And
- * several link lines (see the Makefile: modeltest, interoptest) compile
- * lib/p256.c WITHOUT lib/ct.c, so defining these in ct.c would quietly make
- * ct.o a new link-time dependency of the curve code for binaries that have
- * never needed it. A header-only definition has no such reach. */
+ * some link lines compile lib/p256.c WITHOUT lib/ct.c, so defining these in
+ * ct.c would quietly make ct.o a new link-time dependency of the curve code
+ * for binaries that have never needed it. A header-only definition has no
+ * such reach. */
 
 /* 0 -> 0, 1 -> all ones. Anything else is a caller bug. */
 static inline uint64_t ct_mask64(uint64_t c)

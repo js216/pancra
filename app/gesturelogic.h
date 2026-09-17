@@ -24,9 +24,8 @@
  * decision over four small integers, it is where this class of bug lives, and
  * nothing in the Android shell is reachable by any test. The one thing the
  * host stubs cannot express is a second finger (see stub_android.c), which is
- * precisely the case that matters -- so the decision is lifted out to where a
- * test can hand it as many fingers as it likes, in any slot order. See
- * test/app/gesturetest.c.
+ * precisely the case that matters -- so the decision is lifted out to where
+ * it can be handed as many fingers as one likes, in any slot order.
  *
  * Pure: no globals, no clock, no event, no JNI. The caller reads the pointer
  * ids out of the event and passes them in; it holds the latch and updates it

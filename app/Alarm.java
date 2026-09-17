@@ -229,19 +229,25 @@ public final class Alarm {
     private static final int NUDGE_AMP = 17000;   /* softer than the chirp */
     private static android.media.AudioTrack nudgeTrack;
 
-    /* One enveloped sine note written into pcm[off..off+n). The raised-cosine
-     * fade on each end is what keeps the note from clicking; the chirp learned
-     * that the same way. */
-    private static void note(short[] pcm, int off, int n, double hz, int rate) {
-        int fade = rate / 125;                    /* 8 ms of ramp each end */
+    /* One enveloped sine note of amplitude `amp` written into pcm[off..off+n).
+     * The raised-cosine fade on each end is what keeps the note from clicking;
+     * the chirp learned that the same way. The ramp is capped at a quarter of
+     * the note so a short one still reaches full amplitude in the middle: a
+     * Morse dit is 48 ms, and an 8 ms ramp on each end of it would spend a
+     * third of the note ramping. */
+    private static void note(short[] pcm, int off, int n, double hz, int rate,
+                             int amp) {
+        int fade = Math.min(rate / 125, n / 4);   /* up to 8 ms each end */
         double phase = 0;
         for (int i = 0; i < n; i++) {
             phase += (2.0 * Math.PI * hz) / rate;
             double a = 1.0;
-            if (i < fade) a = 0.5 - (0.5 * Math.cos((Math.PI * i) / fade));
-            else if (i > n - fade)
-                a = 0.5 - (0.5 * Math.cos((Math.PI * (n - i)) / fade));
-            pcm[off + i] = (short) (Math.sin(phase) * a * NUDGE_AMP);
+            if (fade > 0) {
+                if (i < fade) a = 0.5 - (0.5 * Math.cos((Math.PI * i) / fade));
+                else if (i > n - fade)
+                    a = 0.5 - (0.5 * Math.cos((Math.PI * (n - i)) / fade));
+            }
+            pcm[off + i] = (short) (Math.sin(phase) * a * amp);
         }
     }
 
@@ -263,8 +269,8 @@ public final class Alarm {
                 }
                 double first = (kind == KIND_LOW) ? NUDGE_HI_HZ : NUDGE_LO_HZ;
                 double second = (kind == KIND_LOW) ? NUDGE_LO_HZ : NUDGE_HI_HZ;
-                note(pcm, 0, nn, first, rate);
-                note(pcm, nn + ng, nn, second, rate);
+                note(pcm, 0, nn, first, rate, NUDGE_AMP);
+                note(pcm, nn + ng, nn, second, rate, NUDGE_AMP);
                 android.media.AudioTrack tr = playPcm(pcm, rate, "nudge", AudioAttributes.USAGE_ALARM);
                 if (tr != null) {
                     if (nudgeTrack != null) {
@@ -287,6 +293,89 @@ public final class Alarm {
         } catch (Throwable t) { Log.i("pancra", "nudge (vibrate): " + t); }
     }
 
+    /* MORSE: the reading keyed out, so the number itself can be heard.
+     *
+     * `elems` is what morse_encode (app/alarmlogic.h) produced -- '.' a dit,
+     * '-' a dah, ' ' the gap between two characters. THE MAPPING IS C'S AND
+     * THE TEMPO IS THIS FILE'S, the same division of labour the chirp uses:
+     * which dits spell a 7 is decidable off the phone, how long a dit lasts
+     * is not.
+     *
+     * The unit of time is the PARIS dit, 1200/wpm milliseconds -- 48 ms at
+     * 25 WPM. From it the whole of Morse timing follows: a dah is three dits,
+     * elements within a character are one dit apart, and characters three.
+     * Each element is therefore written as its tone plus ONE dit of trailing
+     * silence, and a ' ' adds the two that bring that gap up to three.
+     *
+     * The pitch is the beep's, so MORSE is recognisably the same voice as the
+     * other two new-datapoint modes and not a second kind of event. It rides
+     * on USAGE_MEDIA for the same reason the chirp does: it is ambient, it
+     * arrives with a reading, and it is not announcing a threshold -- see
+     * playPcm, which explains why anything that IS goes to USAGE_ALARM.
+     *
+     * Called on a BLE binder thread, so nothing here blocks: the whole
+     * message is synthesised into one buffer and handed to the mixer at once.
+     * At 25 WPM a three-digit reading runs about three seconds. */
+    private static final int MORSE_WPM = 25;
+    private static final int MORSE_DIT_MS = 1200 / MORSE_WPM;
+    private static final int MORSE_PAD_MS = 40;   /* see CHIRP_PAD_MS */
+    private static final int MORSE_AMP = 26000;   /* == the chirp's */
+    /* What a sane message can cost, in dit units of tone and silence. The
+     * longest value the app can key ("-555.4") needs under 150 of them; past
+     * this something has gone wrong upstream, and the answer is a log line
+     * rather than a minute of beeping and a buffer to match. */
+    private static final int MORSE_MAX_UNITS = 512;
+    private static android.media.AudioTrack morseTrack;
+
+    public static synchronized void morse(Context ctx, String elems) {
+        try {
+            if (elems == null) return;
+            final int rate = 22050;
+            final int dit = (rate * MORSE_DIT_MS) / 1000;
+            /* Measure first, then render: the buffer has to be exact, and
+             * the two loops must read the string the same way -- so both
+             * reject anything that is not an element rather than one of them
+             * skipping what the other counted. */
+            int units = 0;
+            for (int i = 0; i < elems.length(); i++) {
+                char c = elems.charAt(i);
+                if (c == '.') units += 2;        /* 1 tone + 1 gap */
+                else if (c == '-') units += 4;   /* 3 tone + 1 gap */
+                else if (c == ' ') units += 2;   /* the gap up to 3 */
+                else {
+                    Log.i("pancra", "morse: not an element: " + c);
+                    return;
+                }
+            }
+            if (units == 0 || units > MORSE_MAX_UNITS) {
+                Log.i("pancra", "morse: refusing " + units + " units");
+                return;
+            }
+            int pad = (rate * MORSE_PAD_MS) / 1000;
+            short[] pcm = new short[(units * dit) + pad]; /* gaps stay zero */
+            int off = 0;
+            for (int i = 0; i < elems.length(); i++) {
+                char c = elems.charAt(i);
+                if (c == '.') {
+                    note(pcm, off, dit, CHIRP_HZ, rate, MORSE_AMP);
+                    off += 2 * dit;
+                } else if (c == '-') {
+                    note(pcm, off, 3 * dit, CHIRP_HZ, rate, MORSE_AMP);
+                    off += 4 * dit;
+                } else {
+                    off += 2 * dit;
+                }
+            }
+            android.media.AudioTrack tr = playPcm(pcm, rate, "morse", AudioAttributes.USAGE_MEDIA);
+            if (tr == null) return;
+            /* Release the PREVIOUS track, never this one -- see playPcm. */
+            if (morseTrack != null) {
+                try { morseTrack.release(); } catch (Throwable x) {}
+            }
+            morseTrack = tr;
+        } catch (Throwable t) { Log.i("pancra", "morse: " + t); }
+    }
+
     private static void ensureChannel(NotificationManager nm) {
         if (nm.getNotificationChannel(CH) != null) return;
         NotificationChannel c = new NotificationChannel(CH, "Glucose alarm",
@@ -306,8 +395,8 @@ public final class Alarm {
      * not recognise announced a hypoglycaemic emergency. A fourth alarm added
      * on the C side would have done exactly that.
      *
-     * Named here, named AJ_* there, and `make -f test/Makefile javacheck`
-     * compares the two lists literally, so neither can move alone. */
+     * Named here, named AJ_* there. The two lists are one list written
+     * twice, so neither may move alone. */
     public static final int KIND_LOW   = 0;
     public static final int KIND_HIGH  = 1;
     public static final int KIND_STALE = 2;

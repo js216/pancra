@@ -26,10 +26,9 @@
  *   THE VIEW      one struct calib_view, filled by both halves.
  *
  * EVERY NAME HERE IS cal_. Not because the prefix is pretty: this header
- * speaks for three translation units, and `make -f test/Makefile inclusions`
- * refuses a header that collects several modules' declarations UNLESS they
- * are one named contract -- which is exactly what this is, and the single
- * prefix is how that is checked mechanically rather than asserted.
+ * speaks for three translation units, and a header that collects several
+ * modules' declarations is only legitimate when they are ONE named contract
+ * -- which is exactly what this is, and the single prefix is what says so.
  *
  * NOT PUBLIC. app/calib.h is what the rest of the app sees. Nothing outside
  * these three files may include this one.
@@ -42,8 +41,7 @@
 /* NOT #include "calib.h". The public header is what the rest of the app sees,
  * and every one of these three files includes it directly; including it from
  * here as well would make the private header and the public one one node in
- * the include graph, which is a cycle (`make -f test/Makefile inclusions`
- * says so). A pointer needs no definition. */
+ * the include graph, which is a cycle. A pointer needs no definition. */
 struct calib_view;
 
 /* ---- THE LOCK, WHICH IS THE COORDINATOR'S ---------------------------

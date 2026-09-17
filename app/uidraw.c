@@ -9,8 +9,10 @@
 #include "exercise.h" /* EX_MAX_LEVEL: the button draws its own level */
 #include "font.h"
 #include "insrow.h"
+#include "log.h" /* LOGW: a touch target that could not be recorded */
 #include "ndk.h"
 #include "sensors.h"
+#include "stats.h" /* STAT_TIR_LO/HI: the in-range band this colours by */
 #include "style.h"
 #include "uiact.h"
 #include "uifmt.h"
@@ -56,9 +58,9 @@ static void draw_cell(uint32_t *px, const struct ANativeWindow_Buffer *buf,
       x1 = buf->width;
    if (y1 > buf->height)
       y1 = buf->height;
-   /* WHAT FELL OUTSIDE, counted exactly as the per-pixel test counted it: the
-    * cell's area less the part that landed. ui_clip_bump is what the tests
-    * read to say a glyph was cut off, so this number is load-bearing. */
+   /* WHAT FELL OUTSIDE: the cell's area less the part that landed. This is
+    * the only record that a glyph was cut off, so the number is
+    * load-bearing. */
    int vw   = x1 - x0;
    int vh   = y1 - y0;
    long vis = (vw > 0 && vh > 0) ? (long)vw * vh : 0;
@@ -102,9 +104,8 @@ void draw_frame(uint32_t *px, const struct ANativeWindow_Buffer *buf, int x,
    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > buf->width ||
        y + h > buf->height) {
       /* Count it. A frame that does not fit vanishes ENTIRELY and silently --
-       * key boxes, DEL/OK, the gate's CONTINUE button. draw_cell's counter
-       * never saw this path, which is why a keypad whose key frames had all
-       * disappeared still reported zero clipped cells. */
+       * key boxes, DEL/OK, the gate's CONTINUE button -- and it draws no
+       * glyphs, so the per-cell count says nothing about it. */
       ui_clip_bump(1);
       return;
    }
@@ -217,11 +218,31 @@ int add_hit(struct hits *h, struct ui_rect r, int kind, int arg)
    const int y   = r.y;
    const int w   = r.w;
    const int hgt = r.h;
+   /* A BOX WITH NO AREA IS A CONTROL NOBODY CAN TAP, and it is invisible to
+    * both instruments this file keeps: the clip counter never sees it, because
+    * a hit box is not drawn, and the overflow flag never sees it, because it
+    * fits. Counted as clipping, it becomes something the log says. */
+   if (w <= 0 || hgt <= 0) {
+      ui_clip_bump(1);
+      return UI_HIT_DROPPED;
+   }
    if (h->n >= UI_MAX_HITS) {
       /* LOUD, not silent. A dropped box draws normally and is dead to
        * touch, which is indistinguishable from a control that simply does
        * not work -- exactly the failure the keypad-title fallthrough had.
-       * uitest gates on this staying clear at every screen and geometry. */
+       * This must stay clear at every screen and geometry.
+       *
+       * SAID IN THE LOG, ONCE PER PROCESS. `overflow` is
+       * a flag on a frame nothing outside the renderer reads, so on its own
+       * it makes nothing loud at all; a line here is what turns a dead
+       * control into something a reader can find. */
+      static int said;
+      if (!said) {
+         said = 1;
+         LOGW("ui: more touch targets than the %d this build records; "
+              "controls on this screen are drawn and cannot be tapped",
+              UI_MAX_HITS);
+      }
       h->overflow = 1;
       return UI_HIT_DROPPED;
    }
@@ -719,8 +740,8 @@ const char *sensor_disp_name(int type)
    }
 }
 
-/* UI_DEV_ABOVE -- the rows the DEVICES screen spends outside its list -- lives
- * in ui.h, so test/uitest.c reads the same definition. See there for why. */
+/* UI_DEV_ABOVE -- the rows the DEVICES screen spends outside its list --
+ * lives in ui.h, so there is one definition of it. See there for why. */
 
 /* Layout scale for the DEVICES screen.
  *
@@ -750,6 +771,22 @@ int ui_fit_scale(int w, int h, int rows)
    if (vsc < 1)
       vsc = 1;
    return vsc < sc ? vsc : sc;
+}
+
+int ui_screen_too_short(int w, int h, int rows)
+{
+   /* WHAT ui_fit_scale's FLOOR HIDES. It clamps the vertical scale to 1 so a
+    * caller always gets a usable number, which means "does not fit" comes back
+    * as "fits at the smallest size" -- and the renderer then lays its rows out
+    * past the bottom of the surface, where draw_str and draw_frame drop them
+    * silently. A control below the cut is drawn nowhere and answers no tap.
+    *
+    * The same expression ui_fit_scale evaluates, asked BEFORE the clamp: a
+    * screen fits `rows` lines only if the height it leaves covers them at
+    * scale 1. Callers that spend many rows and end on a button ask this first
+    * and say so, the way render_devices does for its list. */
+   (void)w;
+   return (h - (h / 20)) < (8 + (rows * 16));
 }
 
 int ui_devices_scale(int w, int h)
@@ -786,6 +823,16 @@ int ui_sensor_capacity(int w, int h)
     * dividing by the bare line height would promise more rows than fit and
     * push the ADD button off the bottom. */
    int n = avail / UI_DEV_PITCH(sc);
+   /* The hit clamp below is always the tighter of the two at every supported
+    * geometry, so the UI_MAX_SLOTS clamp at the end is a bound on the type
+    * rather than a limit anything reaches. */
+   /* AND BY THE HIT TABLE, not only by the height. A tall screen fits more
+    * device rows than add_hit can record targets for, and the excess is
+    * drawn normally and dead to touch -- taking the pager and ADD NEW DEVICE
+    * with it, because they are recorded after the rows. See uiact.h. */
+   int byhits = (UI_MAX_HITS - UI_DEV_FIXED_HITS) / UI_DEV_HITS_PER_ROW;
+   if (n > byhits)
+      n = byhits;
    return n > UI_MAX_SLOTS ? UI_MAX_SLOTS : n;
 }
 
@@ -926,8 +973,8 @@ int ui_unpaired_count(const struct screen *m)
    if (!m)
       return 0;
    for (int i = 0; i < m->dev.nsensors; i++)
-      if (m->dev.sensors[i].kind == KIND_CGM && !m->dev.sensors[i].old &&
-          m->dev.sensors[i].bond == UI_BOND_NONE)
+      if (m->dev.sensors[i].have_rec && m->dev.sensors[i].kind == KIND_CGM &&
+          !m->dev.sensors[i].old && m->dev.sensors[i].bond == UI_BOND_NONE)
          n++;
    return n;
 }
@@ -1004,14 +1051,13 @@ void fmt_thresh(int mgdl, int units, int ishigh, char *out, int n)
 
 /* ONE ROW FOR ALL FOUR THRESHOLDS, and the arrows are what makes it one.
  *
- * It was two: an ALARM row and a NUDGE row, each spelling "LOW" and "HIGH".
- * Four numbers that describe ONE axis were split across two lines, each line
- * spending half its width on words, and reading "is 110 the nudge or the
- * alarm" meant looking at which row it sat on. Ordered low to high with the
- * count of arrows saying how far out the band is -- two down, one down, one
- * up, two up -- the four read as the scale they actually are, and the row
- * they used to need is what the second and third rows of shortcut buttons are
- * drawn in.
+ * ONE ROW, NOT TWO. The four thresholds describe ONE axis, so an ALARM row
+ * and a NUDGE row spelling "LOW" and "HIGH" split a single scale across two
+ * lines, spend half of each line on words, and make "is 110 the nudge or the
+ * alarm" a question about which row a number sits on. Ordered low to high
+ * with the count of arrows saying how far out the band is -- two down, one
+ * down, one up, two up -- the four read as the scale they are, in one line,
+ * and the second line is what the shortcut buttons below are drawn in.
  *
  * THE SYMBOLS ARE THE ALARM'S ONLY. Sound, vibration and the disconnect
  * alarm are alarm outputs; the dot is NEW DATAPOINT. The nudge has its own
@@ -1217,11 +1263,11 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
 
 /* ALL FOUR BUTTONS, ALWAYS, AND GREYED WHEN THEY HAVE NOWHERE TO GO.
  *
- * They used to appear and disappear: at page one there was no "<" at all, so
- * the row's controls moved under the finger as you paged, and "am I at the
- * start" had to be inferred from a missing glyph. A control that is present
- * but dim says the same thing without moving anything, and the four cells
- * give the counter a fixed place to sit between them.
+ * Hiding a button that has nowhere to go moves the row's controls under the
+ * finger as the user pages, and makes "am I at the start" something to infer
+ * from a missing glyph. A control that is present but dim says the same thing
+ * without moving anything, and the four cells give the counter a fixed place
+ * to sit between them.
  *
  * FIRST AND LAST EARN THEIR PLACE on the logs, where the page count runs to
  * twenty-five: stepping back to the newest entries one page at a time is not
@@ -1280,14 +1326,6 @@ void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
    char pg[24];
    (void)snprintf(pg, sizeof pg, "%d/%d", page + 1, npages);
    draw_str(px, fb, (x + rx - (str_len(pg) * 6 * sc)) / 2, y, sc, pg, UI_MUTED);
-}
-
-int fit_scale(const char *s, int maxw, int min, int max)
-{
-   int t = max;
-   while (t > min && ((str_len(s) * 6) - 1) * t > maxw)
-      t--;
-   return t;
 }
 
 /* One "LOW"/"HIGH" row in the ALARM submenu: the value in display units, or
@@ -1357,8 +1395,8 @@ const char *const ui_orient_lbl[] = {"PORTRAIT", "LANDSCAPE", "GRAVITY",
                                      "SYSTEM"};
 /* Must match disc_min[] in alarm.c -- these are the labels for those values. */
 const char *const ui_disc_lbl[] = {"OFF", "15 MIN", "30 MIN", "60 MIN"};
-/* Indexed by ND_OFF / ND_BEEP / ND_CHIRP. */
-const char *const ui_newdata_lbl[] = {"OFF", "BEEP", "CHIRP"};
+/* Indexed by ND_OFF / ND_BEEP / ND_CHIRP / ND_MORSE; ND_MODE_N entries. */
+const char *const ui_newdata_lbl[] = {"OFF", "BEEP", "CHIRP", "MORSE"};
 
 void ui_span_label(int hours, char *out, int n)
 {
@@ -1389,16 +1427,30 @@ void fmt_rescale_pct(int pm, char *out, int n)
    (void)snprintf(out, n, "%c%d.%d%%", (d < 0) ? '-' : '+', a / 10, a % 10);
 }
 
-/* big-number colour by fixed medical range (0xAABBGGRR) */
+/* THE BIG NUMBER'S COLOUR ON THE FIXED MEDICAL SCALE (0xAABBGGRR).
+ *
+ * THE IN-RANGE BAND IS stats.h's, NOT A SECOND COPY OF IT, and it is inclusive
+ * at both ends exactly as stat_in_range is. Written out here as literals the
+ * two drift: a reading of 180 counted towards the time-in-range figure while
+ * the headline number had already turned white, so the app said "in range" in
+ * the table and "high" in the one number the user actually looks at, about the
+ * same reading -- and the boundary it disagreed on was the published consensus
+ * number itself.
+ *
+ * THIS IS THE FIXED SCALE ONLY. A user whose high alarm sits at or below 180
+ * still sees the alarm colour there, because glu_color_band applies the
+ * configured band on top of this and only ever in the direction of MORE alarm;
+ * and the alarm itself is alarm_zone's business, which reaches AL_HIGH at
+ * `glu >= hi` whatever any of this draws. */
 uint32_t glu_color(int g)
 {
    if (g < 50)
-      return UI_GLU_LOW; /* under 50 */
-   if (g < 70)
-      return UI_GLU_SOFT; /* 50..70   */
-   if (g < 180)
-      return UI_GLU_MID; /* 70..180  */
-   return UI_GLU_HIGH;   /* over 180 */
+      return UI_GLU_LOW; /* under 50            */
+   if (g < STAT_TIR_LO)
+      return UI_GLU_SOFT; /* 50 to under 70      */
+   if (g <= STAT_TIR_HI)
+      return UI_GLU_MID; /* 70 to 180 inclusive */
+   return UI_GLU_HIGH;   /* above 180           */
 }
 
 int thresh_off(int mgdl, int ishigh)

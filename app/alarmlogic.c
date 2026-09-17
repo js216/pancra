@@ -30,9 +30,9 @@ enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi)
 
 enum nudge_mode nudge_mode_of(int stored)
 {
-   /* NAMED, NOT RANGE-CHECKED. `stored >= ND_OFF && stored <= ND_CHIRP` is
-    * the same answer today and stops being one the moment a fourth mode is
-    * added out of order; and it reads as arithmetic on a type that has no
+   /* NAMED, NOT RANGE-CHECKED. `stored >= ND_OFF && stored <= ND_MORSE` is
+    * the same answer today and stops being one the moment a mode is added
+    * out of order; and it reads as arithmetic on a type that has no
     * arithmetic. Anything unrecognised is ND_OFF: a settings file written by
     * a future version, or edited by hand, must not sound something nothing
     * here can describe. */
@@ -40,6 +40,8 @@ enum nudge_mode nudge_mode_of(int stored)
       return ND_BEEP;
    if (stored == ND_CHIRP)
       return ND_CHIRP;
+   if (stored == ND_MORSE)
+      return ND_MORSE;
    return ND_OFF;
 }
 
@@ -49,6 +51,8 @@ enum nudge_mode nudge_mode_next(enum nudge_mode m)
       return ND_BEEP;
    if (m == ND_BEEP)
       return ND_CHIRP;
+   if (m == ND_CHIRP)
+      return ND_MORSE;
    return ND_OFF;
 }
 
@@ -63,6 +67,62 @@ int chirp_semitone10(int delta_mgdl)
    if (st10 < -cap)
       st10 = -cap;
    return st10;
+}
+
+/* International Morse for every character fmt_glu can write: the ten digits,
+ * the decimal point mmol/L carries, and the minus sign the formatter's clamp
+ * can produce. A '.' in a code is a dit and a '-' a dah, which is why the
+ * two characters that are also SPELLED that way still need their own rows. */
+static const struct morse_row {
+   char ch;
+   const char *el;
+} morse_tbl[] = {
+    {'0', "-----"},  {'1', ".----"},  {'2', "..---"}, {'3', "...--"},
+    {'4', "....-"},  {'5', "....."},  {'6', "-...."}, {'7', "--..."},
+    {'8', "---.."},  {'9', "----."},  {'.', ".-.-.-"}, {'-', "-....-"}};
+#define MORSE_TBL_N ((int)(sizeof morse_tbl / sizeof morse_tbl[0]))
+
+static const char *morse_of(char ch)
+{
+   int k;
+   for (k = 0; k < MORSE_TBL_N; k++)
+      if (morse_tbl[k].ch == ch)
+         return morse_tbl[k].el;
+   return 0;
+}
+
+int morse_encode(const char *text, char *out, int n)
+{
+   int w = 0;
+   int i;
+
+   if (n < 1)
+      return 0;
+   for (i = 0; text[i]; i++) {
+      const char *el = morse_of(text[i]);
+      int j;
+
+      if (!el)
+         goto refuse;
+      if (w > 0) { /* three dits between characters: this is the extra two */
+         if (w + 1 >= n)
+            goto refuse;
+         out[w++] = ' ';
+      }
+      for (j = 0; el[j]; j++) {
+         if (w + 1 >= n) /* the +1 is the terminator's room */
+            goto refuse;
+         out[w++] = el[j];
+      }
+   }
+   out[w] = 0;
+   /* An empty text keys nothing and returns 0, which the caller reads as the
+    * refusal it is -- there is no such thing as a silent message here. */
+   return w;
+
+refuse:
+   out[0] = 0;
+   return 0;
 }
 
 enum nudge_band nudge_zone(int glu, long glu_t, long now, int lo, int hi)
@@ -205,8 +265,8 @@ bool alarm_stranded(int glu, long glu_t, long now, int lo, int hi)
    /* Only a stamp we can actually AGE hands this back to the zone rules. A
     * future-dated reading must NOT take this early return: the one rule that
     * keeps a ringing hypo alive through a dropout would switch itself off at
-    * the exact moment the data became untrustworthy, and alarm_want would
-    * return AL_NONE and SILENCE it. Refusing the future stamp means the
+    * the exact moment the data became untrustworthy, and alarm_want_sustained
+    * would return AL_NONE and SILENCE it. Refusing the future stamp means the
     * sustain applies; it can still only sustain, never originate. */
    if (data_fresh(now, glu_t, AL_FRESH_S))
       return false; /* still fresh: the zone rules apply */

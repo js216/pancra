@@ -75,8 +75,18 @@ static atomic_uint g_total;
  * pairing action. A release store on the writer alone does not order the
  * plain-load readers on ARM, and two threads doing read-modify-write on g_ndevs
  * (binder increment vs main reset) is a lost-update race no single atomic
- * closes. A tiny leaf lock -- taken alone, never nested inside another lock and
- * never held across a call that takes one -- fixes both. */
+ * closes. A tiny leaf lock -- never held across a call that takes another --
+ * fixes both.
+ *
+ * IT IS NESTED, INNERMOST, UNDER THE HISTORY LOCK. A frame holds the history
+ * lock across build_model, and fill_sensor asks pairing_adv_name for each
+ * device row, so this is taken and released inside that hold once per row.
+ * That is safe because nothing under this lock reaches for another -- every
+ * region below does string and clock work only -- so it cannot be half of a
+ * cycle. What it does cost is a spin: struct mutex has no timeout, so the
+ * main thread waits here while a binder advert thread holds it. The regions
+ * are a bounded walk of a table of at most a few dozen rows, which is what
+ * keeps that wait short. */
 static struct mutex g_devlist_lk = MUTEX_INIT;
 
 static void devlist_lock(void)
@@ -115,7 +125,47 @@ static atomic_int g_smart_pairing;
  * 0 = none), every menu closes, and the 1 Hz tick commits the pairing the
  * moment an unambiguous candidate appears. DEVICES shows a PENDING row
  * (tappable to cancel) so the armed state is visible, not mysterious. */
+/* THE NAME ANDROID KNOWS A DEVICE BY, for devices we have already registered.
+ *
+ * The candidate list only holds sensors that are NOT ours (that is what makes
+ * them candidates), so a registered sensor's advertised name is seen on every
+ * advert and kept nowhere. It is the name the Bluetooth settings list shows,
+ * which is the only thing tying a row in this app to a row in that one -- and
+ * the difference between forgetting the right bond and the wrong one.
+ *
+ * In memory only: it costs one advert to relearn, and a name recorded into
+ * the append-only provenance file would be a second identity for a device
+ * that already has one. Under the devlist lock, like every other field the
+ * binder advert path writes. */
+/* SIZED BY WHAT IS ON THE AIR, not by what the registry can hold. Every
+ * Dexcom in range is recorded, strangers included, and the table is searched
+ * once per advertisement on a binder thread -- so its length is a cost paid
+ * continuously, and a room with a hundred sensors in it must not make that
+ * walk a hundred long. Thirty-two is well past the number of Dexcoms within
+ * radio range of one phone.
+ *
+ * FULL MEANS REUSE THE OLDEST, round-robin, because there is nothing here to
+ * lose: one advertisement from that device puts its name straight back. */
+#define ADVNAME_MAX 32
+
+static struct {
+   char mac[20];
+   char name[9];
+} g_advname[ADVNAME_MAX];
+
+static int g_nadvname;
+static int g_advname_next; /* the seat the next unknown address takes */
+
 static int g_pend_pairing;
+/* WHEN the code was accepted, so the pending screen can say how long it has
+ * been waiting. A wait with no elapsed time on it is indistinguishable from a
+ * wait that is not happening, which is the complaint this answers. */
+static long g_pend_at;
+/* Whether this arm has already offered the candidate list. One arm asks once:
+ * the tie usually persists for as long as both sensors are on the air, and a
+ * screen that reopened every second would be unusable. Cleared wherever the
+ * arm is set or consumed. */
+static int g_amb_asked;
 
 /* --- Java -> C: one advertisement heard (BLE binder thread) ---
  *
@@ -177,26 +227,28 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
     * something that is already paired, so it does not belong in the list. */
    /* THE REGISTRY, ONCE PER ADVERT. Three questions are asked of it below --
     * is this device already ours, is it a CGM we should reconnect, is it one
-    * of our meters -- and one snapshot answers all three. Taken separately
-    * they were three locked walks and three ~1.5 KB copies on a BINDER
-    * thread, per advertisement, several a second: a measurable cost on the
-    * hottest path in the app (pairingtest's concurrency case noticed it), and
-    * three answers from three different instants where one device could
-    * appear between two of them. */
-   struct sensor_view v;
-   sensors_view_get(&v);
+    * of our meters -- and one snapshot answers all three. Asked separately they
+    * are three locked walks and three ~1.5 KB copies on a BINDER thread, per
+    * advertisement, several a second: a measurable cost on the hottest path in
+    * the app, and three answers from three different instants, where one device
+    * can appear between two of them. */
+   /* BY REFERENCE, not by copy: this is the advert path and it runs several
+    * times a second. The picture is still one instant and still cannot shift
+    * while the driver calls below run -- it is simply the instant the
+    * registry last changed, handed out rather than rebuilt. */
+   const struct sensor_view *vp = sensors_view_ref();
 
    int known = 0;
    {
-      int kidx  = -1;
+      /* THE INDEX, not a walk: this runs on every advertisement, and a walk
+       * here compares every device ever registered. */
+      int kidx  = sensors_view_find_mac(vp, mac);
       int kid   = -1;
       int kkind = KIND_BGM;
-      for (int i = 0; i < v.n && kidx < 0; i++)
-         if (v.have_rec[i] && !strcmp(v.rec[i].identity, mac)) {
-            kidx  = i;
-            kid   = v.slot[i].id;
-            kkind = sensor_kind(v.rec[i].type);
-         }
+      if (kidx >= 0) {
+         kid   = vp->slot[kidx].id;
+         kkind = sensor_kind(vp->rec[kidx].type);
+      }
       if (kidx >= 0 && kkind == KIND_CGM) {
          /* A CGM is registered the moment the user COMMITS to pairing it, so
           * "has a slot" no longer implies "is paired". Exclude it from the
@@ -219,6 +271,27 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
          known = (kidx >= 0); /* meters keep the pre-existing rule */
       }
    }
+   /* RECORDED FOR EVERY DEXCOM, ours or not: `known` decides whether it is a
+    * pairing candidate, not whether its name is worth knowing -- and it is
+    * precisely the registered ones whose name no other table keeps. */
+   if (is_dexcom && name[0]) {
+      devlist_lock();
+      int a = 0;
+      for (; a < g_nadvname; a++)
+         if (strcmp(g_advname[a].mac, mac) == 0)
+            break;
+      if (a == g_nadvname) {
+         if (g_nadvname < ADVNAME_MAX) {
+            g_nadvname++;
+         } else {
+            a              = g_advname_next;
+            g_advname_next = (g_advname_next + 1) % ADVNAME_MAX;
+         }
+      }
+      str_snapshot(g_advname[a].mac, sizeof g_advname[a].mac, mac);
+      str_snapshot(g_advname[a].name, sizeof g_advname[a].name, name);
+      devlist_unlock();
+   }
    int listed =
        !known &&
        ((sensor_kind(sel_add_type()) == KIND_BGM) ? is_meter : is_dexcom);
@@ -237,26 +310,34 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
        *
        * This runs on a BINDER thread while the main thread can be inside
        * sensor_forget's shift-down and another binder thread inside
-       * srec_push's memmove. Reading slot_count() and holding a sensor_rec*
-       * across the driver calls below is the exact hazard link_for_slot and
-       * src_for_link were both rewritten to close -- a torn read here hands
+       * srec_push's memmove. Reading a live count and holding a sensor_rec*
+       * across the driver calls below is the exact hazard link_for_sensor and
+       * src_for_link both resolve through a snapshot to close -- a torn read
+       * here hands
        * dexble_pair a link resolved from a different sensor's identity, so one
        * sensor's address is bound to another's link and key file. */
+      /* ONLY THE SLOTS THIS ADVERT IS FROM, which is what bounds the array:
+       * an advert carries ONE address, and a slot is collected only when the
+       * registry says that address is its own. */
       int n_ids = 0;
-      int ids[MAX_SLOTS];
-      int match[MAX_SLOTS];
-      for (int i = 0; i < v.n && n_ids < MAX_SLOTS; i++) {
-         if (v.slot[i].old) /* disconnected: never auto-reconnect */
+      int ids[LINK_MAX];
+      for (int i = 0; i < vp->n_live; i++) {
+         if (!vp->have_rec[i] || sensor_kind(vp->rec[i].type) != KIND_CGM)
             continue;
-         if (!v.have_rec[i] || sensor_kind(v.rec[i].type) != KIND_CGM)
+         if (strcmp(vp->rec[i].identity, mac) != 0)
             continue;
-         ids[n_ids]   = v.slot[i].id;
-         match[n_ids] = (strcmp(v.rec[i].identity, mac) == 0);
-         n_ids++;
+         if (n_ids >= (int)(sizeof ids / sizeof ids[0])) {
+            /* Unreachable while one address belongs to one slot per kind --
+             * so reaching it means that is no longer true, which is worth
+             * saying rather than dropping the match. */
+            LOGW("advert: more slots claim one address than there are links; "
+                 "slot %d not reconnected",
+                 vp->slot[i].id);
+            break;
+         }
+         ids[n_ids++] = vp->slot[i].id;
       }
       for (int i = 0; i < n_ids; i++) {
-         if (!match[i])
-            continue;
          /* BY ID. This array is COMPACTED -- it skips non-CGM slots -- so
           * the row number here was never the registry's; passing `i` meant
           * that with a meter registered before a CGM (or after any forget
@@ -369,19 +450,17 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
        * a fixed address test has -- a stranger's meter is still ignored,
        * because it has no slot. */
       int mid = -1;
-      for (int i = 0; i < v.n && mid < 0; i++) {
-         if (v.slot[i].old) /* a disconnected meter is inert */
-            continue;
-         if (v.have_rec[i] && v.rec[i].type == SENSOR_ONETOUCH &&
-             !strcmp(v.rec[i].identity, mac))
-            mid = v.slot[i].id;
+      for (int i = 0; i < vp->n_live && mid < 0; i++) {
+         if (vp->have_rec[i] && vp->rec[i].type == SENSOR_ONETOUCH &&
+             !strcmp(vp->rec[i].identity, mac))
+            mid = vp->slot[i].id;
       }
       /* PER-METER throttle: only rate-limit THIS meter, so one meter syncing
        * never blocks another (the global gate here made a second meter that
        * advertised alongside the first never get a turn). */
       /* MONOTONIC: this is "have we already answered this meter's adverts in
        * the last minute", an interval between two events in this process.
-       * meter_seen() is the same event on the wall clock and is what the
+       * meter_note_advert() is the same event on the wall clock and is what the
        * screen shows; measuring the throttle against it let a forward clock
        * correction wake the meter on every advert of one wake window. */
       /* THE THROTTLE AND THE RECORD ARE ONE STEP (meter.h). This read the
@@ -483,6 +562,7 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
               did_log_count);
    }
 
+   sensors_view_put(vp);
    (*env)->ReleaseStringUTFChars(env, jname, name);
    (*env)->ReleaseStringUTFChars(env, jmac, mac);
    shell_ui_dirty();
@@ -517,10 +597,41 @@ void pair_cancel(void)
  *   >1 found -> the strongest IF it beats the next by >= 20 dB (clearly the
  * one on your body); otherwise -1 (ambiguous -> let the user pick).
  */
+/* A COMMIT FAILURE THAT PERSISTS SAYS SO ONCE A MINUTE, NOT ONCE A SECOND.
+ *
+ * The arm deliberately survives a refused commit, and pairing_tick re-enters
+ * commit_pair on every tick while a candidate is on the air -- so a failure
+ * that is not going to clear (no free link, an unwritable registry) would
+ * otherwise fill the log at 1 Hz for the life of the process, burying the one
+ * line that explains it. The reason is the key: a DIFFERENT failure is news
+ * and prints immediately. */
+static void pair_fail_log(int reason)
+{
+   static int last_reason;
+   static long last_at;
+   long now = mono_s();
+   if (reason == last_reason && last_at && now - last_at < 60)
+      return;
+   last_reason = reason;
+   last_at     = now;
+   switch (reason) {
+      case 1: LOGI("refusing to pair: all %d links in use", LINK_MAX); break;
+      case 2:
+         LOGW("pairing commit: the provenance row could not be minted");
+         break;
+      case 3: LOGW("pairing commit: the sensor could not claim a slot"); break;
+      case 4:
+         LOGI("pairing commit: registered, but every link went while it was "
+              "being written");
+         break;
+      default: break;
+   }
+}
+
 int select_candidate(void)
 {
-   /* Decision in scanlogic.c so `make check` can fail on it: with the rule
-    * inline here, deleting it passes the entire gate. */
+   /* Decision in scanlogic.c, which is pure and decidable on its own; this
+    * function only actuates it. */
    /* Only candidates heard RECENTLY qualify. The list is never pruned, so a
     * sensor that left the room an hour ago still sits there with its stale
     * RSSI -- and a pending pairing evaluates this on every tick, possibly
@@ -607,6 +718,8 @@ void commit_pair(const char *mac)
     * that. */
    atomic_store_explicit(&g_smart_pairing, 0, memory_order_release);
    g_pend_pairing = 0; /* any commit supersedes an armed pending pairing */
+   g_amb_asked    = 0;
+   g_pend_at      = 0;
    /* A meter has no key exchange: it bonds at the OS level (the meter shows
     * a passkey, Android prompts for it) the first time we touch its GATT. So
     * "pairing" one is just registering it and connecting -- the bond happens
@@ -630,13 +743,26 @@ void commit_pair(const char *mac)
        * costs the user a retry and nothing else. */
       if (meter_busy()) {
          LOGI("refusing to pair a meter while another is mid-sync");
-         set_status("METER BUSY, RETRY");
+         set_status_refused("METER BUSY, RETRY");
          keypad_close();
          return;
       }
       int id = sensor_mint(sel_add_type(), mac, "", "", "", 0);
       if (id < 0) {
-         set_status("METER: REGISTER FAILED");
+         set_status_refused("METER: REGISTER FAILED");
+         keypad_close();
+         return;
+      }
+      /* THE LINK FIRST, BEFORE THE SLOT. Registering the meter makes it
+       * invisible to the CGM link ranking while its link is still unclaimed,
+       * so an advertisement arriving during the registration, the bind and
+       * the JNI scan-stop below can hand a CGM the link this meter is about
+       * to want -- and the pairing then fails for want of one. Claiming here
+       * closes that: driver_link_claim arms the link under the driver's own
+       * lock, so nothing else can take it from this point on. */
+      int mlink = meter_alloc_link(mac);
+      if (mlink < 0) {
+         set_status_refused("METER: NO FREE LINK");
          keypad_close();
          return;
       }
@@ -645,11 +771,28 @@ void commit_pair(const char *mac)
        * at the next launch, so nothing below -- the bond, the key file, the
        * connect -- may happen. */
       if (sensor_claim_slot(id, sel_add_type(), mac) < 0) {
-         set_status("METER NOT REGISTERED");
+         meter_release_link(mlink); /* taken above, and now unused */
+         set_status_refused(sensors_writable()
+                                ? "METER NOT REGISTERED"
+                                : "REGISTRY UNREADABLE: RESTART");
          keypad_close();
          return;
       }
-      meter_bind(id, mac);
+      /* THE BIND CAN STILL BE REFUSED HERE. meter_busy() was tested above,
+       * before the mint and the slot claim -- two flash writes -- and a meter
+       * already on the air can start its own sync on a binder thread in that
+       * window. Pairing into a live exchange resets the SAME otble statics the
+       * refusal above exists to protect, so it stops here: the sensor IS
+       * registered (nothing is undone) and its own screen is where the retry
+       * lives. */
+      if (!meter_bind(id, mac)) {
+         meter_release_link(mlink); /* taken above, and now unused */
+         LOGI("meter registered, but another meter began a sync mid-commit");
+         set_status_refused("METER BUSY, RETRY");
+         keypad_close();
+         open_new_device(id);
+         return;
+      }
       /* Everything from here -- seeding this meter's record index, arming
        * its link, asking for the OS bond and issuing the connect -- is the
        * meter runtime's, not the shell's (see meter.h). The shell only
@@ -659,10 +802,10 @@ void commit_pair(const char *mac)
          scan_hold_until(mono_s() + 20); /* quiet radio to bond: an INTERVAL */
          stop_scan(shell_activity());
       }
-      if (meter_pair(id, mac))
+      if (meter_pair(id, mac, mlink))
          set_status("METER: PAIRING");
       else
-         set_status("METER: NOT PAIRED");
+         set_status_refused("METER: NOT PAIRED");
       keypad_close();
       /* Even on a failed connect: the slot IS registered, and its own screen
        * is where the failure is stated and retried. Returning to the list
@@ -675,8 +818,23 @@ void commit_pair(const char *mac)
     * sensor neither disturbs nor replaces one that is already streaming. */
    int link = link_for_new_sensor();
    if (link < 0) {
-      set_status("NO FREE SENSOR LINK");
-      LOGI("refusing to pair: all %d links in use", LINK_MAX);
+      /* THE ARM SURVIVES THE REFUSAL, and the message names the way out.
+       *
+       * Every CGM failure below does the same -- the METER paths do not, and
+       * deliberately: a meter pairing carries no typed code to preserve, so
+       * there is nothing an arm would be holding for the user. Dropping the
+       * arm here would take the code the user typed with it, leaving a status
+       * line the next one replaces as the only thing ever said about it. Left
+       * armed, the wait continues and a link freed by a disconnect is picked
+       * up by the tick with something to re-enter. */
+      /* THE WAIT IS STAMPED HERE TOO. commit_pair cleared it on the way in,
+       * and a restored arm with no instant on it shows a CGM PENDING screen
+       * that cannot say how long it has been waiting -- which is the one
+       * thing that screen exists to answer. */
+      g_pend_pairing = sel_add_type();
+      g_pend_at      = realtime_s();
+      set_status_refused("NO FREE LINK: DISCONNECT ONE");
+      pair_fail_log(1);
       keypad_close();
       return;
    }
@@ -694,14 +852,48 @@ void commit_pair(const char *mac)
                                                                : SENSOR_STELO;
       int id       = sensor_mint(cgm_type, mac, "", "", "", 0);
       if (id < 0) {
-         set_status("SENSOR: REGISTER FAILED");
+         /* SAID OUT LOUD. A commit that stops here leaves the user on the
+          * device list with an unchanged screen and a status line that is
+          * gone by the time they look, so the log is the only record that
+          * the pairing they asked for went nowhere. */
+         pair_fail_log(2);
+         g_pend_pairing = sel_add_type();
+         g_pend_at      = realtime_s();
+         /* THE THREE REASONS A MINT FAILS ARE THREE DIFFERENT MESSAGES.
+          * "STORAGE?" for the one that really is the disk; a registry file that
+          * did not read is not a disk fault and is not fixed by retrying, and
+          * the id space being spent is neither. A mint reads BOTH tables, so
+          * either file can be the one to name. */
+         const char *why = "REGISTER FAILED: STORAGE?";
+         if (!sensors_slots_whole())
+            why = "SLOTS.CSV UNREADABLE: RESTART";
+         else if (!sensors_provenance_loaded())
+            why = "SENSORS.CSV UNREADABLE: RESTART";
+         set_status_refused(why);
          keypad_close();
          return;
       }
       /* See the meter path above: an unwritten claim must not reach the
        * radio, because driver_forget below erases this link's key file. */
       if (sensor_claim_slot(id, cgm_type, mac) < 0) {
-         set_status("SENSOR NOT REGISTERED");
+         /* The slot table is full, or slots.csv could not be replaced. Same
+          * reason as the mint above: nothing else records that this failed. */
+         pair_fail_log(3);
+         g_pend_pairing = sel_add_type();
+         g_pend_at      = realtime_s();
+         /* THE TWO REASONS A CLAIM IS REFUSED ARE NOT THE SAME MESSAGE. A
+          * registry that did not load is also an EMPTY list, so naming a
+          * device to disconnect points at rows the screen is not showing and
+          * an action that cannot help.
+          *
+          * AND THE ACTION NAMED IS THE ONE THAT EXISTS. Nothing in this app
+          * deletes a device -- DISCONNECT retires the slot and keeps it -- so
+          * a full table is not freed by anything the user can tap. What
+          * disconnecting does buy is a LINK, which is the limit they will
+          * actually meet. */
+         set_status_refused(sensors_writable()
+                                ? "LIST FULL: DISCONNECT ONE"
+                                : "REGISTRY UNREADABLE: RESTART");
          keypad_close();
          return;
       }
@@ -710,6 +902,44 @@ void commit_pair(const char *mac)
        * slots.csv, which is private app storage; logcat is not. */
       LOGI("registered sensor id=%d type=%s at pairing commit", id,
            sensor_type_name(cgm_type));
+   }
+   /* THE LINK IS RESOLVED AGAIN, AFTER THE REGISTRATION, and this answer is
+    * the one the radio work below uses.
+    *
+    * The first answer was taken before the mint, because a refusal there must
+    * not register anything. But the free-link pool is shared with the METER
+    * runtime, and meter_alloc_link leaves free only as many links as there are
+    * live CGMs still waiting for one -- counted from the published view. A
+    * meter advert arriving on a binder thread while the two flash writes above
+    * are in progress counts a table this sensor is not yet in, so it may arm
+    * the last free link: the very one resolved above. Connecting a CGM on a
+    * link a meter has armed seizes that meter's GATT client.
+    *
+    * Asked after the registration, the count includes this sensor, so a
+    * concurrent meter claim leaves its link alone -- and the rank the ranking
+    * gives it is the rank it will keep. */
+   {
+      int relink = link_for_sensor(newdev);
+      if (relink < 0) {
+         /* Every free link went while this sensor was being written. It IS
+          * registered, so the pairing continues from its own screen as soon as
+          * a link frees -- sensor_reconcile connects a registered sensor
+          * whenever one does. Nothing here is undone. */
+         pair_fail_log(4);
+         /* THE ARM SURVIVES, like the refusal before the mint: the J-PAKE code
+          * lives only in this flow, so a registered sensor that never got a
+          * link cannot be connected by sensor_reconcile -- it needs
+          * pairing_tick to re-enter this commit once a link frees. The mint
+          * recognises the address it already holds, so the retry lands on the
+          * same id rather than a second one. */
+         g_pend_pairing = sel_add_type();
+         g_pend_at      = realtime_s();
+         set_status_refused("NO FREE LINK: DISCONNECT ONE");
+         keypad_close();
+         open_new_device(newdev);
+         return;
+      }
+      link = relink;
    }
    /* The LINK is named, so there is no selection to race: this erases the key
     * and MAC files of the link being paired and no other. */
@@ -720,18 +950,29 @@ void commit_pair(const char *mac)
       stop_scan(shell_activity());
    }
    set_status("PAIRING");
-   /* Ask for the OS bond BEFORE the GATT work, for the same reason as the
-    * meter above: the dialog then belongs to the tap that caused it.
+   /* ASK FOR THE OS BOND ON THE CONNECT, so the dialog belongs to the tap
+    * that caused it rather than arriving at some later moment the user has
+    * stopped watching for it.
+    *
+    * THE METER PATH STILL ASKS IMMEDIATELY (meter_pair, before its own
+    * connect). The two are not the same shape, and this comment does not
+    * claim they are: what is established below is why a CGM's request must
+    * wait for a link, not that a meter's need not.
+    *
+    * ON the connect and not here, because a bond request needs a connection
+    * under it. Issued at this instant it goes out seconds before
+    * dexble_pair's connectGatt has a link, Android opens one of its own, the
+    * sensor declines to pair over it, and the attempt fails in under a
+    * second -- surfaced to the user as "couldn't pair, incorrect PIN or
+    * passkey", which names the one thing not involved. The pairing then
+    * completes anyway on the prompt the sensor's own security request raises
+    * moments later, so the only thing the early attempt ever produced was
+    * that message.
     *
     * Safe against the J-PAKE that follows. Ble.createBond returns immediately
     * when the device is already BONDED or already BONDING, so this cannot
-    * restart a bond mid-flight; when it is neither, the request goes out and
-    * dexble_pair's connectGatt (autoConnect=true) attaches to the same device.
-    * The sensor asks for security itself a few seconds into the connection
-    * anyway -- an HCI capture shows the full LE Secure Connections exchange
-    * completing seven seconds before the first EGV -- so this only moves the
-    * prompt earlier, it does not add one that was not going to happen. */
-   dexble_create_bond(mac);
+    * restart a bond mid-flight. */
+   dexble_bond_on_connect(link, mac);
    if (shell_activity())
       dexble_pair(link, mac, sp.code_str);
    keypad_close();
@@ -776,7 +1017,7 @@ int kp_commit_pair(void)
           * on would run the J-PAKE exchange with a secret the user did not
           * type. It would fail at round 3 with nothing on screen to explain
           * it, and burn one of the three attempts the code allows. */
-         set_status("CODE NOT SAVED");
+         set_status_refused("CODE NOT SAVED");
          return 0;
       }
       int idx = select_candidate();
@@ -799,6 +1040,33 @@ int kp_commit_pair(void)
          str_snapshot(g_pend_name, sizeof g_pend_name, g_devs[idx].name);
          devlist_unlock();
          nav_go(SCR_PAIRCONF);
+      } else if (fresh_candidates() >= 2) {
+         /* SEVERAL ON THE AIR AND NONE CLEAR OF THE REST. The app has a code
+          * and no way to tell which sensor it belongs to: every candidate
+          * answers to the same family, and proximity -- the one signal there
+          * is -- has already declined to separate them (scan_pick_candidate).
+          *
+          * So the user is asked. Guessing here pairs the wrong sensor, and
+          * that is not a recoverable mistake: commit_pair drops the bond and
+          * key of whatever it aims at. The list is ordered by live signal and
+          * a row PROPOSES rather than commits, so the confirmation still
+          * names the device before anything is touched.
+          *
+          * The pairing is armed as well, so backing out of the list without
+          * choosing leaves the wait running rather than discarding the code
+          * the user just typed. */
+         g_pend_pairing = sel_add_type();
+         /* ASKED, AND RECORDED AS ASKED. Cleared here, the tick's own
+          * ambiguity check offers the list again on the very next second --
+          * the repeating screen this flag exists to prevent. */
+         g_amb_asked = 1;
+         g_pend_at   = realtime_s();
+         atomic_store_explicit(&g_smart_pairing, 0, memory_order_release);
+         set_status("PICK THE SENSOR");
+         LOGI("pairing: %d candidates and none clear -- asking the user",
+              fresh_candidates());
+         keypad_close();
+         nav_go(SCR_DEVLIST);
       } else {
          /* No candidate on the air yet: ARM the pairing and free the
           * user. Parking them in the device list until the sensor
@@ -808,6 +1076,8 @@ int kp_commit_pair(void)
           * commits the moment an unambiguous candidate appears; DEVICES
           * shows the armed state as a PENDING row. */
          g_pend_pairing = sel_add_type();
+         g_amb_asked    = 0;
+         g_pend_at      = realtime_s();
          atomic_store_explicit(
              &g_smart_pairing, 0,
              memory_order_release); /* other sensors reconnect freely again */
@@ -840,6 +1110,34 @@ int pairing_pending(void)
    return g_pend_pairing;
 }
 
+long pairing_pend_since(void)
+{
+   return g_pend_at;
+}
+
+int pairing_adv_name(const char *mac, char *out, int cap)
+{
+   if (out && cap > 0)
+      out[0] = 0;
+   if (!mac || !mac[0] || !out || cap <= 0)
+      return 0;
+   int got = 0;
+   devlist_lock();
+   for (int a = 0; a < g_nadvname; a++)
+      if (strcmp(g_advname[a].mac, mac) == 0) {
+         str_snapshot(out, cap, g_advname[a].name);
+         got = out[0] != 0;
+         break;
+      }
+   devlist_unlock();
+   return got;
+}
+
+int pairing_candidates_waiting(void)
+{
+   return g_pend_pairing ? fresh_candidates() : 0;
+}
+
 int pairing_smart(void)
 {
    return atomic_load_explicit(&g_smart_pairing, memory_order_acquire);
@@ -848,6 +1146,8 @@ int pairing_smart(void)
 void pairing_arm(int type)
 {
    g_pend_pairing = type;
+   g_amb_asked    = 0;
+   g_pend_at      = realtime_s();
 }
 
 const char *pairing_pend_mac(void)
@@ -954,6 +1254,18 @@ void pairing_tick(void)
        cur_screen() != SCR_KEYPAD && cur_screen() != SCR_DEVLIST &&
        cur_screen() != SCR_PAIRCONF) {
       int pidx = select_candidate();
+      /* AMBIGUOUS, NOT ABSENT. An armed pairing that keeps waiting while two
+       * sensors answer is waiting for something that will not happen: the
+       * tie is not going to break itself, and the user is the only one who
+       * knows which sensor they just applied. Shown ONCE per arm, so the
+       * list is offered rather than forced back over whatever they do next. */
+      if (pidx < 0 && fresh_candidates() >= 2 && !g_amb_asked) {
+         g_amb_asked = 1;
+         set_status("PICK THE SENSOR");
+         LOGI("pending pairing: %d candidates and none clear -- asking",
+              fresh_candidates());
+         nav_go(SCR_DEVLIST);
+      }
       if (pidx >= 0) {
          char pmac[sizeof g_devs[0].mac];
          int have = 0;

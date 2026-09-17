@@ -17,7 +17,7 @@
  * shape the other workflows use (alarmlogic, scanlogic, meterlogic): main.c
  * observes, this module decides, main.c acts.
  *
- * Pure: no globals, no clock, no JNI, no locks. test/senstest.c pins it.
+ * Pure: no globals, no clock, no JNI, no locks.
  */
 #ifndef SENSLOGIC_H
 #define SENSLOGIC_H
@@ -124,25 +124,5 @@ struct sens_effect {
 
 /* Decide for one link. */
 void sens_link_eval(const struct sens_obs *o, long now, struct sens_effect *e);
-
-/* ONE SLOT, for the provenance-stamp decision. */
-struct sens_slot_obs {
-   int id;      /* the slot's sensor id (>0) */
-   int old;     /* retired: no live session to reconcile */
-   int is_cgm;  /* the slot's registered type is a CGM */
-   int live;    /* its link carries a bonded session for THIS slot's address */
-   int primary; /* the user marked it primary */
-};
-
-/* Which sensor id should stamp readings that carry no source of their own.
- *
- * Returns the id, or -1 for "leave it alone" -- never 0, which means
- * "pre-registry legacy" in a log that is never rewritten.
- *
- * PREFER THE PRIMARY, AND STOP AT IT. Without that this walked to the end and
- * left the stamp on whichever bonded CGM sat highest in the slot table, so a
- * second sensor's readings were stamped with the first's id -- and per-source
- * dedup then silently discarded samples that collided within 150 s. */
-int sens_primary_pick(const struct sens_slot_obs *slots, int n);
 
 #endif

@@ -45,12 +45,39 @@
 
 #include "dexdriver.h" /* LINK_MAX */
 
+/* HOW MANY METERS THIS APP TRACKS AT ONCE, and it bounds every per-meter
+ * table and every per-meter file: the runtime rows, the last-sync file, the
+ * record-index file and the walk that arms them.
+ *
+ * It is small on purpose, and it is NOT the registry's capacity. A meter is a
+ * device the user picks up, not a sensor they wear out every fortnight; the
+ * registry counts sensors in the thousands because it must hold a lifetime of
+ * them (sensors.h), while the meters in service at any moment are the ones on
+ * a shelf. Sizing the meter tables from the registry's number would put tens
+ * of kilobytes of empty rows in a stack frame for a table that holds three.
+ *
+ * IT COUNTS METERS EVER REGISTERED, not meters in service. prune_dead drops
+ * a row only when sensor_id_is_live says the id is gone, and that answers YES
+ * for a RETIRED slot -- slots are never released -- so a disconnected meter's
+ * row is never reclaimed. Thirty-two is still far past a lifetime of meters,
+ * and rt_find says so rather than failing quietly when it is not. */
+#define METER_MAX 32
+
 /* --- the link table --- */
 
 /* Does this link carry a meter? Several CGM-only passes walk every link and
  * must skip meters; this is the fact they check. It mirrors what the
  * transport was told, and is written in one place, so the two cannot drift. */
 int meter_link_is(int link);
+
+/* THE LINK A METER HOLDS, or -1. Found in the ARM table, which is where a
+ * meter's identity actually lives: drv_connect never stamps the driver
+ * session for a meter (only the Dexcom handshake does), so the address-based
+ * lookup every CGM uses -- link_for_sensor -- cannot ever resolve one. Asked
+ * of that, a meter's link comes back as some FREE CGM link instead, and a
+ * caller that then tears it down wipes an unrelated sensor's key file while
+ * the meter's own link stays armed and leaks. */
+int meter_link_of_mac(const char *mac);
 /* Say whether `link` carries a meter (1) or a CGM (0). */
 void meter_link_set(int link, int on);
 /* Un-arm: this meter no longer has a connection outstanding, so the tick may
@@ -73,11 +100,26 @@ int meter_armed(const char *mac); /* this meter has a connect outstanding */
  * at once. */
 int meter_alloc_link(const char *mac);
 void meter_sync_start(int mid, const char *mac);
-/* Pair a newly registered meter: seed its index, arm a link, bond, connect.
- * Returns 1 when a connect is outstanding; every other path releases the
- * link, because an armed link with nothing behind it is what stops the tick
- * from ever retrying. */
-int meter_pair(int id, const char *mac);
+/* Pair `id` on a link the CALLER has already claimed with meter_alloc_link:
+ * seed its index, arm the link, ask for the OS bond, connect. Returns 1 when
+ * a connect is outstanding.
+ *
+ * THE LINK IS TAKEN BEFORE THE REGISTRY SLOT, and that order is the point.
+ * A meter that is registered but holds no link is invisible to the CGM link
+ * ranking (a meter's link comes from this pool, so link_in_view skips it)
+ * while its future link still reads FREE to driver_free_cgm_link_in -- so an
+ * advertisement arriving in that gap can hand a CGM the link this meter is
+ * about to ask for, and the pairing then fails for want of one. The gap is
+ * not short: the caller registers the slot, binds it and stops the scan
+ * through JNI before it gets here. Claiming first removes it, because
+ * driver_link_claim arms the link inside the driver's own lock.
+ *
+ * ONCE THIS IS CALLED THE LINK IS ITS OWN: a failure after it has taken the
+ * link releases it here, so a caller that releases again would hand a link
+ * this meter still believes it holds to the next device. The caller releases
+ * ONLY when it claimed a link and then did not call this at all -- the slot
+ * registration failing in between is the one such path. */
+int meter_pair(int id, const char *mac, int mlink);
 /* Bounded recovery for an exchange that never finished and for a link that
  * never got its disconnect callback. Called from the 1 Hz tick AND from the
  * BLE service thread. It is this module's function, so it is declared here;
@@ -105,9 +147,12 @@ enum load_result meter_state_load(void);
 int meter_src(void);
 /* Bind to a meter: the id whose fingersticks are being imported, and the
  * address the "is this OUR meter" guard compares against. Without the address
- * that guard accepted ANY OneTouch in range after a restart -- importing a
- * stranger's readings under our sensor id. */
-void meter_bind(int id, const char *mac);
+ * that guard accepts ANY OneTouch in range after a restart, importing a
+ * stranger's readings under our sensor id.
+ *
+ * 1 when bound, 0 when a sync is already running -- that sync named its own
+ * source, and every record it reads belongs to it. */
+int meter_bind(int id, const char *mac);
 
 /* PER-METER runtime, keyed by registry id: in-memory, reset each launch,
  * except the last-sync time which is persisted. It exists because the

@@ -72,7 +72,7 @@ int sessc_restore(int id, long now, struct dex_session *out);
  * That window is a handful of instructions wide, and it is what sessc_lk
  * exists for -- so a build without the lock wrote a perfectly coherent file
  * on every run and the torn-row assertion passed against it. A pointer rather
- * than a bare yield so the suite can install it only around the section that
+ * than a bare yield so a caller can install it only around the section that
  * needs it; app_fault_gap_here in util.h is the same device. Test builds
  * only; nothing that ships defines APP_FAULTS. */
 extern void (*sess_fault_gap_here)(void);

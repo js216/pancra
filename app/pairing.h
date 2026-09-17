@@ -67,6 +67,19 @@ void pairing_stop_smart(void);
 /* Is a pairing armed but not yet committed, and is the smart scan running?
  * The device list shows both. */
 int pairing_pending(void);
+/* WHEN that pairing was armed, so the pending screen can say how long it has
+ * been waiting -- a wait with no elapsed time on it looks the same as a wait
+ * that is not happening. 0 when nothing is armed. */
+long pairing_pend_since(void);
+/* How many candidates of any family are on the air while a pairing is armed.
+ * Two or more is why an armed pairing can sit there: the app will not choose
+ * between them, and the row that says PENDING should say so. */
+int pairing_candidates_waiting(void);
+/* THE NAME ANDROID SHOWS for this address, learned from its advertisements --
+ * "DXCMrb" and the like. 1 when one is known. It is what ties a device row
+ * here to a row in the Bluetooth settings list, which is where a bond has to
+ * be forgotten from. */
+int pairing_adv_name(const char *mac, char *out, int cap);
 int pairing_smart(void);
 void pairing_arm(int type); /* 0 = disarm */
 

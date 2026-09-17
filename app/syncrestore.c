@@ -107,7 +107,7 @@ static int copy_into(int fd, const char *path, int64_t *copied)
 
 /* The body, so the many early returns inside it do not each have to remember
  * to release the operation lock -- and so none of them RETURNS while holding
- * it, which test/app/lockorder.py is right to refuse. */
+ * it, which no path in this codebase may do. */
 int sync_restore_inner(const struct sync_ctx *sx)
 {
    if (!sx->have_key || !sx->http)

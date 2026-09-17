@@ -55,11 +55,11 @@
  * design that grants the URI before the close is the same bug wearing a
  * different hat -- it publishes bytes that are still in a buffer.
  *
- * WHY IT IS ITS OWN CLASS. All of it is java.io and none of it is Android,
- * so `make exportjavatest` runs it on the host: a source that throws part-way
- * through a read, an output whose CLOSE is the thing that fails, a file whose
- * tail is a torn row. None of those can be produced on a phone on demand,
- * which is exactly why they were never checked. */
+ * WHY IT IS ITS OWN CLASS. All of it is java.io and none of it is Android, so
+ * it runs under a plain host JVM -- which is the only place the cases that
+ * matter can be produced on demand: a source that throws part-way through a
+ * read, an output whose CLOSE is the thing that fails, a file whose tail is a
+ * torn row. None of those can be arranged on a phone. */
 package com.jk.pancra;
 
 import java.io.BufferedOutputStream;

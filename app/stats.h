@@ -117,7 +117,7 @@ enum load_result stat_load(const char *readings_path);
  * (app/thread.h, rule 6), and the caller that wants this -- pancra_logs_reload
  * -- is holding the HISTORY lock across store_load. Parsing under that lock
  * would take the registry INSIDE the history, the exact inversion behind two
- * phone freezes in one day, and test/app/lockorder.py refuses it.
+ * phone freezes in one day.
  *
  * So the work is split where the locks say it must be:
  *

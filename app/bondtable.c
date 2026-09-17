@@ -5,14 +5,13 @@
 /* SPLIT OUT OF dexble.c SO IT CAN BE TESTED.
  *
  * This table is written from a binder thread (the OS's bond-state broadcast)
- * and read by the main loop while it renders. It lived in the middle of the
- * JNI bridge, which is one translation unit holding every native method and a
- * JavaVM -- so linking it into a host suite was not practical, and the
- * synchronisation below was argued in a comment rather than demonstrated.
+ * and read by the main loop while it renders.
  *
- * Here it needs nothing but a lock and string comparison, so bondtabletest
- * runs a reader and a writer at it under ThreadSanitizer and the argument is
- * checked. */
+ * ITS OWN FILE, and not part of the JNI bridge, because the bridge is one
+ * translation unit holding every native method and a JavaVM: anything inside
+ * it can only be exercised with a JVM under it. The table needs none of that
+ * -- a fixed array, a lock, and two functions over strings -- so it lives
+ * where a plain host build can link it and run a reader and a writer at it. */
 #include "bondtable.h"
 #include "thread.h"
 
@@ -76,8 +75,8 @@ static int g_bond_n;
  * a driver operation reaches the lookup with driver_lk still down
  * (driver_kick -> drv_connect -> set_status -> update_screen -> draw ->
  * build_model -> fill_sensor -> dexble_bond_state, all on the main thread
- * from on_timer's watchdog). test/app/lockorder.py ranks this lock below the
- * driver's for that reason and reports the pair. What this is NOT is a BLE
+ * from on_timer's watchdog). This lock therefore ranks BELOW the driver's.
+ * What this is NOT is a BLE
  * callback waiting on the DRIVER mutex for a cosmetic value: the only thing a
  * callback can wait on here is another lookup. */
 static struct mutex bond_lk = MUTEX_INIT;

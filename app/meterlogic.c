@@ -31,6 +31,17 @@ void meter_tick_eval(int busy, long start, const long *idle_since, int nlinks,
    for (int l = 0; l < nlinks; l++) {
       if (!idle_since[l]) /* 0 = not waiting for a teardown */
          continue;
+      /* THE STAMP ALONE DECIDES, and an ARMED link is deliberately NOT skipped.
+       *
+       * Case 2 of the contract in meterlogic.h -- a close asked for, the link
+       * left armed on purpose, and the disconnect callback never landing -- is
+       * armed AND stamped by construction. Skipping armed links makes that case
+       * unreachable, which is the one case this check exists for.
+       *
+       * It is safe because a claim CLEARS the stamp, at the moment of arming
+       * (meter_alloc_link) and again at meter_link_set: a link somebody has
+       * taken again has no stamp, so the test above has already skipped it. A
+       * live exchange is covered separately by the `busy` return. */
       if (now - idle_since[l] < METER_TEARDOWN_MAX_S)
          continue;
       out->release[l] = 1;

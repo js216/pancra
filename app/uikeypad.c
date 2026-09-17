@@ -42,6 +42,23 @@
 const char ui_label_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -.@_+";
 #define UI_LABEL_COLS 6
 
+/* WHAT THIS SCREEN COSTS THE HIT TABLE, as a build error rather than a note.
+ *
+ * render_label records one target per character plus three fixed ones: the
+ * close band over the title, DEL and OK. Forty-five, at every geometry -- the
+ * count does not depend on the scale -- so growing this string is the one way
+ * this screen can outgrow the table, and it is checked here rather than
+ * measured. Three characters of headroom; four more and add_hit starts dropping
+ * boxes, which are drawn keys that are dead to touch.
+ *
+ * (The tightest screen in the app is the EXERCISE LOG, not this one: its rows
+ * are capped against UI_LOG_FIXED, which is what holds it down.) */
+#define UI_LABEL_FIXED_HITS 3
+_Static_assert((int)sizeof ui_label_chars - 1 + UI_LABEL_FIXED_HITS <=
+                   UI_MAX_HITS,
+               "render_label records one hit per character plus the close "
+               "band, DEL and OK: the alphabet has outgrown UI_MAX_HITS");
+
 /* (No assertion is needed here that this array has not grown into MA_WTTAB's
  * action range: a key is (MA_CHAR, index), so however long this string gets
  * it cannot reach another control. With a base+index range it could -- a tap
@@ -131,27 +148,41 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
       ksc = sc;
    if (ksc > 3 * sc)
       ksc = 3 * sc;
-   for (int i = 0; i < n; i++) {
-      int cx      = gm + ((i % UI_LABEL_COLS) * cw);
-      int cy      = y + ((i / UI_LABEL_COLS) * ch);
-      char lbl[2] = {ui_label_chars[i], 0};
-      draw_str(px, fb, cx + ((cw - (6 * ksc)) / 2), cy + ((ch - (7 * ksc)) / 2),
-               ksc, lbl, UI_TEXT);
-      add_hit_ix(h, ui_rect(cx, cy, cw, ch), MA_CHAR, i);
-   }
-   /* DEL and OK share the last row */
+   /* THE COMMIT BUTTONS ARE RECORDED FIRST, and the letters after them.
+    *
+    * add_hit drops what does not fit, so the order the targets are recorded in
+    * is the order they survive in. If the alphabet ever grows past what the
+    * table holds, the thing that must not go is the button that commits the
+    * rename, the server address and the account email: losing a letter is a
+    * letter the user cannot type, losing OK is a screen with no way to save
+    * anything.
+    *
+    * RECORD ORDER AND DRAW ORDER DIFFER HERE, deliberately, and that is safe
+    * only because the rectangles cannot overlap: the grid occupies rows
+    * 0..rows-1 and these two sit in row `rows`. ui_hit_idx resolves a tap to
+    * the LAST matching box, so an overlap would be resolved by draw order and
+    * these would win it -- which is why the two must stay in separate rows. */
    int cy = y + (rows * ch);
    int hw = gw / 2;
+   add_hit_ix(h, ui_rect(gm, cy, hw, ch), MA_BACKSPACE, 0);
+   add_hit_ix(h, ui_rect(gm + hw, cy, hw, ch), MA_OK, 0);
+   for (int i = 0; i < n; i++) {
+      int kx      = gm + ((i % UI_LABEL_COLS) * cw);
+      int ky      = y + ((i / UI_LABEL_COLS) * ch);
+      char lbl[2] = {ui_label_chars[i], 0};
+      draw_str(px, fb, kx + ((cw - (6 * ksc)) / 2), ky + ((ch - (7 * ksc)) / 2),
+               ksc, lbl, UI_TEXT);
+      add_hit_ix(h, ui_rect(kx, ky, cw, ch), MA_CHAR, i);
+   }
+   /* DEL and OK share the last row; their targets were recorded above. */
    draw_frame(px, fb, gm + (2 * sc), cy + (2 * sc), hw - (4 * sc),
               ch - (4 * sc), UI_RULE);
    draw_str(px, fb, gm + ((hw - (3 * 6 * ksc)) / 2),
             cy + ((ch - (7 * ksc)) / 2), ksc, "DEL", UI_TEXT);
-   add_hit_ix(h, ui_rect(gm, cy, hw, ch), MA_BACKSPACE, 0);
    draw_frame(px, fb, gm + hw + (2 * sc), cy + (2 * sc), hw - (4 * sc),
               ch - (4 * sc), UI_RULE);
    draw_str(px, fb, gm + hw + ((hw - (2 * 6 * ksc)) / 2),
             cy + ((ch - (7 * ksc)) / 2), ksc, "OK", UI_OK);
-   add_hit_ix(h, ui_rect(gm + hw, cy, hw, ch), MA_OK, 0);
 }
 
 /* One keypad key: framed cell, centred label (in `col`), full-cell ACT_MENU

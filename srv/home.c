@@ -94,9 +94,8 @@ static size_t hour_row(char *out, size_t cap, int hour, const struct hpt *hp,
  * value the phone has already replaced with "---", and a reader comparing the
  * two sees the page contradict the device. The app's
  * definition lives in app/alarmlogic.h (AL_FRESH_S) with the reasoning for
- * the value; `make crosscheck` fails if these two ever drift apart again --
- * the server cannot include an app header, so the agreement is checked
- * rather than shared. */
+ * the value. The server cannot include an app header, so the agreement is
+ * held by hand: keep these two equal. */
 #define WEB_FRESH_S 660
 
 /* One reading row, newest first, as the page walks backwards. */

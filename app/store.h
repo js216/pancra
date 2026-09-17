@@ -12,20 +12,20 @@
  * actually be filled. It MUST be a count large enough that a full 7 days of
  * readings never overflow it -- otherwise the oldest in-window points get
  * evicted as new ones arrive and the "7D" plot silently shrinks below a week
- * (the very bug this sizing fixes). 2100 was "7 days at exactly one 5-min CGM
- * sample" with zero headroom, so any extra density -- a second sensor, meter
- * fingersticks, reconnect backfill re-reads -- pushed real 7-day data off the
- * left edge. 5040 = 7 days at one reading every 2 minutes, a ceiling that
- * covers two concurrent 5-min CGMs plus a meter plus backfill with margin.
- * Keep UI_PLOT_MAX in uirender.c EQUAL to this (the Makefile crosscheck
- * enforces it; uirender.c is decoupled from this header, so a smaller UI cap
- * would re-truncate the plot even with a large NHIST). */
+ * (which is what this sizing exists to prevent). Seven days at exactly one
+ * 5-min CGM sample is 2016 with no headroom at all, and any extra density -- a
+ * second sensor, meter fingersticks, reconnect backfill re-reads -- then pushes
+ * real 7-day data off the left edge. 5040 is 7 days at one reading every 2
+ * minutes: two concurrent 5-min CGMs plus a meter plus backfill, with margin.
+ * The renderer's own point cap must be at least this: it is decoupled from
+ * this header, so a smaller cap there would re-truncate the plot even with a
+ * large NHIST. */
 #define NHIST 5040
 /* Read BUFFER size for the startup replay -- not a limit on how much of the
  * log is read. store_load streams the WHOLE file through this in chunks,
  * because the log is in arrival order: after importing months of history the
- * newest readings are NOT at the end, and a tail-limited read came back with
- * an empty plot from an intact log. */
+ * newest readings are NOT at the end, so a read limited to the tail can come
+ * back with an empty plot from an intact log. */
 #define STORE_TAIL 262144
 
 /* `struct reading` -- the record this history is made of. Its own header so
@@ -34,11 +34,11 @@
 #include "readingrec.h"
 #include "sensors.h" /* enum sensor_kind: a reading is a CGM sample or a stick */
 
-/* THE HISTORY IS PRIVATE. It was `extern struct reading g_hist[NHIST]` and a
- * count, which made every reader depend on the representation (an array, this
- * long, NEWEST FIRST, deduped) and let any of them write to it -- and a
- * reading written by hand is a reading in the plot and the alarms that is not
- * in the log.
+/* THE HISTORY IS PRIVATE, and reached only through the questions below. An
+ * exported `struct reading g_hist[NHIST]` and a count makes every reader depend
+ * on the representation -- an array, this long, NEWEST FIRST, deduped -- and
+ * lets any of them write to it, and a reading written by hand is a reading in
+ * the plot and the alarms that is not in the log.
  *
  * ORDER IS PART OF THE CONTRACT: newest first, because everything that reads
  * this wants the recent end and stops early.
@@ -71,6 +71,25 @@
 
 /* The instant of the newest CGM reading from `src`, or 0 if it has none. */
 long hist_newest_t(int src);
+/* The newest instant `src` ever wrote, across the WHOLE log rather than the
+ * in-memory tail -- so a device last worn months ago still has a last-seen
+ * time to show. 0 when the log holds no CGM row from it.
+ *
+ * CALLER HOLDS hist_lock, like the walks above: this reads the id-indexed
+ * last-seen table, which store_load rewrites. Its one caller is inside
+ * build_model, which holds the lock across the whole frame. */
+long store_src_last_seen(int src);
+
+/* Forget every last-seen date. Called by store_load before it re-reads the
+ * file: these are maxima, so a restore that REPLACES readings.csv would
+ * otherwise leave dates from rows the log no longer holds.
+ *
+ * TAKES NO LOCK, unlike the queries above it: its one caller already holds
+ * the history lock for the reload it is part of. It also runs BEFORE that
+ * reload can fail, so a load that gives up leaves the dates cleared rather
+ * than stale -- which is the safe direction: a missing date reads as "--"
+ * and a wrong one reads as fact. */
+void store_src_last_reset(void);
 /* ...and of the oldest one held in the tail, or 0. NOT the oldest in the LOG:
  * this is the in-memory tail, which is a display window. */
 long hist_oldest_t(int src);
@@ -87,8 +106,8 @@ int hist_in_memory(void);
  * ALREADY-LOCKED TRAVERSAL, and the only caller that may use it is one that
  * already holds the lock for another reason -- the frame builder, which runs
  * inside draw()'s hold (see the note in model.c's build_model). Everything
- * else asks one of the questions above; `make -f test/Makefile lockcheck`
- * refuses this pair anywhere else. */
+ * else asks one of the questions above; this pair may not be used
+ * anywhere else. */
 int hist_count(void);
 /* The i-th, NEWEST first; out of range yields a zeroed reading. Same rule as
  * hist_count. */

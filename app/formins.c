@@ -66,12 +66,10 @@ static void ins_draft_done(struct ins_draft *d)
 
 int form_ins_action(int action, int ix)
 {
-   if (action == MA_INS_OPEN || action == MA_INS_FAST ||
-       action == MA_INS_SLOW) {
-      /* The ADD menu picks the type up front (FAST / SLOW buttons); the
-       * legacy MA_INS_OPEN keeps the last-used type. Pre-populate: now
-       * (whole minute) and the type's last entered amount (1 U when none
-       * is known). */
+   if (action == MA_INS_FAST || action == MA_INS_SLOW) {
+      /* The ADD menu picks the type up front (FAST / SLOW buttons).
+       * Pre-populate: now (whole minute) and the type's last entered amount
+       * (1 U when none is known). */
       /* The form's own rules live in insulin.c, where a test can reach them:
        * which amount a fresh form offers, and why the instant is a whole
        * minute. */
@@ -111,9 +109,9 @@ int form_ins_action(int action, int ix)
        * Editing rewrites the matched original row; logging appends. */
       if (cur_screen() == SCR_INSULIN) {
          int rc = -1;
-         /* The dose's OWN offset, resolved at the dose's instant. See the
-          * weight CONFIRM above and TODO 131: a dose moved to a date in the
-          * other half of the year was persisted with today's offset. */
+         /* The dose's OWN offset, resolved at the dose's instant -- see the
+          * weight CONFIRM above. With today's offset instead, a dose moved to a
+          * date in the other half of the year persists an hour wrong. */
          long itz = form_zone(0, g_ins.f.t);
          if (g_ins.f.edit >= 0)
             rc = insulin_update(&g_ins.orig, g_ins.f.t, g_ins.f.type,
@@ -131,7 +129,7 @@ int form_ins_action(int action, int ix)
          } else {
             /* Refuse VISIBLY -- a dose the user believes recorded but is not
              * would corrupt every judgement made on top of the log. */
-            set_status("INSULIN: WRITE FAILED");
+            set_status_refused("INSULIN: WRITE FAILED");
          }
          /* ...AND STAY ON THE FORM WHEN IT FAILED. The draft is the only
           * copy of what was typed and g_ins.f.edit is the only thing saying
@@ -175,7 +173,7 @@ int form_ins_action(int action, int ix)
             set_status("INSULIN DELETED");
             fate = DRAFT_DONE;
          } else {
-            set_status("INSULIN: DELETE FAILED");
+            set_status_refused("INSULIN: DELETE FAILED");
          }
          if (fate == DRAFT_DONE) {
             nav_back();

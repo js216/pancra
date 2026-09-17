@@ -24,9 +24,8 @@
  * lines twice is not that: neither copy is a check on the other, and they are
  * compared only by a pairing that either works or does not.
  *
- * The GOLDEN VECTORS STAY INDEPENDENT (lib/wirevec.h, checked by
- * test/srv/wiretest.c and test/app/interoptest.c): they pin the BYTES, and
- * they are what says this one implementation is right rather than merely
+ * The GOLDEN VECTORS STAY INDEPENDENT (lib/wirevec.h): they pin the BYTES,
+ * and they are what says this one implementation is right rather than merely
  * consistent with itself.
  *
  * FREESTANDING. The app half is built with no libc, so this takes its own

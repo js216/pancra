@@ -21,22 +21,22 @@
  * keeps an unsilenceable alarm from wedging on stale data after a sensor drops
  * out -- the prediction must be current, not a value frozen at disconnect.
  *
- * The threshold and the predicate both live in alarmlogic.h now, where a test
- * can execute them; this file keeps the per-link state and the fold. */
+ * The threshold and the predicate both live in alarmlogic.h, which has no
+ * state and no platform under it, so either can be executed on its own; this
+ * file keeps the per-link state and the fold. */
 
 /* The glucose zone RIGHT NOW: 0 in range, 1 low, 2 high. Derived, never
  * latched. Call with alarm_lock held.
  *
- * This must be recomputed by the 1 Hz path as well as by the reading path.
- * When only alarm_reeval() (which runs when a reading arrives) updated the
- * zone, the freshness test below effectively always passed -- it ran
- * microseconds after a reading landed -- so a non-zero zone could never decay.
- * alarm_disc_reeval() on the 1 Hz timer now recomputes it, which is also what
- * makes a glucose alarm get raised at all now that the BLE threads do not
- * evaluate. A sensor dropping out while low then left `zone` latched at 1
- * forever, and because alarm_apply ranks zone above stale, the DISCONNECT alarm
- * could never sound: exactly the lost-alarm failure the level-based rewrite
- * existed to prevent, reintroduced through a different door. */
+ * RECOMPUTED BY THE 1 Hz PATH AS WELL AS BY THE READING PATH, and the 1 Hz
+ * half is what makes the zone able to DECAY. Updated only when a reading
+ * arrives, the freshness test below runs microseconds after that reading landed
+ * and so always passes: a sensor dropping out while low leaves `zone` latched
+ * at 1 for ever, and because alarm_apply_ex ranks zone above stale, the
+ * DISCONNECT alarm can then never sound -- the lost-alarm failure this whole
+ * design exists to prevent, reached through a different door.
+ * alarm_disc_reeval() on the timer is also what raises a glucose alarm at all,
+ * since the BLE threads do not evaluate. */
 /* The current reading, read as ONE consistent pair.
  *
  * hist_refresh_current writes g_cur_glu and g_cur_time as separate stores
@@ -107,7 +107,7 @@ static bool g_alarm_sounding;          /* an audible alarm is active */
  * reading or threshold tap. */
 /* Alarm state, and why it is shaped this way.
  *
- * alarm_apply is called from THREE kinds of thread, not one. It is NOT true
+ * alarm_apply_ex is called from THREE kinds of thread, not one. It is NOT true
  * that "every caller runs on the MAIN looper", nor that "the BLE threads
  * deliberately do not evaluate alarms" -- and those are exactly the
  * assumptions someone would rely on when deciding a lock here is unnecessary.
@@ -123,7 +123,7 @@ static bool g_alarm_sounding;          /* an audible alarm is active */
  *
  * Two properties are load-bearing and must survive any future change:
  *
- * 1. LEVEL-based, not edge-triggered. alarm_apply recomputes what should be
+ * 1. LEVEL-based, not edge-triggered. alarm_apply_ex recomputes what should be
  *    sounding and reconciles, so a missed transition self-corrects on the next
  *    tick. The original edge-triggered version lost a disconnect alarm
  *    permanently when a reading silenced it a microsecond after it was raised:
@@ -185,8 +185,8 @@ static bool g_alarm_acked;
  * with a reading's timestamp -- its only job is to answer "did this arrive
  * recently enough to still mean something", which is an interval. On the wall
  * clock a backward correction makes every stored prediction indefinitely
- * fresh. `make clockcheck` names alarm_note_pred, so the caller
- * cannot quietly go back to supplying realtime_s(). */
+ * fresh. alarm_note_pred takes a MONOTONIC stamp; realtime_s() is the wrong
+ * clock for it. */
 static _Atomic unsigned long long g_link_pred[LINK_MAX];
 
 static void alarm_lock(void)
@@ -292,9 +292,9 @@ static void meter_links_snapshot(int *out)
  *
  * It does NOT compose the sustain rule, the imminent-hypo override and the
  * decision by hand: alarmlogic.c holds that composition (alarm_plan_next),
- * pure and tested. A hand-written copy here would leave the tested one
- * uncalled -- deleting it would fail alarmtest and change nothing on the
- * phone, which is the exact shape of gap this header exists to close.
+ * pure. A hand-written copy here would leave that one uncalled -- deleting it
+ * would change nothing on the phone, which is the exact shape of gap
+ * alarmlogic.h exists to close.
  *
  * Call with alarm_lock held. */
 static void alarm_apply_ex(enum alarm_level zone, bool stale, bool stranded,
@@ -417,6 +417,30 @@ static void nudge_emit(enum nudge_band ng)
    dexble_nudge(ng == NG_LOW ? AJ_LOW : AJ_HIGH, sp.nudge_sound, sp.nudge_vib);
 }
 
+/* ONE SAMPLE INTO THE THREE RUNNING ANSWERS. The worst band on ANY worn CGM
+ * wins, and a LOW outranks a HIGH; a sensor with no current reading
+ * contributes nothing rather than voting "in range", which would clear the
+ * latch on a dropout and re-arm the nudge to fire again. */
+static void alarm_merge_sample(int glu, long t, long now,
+                               const struct prefs *sp, enum alarm_level *zone,
+                               bool *stranded, enum nudge_band *nzone)
+{
+   *zone = alarm_zone_merge(
+       *zone, alarm_zone(glu, t, now, sp->alarm_low, sp->alarm_high));
+   if (alarm_stranded(glu, t, now, sp->alarm_low, sp->alarm_high))
+      *stranded = true;
+   enum nudge_band nz = nudge_zone(glu, t, now, sp->nudge_low, sp->nudge_high);
+   /* MERGED THROUGH THE ALARM'S RULE, which is a rule about SEVERITY and not
+    * about either enum's numbering: low beats high beats neither. The two
+    * bands happen to share their values, so the conversion is exact -- and it
+    * is written out, both ways, rather than left to the fact that they do. */
+   if (nz != NG_UNKNOWN)
+      *nzone = (*nzone == NG_UNKNOWN)
+                   ? nz
+                   : (enum nudge_band)alarm_zone_merge(
+                         (enum alarm_level) * nzone, (enum alarm_level)nz);
+}
+
 /* Gather the alarm zone, the stranded flag and the NUDGE zone across every
  * live CGM from ONE snapshot of the history. The nudge rides along rather
  * than gathering again: two passes could see different samples, and a nudge
@@ -429,71 +453,39 @@ static void alarm_gather(long now, enum alarm_level *zone, bool *stranded,
    struct prefs sp;
    settings_get(&sp);
 
-   struct {
-      int glu;
-      long t;
-   } smp[MAX_SLOTS];
-
-   int ids[MAX_SLOTS];
-   int nids = 0;
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n && nids < MAX_SLOTS; i++) {
-      if (v.slot[i].old) /* disconnected: not part of the live alarm set */
-         continue;
-      if (v.have_rec[i] && sensor_kind(v.rec[i].type) == KIND_CGM)
-         ids[nids++] = v.slot[i].id;
-   }
-   int ns = 0;
-   /* ONE QUESTION PER SENSOR: the newest CGM instant it has. This
-    * was a count/index walk per sensor under a hand-taken store lock, with
-    * the "not a fingerstick" rule written out here as well as in three other
-    * files. The GLUCOSE still needs the reading itself, so this asks for the
-    * newest one rather than only its time. */
-   for (int i = 0; i < nids; i++) {
-      struct reading r;
-      if (hist_copy_src(ids[i], &r, 1) == 1) {
-         smp[ns].glu = r.glu;
-         smp[ns].t   = r.t;
-         ns++;
-      }
-   }
-   if (nids == 0) { /* pre-registry fallback: judge the current reading */
-      /* THE PAIR, FROM ONE INSTANT. store_now takes the lock itself and
-       * returns the glucose and its time together, which is the same
-       * guarantee the hand-taken lock around store_now_locked was buying --
-       * and this path no longer holds that lock for anything else. */
-      struct reading_now cur = store_now(realtime_s());
-      smp[0].glu             = cur.glu;
-      smp[0].t               = cur.t;
-      ns                     = 1;
-   }
    *zone     = AL_NONE;
    *stranded = false;
    *nzone    = NG_UNKNOWN;
-   for (int i = 0; i < ns; i++) {
-      *zone = alarm_zone_merge(*zone, alarm_zone(smp[i].glu, smp[i].t, now,
-                                                 sp.alarm_low, sp.alarm_high));
-      if (alarm_stranded(smp[i].glu, smp[i].t, now, sp.alarm_low,
-                         sp.alarm_high))
-         *stranded = true;
-      /* Merged the same way the alarm zone is -- the worst band on ANY worn
-       * CGM wins, and a LOW outranks a HIGH. A sensor with no current
-       * reading contributes nothing rather than voting "in range", which
-       * would clear the latch on a dropout and re-arm the nudge to fire
-       * again. */
-      enum nudge_band nz =
-          nudge_zone(smp[i].glu, smp[i].t, now, sp.nudge_low, sp.nudge_high);
-      /* MERGED THROUGH THE ALARM'S RULE, which is a rule about SEVERITY and
-       * not about either enum's numbering: low beats high beats neither. The
-       * two bands happen to share their values, so the conversion is exact
-       * -- and it is written out, both ways, rather than left to the fact
-       * that they do. */
-      if (nz != NG_UNKNOWN)
-         *nzone = (*nzone == NG_UNKNOWN)
-                      ? nz
-                      : (enum nudge_band)alarm_zone_merge(
-                            (enum alarm_level) * nzone, (enum alarm_level)nz);
+
+   /* THE REFERENCE IS HELD ACROSS THE STORE, and that is safe because it is a
+    * snapshot and not a lock: sensors_view_ref takes the view's own mutex
+    * only long enough to count a reference, and the view it hands back is
+    * immutable for as long as that reference lives. So the walk below can ask
+    * the history about each sensor as it reaches it, holding nothing, without
+    * either copying the registry out first or taking registry -> history.
+    *
+    * MERGED AS IT GOES rather than collected and folded afterwards: the
+    * result is three merged values, so nothing here needs two samples at
+    * once, and no per-sensor array has to exist. */
+   int nlive                    = 0;
+   const struct sensor_view *vp = sensors_view_ref();
+   for (int i = 0; i < vp->n_live; i++) {
+      if (!vp->have_rec[i] || sensor_kind(vp->rec[i].type) != KIND_CGM)
+         continue;
+      nlive++;
+      /* ONE QUESTION PER SENSOR: the newest CGM instant it has. The GLUCOSE
+       * is needed and not just its time, so this asks for the reading. */
+      struct reading r;
+      if (hist_copy_src(vp->slot[i].id, &r, 1) == 1)
+         alarm_merge_sample(r.glu, r.t, now, &sp, zone, stranded, nzone);
+   }
+   sensors_view_put(vp);
+
+   if (nlive == 0) { /* pre-registry fallback: judge the current reading */
+      /* THE PAIR, FROM ONE INSTANT. store_now takes the lock itself and
+       * returns the glucose and its time together. */
+      struct reading_now cur = store_now(realtime_s());
+      alarm_merge_sample(cur.glu, cur.t, now, &sp, zone, stranded, nzone);
    }
 }
 
@@ -572,7 +564,7 @@ int alarm_set_threshold(int isnudge, int islow, int mgdl)
 /* Re-issue the CURRENT alarm level to Java, even though the level has not
  * changed.
  *
- * alarm_apply is idempotent on the level -- re-asserting the same one must
+ * alarm_apply_ex is idempotent on the level -- re-asserting the same one must
  * not re-chime -- but that early return also swallowed a change to whether
  * the level is PERCEPTIBLE. With SOUND and VIBRATION both off, a low reading
  * commits g_alarm_want = AL_LOW while nothing sounds; turning SOUND on then

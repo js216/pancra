@@ -152,6 +152,17 @@ public final class PancraService extends Service {
      * cache -- so a restart or wake-alarm re-post never downgrades it to a bare
      * placeholder. Before the first reading it shows "Reading glucose". */
     private static Notification buildNotif(Context app) {
+        /* THE ID LIST CHECKS ITSELF, ONCE, WHERE THE FIRST NOTIFICATION IS
+         * BUILT. NotifPolicy.notifIdsDistinct() is only worth having if
+         * something calls it: two ids that collide are one slot used by two
+         * things, and the loser is whichever posted first -- which for a
+         * monitoring-stopped warning means the app silently stops saying it is
+         * not watching. Said in the log rather than thrown: a duplicated id is
+         * a build mistake, and refusing to show glucose over it would be a
+         * worse outcome than showing it with one notice mis-slotted. */
+        if (!NotifPolicy.notifIdsDistinct())
+            Log.i("pancra", "NOTIFICATION IDS COLLIDE -- two notices share a "
+                            + "slot and will replace each other");
         NotificationManager nm = app.getSystemService(NotificationManager.class);
         NotificationChannel ch =
             new NotificationChannel(CH, "Pancra",

@@ -18,11 +18,11 @@
  *   - whether it is one of the four thresholds (a predicate in the renderer,
  *     and the same range spelled out by hand in the shell).
  *
- * They drifted, as copies do. The dot-key range said 10..11 in the input path
- * while the renderer drew it for 10..13, so the NUDGE keypads had a visible,
- * tappable, DEAD '.' -- and with it no way to enter a nudge threshold at all
- * in mmol/L. The weight mode was missing from the slots table and worked by
- * falling through to the pairing code's entry, which happened to want the
+ * Copies of a rule drift, and these two drift in ways nothing catches: a
+ * dot-key range that says 10..11 in the input path while the renderer draws it
+ * for 10..13 gives the NUDGE keypads a visible, tappable, DEAD '.', and with it
+ * no way to enter a nudge threshold at all in mmol/L. A mode missing from the
+ * slots table works by falling through to whichever entry happens to want the
  * same number of digits.
  *
  * So: a NAMED mode, and one description of each. The renderer asks what to

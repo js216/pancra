@@ -71,8 +71,8 @@
 
 /* The block-count capacity of a 32-bit counter that starts at 2 and must never
  * wrap. Spelled as a suffixed integer constant, not a cast, so it can be used
- * in #if -- test/srv/cryptotest.c needs that to decide whether this platform's
- * size_t can even express a length past the bound. */
+ * in #if, which is what lets a caller decide at compile time whether this
+ * platform's size_t can even express a length past the bound. */
 #define GCM_CTR_BLOCKS_MAX 0xFFFFFFFEull /* 2^32 - 2 */
 
 /* SP 800-38D 5.2.1.1's len(P) <= 2^39 - 256 bits, in BYTES: 68719476704, which

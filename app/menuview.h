@@ -33,7 +33,7 @@
  * ui_perm_lbl names them in it, and the PERMISSIONS screen lists them in it.
  * The indices are NAMED because they are not interchangeable -- PERM_STEPS is
  * the only optional one, needed just while step counting is switched on, and
- * a bare 3 in the test that knows that would be a number nothing explains. */
+ * a bare 3 anywhere that knows that is a number nothing explains. */
 enum {
    PERM_BT_SCAN = 0,
    PERM_BT_CONN = 1,
@@ -66,6 +66,18 @@ struct menu_view {
    /* WHICH PAGE the two paginated device lists are showing. Menu state, not
     * frame state: the arrows are taps. */
    int old_page, dev_page;
+   /* HOW MANY RETIRED DEVICES A PAGE HOLDS, which the SCREEN decides and the
+    * MODEL has to know: the frame fills exactly one page, so if the screen
+    * can draw fewer rows than the frame filled, the tail of every page has no
+    * row and no tap target -- devices the user cannot reach at all.
+    *
+    * It travels through the menu state because the model is built BEFORE the
+    * surface is locked (main.c: the history lock must not span
+    * dequeueBuffer), so a frame cannot measure the window it will be drawn
+    * into. The screen measures itself and records it here for the next frame;
+    * it is a property of the geometry, so it only changes when the geometry
+    * does. UI_OLD_PAGE until a screen says otherwise. */
+   int old_rows;
 
    /* EXPORT DATA's checkboxes (session-only; the defaults -- everything, all
     * time -- are the whole point). Range 0 = 30 D, 1 = 1 Y, 2 = ALL. */
@@ -81,5 +93,16 @@ struct menu_view {
 
 /* One consistent copy. Main thread, like every other part of a frame. */
 void menu_view_get(struct menu_view *out);
+
+/* THE SCREEN TELLING THE MODEL HOW MANY ROWS IT CAN DRAW.
+ *
+ * Called by the OLD DEVICES renderer once it has measured the window. The
+ * next frame fills exactly this many retired devices and pages by the same
+ * number, so the window the model builds and the rows the screen paints are
+ * one set: a screen too short for UI_OLD_PAGE rows then shows SMALLER pages
+ * instead of losing the tail of every page to rows that are never drawn and
+ * cannot be tapped. Clamped to [1, UI_OLD_PAGE]. Main thread only, like the
+ * rest of the menu state. */
+void menu_old_rows_set(int rows);
 
 #endif

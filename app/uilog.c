@@ -641,6 +641,16 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
          int ax = dx < 0 ? -dx : dx;
          int ay = dy < 0 ? -dy : dy;
          int st = ax > ay ? ax : ay;
+         /* BOUNDED BY THE SURFACE, not by the two points. `st` is a pixel
+          * distance, so it is normally a few tens -- but the x of a point comes
+          * from its timestamp, and one row out of order (a restored log, a
+          * clock that moved) makes the span the width of the plot many times
+          * over. Every step is a fill_rect on the UI thread, so an unbounded
+          * count is a frame that never finishes. The diagonal of the surface is
+          * the most a visible segment can need. */
+         int stmax = fb->width + fb->height;
+         if (st > stmax)
+            st = stmax;
          for (int k = 1; k <= st && st > 0; k++)
             fill_rect(px, fb, prevx + ((dx * k) / st), prevy + ((dy * k) / st),
                       sc, sc, UI_MARK_FAST);

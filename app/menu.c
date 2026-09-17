@@ -8,7 +8,6 @@
 #include "clock.h"
 #include "device.h"
 #include "devtag.h" /* a log may not carry an address; see there */
-#include "dexdriver.h"
 #include "food.h"
 #include "forms.h"
 #include "jbridge.h"
@@ -51,6 +50,10 @@ static int g_exp_ins   = 1;
 static int g_exp_wt    = 1; /* EXPORT DATA: include the weight log */
 
 static int g_old_page; /* which page the OLD DEVICES list is showing */
+/* How many rows of that list the screen can actually draw. Set by the
+ * renderer once it has measured the window (menu_old_rows_set); read by the
+ * frame builder, which fills exactly that many. */
+static int g_old_rows = UI_OLD_PAGE;
 static int g_dev_page; /* which page the LIVE device list is showing */
 
 static const char *perms[] = {"android.permission.BLUETOOTH_SCAN",
@@ -74,11 +77,9 @@ static int g_sys_bg;
 /* Where the PAIRING flow (type tap -> keypad / meter help) was entered
  * from: the ADD menu or the ADD DEVICE picker. Every abort path returns
  * exactly there -- recorded, never inferred (the recurring bug). */
-/* How deep the path was when the ADD-A-DEVICE flow started, so every abort
- * inside it lands where it began. See nav_mark(). */
 /* How deep the navigation path was when the ADD-A-DEVICE flow began, so every
- * abort inside it lands where it started (see nav_mark()). Private: nothing
- * outside this file has ever read it, and it was exported anyway. */
+ * abort inside it lands where it started (see nav_mark()). Private: no file
+ * outside this one has any use for it. */
 static int g_pair_mark = 1;
 
 /* --- settings-menu system ops (main thread; shell_activity()->env valid) ---
@@ -120,6 +121,15 @@ static int sys_export_data(void)
  * main-thread state and the frame is built on the main thread, so no lock --
  * what this buys is that a frame cannot see the selected slot change between
  * the row it draws and the panel below it. */
+void menu_old_rows_set(int rows)
+{
+   if (rows < 1)
+      rows = 1;
+   if (rows > UI_OLD_PAGE)
+      rows = UI_OLD_PAGE;
+   g_old_rows = rows;
+}
+
 void menu_view_get(struct menu_view *out)
 {
    if (!out)
@@ -132,6 +142,7 @@ void menu_view_get(struct menu_view *out)
    out->standby_bucket = g_sys_bucket;
    out->bg_restricted  = g_sys_bg;
    out->old_page       = g_old_page;
+   out->old_rows       = g_old_rows;
    out->dev_page       = g_dev_page;
    out->exp_range      = g_exp_range;
    out->exp_glu        = g_exp_glu;
@@ -196,10 +207,10 @@ static int alarm_menu_action(int action)
       forms_kp_open(mode, cur_screen() == SCR_ALARM ? SCR_ALARM : SCR_MAIN);
    } else if (action == MA_NUDGE_SOUND) {
       if (settings_set_nudge_sound(!sp.nudge_sound) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
    } else if (action == MA_NUDGE_VIB) {
       if (settings_set_nudge_vib(!sp.nudge_vib) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
    } else if (action == MA_ALARM_OPEN) {
       /* Entered from the settings row or the main alarm row; record the
        * origin so MA_ALARM_BACK returns exactly there. */
@@ -264,7 +275,7 @@ static int remote_menu_action(int action)
        * the way OFF and not on the way on. */
       int want = !sp.remote_on;
       if (remote_set_on(want) != SETTINGS_OK)
-         set_status("SYNC SETTING NOT SAVED");
+         set_status_refused("SYNC SETTING NOT SAVED");
       /* TURNING IT BACK ON IS A REQUEST TO SYNC. Whatever schedule the last
        * failure earned belongs to the settings that failed; the user has
        * just changed one. Without this, switching sync off and on again --
@@ -315,7 +326,7 @@ static int remote_menu_action(int action)
        * phone that has stopped syncing while the screen still says PAIRED,
        * and the next launch loads the identity straight back. */
       if (remote_forget_identity() != SETTINGS_OK)
-         set_status("UNPAIR NOT SAVED");
+         set_status_refused("UNPAIR NOT SAVED");
       else
          sync_set_key(0, sc.key);
    } else if (action == MA_REMOTE_IP) {
@@ -371,15 +382,15 @@ static int devlist_menu_action(int action, int ix)
       int id = ui_shortcut_id(ix);
       if (settings_pinned(id)) {
          if (settings_pin_remove(id) != SETTINGS_OK)
-            set_status("PIN NOT SAVED");
+            set_status_refused("PIN NOT SAVED");
       } else {
          int pr = settings_pin_add(id);
          if (pr == SETTINGS_FULL) {
             char full[24];
             (void)snprintf(full, sizeof full, "%d PINS MAX", SC_MAX);
-            set_status(full);
+            set_status_refused(full);
          } else if (pr != SETTINGS_OK) {
-            set_status("PIN NOT SAVED");
+            set_status_refused("PIN NOT SAVED");
          }
       }
    } else if (action == MA_DEVPAGE) {
@@ -444,9 +455,9 @@ static int style_action(int action, int ix)
       if (forms_markpick() >= 0) {
          /* the picker is editing an INSULIN type's marker, not a sensor's */
          if (settings_set_ins_style(forms_markpick(), mk, -1, 0) != SETTINGS_OK)
-            set_status("MARKER NOT SAVED");
+            set_status_refused("MARKER NOT SAVED");
       } else if (sensor_set_marker(sel.id, mk) != 0) {
-         set_status("MARKER NOT SAVED");
+         set_status_refused("MARKER NOT SAVED");
       }
       /* stay on the combined MARKER menu so shape/size/colour can be
        * adjusted together; the title-row X returns to the device menu */
@@ -455,14 +466,11 @@ static int style_action(int action, int ix)
       if (sz >= 1 && sz <= MARK_SIZE_MAX && forms_markpick() >= 0) {
          if (settings_set_ins_style(forms_markpick(), -1, -1, sz) !=
              SETTINGS_OK)
-            set_status("SIZE NOT SAVED");
+            set_status_refused("SIZE NOT SAVED");
       } else if (sensor_set_size(sel.id, sz) != 0) {
-         set_status("SIZE NOT SAVED");
+         set_status_refused("SIZE NOT SAVED");
       }
       /* stay on the combined MARKER menu */
-   } else if (action == MA_SIZE) {
-      if (sensor_cycle_size(sel.id) != 0)
-         set_status("SIZE NOT SAVED");
    } else if (action == MA_LABEL) {
       if (have_sel) {
          /* seed the field with the current name so a small edit is a small
@@ -495,16 +503,13 @@ static int style_action(int action, int ix)
          cap = FOOD_NAME_MAX;
       if (forms_kp_len() < cap)
          forms_kp_type(ui_label_chars[ix]);
-   } else if (action == MA_COLOR) {
-      if (have_sel)
-         nav_go(SCR_COLORPICK); /* open the colour picker */
    } else if (action == MA_COLOR_PICK) {
       int ci = ix;
       if (forms_markpick() >= 0) {
          if (settings_set_ins_style(forms_markpick(), -1, ci, 0) != SETTINGS_OK)
-            set_status("COLOUR NOT SAVED");
+            set_status_refused("COLOUR NOT SAVED");
       } else if (sensor_set_color(sel.id, ci) != 0) {
-         set_status("COLOUR NOT SAVED");
+         set_status_refused("COLOUR NOT SAVED");
       }
       /* stay on the combined MARKER menu (see MA_MARK_PICK) */
    } else {
@@ -515,8 +520,8 @@ static int style_action(int action, int ix)
 
 /* SETTINGS TOGGLES: the rows on the SETTINGS screen that flip one stored
  * preference and nothing else. No navigation, no radio, no storage beyond
- * settings_save() -- which is what makes this the smallest family and the one
- * to copy when adding another switch. */
+ * set_render_settings() -- which is what makes this the smallest family and the
+ * one to copy when adding another switch. */
 static int settings_action(int action, int ix)
 {
    struct prefs sp;
@@ -524,21 +529,21 @@ static int settings_action(int action, int ix)
    (void)ix; /* no indexed action in this family */
    if (action == MA_ORIENT) {
       if (settings_cycle_orient() != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
    } /* applied on close */
    else if (action == MA_SOUND) {
       if (settings_set_sound(!sp.sound_on) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
       alarm_reactuate(); /* an alarm may be latched but inaudible -- see
                           * there
                           */
    } else if (action == MA_VIB) {
       if (settings_set_vib(!sp.vib_on) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
       alarm_reactuate();
    } else if (action == MA_UNITS) {
       if (settings_set_units(!sp.units) != SETTINGS_OK)
-         set_status("UNITS NOT SAVED");
+         set_status_refused("UNITS NOT SAVED");
       /* The notification renders the value in DISPLAY units (title AND the
        * status-bar icon) but is only rebuilt on a new datapoint -- without
        * an explicit refresh the bar keeps showing the previous units'
@@ -548,16 +553,16 @@ static int settings_action(int action, int ix)
       notify_tick();
    } else if (action == MA_DISC) {
       if (settings_cycle_disc() != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
    } else if (action == MA_SCREEN) {
       if (settings_set_screen_on(!sp.screen_on) != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
       shell_apply_screen_on(); /* takes effect immediately, not on menu close */
    } else if (action == MA_NEWDATA) {
-      /* OFF -> BEEP -> CHIRP -> OFF. A cycle, not a toggle, since CHIRP
-       * joined: the row shows which of the three is active. */
+      /* OFF -> BEEP -> CHIRP -> MORSE -> OFF. A cycle, not a toggle: the
+       * row shows which of the modes is active. */
       if (settings_cycle_newdata() != SETTINGS_OK)
-         set_status("NOT SAVED");
+         set_status_refused("NOT SAVED");
    } else {
       return 0;
    }
@@ -662,7 +667,7 @@ static int device_primary_action(int action, int ix)
    if (action == MA_PRIMARY) {
       if (sensor_slot_of(sel_device(), &psel)) {
          if (sensor_set_primary(psel.id) != SENSOR_OK)
-            set_status("PRIMARY NOT SAVED");
+            set_status_refused("PRIMARY NOT SAVED");
          /* Re-bind the big number NOW, not on the next reading (up to 5 min
           * away): the primary owns it by contract, and if the new primary
           * has no data yet the display must clear rather than keep the
@@ -682,7 +687,7 @@ static int device_primary_action(int action, int ix)
        * the drawn row at touch-down (see input.c); sensor_set_primary still
        * refuses a meter or an old device. */
       if (sensor_set_primary(ix) != SENSOR_OK)
-         set_status("PRIMARY NOT SAVED");
+         set_status_refused("PRIMARY NOT SAVED");
       int prime = sensor_primary_id();
       store_lock();
       hist_refresh_current(prime);
@@ -753,7 +758,7 @@ static int device_life_action(int action)
       struct sensor_slot wsel;
       if (!sensor_slot_of(sel_device(), &wsel) ||
           sensor_cycle_wear(wsel.id) != 0)
-         set_status("WEAR BUDGET NOT SAVED");
+         set_status_refused("WEAR BUDGET NOT SAVED");
    } else if (action == MA_FORGET) {
       if (sensor_slot_of(sel_device(), 0))
          nav_go(SCR_FORGET); /* confirm first; this action changes nothing */
@@ -794,7 +799,7 @@ static int device_life_action(int action)
              * meter's records under another's id -- but refusing SILENTLY is
              * what this whole handler was already guilty of. */
             LOGI("manual sync refused: a meter sync is already in flight");
-            set_status("METER BUSY, RETRY");
+            set_status_refused("METER BUSY, RETRY");
          } else {
             LOGI("manual sync: connecting to meter id %d (dev %s)", mid,
                  devtag(mmac, dt));
@@ -857,7 +862,7 @@ static int calib_action(int action, int ix)
    } else if (action == MA_CAL_CANCEL) {
       /* Discard the queued calibration entirely. */
       if (calib_cancel() != CALIB_OK)
-         set_status("CANCEL NOT SAVED");
+         set_status_refused("CANCEL NOT SAVED");
       nav_go(SCR_SENSOR);
    } else if (action == MA_RESCALE_OPEN && have_sel &&
               calib_rescale_engaged(sel.id)) {
@@ -871,7 +876,7 @@ static int calib_action(int action, int ix)
       forms_set_rescale_entry(0);
    } else if (action == MA_RESCALE_STOP) {
       if (calib_rescale_stop() != CALIB_OK)
-         set_status("RESCALE STOP NOT SAVED");
+         set_status_refused("RESCALE STOP NOT SAVED");
       nav_go(SCR_SENSOR);
    } else if (action == MA_RESCALE_ENTER) {
       /* CONFIRM: compute the factor from the entered true value over the
@@ -894,7 +899,7 @@ static int calib_action(int action, int ix)
       if (forms_rescale_entry() > 0 && have_sel &&
           calib_rescale_set(sel.id, calib_raw_on_link(link_for_sensor(sel.id)),
                             forms_rescale_entry()) != CALIB_OK) {
-         set_status("RESCALE NOT SAVED");
+         set_status_refused("RESCALE NOT SAVED");
          rfate = DRAFT_RETRY;
       }
       if (rfate == DRAFT_DONE) {
@@ -904,10 +909,6 @@ static int calib_action(int action, int ix)
    } else if (action == MA_CAL_BACK || action == MA_FORGET_NO ||
               action == MA_RESCALE_BACK || action == MA_RECON_NO) {
       nav_go(SCR_SENSOR); /* these sub-screens back out to the sensor */
-   } else if (action == MA_CAL_REFRESH) {
-      int callink = cal_link();
-      if (callink >= 0)
-         driver_cal_bounds(callink);
    } else if (action == MA_CAL_ENTER) {
       /* CONFIRM: QUEUE the calibration durably (persisted), then try once
        * now. It is NOT dropped if the sensor is not streaming this instant
@@ -931,7 +932,7 @@ static int calib_action(int action, int ix)
           * sensor against a value the app will have forgotten by the next
           * launch. */
          if (calib_queue(sel.id, forms_cal_pending()) != CALIB_OK) {
-            set_status("CALIBRATION NOT SAVED");
+            set_status_refused("CALIBRATION NOT SAVED");
             cfate = DRAFT_RETRY;
          } else {
             int callink = cal_link();
@@ -985,11 +986,7 @@ static int system_action(int action, int ix)
       jb_set_orientation(shell_activity(), sp.orient);
    } /* apply orient */
    /* --- keypad (opened from settings rows: return there on close) --- */
-   else if (action == MA_PAIR_CODE) {
-      nav_go(SCR_KEYPAD);
-      forms_kp_open(KP_PAIR_CODE, SCR_SETTINGS);
-      pair_scan_start(); /* scan under the code entry to hide the delay */
-   } else if (action == MA_PLOTMAX) {
+   else if (action == MA_PLOTMAX) {
       nav_go(SCR_KEYPAD);
       forms_kp_mode_set(KP_PLOT_MAX);
       forms_kp_return_set(SCR_DISPLAY); /* PLOT MAX now lives on DISPLAY */
@@ -1064,6 +1061,15 @@ static int pair_action(int action, int ix)
                                      began */
       pair_cancel();
       nav_return_to(g_pair_mark);
+      /* AND IT MUST ACTUALLY LEAVE THE LIST. nav_return_to does nothing when
+       * the mark is at or above the current depth -- and the two ambiguity
+       * routes reach this screen with exactly that shape, because the flow
+       * had already popped to the mark before the list was pushed. Without
+       * this the screen has NO exit: the back key maps here too, so the only
+       * way off it is to pick a device and confirm, which pairs a sensor the
+       * user never chose and drops the bond of the one they did. */
+      if (cur_screen() == SCR_DEVLIST)
+         nav_back();
    } else if (action == MA_DEV_PICK) { /* device list: pick */
       /* Only honour a device-pick while the list is actually open and the
        * index is a real device. The hit-box array is rebuilt by draw()
@@ -1123,10 +1129,10 @@ static int shortcut_action(int action, int ix)
               action == MA_NOTIF_REOPEN) {
       if (action == MA_STATBAR) {
          if (settings_set_statbar(!sp.statbar_val) != SETTINGS_OK)
-            set_status("NOT SAVED");
+            set_status_refused("NOT SAVED");
       } else if (action == MA_LOCKSCR) {
          if (settings_set_lockscr(!sp.lockscr_val) != SETTINGS_OK)
-            set_status("NOT SAVED");
+            set_status_refused("NOT SAVED");
       }
       /* All three re-post the notification immediately: the toggles so
        * the change is visible at once, REOPEN because re-posting IS the
@@ -1171,7 +1177,6 @@ int menu_back_code(int *ix)
       case SCR_EXEDIT: return MA_EX_DISCARD;
       case SCR_EXDEL: return MA_EXDEL_NO;
       case SCR_MARKPICK:
-      case SCR_COLORPICK:
          /* the combined picker's X: DISPLAY for an insulin type's styling,
           * the owning sensor's screen otherwise (same as render_markpick) */
          if (forms_markpick() >= 0)
@@ -1241,13 +1246,11 @@ void menu_action(int action, int ix)
        * written, and an action claimed by NONE of them produces a button that
        * draws perfectly and does nothing.
        *
-       * `make -f test/Makefile actioncheck` now proves neither can happen: it
-       * attributes every MA_* to the function that tests it, across all six
-       * dispatch files, and refuses a duplicate or an orphan. With ownership
-       * unique the chain answers the same whatever order it is written in --
-       * so the order below is a reading convenience rather than a rule, and
-       * adding a family cannot change what an existing control does. (It
-       * found six actions nothing dispatched, on its first run.) */
+       * So EVERY MA_* IS CLAIMED BY EXACTLY ONE family, across all six
+       * dispatch files -- no duplicate, no orphan. With ownership unique the
+       * chain answers the same whatever order it is written in, so the order
+       * below is a reading convenience rather than a rule, and adding a
+       * family cannot change what an existing control does. */
    } else if (action == MA_OK) {
       /* OK MEANS "I HAVE FINISHED TYPING", and nothing more. The keypad and
        * the label editor are one widget each, shared by every field that needs

@@ -7,6 +7,7 @@
 #include "dexlibc.h"
 #include "loadresult.h" /* what a load actually found */
 #include "log.h"
+#include "meter.h" /* METER_MAX: what every per-meter table is sized by */
 #include "sensors.h"
 #include "thread.h" /* mrt_lk: the table's own lock */
 #include "util.h"
@@ -18,13 +19,25 @@
  * meter's sync throttle the other (a global 60 s gate) and show one meter's
  * signal/sync-time against both. */
 
-static struct meter_rt g_meter_rt[MAX_SLOTS];
+static struct meter_rt g_meter_rt[METER_MAX];
 static int g_meter_nrt;
 static char g_meter_path[256];
 static char g_metersync_path[256]; /* per-meter last-sync time, persisted */
 
 /* THE LOCK OVER THE TABLE. See meterstore.h for why the pointer does not
  * leave any more. A leaf: nothing below reaches another module. */
+/* The widest row each per-meter file can hold, which is what sizes both the
+ * render buffer and the parse buffer for it -- a file the writer can produce
+ * and the reader cannot swallow is the one shape neither side reports.
+ *
+ * Taken from what the FORMAT can print rather than from the values expected
+ * in it, so a wide value cannot overflow the render; an overflow here does
+ * not corrupt anything, but it abandons the write silently. */
+/* "%d,%ld,%d,%d\n" is 57 characters at the widest an int and a long print. */
+#define MSYNC_ROW 64
+/* "%d,%d\n" is 24 at the widest two ints print. */
+#define IDX_ROW 24
+
 static struct mutex mrt_lk = MUTEX_INIT;
 
 /* ---- WHAT IS ON DISK, AND WHAT IS ONLY IN MEMORY -------------
@@ -74,6 +87,19 @@ static struct meter_rt *rt_find(int id, int create)
    for (int i = 0; i < g_meter_nrt; i++)
       if (g_meter_rt[i].id == id)
          return &g_meter_rt[i];
+   if (create &&
+       g_meter_nrt >= (int)(sizeof g_meter_rt / sizeof g_meter_rt[0])) {
+      /* ONCE PER PROCESS, not once per call. meter_note_advert asks for this
+       * record on every advertisement a meter sends, so a table that is full
+       * stays full and would repeat this line for the life of the run. */
+      static int said;
+      if (!said) {
+         said = 1;
+         LOGW("meter: %d meters registered is all this build tracks; meter %d "
+              "keeps no last-sync time and re-walks its records every sync",
+              g_meter_nrt, id);
+      }
+   }
    if (create &&
        g_meter_nrt < (int)(sizeof g_meter_rt / sizeof g_meter_rt[0])) {
       struct meter_rt *r = &g_meter_rt[g_meter_nrt++];
@@ -245,7 +271,7 @@ int meter_rt_done(int id, long synced_mono)
  * crash never truncates it to nothing. */
 /* Drop records for meters the registry does not hold.
  *
- * The table is MAX_SLOTS long and the loader creates a record for every row
+ * The table is METER_MAX long and the loader creates a record for every row
  * in the file, so a forgotten meter's row is self-perpetuating: the save
  * writes it back, the next launch loads it again, and the seats it occupies
  * are never returned. Fill the table that way and every write for a LIVE
@@ -253,21 +279,21 @@ int meter_rt_done(int id, long synced_mono)
  * and the save.
  *
  * IN THREE STEPS, because the registry's answer cannot be asked for under
- * mrt_lk: that would be meter-rt held while registry is taken, the reverse of
- * the order everything else uses, and test/app/lockorder.py would say so. So:
+ * mrt_lk: that would be meter-rt held while registry is taken, the reverse
+ * of the order everything else uses. So:
  * copy the ids out, ask, then compact. A record created in between is left
  * alone -- it was not in the list, so it is not one of the ones being
  * dropped. */
 static void prune_dead(void)
 {
-   int ids[MAX_SLOTS];
+   int ids[METER_MAX];
    int n = 0;
    mutex_lock(&mrt_lk);
-   for (int i = 0; i < g_meter_nrt && n < MAX_SLOTS; i++)
+   for (int i = 0; i < g_meter_nrt && n < METER_MAX; i++)
       ids[n++] = g_meter_rt[i].id;
    mutex_unlock(&mrt_lk);
 
-   int dead[MAX_SLOTS];
+   int dead[METER_MAX];
    int nd    = 0;
    int alive = 0;
    for (int i = 0; i < n; i++) {
@@ -347,8 +373,7 @@ static void prune_dead(void)
  * MRT_LK IS NOT HELD while waiting, and not held across the file. msync_lk is
  * therefore the same shape as calfile_lk and set_file_lk -- taken OUTSIDE the
  * state lock, held across the I/O, and never taken by a reader. See the rank
- * table in app/thread.h, which lists it, and test/app/lockorder.py, which
- * checks it. */
+ * table in app/thread.h, which lists it. */
 static struct mutex msync_lk = MUTEX_INIT;
 
 /* THE BODY OF BOTH THE SAVE AND THE RETRY. `block` says what to do when
@@ -360,7 +385,7 @@ static struct mutex msync_lk = MUTEX_INIT;
  * Returns 0 written, -1 refused by the file system, 1 not attempted. */
 static int sync_flush(int block)
 {
-   char all[(MAX_SLOTS * 64) + 1];
+   char all[(METER_MAX * MSYNC_ROW) + 1];
    int used = 0;
    /* A forgotten meter's row is not written back, and does not go on holding
     * a seat in the table.
@@ -373,7 +398,7 @@ static int sync_flush(int block)
    int rc = 0;
    /* THE REFUSAL IS OUTSIDE THE LOCK, and it is a refusal to take one --
     * nothing is held here, which is what makes this an ordinary early
-    * return rather than the shape lockorder.py rejects. */
+    * return rather than a return out of a critical section. */
    if (!block && !mutex_trylock(&msync_lk))
       return 1;
    if (block)
@@ -423,10 +448,10 @@ static int sync_flush(int block)
        * between rows.
        *
        * A HOOK RATHER THAN A BARE YIELD, and the reason is measured: this
-       * loop also runs under the suite's OTHER concurrency section, where a
+       * loop also runs under a concurrency exercise where a
        * save thread renders continuously while two writers hammer the table.
        * Yielding under mrt_lk there starved those writers and turned a 15 s
-       * suite into one that had not finished in five minutes. So the test
+       * run into one that had not finished in five minutes. So a caller
        * installs the gap around the section that needs it and takes it away
        * again -- app_fault_gap_here in util.h is the same device. Nothing
        * that ships defines APP_FAULTS. */
@@ -439,9 +464,8 @@ static int sync_flush(int block)
                         rid, rsync, rrssi, rok);
       if (bn <= 0 || bn >= (int)sizeof all - used) {
          /* ONE EXIT, and it is not a `return`: leaving from here would walk
-          * away holding both locks, and both are yield-spins with no timeout.
-          * test/app/lockorder.py refuses a return taken while a lock is
-          * held for exactly this reason. */
+          * away holding both locks, and both are yield-spins with no
+          * timeout. */
          rc = -1;
          break;
       }
@@ -462,7 +486,7 @@ static int sync_flush(int block)
     * In this build the yield sits INSIDE msync_lk, where it costs a delayed
     * write and nothing else. In a build that takes the lock after the render
     * it sits outside, and the overtaking becomes ordinary rather than rare --
-    * which is exactly the difference the test has to be able to see. Nothing
+    * which is exactly the difference a check has to be able to see. Nothing
     * that ships defines APP_FAULTS. */
    if (meter_fault_gap_here)
       meter_fault_gap_here();
@@ -555,7 +579,7 @@ enum sync_retry meter_sync_retry(long now)
  * and apply nothing until all of it is known good. */
 
 /* At most one row per slot: this file is written from the runtime table,
- * which is MAX_SLOTS wide. A file with more rows than that is not one this
+ * which is METER_MAX wide. A file with more rows than that is not one this
  * app wrote. */
 /* Epoch bound on a last-seen instant: the same value and the same rationale
  * as EX_T_MAX, INS_T_MAX and WT_T_MAX -- year 3000, wide enough for any real
@@ -611,19 +635,18 @@ static int msync_parse(const char *line, const char *end, struct msync_row *r)
 
 enum load_result meter_sync_load(void)
 {
-   /* ONE EXACT READ. This function's own loop -- EINTR-safe, to
-    * the end, with a probe for a byte past the buffer -- is where
-    * read_file_exact came FROM: it was the only loader in the app that had
-    * all three right, and the others each had their own single unchecked
-    * read. It is shared now, so there is one of it. */
-   char b[1024];
+   /* ONE EXACT READ, shared rather than written out here: EINTR-safe, to the
+    * end, with a probe for a byte past the buffer. A loader that has its own
+    * single unchecked read gets two of those three wrong, and each loader
+    * getting them wrong differently is what read_file_exact exists to end. */
+   char b[(METER_MAX * MSYNC_ROW) + 1];
    int used            = 0;
    enum load_result rr = read_file_exact(g_metersync_path, b, sizeof b, &used);
    if (rr != LOAD_OK)
       return rr;
 
    /* STAGED, and nothing is published until every row has parsed. */
-   struct msync_row rows[MAX_SLOTS];
+   struct msync_row rows[METER_MAX];
    int nrow = 0;
    int at   = 0;
    while (at < used) {
@@ -667,7 +690,7 @@ enum load_result meter_sync_load(void)
  * since they are outside the in-memory dedup window) and held each meter
  * awake for a full walk on every advert.
  *
- * Stored as "id,index" lines, rewritten whole -- it is at most MAX_SLOTS
+ * Stored as "id,index" lines, rewritten whole -- it is at most METER_MAX
  * rows.
  */
 /* THE INDEX FILE'S OWN LOCK, distinct from the runtime table's.
@@ -696,8 +719,8 @@ int meter_index_save(int id, int idx)
 {
    if (id <= 0)
       return -1;
-   int ids[MAX_SLOTS];
-   int vals[MAX_SLOTS];
+   int ids[METER_MAX];
+   int vals[METER_MAX];
    mutex_lock(&idx_lk);
    /* A REWRITE MUST SEE THE WHOLE MAP. This function reads every
     * pair, changes one, and writes them all back -- so a read that could not
@@ -705,7 +728,7 @@ int meter_index_save(int id, int idx)
     * is exactly the loss this file exists to prevent, in the one operation
     * that can cause it. */
    int over = 0;
-   int n    = index_all_locked(ids, vals, MAX_SLOTS, NULL, &over);
+   int n    = index_all_locked(ids, vals, METER_MAX, NULL, &over);
    if (over) {
       mutex_unlock(&idx_lk);
       LOGW("meter.idx: holds more meters than this build can rewrite; the "
@@ -717,7 +740,7 @@ int meter_index_save(int id, int idx)
    for (int i = 0; i < n && at < 0; i++)
       if (ids[i] == id)
          at = i;
-   if (at < 0 && n < MAX_SLOTS) {
+   if (at < 0 && n < METER_MAX) {
       at      = n++;
       ids[at] = id;
    }
@@ -737,10 +760,16 @@ int meter_index_save(int id, int idx)
        * re-appends fingersticks that are weeks old and therefore outside the
        * dedup window -- double-counted in the stats, permanently. */
       /* WHICH ROWS ARE LIVE IS THE REGISTRY'S QUESTION, and it is asked
-       * here, inside idx_lk, only because the answer is used immediately. It
-       * is safe in this order -- idx_lk is a leaf that the registry never
-       * takes -- but it is the one call out of this file under a lock, so it
-       * is worth naming. See test/app/lockorder.py, which checks the pair. */
+       * here, inside idx_lk.
+       *
+       * SO idx_lk IS NOT A LEAF, whatever is convenient to call it: the
+       * registry lock is taken under it here, and the file write below runs
+       * under it too. The order is driver -> idx_lk -> reg_lk, and it is
+       * one-way only because the registry never reaches back for this lock.
+       * thread.h ranks it there. What it costs is a wait: mutex_lock is an
+       * untimed yield-spin, so a thread wanting idx_lk spins while this one
+       * is inside an fsync AND holding reg_lk. That is why this is the ONLY
+       * call out of this file under a lock, and why it must stay so. */
       int victim = -1;
       for (int i = 0; i < n && victim < 0; i++)
          if (!sensor_id_is_live(ids[i]))
@@ -766,7 +795,7 @@ int meter_index_save(int id, int idx)
     * outside the dedup window, so they are appended a second time and
     * double-counted in the stats. rename() is atomic: old values or new,
     * never nothing. */
-   char all[(MAX_SLOTS * 32) + 1];
+   char all[(METER_MAX * IDX_ROW) + 1];
    int used = 0;
    for (int i = 0; i < n; i++) {
       int bn = snprintf(all + used, sizeof all - (size_t)used, "%d,%d\n",
@@ -794,7 +823,7 @@ static int index_all_locked(int *ids, int *vals, int cap, enum load_result *how,
     * missing file, an unreadable one and a good one this meter is not in;
     * the first two want different actions from the third -- see
     * meter_index_load in meterstore.h -- so what happened travels. */
-   char b[256];
+   char b[(METER_MAX * IDX_ROW) + 1];
    int n                     = 0;
    enum load_result how_read = read_file_exact(g_meter_path, b, sizeof b, &n);
    if (how)
@@ -881,11 +910,11 @@ enum load_result meter_index_load(int id, int *out)
    if (!out)
       out = &dummy;
    *out = -1;
-   int ids[MAX_SLOTS];
-   int vals[MAX_SLOTS];
+   int ids[METER_MAX];
+   int vals[METER_MAX];
    enum load_result how = LOAD_OK;
    mutex_lock(&idx_lk);
-   int n = index_all_locked(ids, vals, MAX_SLOTS, &how, NULL);
+   int n = index_all_locked(ids, vals, METER_MAX, &how, NULL);
    mutex_unlock(&idx_lk);
    if (how == LOAD_ERROR)
       return LOAD_ERROR; /* the file is there and did not answer */

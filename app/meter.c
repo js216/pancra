@@ -82,8 +82,8 @@ static int sess_link(void)
 /* Which links carry a meter, mirroring what the transport was told. The
  * shell needs its own copy because several CGM-only passes below iterate the
  * links and must skip meters. A per-link FACT rather than a fixed link
- * number: any link can carry a meter. Written only through link_set_meter, so
- * the two copies cannot drift. */
+ * number: any link can carry a meter. Written only through
+ * driver_link_set_meter, so the two copies cannot drift. */
 /* (The per-link ROLE and ARMING tables moved into the driver: its own
  * callbacks read them, so they belong with its lock -- see dexdriver.h's
  * driver_link_* operations. What is left here is this module's own
@@ -123,7 +123,7 @@ static int sess_link(void)
  * Releasing is the other half of arming and has to undo both facts. */
 
 /* (The RSSI of the sync connection is recorded PER METER, in the runtime
- * table keyed by registry id -- meter_rssi_of, and only there. A second
+ * table keyed by registry id -- meter_ui_of, and only there. A second
  * process-global copy would be three more fields written from a binder thread
  * for no reader.) */
 static char g_meter_model[24], g_meter_fw[24];
@@ -218,7 +218,7 @@ int meter_armed(const char *mac)
 /* A free link a meter may take, or -1.
  *
  * Shared by the arming path and by pairing a NEW meter: two callers, one
- * rule. NOT link_for_slot, whose free-link search knows nothing about armed
+ * rule. NOT link_for_sensor, whose free-link search knows nothing about armed
  * meters and will happily hand back LINK_CGM. */
 int meter_alloc_link(const char *mac)
 {
@@ -227,21 +227,30 @@ int meter_alloc_link(const char *mac)
     * devices than links the meters would take them all and a sensor that
     * streams continuously would be left with none. Count the live CGMs still
     * waiting for a link and ask the driver to leave that many free. */
-   int want = 0;
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n; i++) {
-      if (v.slot[i].old)
+   int want                     = 0;
+   const struct sensor_view *vp = sensors_view_ref();
+   for (int i = 0; i < vp->n_live; i++) {
+      if (!vp->have_rec[i] || sensor_kind(vp->rec[i].type) != KIND_CGM)
          continue;
-      if (!v.have_rec[i] || sensor_kind(v.rec[i].type) != KIND_CGM)
-         continue;
-      if (driver_link_of_identity(v.rec[i].identity) < 0)
+      if (driver_link_of_identity(vp->rec[i].identity) < 0)
          want++;
    }
+   sensors_view_put(vp);
    /* THE SEARCH AND THE CLAIM ARE THE DRIVER'S, in one critical section: a
     * link that reads free here and is claimed by a binder thread before this
     * caller uses it would be handed to two devices at once. */
-   return driver_link_claim(mac, want);
+   int link = driver_link_claim(mac, want);
+   /* A CLAIM CANCELS THE PREVIOUS OWNER'S TEARDOWN DEADLINE, here at the
+    * ARMING and not later at meter_link_set. The pairing path runs a mint and
+    * a slot claim -- two flash writes -- between the two, and a stamp left
+    * standing across that window is one the stranded-link watchdog can act on:
+    * it would release a link this caller has just been given, mid-connect.
+    *
+    * With this, "armed" and "stamped" cannot both be true of a live link, which
+    * is what lets meter_tick_eval judge a stranded link on its stamp alone. */
+   if (link >= 0)
+      msess_idle_set(link, 0);
+   return link;
 }
 
 void meter_sync_start(int mid, const char *mac)
@@ -256,7 +265,7 @@ void meter_sync_start(int mid, const char *mac)
    int link = meter_link_of(mac);
    if (link < 0) {
       /* A free link: claimed by no other meter, and carrying no CGM session.
-       * NOT link_for_slot -- that ranks devices the DEXCOM session binds, and
+       * NOT link_for_sensor -- that ranks devices the DEXCOM session binds, and
        * a meter never runs one, so two meters would rank to the same link and
        * the second would evict the first. */
       link = meter_alloc_link(mac);
@@ -275,7 +284,7 @@ void meter_sync_start(int mid, const char *mac)
       if (now - last_warn > 60) {
          last_warn = now;
          LOGI("meter id %d (dev %s): no free link", mid, devtag(mac, dt));
-         set_status("NO FREE LINK");
+         set_status_refused("NO FREE LINK");
       }
       return;
    }
@@ -353,23 +362,25 @@ static int meter_hook_connected(int link)
    if (link < 0 || link >= LINK_MAX)
       return 0;
    /* Which meter is this? FROM THE ARMED TABLE -- the address we issued the
-    * connect with.
+    * connect with, and the only record of which meter owns a link.
     *
     * NOT from the driver session: drv_connect does not write it, only the
-    * Dexcom handshake does, so for a meter link it is always empty. Reading
-    * it here made the lookup fail every single time, which refused and
-    * closed every meter connection that ever arrived -- meters could not
-    * sync at all. The armed table is the only record of which meter owns a
-    * link. */
+    * Dexcom handshake does, so on a meter link it is empty and every lookup
+    * against it fails -- which refuses and closes the connection. */
    char mac[24];
    driver_link_armed_mac(link, mac, sizeof mac);
-   int mid = -1;
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n && mid < 0; i++)
-      if (mac[0] && v.have_rec[i] && !strcmp(v.rec[i].identity, mac) &&
-          sensor_kind(v.rec[i].type) == KIND_BGM)
-         mid = v.slot[i].id;
+   int mid                     = -1;
+   const struct sensor_view *v = sensors_view_ref();
+   /* THE LIVE PREFIX, like every other meter walk. On the whole table a
+    * meter the user DISCONNECTED still resolves here, so its next power-on
+    * completes a sync and appends fingersticks under a retired id. */
+   for (int i = 0; i < v->n_live && mid < 0; i++)
+      if (mac[0] && v->have_rec[i] && !strcmp(v->rec[i].identity, mac) &&
+          sensor_kind(v->rec[i].type) == KIND_BGM)
+         mid = v->slot[i].id;
+   /* Released before the branches below, all four of which return: the id is
+    * the only thing any of them needs. */
+   sensors_view_put(v);
    if (mid <= 0) {
       LOGI("meter connect on link %d: no registered meter there", link);
       return 0;
@@ -402,6 +413,12 @@ static int meter_hook_connected(int link)
       LOGW("meter %d: the stored index could not be read; not syncing this "
            "cycle rather than re-walking its records",
            mid);
+      /* THE CLAIM ABOVE IS GIVEN BACK. This refusal is downstream of a
+       * msess_claim that SUCCEEDED, so returning without it leaves the session
+       * held by a link that is about to be closed: every other meter's connect
+       * is refused until the transport's disconnect callback arrives, and if it
+       * never does, until the 90 s watchdog. */
+      (void)msess_end(link, 0);
       return 0;
    }
    ot_init(seed); /* caller holds driver_lock */
@@ -502,20 +519,32 @@ static void meter_sync_watchdog_locked(void)
     * than only the last one used. Arming is idempotent (meter_armed), so
     * this is a no-op on every tick but the first after a restart or a
     * finished sync. */
-   int ids[MAX_SLOTS];
-   char macs[MAX_SLOTS][24];
-   int n = 0;
-   struct sensor_view av;
-   sensors_view_get(&av);
-   for (int i = 0; i < av.n && n < MAX_SLOTS; i++) {
-      if (av.slot[i].old)
-         continue; /* retired: holds no link */
-      if (!av.have_rec[i] || sensor_kind(av.rec[i].type) != KIND_BGM)
+   int ids[METER_MAX];
+   char macs[METER_MAX][24];
+   int n                        = 0;
+   const struct sensor_view *av = sensors_view_ref();
+   int over                     = 0;
+   for (int i = 0; i < av->n_live; i++) {
+      if (!av->have_rec[i] || sensor_kind(av->rec[i].type) != KIND_BGM)
          continue;
-      ids[n] = av.slot[i].id;
-      str_snapshot(macs[n], sizeof macs[n], av.rec[i].identity);
+      if (n >= METER_MAX) {
+         over++;
+         continue;
+      }
+      ids[n] = av->slot[i].id;
+      str_snapshot(macs[n], sizeof macs[n], av->rec[i].identity);
       n++;
    }
+   /* Released with the ids copied out: everything below works from those and
+    * the driver, so no path out of here can still be holding a view. */
+   sensors_view_put(av);
+   /* SAID, NOT SWALLOWED. A meter this walk did not reach is one that never
+    * gets armed and so never syncs -- the same silence the capacity row on
+    * the DEVICES screen exists to end. */
+   if (over)
+      LOGW("meter: %d meters in service past the %d this build arms; they "
+           "will not sync until one is disconnected",
+           over, METER_MAX);
    long now =
        mono_s(); /* a COOLDOWN clock; the block above can take a moment */
    for (int i = 0; i < n; i++) {
@@ -801,7 +830,7 @@ int ot_drv_reading(long naive, int mg_dl)
     * is not one. Both were `isnew` and read as a truth value. */
    enum hist_insert_result got = mrr.inserted;
    if (hist_kept(got) && !mrr.persisted)
-      set_status("METER: WRITE FAILED");
+      set_status_refused("METER: WRITE FAILED");
    LOGI("meter reading %d mg/dL at %ld (raw %ld)%s", mg_dl, t, naive,
         hist_kept(got) ? "" : " (already stored)");
    shell_ui_dirty();
@@ -895,9 +924,9 @@ int meter_src(void)
    return msess_src();
 }
 
-void meter_bind(int id, const char *mac)
+int meter_bind(int id, const char *mac)
 {
-   msess_bind(id, mac);
+   return msess_bind(id, mac);
 }
 
 int meter_busy(void)
@@ -907,7 +936,7 @@ int meter_busy(void)
 
 /* THE LOCK LIVES WITH THE TABLE, not with each caller.
  *
- * g_link_meter is written under driver_lock (link_set_meter tells the
+ * g_link_meter is written under driver_lock (driver_link_set_meter tells the
  * transport in the same critical section), so every reader needed that lock
  * too -- and every reader took it by hand, or forgot to. One of them read it
  * TWICE in the same function under different locks and got two different
@@ -915,6 +944,26 @@ int meter_busy(void)
  *
  * Recursive, so the callers that legitimately hold it across a longer
  * sequence pay nothing. */
+int meter_link_of_mac(const char *mac)
+{
+   if (!mac || !mac[0])
+      return -1;
+   /* THE ROUTING BIT IS TESTED FIRST, and both reads are of THIS module's own
+    * table or the driver's -- taken in two separate holds, so a release
+    * landing between them answers -1. That is the safe direction: a link this
+    * function does not claim is one the caller leaves alone, where the wrong
+    * link would be one it tears down. */
+   for (int l = 0; l < LINK_MAX; l++) {
+      if (!meter_link_is(l))
+         continue;
+      char am[24];
+      driver_link_armed_mac(l, am, (int)sizeof am);
+      if (am[0] && strcmp(am, mac) == 0)
+         return l;
+   }
+   return -1;
+}
+
 int meter_link_is(int link)
 {
    if (link < 0 || link >= LINK_MAX)
@@ -959,7 +1008,7 @@ void meter_ui_of(int id, struct meter_ui *out)
    if (!out)
       return;
    /* ONE COPY, and everything the row shows comes out of it -- including the
-    * signal. A second read (meter_rssi_of) of a record a binder thread is
+    * signal. A second read (meter_ui_of) of a record a binder thread is
     * writing puts a time from one instant beside a signal from another, on
     * the same row.
     *
@@ -1088,12 +1137,12 @@ enum load_result meter_state_load(void)
    return meter_sync_load();
 }
 
-/* PAIR a meter that has just been registered: seed its record index, take a
- * link, arm it, ask for the OS bond and connect.
+/* PAIR a meter on the link the CALLER claimed for it (meter.h): seed its
+ * record index, arm the link, ask for the OS bond and connect.
  *
- * Returns 1 when a connect is outstanding. On every other path the link is
- * RELEASED -- an armed link with nothing behind it is exactly what stops the
- * tick from ever retrying it.
+ * Returns 1 when a connect is outstanding. On every other path this function
+ * has entered, the link is RELEASED here -- an armed link with nothing behind
+ * it is exactly what stops the tick from ever retrying it.
  *
  * Split out of commit_pair, which had grown its own copy of the arming
  * discipline. That copy left the arm table EMPTY, and
@@ -1103,9 +1152,44 @@ enum load_result meter_state_load(void)
  * 1 Hz tick called meter_sync_start, which allocated the meter a SECOND link
  * and armed that one properly. The pairing succeeded and a link leaked every
  * time. */
-int meter_pair(int id, const char *mac)
+int meter_pair(int id, const char *mac, int mlink)
 {
    char dt[DEVTAG_LEN];
+   /* THE SESSION IS CLAIMED FIRST, and the claim is a TEST as well as a set.
+    *
+    * Everything below resets state that a running exchange owns: the seeded
+    * record index is otble's, shared by every meter, and the session carries
+    * `src` -- the id every record read off the wire is filed under. The caller
+    * tests meter_busy() and then does JNI work (a scan stop) before reaching
+    * here, and meter_hook_connected claims on a BINDER thread from Java's GATT
+    * callback, so another meter can latch inside that window. Seizing it anyway
+    * files that meter's remaining fingersticks under THIS id in an append-only
+    * log, saves its walk position under this id, and wedges its exchange until
+    * the 90 s watchdog.
+    *
+    * CLAIMED BEFORE THE SEED, not after: the seed is the first thing that
+    * touches shared state, so a claim behind it protects nothing. Refusing
+    * releases the link, because an armed link with nothing behind it is what
+    * stops the tick from ever retrying. */
+   /* BOTH bounds FIRST: the arm table is indexed by this below, so a value at
+    * or past LINK_MAX is a write off the end -- and everything between here and
+    * that write resets state a running exchange owns, so the check has to
+    * precede them rather than sit under them.
+    *
+    * NOTHING TO RELEASE on this arm: a link this function never accepted is one
+    * it never took ownership of, and meter_alloc_link cannot return a value in
+    * this range anyway. Releasing here would free a link the caller may still
+    * be holding for something else. */
+   if (mlink < 0 || mlink >= LINK_MAX) {
+      LOGI("meter dev %s: no link to pair on", devtag(mac, dt));
+      return 0;
+   }
+   if (!msess_claim(mlink, id, mac, mono_s())) {
+      LOGI("meter dev %s: another meter is mid-exchange; not pairing now",
+           devtag(mac, dt));
+      meter_release_link(mlink);
+      return 0;
+   }
    /* Seed THIS meter's stored index. Without it the driver keeps whatever
     * last_index the last synced meter left in its static state, so a
     * newly paired meter with a higher counter has its oldest records skipped
@@ -1134,21 +1218,11 @@ int meter_pair(int id, const char *mac)
    g_meter_fw[0]    = 0;
    mutex_unlock(&mdis_lk);
 
-   int mlink = meter_alloc_link(mac);
-   /* BOTH bounds, as meter_sync_start does: the arm table is indexed by this
-    * below, so a value at or past LINK_MAX is a write off the end. */
-   if (mlink < 0 || mlink >= LINK_MAX) {
-      LOGI("meter dev %s: no free link to pair on", devtag(mac, dt));
-      return 0;
-   }
    meter_link_set(mlink, 1);
-   /* Armed BEFORE the connect: the callback lands on a binder thread and a
-    * meter this close answers in milliseconds. */
+   /* Re-armed with this address: the claim armed it already, and doing it
+    * again here is what makes the arm say WHICH meter holds the link even if
+    * the caller claimed it before it knew. */
    driver_link_arm(mlink, mac);
-   /* Claimed outright rather than tested: the user has just registered this
-    * meter and is standing in front of it, and the link was allocated for it
-    * one line ago. */
-   msess_begin(mlink, id, mono_s()); /* an INTERVAL: see util.h */
    /* Ask for the OS bond NOW rather than letting the first GATT touch
     * trigger it minutes from now: the meter shows a passkey and Android
     * prompts for it, and a prompt that arrives while the user is still
@@ -1171,5 +1245,16 @@ int meter_pair(int id, const char *mac)
  * meter that just connected. */
 void meter_link_set(int link, int on)
 {
+   /* CLAIMING A LINK CANCELS ANY TEARDOWN DEADLINE ON IT.
+    *
+    * device_retire leaves a disconnected meter's link UNARMED (so it can be
+    * re-allocated) but still routed and STAMPED, so the routing bit is
+    * cleared once the in-flight callback can no longer arrive. An unarmed
+    * link is claimable, though -- driver_link_claim looks at the arm and at
+    * the driver session, not at this stamp -- so without this the stale
+    * deadline fires on the link's NEXT owner and releases a meter that has a
+    * live connectGatt outstanding, mid-exchange. */
+   if (on)
+      msess_idle_set(link, 0);
    driver_link_set_meter(link, on);
 }

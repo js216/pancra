@@ -218,11 +218,11 @@ static int jni_http(const char *method, const char *path, const char *hdr,
    /* A REPLY THAT DOES NOT FIT IS A FAILED REQUEST, not a short one.
     *
     * Clamping to outcap-1 and handing back 200 leaves the caller unable to
-    * tell: a truncated body is exactly outcap-1 bytes, which is also
-    * what a legitimate body of that length looks like, and sync_fetch_bucket
-    * checks only `len < cap`. So a bucket between the phone's own buffer
-    * (SYNC_BUF_MAX) and the wire's ceiling (BODY_MAX) was accepted with rows
-    * missing off the end -- and then compared, hashed and acted on. The
+    * tell: a truncated body is exactly outcap-1 bytes, which is also what a
+    * legitimate body of that length looks like. A bucket between the phone's
+    * own buffer (SYNC_BUF_MAX) and the wire's ceiling (BODY_MAX) would then be
+    * accepted with rows missing off the end -- and compared, hashed and acted
+    * on. The
     * asymmetry rule in lib/wirevec.h is explicit that an implementation may
     * hold less than the wire allows and must then DECLINE, never truncate. */
    if (r) {
@@ -279,7 +279,7 @@ unwind:
 }
 
 /* WHICH FILES SYNC. Everything that is a record of what happened, and nothing
- * that is a credential: code_path() and remote_path() hold the pairing code
+ * that is a credential: g_code_path() and g_remote_path() hold the pairing code
  * and the derived key, and uploading those would put the secret that
  * authenticates us TO the server inside the server's own database.
  *
@@ -307,7 +307,20 @@ void syncjni_register_logs(void)
         * only, so a single bucket costs nothing, exactly as for slots
         * below. */
        {"foodtypes", food_types_path(), 0},
-       {"sensors",   sensors_path(),    1},
+       /* THE PROVENANCE TABLE IS NOT BUCKETED EITHER, for the reason written
+        * above: its rows are "<id>,<type>,<address>,..." and row_bucket splits
+        * on the LEADING field read as a UTC day. Every id this app can mint is
+        * far below 86400, so the flag would file the whole file under day 0 --
+        * a single bucket wearing a bucketed label, which is worse than an
+        * honest single bucket because it reads as a limit that does not apply.
+        *
+        * THE CEILING THAT FOLLOWS FROM THAT: one bucket must fit SYNC_BUF_MAX,
+        * so at the ~84 bytes per id this file measures, syncing stops carrying
+        * it somewhere past 3000 sensors -- decades of wear, and well short of
+        * what the registry itself holds (see MAX_SLOTS). Bucketing it properly
+        * means splitting on a field that is not the first one, which is a
+        * change to the wire format both sides read. */
+       {"sensors",   sensors_path(),    0},
        {"slots",     slots_path(),      0},
    };
    /* A REFUSAL IS SAID OUT LOUD. It can only mean a path too long for the
@@ -328,13 +341,16 @@ void syncjni_register_logs(void)
  * size is identical and the phone concluded it had nothing to send. The
  * correction then sat unsent until the six-hour safety sync.
  *
- * THIS LIST AND syncjni_register_logs MUST NAME THE SAME FILES. A log
- * registered for sync but missing here is worse than one missing from both:
- * it uploads correctly whenever something ELSE has changed, and never when
- * only it has -- so it appears to work, and loses exactly the records that
- * were logged on their own. When this list said "the five synced files" it
- * meant it, and adding food and exercise to the registry without adding them
- * here would have been that bug, twice.
+ * THIS LIST MUST NAME EVERY FILE syncjni_register_logs DOES. A log registered
+ * for sync but missing here is worse than one missing from both: it uploads
+ * correctly whenever something ELSE has changed, and never when only it has --
+ * so it appears to work, and loses exactly the records that were logged on
+ * their own. Adding a log to the registry without adding it here is that bug.
+ *
+ * THE CONVERSE IS NOT REQUIRED, and this list is deliberately longer: it also
+ * watches cal_rescale_path(), which is not synced. A file here that is not
+ * registered only makes the phone ask whether anything needs sending slightly
+ * more often, which costs a comparison and nothing else.
  *
  * Cheap either way: an open/lseek pair per file and a counter, no reading. */
 int64_t syncjni_state_stamp(void)

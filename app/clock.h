@@ -21,8 +21,8 @@
  * back from being off, or finding a network -- moves every deadline in the
  * app at once: forward an hour fires the meter's 90-second sync watchdog
  * immediately and tears down a working exchange; backward an hour postpones
- * it, so a wedged link is never recovered at all. `make clockcheck` keeps
- * deadlines off the wall clock.
+ * it, so a wedged link is never recovered at all. Keep deadlines off the
+ * wall clock.
  */
 #ifndef PANCRA_CLOCK_H
 #define PANCRA_CLOCK_H

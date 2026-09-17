@@ -12,8 +12,8 @@
  * of whichever macros they used. Nothing forced them to agree: a file that
  * logged at priority 4 through a macro called LOGW, or under a tag of its
  * own, would compile and link perfectly and its lines would simply stop
- * appearing where everybody looks for them. They include this now, and
- * `make lockcheck` refuses a new copy (see test/app/lockcheck.sh).
+ * appearing where everybody looks for them. They include this instead, and
+ * no file may declare a copy of its own.
  *
  * THE STUB IS AN IMPLEMENTATION OF THIS CONTRACT, not a second statement of
  * it: app/stub_log.h includes this header rather than repeating the

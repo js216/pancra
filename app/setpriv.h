@@ -4,7 +4,7 @@
 
 /* PRIVATE TO THE SETTINGS MODULES: app/settings.c, app/alarmcfg.c,
  * app/devinfo.c, app/paircode.c, app/remotecfg.c and app/setfile.c. Nothing
- * else includes it -- `make settingscheck` refuses that -- because what it
+ * else may include it, because what it
  * declares is the WRITE HALF of every settings transaction with the
  * transaction taken away, plus the live state itself.
  *
@@ -30,8 +30,8 @@
 /* FORWARD-DECLARED, NOT INCLUDED. settings.h is the preferences module's own
  * public header, and this one is that module's private engine: including it
  * here makes settings.h depend on setpriv.h and setpriv.h on settings.h --
- * one node in the include graph, and test/inclusions.py refuses the cycle
- * (rightly: neither file could then be read on its own). Every .c that uses
+ * one node in the include graph, and that cycle is not allowed: neither file
+ * could then be read on its own. Every .c that uses
  * `g_p` includes settings.h for the layout; an extern needs only the name. */
 struct prefs;
 
@@ -55,9 +55,9 @@ struct save_job {
 typedef void (*render_fn)(struct save_job *);
 
 /* THE LIVE STATE, and the lock over it. Every domain module reads and writes
- * these; they are here rather than in settings.h because a writable aggregate
- * in a public header is a setting anybody can change without saving it (see
- * settingscheck). */
+ * these; they are here rather than in settings.h because a writable
+ * aggregate in a public header is a setting anybody can change without
+ * saving it. */
 extern struct prefs g_p;
 extern struct mutex set_lk;
 

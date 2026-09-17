@@ -14,9 +14,9 @@
  * could point at.
  *
  * WHAT IS NOT HERE: every decision that is arithmetic -- the deadline, the
- * body ceiling, the status mapping -- lives in SyncPolicy, where the host
- * JVM runs it against a dribbling stream and a lying Content-Length
- * (`make boundaryjavatest`). What is here is what genuinely needs Android.
+ * body ceiling, the status mapping -- lives in SyncPolicy, which takes no
+ * Android type and so can be run under a host JVM against a dribbling stream
+ * and a lying Content-Length. What is here is what genuinely needs Android.
  *
  * THE THREE NATIVE ENTRY POINTS IT DRIVES stay on Ble: RegisterNatives binds
  * them to that class (app/dexble.c), so that is where they must be declared.
@@ -160,11 +160,10 @@ public final class PancraNet {
      * read() cannot be interrupted by any amount of checking, and the only
      * lever that reaches it is closing the socket underneath it. Whether that
      * lever actually works is a fact about the platform, not about this code,
-     * so it is demonstrated rather than assumed:
-     * test/app/SyncWatchTest.java drives it against a real server that
-     * accepts a connection and then says nothing, by calling THIS method with
-     * a short delay -- the same code the sync path arms, differing only in
-     * the number.
+     * so it wants demonstrating rather than assuming: drive THIS method,
+     * with a short delay, against a server that accepts a connection and then
+     * says nothing -- the same code the sync path arms, differing only in the
+     * number.
      *
      * `cut` is set BEFORE the disconnect so the worker, whichever call it
      * unblocks from, can tell a socket we closed from one the peer or the
@@ -262,8 +261,7 @@ public final class PancraNet {
              * chose. The 2xx that comes back from wherever it went is then
              * reported as the answer to the request we signed. See
              * SyncPolicy.redirectRefused for what that costs; the refusal
-             * of every 3xx lives there, and `make javacheck` fails the build
-             * if this line goes away. */
+             * of every 3xx lives there, and depends on this line. */
             c.setInstanceFollowRedirects(false);
             if (hdr != null) {
                 /* "Name: value\r\n" lines, exactly as native built them. */
@@ -277,9 +275,8 @@ public final class PancraNet {
             /* THE LIMIT IS NATIVE'S LIMIT. SyncPolicy.SYNC_BODY_MAX is
              * SYNC_BUF_MAX - 1 from app/sync.h, which is the `outcap` every
              * sync.c call site passes to jni_http and the exact length that
-             * jni_http still accepts. `make javacheck` fails the build if the
-             * two ever disagree, so this is one number with a copy the build
-             * will not let rot -- not a second, independent guess.
+             * jni_http still accepts. The two must never disagree: this is
+             * one number with a copy of it, not a second, independent guess.
              *
              * The exchange itself -- write the body and CLOSE it, then the
              * status, then refuse a 3xx, then the bounded read, with every

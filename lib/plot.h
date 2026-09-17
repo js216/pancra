@@ -62,13 +62,13 @@ struct plot_pt {
 
 /* WHAT ONE PLOT IS, as one value the caller owns.
  *
- * The vertical scale and the marker radius were PROCESS GLOBALS: plot_set_max
- * stored the scale, and plot_render stored the horizontal margin it derived
- * from the radius for plot_hit to read back afterwards. Two plots with
- * different settings therefore could not exist at once -- the server renders
- * several windows and the app draws a 3 h trace beside a 30 d one -- and the
- * hit test answered against whatever the LAST render had left behind, which
- * on the phone is a touch resolving to the wrong datapoint on the first
+ * The vertical scale and the marker radius were PROCESS GLOBALS:
+ * settings_set_plot_max stored the scale, and plot_render stored the horizontal
+ * margin it derived from the radius for plot_hit to read back afterwards. Two
+ * plots with different settings therefore could not exist at once -- the server
+ * renders several windows and the app draws a 3 h trace beside a 30 d one --
+ * and the hit test answered against whatever the LAST render had left behind,
+ * which on the phone is a touch resolving to the wrong datapoint on the first
  * frame after a scale change.
  *
  * It is passed by value, so a plot's configuration cannot outlive the call or

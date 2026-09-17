@@ -122,7 +122,7 @@ int settings_cycle_disc(void)
 
 int settings_cycle_newdata(void)
 {
-   /* OFF -> BEEP -> CHIRP -> OFF, as a named step over the mode's own type
+   /* OFF -> BEEP -> CHIRP -> MORSE -> OFF, as a named step over its own type
     *. The stored field is an int because that is what the file
     * holds and what set_int rolls back on a failed write; it becomes a mode
     * on the way in and an int again on the way out, and the wrap is not
@@ -191,8 +191,8 @@ int settings_set_plot_max(int mgdl)
    if (mgdl > 400)
       mgdl = 400;
    /* NOTHING DERIVED TO APPLY. A renderer keeping the scale in a process
-    * global that this has to push into (plot_set_max) is why two plots could
-    * not have different scales and why the touch path answered against
+    * global that this has to push into (settings_set_plot_max) is why two plots
+    * could not have different scales and why the touch path answered against
     * whichever was drawn last. The scale is passed to each render and each
     * hit test, read from this setting at the call. */
    return set_int_field(&g_p.plot_max, mgdl, set_render_settings);
@@ -201,8 +201,8 @@ int settings_set_plot_max(int mgdl)
 /* THE FOUR THRESHOLDS, one at a time. The CALLER decides whether the pair is
  * still ordered -- that check has to share a critical section with the read of
  * the partner value, and the alarm lock that provides it lives in alarm.c --
- * and the caller also calls alarm_save() once the pair is settled, which is
- * why these four store without persisting. */
+ * and the caller also calls alarm_set_thresholds() once the pair is settled,
+ * which is why these four store without persisting. */
 int settings_set_ins_style(int type, int marker, int color, int size)
 {
    if (type < 0 || type > 1)
@@ -358,7 +358,8 @@ void set_render_settings(struct save_job *j)
 
 enum load_result settings_load(void)
 {
-   /* 256, and settings_render's length guard is the same number. See there. */
+   /* 256, and set_render_settings's length guard is the same number. See there.
+    */
    /* ONE EXACT READ: the short-read loop, EINTR, and the
     * probe that tells a full buffer from a file longer than this build
     * can hold, all in read_file_exact rather than one unchecked read whose
@@ -435,9 +436,9 @@ enum load_result settings_load(void)
    g_p.disc      = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
    g_p.plot_max  = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
    g_p.screen_on = v[6] ? 1 : 0;
-   /* Was a 0/1 flag; CHIRP added a third value. Old files hold 0 or 1 and
-    * still mean exactly what they meant, and anything else falls back to
-    * silent rather than to a noise the user never chose. */
+   /* Was a 0/1 flag, and CHIRP and MORSE added values above it. Old files
+    * hold 0 or 1 and still mean exactly what they meant, and anything else
+    * falls back to silent rather than to a noise the user never chose. */
    /* THE STORED NUMBER BECOMES A MODE THROUGH ITS OWN CONVERSION.
     * A range test reads as arithmetic on a domain that has none, and it goes
     * on passing an unknown middle value the day a fourth mode is added out of
@@ -448,7 +449,7 @@ enum load_result settings_load(void)
     * leaving the default) falls back to the defaults.
     *
     * THE BOUNDS COME FROM sensors.h, not from literals kept "decoupled from
-    * sensors.h, crosschecked by eye". The eye is what fails: written out as
+    * sensors.h, checked by eye". The eye is what fails: written out as
     * "9 == MARK_N, 7 colours, 4 == MARK_SIZE_MAX", one of them is wrong --
     * MARK_SIZE_MAX is 5. The size picker offers 1..5 and menu_action saves
     * whatever it is handed, so choosing the LARGEST insulin marker works,
@@ -456,9 +457,10 @@ enum load_result settings_load(void)
     * next launch. A setting that quietly forgets itself across a restart is
     * worse than one that refuses the value outright.
     *
-    * The colour count still has to be a literal: UI_NCOLORS is private to
-    * the renderer, so the static assert below is what keeps it honest instead.
-    */
+    * The colour count still has to be a literal: UI_NCOLORS is private to the
+    * renderer, so this bounds against style.h's SET_NCOLORS and uidraw.c holds
+    * the two equal with a _Static_assert beside its colour table -- the only
+    * place that can see both. */
    for (int k = 0; k < 2; k++) {
       int base          = 8 + (k * 3);
       int defc          = k ? 1 : 6; /* SLOW white, FAST blue */
@@ -492,16 +494,18 @@ enum load_result settings_load(void)
       while (n2 < SC_MAX)
          g_p.shortcut[n2++] = SC_NONE;
    }
-   /* Field 26: the best in-range run, and the newest field in the file. An
-    * older file stops the loop before it and leaves the default of 0, which
-    * reads as "no record yet" -- the next streak of any length becomes the
-    * best, which is the truth about what this install has seen. Bounded like
-    * everything else here: a negative or absurd value is a corrupt file, not
-    * a person who has been in range since the Bronze Age. */
-   /* FIELD 28, THE LAST ONE. It was 25 while six pins preceded it; nine push
-    * it along, and this assignment is the one place the move is spelled as a
-    * number rather than derived -- which is why it was missed and read a pin
-    * slot as the record. */
+   /* FIELD 28: the best in-range run. An older file stops the loop before it
+    * and leaves the default of 0, which reads as "no record yet" -- the next
+    * streak of any length becomes the best, which is the truth about what this
+    * install has seen. Bounded like everything else here: a negative or absurd
+    * value is a corrupt file, not a person who has been in range since the
+    * Bronze Age.
+    *
+    * THE INDEX IS A LITERAL, and it is the only field whose position depends on
+    * how many pin slots precede it: SC_MAX of them, and this line is the one
+    * place that dependency is spelled as a number rather than derived. Change
+    * SC_MAX and this index moves with it, or it reads a pin slot as the
+    * record. */
    g_p.best_streak_s = (v[28] >= 0 && v[28] <= BEST_STREAK_MAX) ? v[28] : 0;
    /* Field 29, and OFF is the default an older file leaves standing -- the
     * loop above stops at the first field the file does not have. Step

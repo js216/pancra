@@ -62,7 +62,7 @@ struct row_reading {
 
 /* The kinds a row may state. These are app/sensors.h's KIND_* values: they
  * are a FILE FORMAT, written into rows that are never rewritten, so they may
- * never be renumbered. `make crosscheck` pins them against the app's. */
+ * never be renumbered, and must stay equal to the app's. */
 /* A row that STOPS after the offset does not carry a kind at all. That is a
  * real shape -- the column was appended to a format that was already on
  * phones, and readings.csv is append-only, so rows written before it exist
@@ -87,7 +87,7 @@ struct row_reading {
  * STORE_GLU_MIN / STORE_GLU_MAX (app/ingest.h), because they describe the
  * same rows: a band narrower than the writer's silently drops readings the
  * phone considers real, and a wider one admits what the phone already
- * refused. `make crosscheck` pins the two together. A value outside it is
+ * refused, so the two must stay equal. A value outside it is
  * not a reading -- it is a warm-up sentinel, a spliced row from a partial
  * write, or another log's number. */
 #define ROW_GLU_MIN 15

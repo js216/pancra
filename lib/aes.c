@@ -22,10 +22,9 @@
  * minimisation: it is the S-box's textbook definition evaluated directly, and
  * the surrounding rounds are the ordinary byte-oriented ShiftRows, MixColumns
  * and AddRoundKey. What stands in for a lookup is arithmetic whose
- * agreement with that lookup is checked EXHAUSTIVELY, for all 256 inputs, in
- * test/srv/cryptotest.c, alongside the FIPS-197 and GCM vectors the file
- * already had to pass. The property itself -- no memory read at a
- * secret-derived index -- is structural and visible: there is one array in
+ * agreement with that lookup is checkable EXHAUSTIVELY, for all 256 inputs,
+ * alongside the FIPS-197 and GCM vectors. The property itself -- no memory read
+ * at a secret-derived index -- is structural and visible: there is one array in
  * this file, the round-constant table, and its index is the round number. */
 #include "aes.h"
 #include <stddef.h>

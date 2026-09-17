@@ -144,8 +144,7 @@ int sb_raw(struct sb *s, const void *data, size_t n)
    if (!sb_room(s, n))
       return 0;
    /* GUARDED, because memcpy(dst, NULL, 0) is undefined behaviour in the
-    * standard even though every implementation copies nothing -- and this file
-    * is compiled under UBSan by `make srvasan`, which says so. */
+    * standard even though every implementation copies nothing. */
    if (n)
       memcpy(s->p + s->n, data, n);
    s->n += n;

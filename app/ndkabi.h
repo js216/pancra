@@ -22,8 +22,7 @@
  * either declaration set, so the same assertions can be compiled twice:
  *
  *   - against app/ndk.h, in every app translation unit, on every build;
- *   - against the OFFICIAL headers of a pinned NDK, by `make ndkcheck`
- *     (test/app/ndkofficial.c, tools/ndk pinned in tools/DEPENDENCIES).
+ *   - against the OFFICIAL headers of a pinned NDK.
  *
  * Both compilations must succeed. That is what makes "ABI-compatible with
  * <android/native_activity.h>" a thing the build knows rather than a sentence
@@ -44,9 +43,9 @@
 #define PANCRA_NDKABI_H
 
 /* THE DECLARATIONS COME FIRST, and this file does not choose which. Including
- * it standalone would silently check nothing, so it refuses: app/ndk.h defines
- * this before including it, and test/app/ndkofficial.c defines it after
- * including <android/...>. */
+ * it standalone would silently check nothing, so it refuses: app/ndk.h
+ * defines this before including it, and a build checking against the official
+ * headers defines it after including <android/...>. */
 #ifndef NDKABI_DECLS
 #error "include the declarations first: app/ndk.h, or the official NDK headers"
 #endif

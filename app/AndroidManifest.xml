@@ -27,8 +27,8 @@
   AAB rule came to pass the target-sdk-version flag 34 for months while nobody could
   have changed the shipped target SDK by editing it: the value in this file
   won every time. An attribute reappearing here does not conflict with the
-  build inputs / it SILENTLY REPLACES them. `make versioncheck` refuses this
-  file if one comes back.
+  build inputs / it SILENTLY REPLACES them, so an attribute must not come
+  back here.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.jk.pancra">
@@ -60,7 +60,7 @@
 
   <!-- debuggable is intentionally absent (defaults to false = release-safe).
        Dev builds flip it on via aapt's debug-mode flag so crash.log is
-       retrievable on-device; `make release` does not. -->
+       retrievable on-device; a release build does not. -->
   <!-- usesCleartextTraffic: the REMOTE push may go to a user-configured LAN
        address over plain HTTP (the server is srv/, and the default is HTTPS
        to pancra.org); Android 9+ blocks cleartext without this. -->

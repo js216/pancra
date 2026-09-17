@@ -117,7 +117,7 @@ public final class Ble {
      * up every other one and make it miss its advertising window. Each Link
      * therefore owns its own gatt, queue and busy flag, and its own callback
      * instance so every event already knows which link it belongs to. */
-    static final int MAX_LINKS = 8; /* == LINK_MAX (dexdriver.h); crosschecked */
+    static final int MAX_LINKS = 8; /* MUST equal LINK_MAX (dexdriver.h) */
 
     /* ONE QUEUED GATT OPERATION, BOUND TO THE CLIENT IT WAS DEQUEUED FOR.
      *
@@ -447,7 +447,10 @@ public final class Ble {
      * Do not add an ACTION_PAIRING_REQUEST auto-confirm path; it silently does
      * nothing outside a system build. */
     private static final String BOND_CH = "pancra-bond";
-    private static final int BOND_NID = 3; /* != Alarm's NID, != the service's 1 */
+    /* FROM THE ONE LIST, not a literal checked by hand against the ids the
+     * author happened to remember. NotifPolicy owns every id this app posts;
+     * a number written here is a number outside the only check there is. */
+    private static final int BOND_NID = NotifPolicy.NOTIF_BOND;
     private static BroadcastReceiver bondRx;
 
     /* Start watching bond state. Registered ONCE, at native init, not lazily at
@@ -659,25 +662,26 @@ public final class Ble {
         }
         try { if (g != null) { g.disconnect(); g.close(); } }
         catch (Throwable t) { Log.i(TAG, "disc: " + t); }
-        /* Deliver the event ourselves: we just cleared L.gatt, so the GATT
-         * callback will see a non-matching client and stay silent. Native still
-         * needs it -- the driver resets its phase, and ot_on_disconnected
-         * persists the meter's record index on exactly this abort path (the
-         * 90 s mid-sync watchdog closes the link this way). Fires once. */
-        /* Deliver unconditionally, not only when a client was published. An
-         * explicit teardown racing an in-flight connect() leaves g == null, and
-         * staying silent there is how the meter lost its record index: the 90 s
-         * mid-sync watchdog closes the link exactly this way, and
-         * ot_on_disconnected is what persists the index. gen was already bumped
-         * above, so the GATT callback for that attempt will stay silent and this
-         * still fires exactly once. */
-        /* Deliver only if this teardown actually ended something. The GATT
-         * callback already delivers for a client it owned (and bumped gen), so
-         * delivering unconditionally here made the UNION of the two paths fire
-         * TWICE for one physical disconnect: driver_on_disconnected then
-         * double-counts ctx->fails and ctx->authfails -- and authfails >= 3
-         * calls drv_key_clear(), destroying the bond. `had` is false exactly
-         * when the callback has already cleared the link. */
+        /* DELIVER THE EVENT OURSELVES, AND EXACTLY ONCE.
+         *
+         * Native needs it whatever happens here: the driver resets its phase,
+         * and ot_on_disconnected persists the meter's record index on exactly
+         * this abort path -- the 90 s mid-sync watchdog closes a link this way,
+         * and an index that is not persisted there is records re-walked or
+         * skipped on the next sync.
+         *
+         * `had` IS THE WHOLE CONDITION, and it is neither "always" nor "only
+         * when a client was published". The GATT callback already delivers for
+         * a client it owned, so delivering unconditionally makes the union of
+         * the two paths fire TWICE for one physical disconnect -- and
+         * driver_on_disconnected then double-counts ctx->fails and
+         * ctx->authfails, where three authfails call drv_key_clear() and
+         * destroy the bond. But staying silent whenever g == null loses the
+         * event for a teardown that raced an in-flight connect(), which is the
+         * case that costs the meter its index. `had` is true in exactly the
+         * cases the callback will not cover: a client we published, or a
+         * connect still in flight. gen was bumped above, so the callback for
+         * that attempt stays silent either way. */
         if (had) onDisconnected(id, 0);
     }
 

@@ -139,10 +139,10 @@ void keypad_close(void)
  * offset in force AT THE INSTANT BEING EDITED -- not tz_off_now(), which is the
  * offset TODAY.
  *
- * That is TODO 131 exactly: the keypad split and recombined with tz_off_now(),
- * so moving a dose to a date on the far side of a DST boundary persisted it an
- * hour wrong, and wrote today's offset into its tz column so nothing
- * downstream could tell it had happened. What each entry does about the
+ * A keypad that splits and recombines with tz_off_now() persists a dose moved
+ * to a date on the far side of a DST boundary an hour wrong, and writes today's
+ * offset into its tz column so nothing downstream can tell it happened. What
+ * each entry does about the
  * repeated and the skipped hour is stated once, in civil.h, and applied by
  * civil_reaim.
  *
@@ -216,7 +216,7 @@ int label_commit(void)
        * against it -- and telling the user it was saved by moving on -- would
        * both be false. Stay on the editor with the failure showing. */
       if (remote_set_email(em) != SETTINGS_OK) {
-         set_status("EMAIL NOT SAVED");
+         set_status_refused("EMAIL NOT SAVED");
          return COMMIT_STAY;
       }
       /* THE ACCOUNT WAS WHAT THE LAST FAILURE WAS ABOUT, often enough: an
@@ -252,7 +252,7 @@ int label_commit(void)
        * did not persist would unpair the phone from the server it is still
        * configured for. */
       if (remote_set_server(host) != SETTINGS_OK) {
-         set_status("SERVER NOT SAVED");
+         set_status_refused("SERVER NOT SAVED");
          return COMMIT_STAY;
       }
       /* A DIFFERENT SERVER MEANS A DIFFERENT ACCOUNT, so the paired identity
@@ -287,7 +287,7 @@ int label_commit(void)
       g_kp.entry[g_kp.len < (int)sizeof g_kp.entry ? g_kp.len : 0] = 0;
       int id = food_type_add(g_kp.entry);
       if (id <= FOOD_TYPE_NONE) {
-         set_status("FOOD NAME NOT SAVED");
+         set_status_refused("FOOD NAME NOT SAVED");
          return COMMIT_DONE; /* stay put: the text is still on the keypad */
       }
       forms_food_type_set(id);
@@ -298,7 +298,7 @@ int label_commit(void)
        * including the blank-name fallback, which is a rule about what a
        * device row must be readable as, not about typing. */
       if (sensor_set_label(sel_device(), g_kp.entry, g_kp.len) != 0)
-         set_status("NAME NOT SAVED");
+         set_status_refused("NAME NOT SAVED");
       g_kp.len = 0;
       nav_go(SCR_SENSOR);
    } else {
@@ -318,8 +318,8 @@ int kp_commit_correction(void)
    settings_get(&sp);
    if (g_kp.mode == KP_CALIB) { /* entry is in display units */
       if (g_kp.len > 0) {
-         /* Conversion and bound live in alarmlogic.c so `make check` can
-          * fail on them; this branch only actuates. */
+         /* Conversion and bound live in alarmlogic.c, which is pure and
+          * decidable on its own; this branch only actuates. */
          /* mmol/L is entered as tenths (e.g. "78" = 7.8), so scale back
           * to mg/dL the same way the plot-max entry does. */
          int mgdl = cal_entry_mgdl(g_kp.entry, g_kp.len, sp.units);
@@ -450,7 +450,7 @@ int kp_commit_thresholds(void)
           * close, rather than clearing the entry as though it were
           * rejected -- retyping it would not help. */
          if (why == TH_NOT_SAVED) {
-            set_status("THRESHOLD NOT SAVED");
+            set_status_refused("THRESHOLD NOT SAVED");
             g_kp.len = 0;
             keypad_close();
             return COMMIT_DONE;
@@ -516,7 +516,7 @@ int kp_commit_number(void)
          /* The clamp and the renderer's scale belong to the setting, not to
           * the keypad that types it -- settings_load applies the same two. */
          if (settings_set_plot_max(sp.units ? (v * 18) / 10 : v) != SETTINGS_OK)
-            set_status("PLOT SCALE NOT SAVED");
+            set_status_refused("PLOT SCALE NOT SAVED");
          keypad_close();
          /* the notification plot shares this vertical scale; without a
           * refresh it keeps the previous scale until the next datapoint */
@@ -561,7 +561,7 @@ int kp_commit_number(void)
          /* Same rule as the server name: the identity is dropped below, and
           * a port that did not persist must not cost the pairing. */
          if (remote_set_port(v) != SETTINGS_OK) {
-            set_status("PORT NOT SAVED");
+            set_status_refused("PORT NOT SAVED");
             g_kp.len = 0;
             return COMMIT_STAY;
          }

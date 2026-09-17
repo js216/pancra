@@ -19,7 +19,10 @@
 
 struct hourbucket {
    int hour, count, in_range, sum;
-   int unsure; /* of `count`, how many were counted on an inference: item 309 */
+   /* Of `count`, how many were counted on an INFERENCE rather than on a
+    * recorded fact -- a warmup window derived from an activation the file did
+    * not carry, say. Kept so a degraded figure can be reported as one. */
+   int unsure;
 };
 static struct hourbucket
     g_hours[STAT_HOURS];   /* ring keyed by hour % STAT_HOURS */
@@ -459,8 +462,9 @@ void stat_reload_publish(void)
 }
 
 /* THE WIDEST PROVENANCE ID THAT CAN EXIST. struct reading stores `src` in
- * sixteen bits (store.h), so sensor_mint refuses to issue an id past 0xFFFF
- * rather than let 65536 alias legacy id 0. A wider number in this column
+ * sixteen bits (store.h), so sensor_mint bounds every id it issues well
+ * inside that rather than let 65536 alias legacy id 0. A wider number in this
+ * column
  * cannot name anything on this phone, so it resolves to no sensor -- which is
  * what an unattributed row already is here. Spelled out rather than shared
  * with sensors.c for the reason plotdata.c gives beside its own copy: that

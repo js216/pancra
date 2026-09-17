@@ -15,8 +15,7 @@
  *
  * HOW IT IS KEPT OUT: lib/rand.c compiles the pointer, this setter and the
  * branch that reads it ONLY under -DRAND_TEST_SOURCE. Nothing that ships
- * defines it (`make -f test/Makefile randcheck` refuses it in the app and
- * server builds), so in a production binary rand_bytes calls the platform
+ * defines it, so in a production binary rand_bytes calls the platform
  * provider directly and there is nothing to override.
  *
  * SCOPE IT. The setter returns the previous provider so a case can put the

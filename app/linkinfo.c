@@ -53,6 +53,10 @@ int linkinfo_conn_rssi(void)
  * display but WRONG for provenance -- see pancra_devinfo. Minting uses these.
  */
 static char g_model_l[LINK_MAX][24], g_fw_l[LINK_MAX][24];
+/* The DIS serial, per link like the two above and for the same reason: it
+ * is minted into an append-only provenance row, so one sensor's must never
+ * be written under another's id. */
+static char g_sn_l[LINK_MAX][24];
 
 /* PER-LINK SIGNAL STRENGTH, retained as "last known" so it never expires
  * into "--" while readings lag. Kept HERE, where the measurement arrives
@@ -61,14 +65,14 @@ static char g_model_l[LINK_MAX][24], g_fw_l[LINK_MAX][24];
  * handed, and the frame builder was then part of every workflow cycle. */
 /* ONE SIGNAL READING IS THREE NUMBERS, AND THEY TRAVEL TOGETHER.
  *
- * The value, whether there is one, and when it was taken. They were three
- * plain arrays written by the Bluetooth binder callback and read by the frame
- * builder on the main thread with nothing between them -- a data race in the
- * language's terms, and one whose visible form is worse than torn text: the
- * reader can take the dBm of a NEW measurement with the timestamp of the OLD
- * one and put the pair on a device row, so a signal that arrived a moment ago
- * is labelled with when the previous one did. A stale row that says it is
- * stale is honest; a fresh number wearing an old time is not.
+ * The value, whether there is one, and when it was taken. As three plain
+ * arrays written by the Bluetooth binder callback and read by the frame builder
+ * on the main thread with nothing between them, that is a data race in the
+ * language's terms -- and one whose visible form is worse than torn text: the
+ * reader takes the dBm of a NEW measurement with the timestamp of the OLD one
+ * and puts the pair on a device row, so a signal that arrived a moment ago is
+ * labelled with when the previous one did. A stale row that says it is stale is
+ * honest; a fresh number wearing an old time is not.
  *
  * A LEAF LOCK, not an atomic per field. Three atomics would fix the tearing
  * of each number and not the pairing, which is the whole defect: what has to
@@ -188,12 +192,15 @@ int src_for_link(int link)
    if (!driver_session_of(link, &s) || !s.mac[0])
       return -1;
    int id = -1;
-   struct sensor_view v;
-   sensors_view_get(&v);
-   for (int i = 0; i < v.n && id < 0; i++)
-      if (v.have_rec[i] && sensor_kind(v.rec[i].type) == KIND_CGM &&
-          !strcmp(v.rec[i].identity, s.mac))
-         id = v.slot[i].id;
+   /* BY REFERENCE: this runs for every reading that arrives. */
+   const struct sensor_view *vp = sensors_view_ref();
+   /* THE CGM AT THIS ADDRESS, asked as one question: filtering after the
+    * search would answer "none" whenever some other kind held the lower
+    * slot. */
+   int i = sensors_view_find_mac_kind(vp, s.mac, KIND_CGM);
+   if (i >= 0)
+      id = vp->slot[i].id;
+   sensors_view_put(vp);
    return id;
 }
 
@@ -276,10 +283,10 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
    /* A meter's identity must not land in the CGM's globals: each sensor's
     * model/firmware is part of its permanent provenance, and mixing them
     * would attribute readings to hardware that never produced them. */
-   /* READ THE ROUTING BIT UNDER THE LOCK. link_set_meter's comment claims
-    * this function is one of the binder-thread readers that "already hold
-    * it" -- the premise the writer's own locking rests on -- and it did not.
-    * The write lands on the main thread in meter_sync_start/commit_pair
+   /* READ THE ROUTING BIT UNDER THE LOCK. driver_link_set_meter's comment
+    * claims this function is one of the binder-thread readers that "already
+    * hold it" -- the premise the writer's own locking rests on -- and it did
+    * not. The write lands on the main thread in meter_sync_start/commit_pair
     * immediately before the connect, and this read arrives on a binder
     * thread just after it, so a stale value is exactly the ordering the
     * lock's barrier exists to prevent. Snapshot and release: the rest of the
@@ -329,16 +336,16 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
     * takes it, and it is the only way out of this file. */
    /* REUSE THE SNAPSHOT -- do not re-read g_link_meter here.
     *
-    * This read was under the REGISTRY's lock, which is the wrong lock for
-    * that variable (link_set_meter writes it under driver_lock), and taking
-    * driver_lock inside the registry's would invert the documented
-    * driver -> reg order. But the deeper problem is that it was a SECOND,
-    * independent read of a bit already decided above: link_set_meter landing
-    * between the two makes this function pick the meter branch for `dst` and
-    * the CGM branch for the per-link copy. Since the per-link copy is the
-    * mint input, that writes a METER's model into the array sensor_mint
-    * reads, in an append-only provenance file that is never rewritten. One
-    * snapshot, one decision. */
+    * Reading it again here would be under the REGISTRY's lock, which is the
+    * wrong lock for that variable (driver_link_set_meter writes it under
+    * driver_lock), and taking driver_lock inside the registry's inverts the
+    * documented driver -> reg order. The deeper problem is that it would be a
+    * SECOND, independent read of a bit already decided above:
+    * driver_link_set_meter landing between the two makes this function pick the
+    * meter branch for `dst` and the CGM branch for the per-link copy. Since the
+    * per-link copy is the mint input, that writes a METER's model into the
+    * array sensor_mint reads, in an append-only provenance file that is never
+    * rewritten. One snapshot, one decision. */
    mutex_lock(&dis_lk);
    if (link >= 0 && link < LINK_MAX && !is_meter) {
       char *ld = 0;
@@ -346,6 +353,8 @@ void pancra_devinfo(int link, const char *uuid, const char *val)
          ld = g_model_l[link];
       else if (strncmp(uuid + 4, "2a26", 4) == 0)
          ld = g_fw_l[link];
+      else if (strncmp(uuid + 4, "2a25", 4) == 0)
+         ld = g_sn_l[link];
       if (ld)
          devinfo_copy(ld, val);
    }
@@ -390,6 +399,13 @@ void linkinfo_refresh_dis(int link, int have_mfr)
     * byte, and "is this empty" asked without the lock is answered `no` the
     * instant byte 0 lands. */
    mutex_lock(&dis_lk);
+   /* THE SERIAL IS NOT IN THIS GATE, deliberately. It is read by the same
+    * request as the model and the firmware, so a link that gets those gets it
+    * too when the sensor offers one -- and a sensor that offers none would
+    * otherwise leave this true for ever, re-reading device information every
+    * LIVE_DIS_RETRY_S for the life of the connection. The gate asks whether
+    * the strings that IDENTIFY the device have arrived; the serial is an
+    * attribute that rides along with them. */
    int want = !g_model_l[link][0] || !g_fw_l[link][0];
    mutex_unlock(&dis_lk);
    if ((want || !have_mfr) && driver_dis_claim(link))
@@ -405,19 +421,24 @@ void linkinfo_refresh_dis(int link, int have_mfr)
  * There is no "_locked" variant to call instead: this takes its own lock, and
  * a caller holding the registry lock around a run of these is exactly the
  * caller that would hold it across driver calls too. */
-void linkinfo_dis(int link, char *model, int mcap, char *fw, int fcap)
+void linkinfo_dis(int link, char *model, int mcap, char *fw, int fcap, char *sn,
+                  int scap)
 {
    mutex_lock(&dis_lk);
    if (model && mcap > 0)
       model[0] = 0;
    if (fw && fcap > 0)
       fw[0] = 0;
+   if (sn && scap > 0)
+      sn[0] = 0;
    if (link < 0 || link >= LINK_MAX)
       goto out;
    if (model)
       str_snapshot(model, mcap, g_model_l[link]);
    if (fw)
       str_snapshot(fw, fcap, g_fw_l[link]);
+   if (sn)
+      str_snapshot(sn, scap, g_sn_l[link]);
 out:
    mutex_unlock(&dis_lk);
 }
@@ -429,5 +450,11 @@ void linkinfo_forget_dis(int link)
    mutex_lock(&dis_lk);
    g_model_l[link][0] = 0;
    g_fw_l[link][0]    = 0;
+   /* THE SERIAL GOES WITH THEM. It is minted into the same provenance row and
+    * that row is append-only, so a stale one is not a display error that the
+    * next read corrects -- it is the forgotten sensor's serial recorded
+    * against a different physical device, for ever. sensor_complete fills a
+    * field only while it is empty, so nothing later can put it right. */
+   g_sn_l[link][0] = 0;
    mutex_unlock(&dis_lk);
 }

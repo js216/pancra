@@ -264,7 +264,31 @@ static int wt_parse_line(struct wt_tail *t, const char *p, const char *e)
  * it is static for the same reason -- this runs on a service thread). */
 static struct wt_tail g_stage;
 
+/* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
+ *
+ * g_stage is a static -- the tail can be thousands of rows and this runs on a
+ * service thread with a small stack -- and TWO threads reach this loader: the
+ * SYNC WORKER through pancra_logs_reload after a restore, and the MAIN thread
+ * through the delete-and-reload path. Both reset it to empty and refill it, so
+ * without this the published tail can be a splice of two parses: rows
+ * duplicated or dropped until something reloads again. The publish itself is
+ * already one assignment under the tail lock; it is the FILL that races.
+ *
+ * A LEAF ABOVE THE TAIL LOCK: taken only here, and only ever with the tail lock
+ * nested inside it. No caller holds the tail lock across a load. */
+static struct mutex wt_stage_lk = MUTEX_INIT;
+
+static int weight_load_staged(void);
+
 int weight_load(void)
+{
+   mutex_lock(&wt_stage_lk);
+   int rc = weight_load_staged();
+   mutex_unlock(&wt_stage_lk);
+   return rc;
+}
+
+static int weight_load_staged(void)
 {
    struct wt_tail *t = &g_stage;
    t->n              = 0;
@@ -450,8 +474,7 @@ static int wt_rewrite(const struct wt_rec *orig, int del, long t, long g,
    /* THE ONE MOMENT THIS FAILURE CAN BE ARRANGED, and the only way a test can
     * reach it: between a rewrite that succeeded and the re-read that must
     * follow it. Never compiled into the app -- nothing that ships defines
-    * APP_FAULTS -- and weighttest uses it to make the log unreadable exactly
-    * here (test/app/weighttest.c). */
+    * APP_FAULTS. */
    if (weight_fault_before_reload)
       weight_fault_before_reload();
 #endif

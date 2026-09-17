@@ -6,7 +6,7 @@
 #include "dexdriver.h"  /* struct dex_session: what is cached and restored */
 #include "loadresult.h" /* what a load actually found */
 #include "senslogic.h"  /* sens_cache_*: the rate limit on the write */
-#include "sensors.h"    /* MAX_SLOTS, SENSOR_ACTIVE_S */
+#include "sensors.h"    /* SENSOR_ACTIVE_S: when a cached row stops counting */
 #include "thread.h"     /* sessc_lk / sessfile_lk: see the block below */
 #include "util.h"
 #if __STDC_HOSTED__
@@ -39,7 +39,26 @@ struct sess_cache {
    long clock;   /* session seconds at that instant */
    int id, state, predicted, sequence;
 };
-static struct sess_cache g_sessc[MAX_SLOTS];
+
+/* HOW MANY SESSION CLOCKS ARE WORTH KEEPING, which is not "one per sensor
+ * ever registered". This is a restore cache for the gap between launch and a
+ * sensor's first response of the new process, and sessc_restore refuses any
+ * row older than SENSOR_ACTIVE_S -- so a row for a sensor that has been quiet
+ * for a day already answers nothing. The phone can hold LINK_MAX bonds at
+ * once, so the rows that can ever be used are a handful; the rest is room for
+ * a changeover. When the table is full the STALEST row is reused, because
+ * that is the one the reader would have refused.
+ *
+ * The file, the parse buffer and the render buffer are all sized from this,
+ * so the cache cannot outgrow what a load can read back. */
+#define SESSC_MAX 32
+/* THE WIDEST ROW THE FORMAT CAN PRINT, not the widest one expected: an int
+ * prints in 11 characters and a long in 20, so "%d,%ld,%ld,%d,%d,%d\n" is 90.
+ * Sized from the values instead, a wide one makes the render overflow, and an
+ * overflow here is a save that is quietly skipped rather than an error. */
+#define SESSC_ROW 96
+
+static struct sess_cache g_sessc[SESSC_MAX];
 static int g_nsessc;
 static char g_sess_path[256];
 /* NOT "when the newest change happened" -- that never fires.
@@ -112,7 +131,7 @@ static struct sens_cache g_sessc_state;
  * it, and only then takes sessfile_lk. That is set_file_lk's shape exactly,
  * and app/settings.c's save_now/write_job split is the worked example this
  * follows, generation reconciliation included. See the rank table in
- * app/thread.h and test/app/lockorder.py, which check the pair. */
+ * app/thread.h, which lists the pair. */
 #ifdef APP_FAULTS
 void (*sess_fault_gap_here)(void);
 #endif
@@ -143,7 +162,7 @@ static unsigned g_sessc_written;
 /* One render, ready to be written with nothing held. Same shape as
  * settings.c's struct save_job, for the same reason. */
 struct sess_job {
-   char buf[(MAX_SLOTS * 96) + 1];
+   char buf[(SESSC_MAX * SESSC_ROW) + 1];
    int len;
    unsigned gen;
    int ok; /* the render itself fitted */
@@ -155,13 +174,24 @@ static struct sess_cache *sessc_get(int id, int create)
    for (int i = 0; i < g_nsessc; i++)
       if (g_sessc[i].id == id)
          return &g_sessc[i];
-   if (create && g_nsessc < MAX_SLOTS) {
+   if (!create)
+      return 0;
+   if (g_nsessc < SESSC_MAX) {
       struct sess_cache *c = &g_sessc[g_nsessc++];
       *c                   = (struct sess_cache){0};
       c->id                = id;
       return c;
    }
-   return 0;
+   /* FULL: take the row whose clock was read longest ago. It is the one with
+    * the least left to say -- sessc_restore refuses a row past
+    * SENSOR_ACTIVE_S -- and the sensor being recorded right now is live. */
+   struct sess_cache *old = &g_sessc[0];
+   for (int i = 1; i < g_nsessc; i++)
+      if (g_sessc[i].clock_t < old->clock_t)
+         old = &g_sessc[i];
+   *old    = (struct sess_cache){0};
+   old->id = id;
+   return old;
 }
 
 /* THE COHERENT SNAPSHOT. CALLER HOLDS sessc_lk: every row is rendered from
@@ -295,7 +325,7 @@ int sess_paths(const char *dir)
  *   look like sensors never seen.
  *
  *   IT DROPPED WHAT DID NOT FIT. A file with more rows than the table holds
- *   quietly kept the first MAX_SLOTS and reported success.
+ *   quietly kept the first SESSC_MAX and reported success.
  *
  *   AN UNTERMINATED LAST ROW WAS A ROW. A file cut by a power loss mid-write
  *   ends without its newline, and its surviving digits parse into a plausible
@@ -339,7 +369,7 @@ static int sess_row_ok(const char *p, const char *e, struct sess_cache *out)
    /* THE RANGES ARE WHAT THIS PROGRAM WRITES. `id` is a registry id, the two
     * clocks are seconds, `state` is the sensor's own byte, `predicted` is a
     * glucose value and `sequence` is a sample counter. A value outside these
-    * did not come from sess_save. */
+    * did not come from sess_flush. */
    if (v[0] <= 0 || v[0] > 0x7fffffffL)
       return 0;
    if (v[1] < 0 || v[1] > 0x7fffffffL)
@@ -365,7 +395,7 @@ enum load_result sess_load(void)
 {
    /* ONE EXACT READ: short reads, EINTR and a file longer than
     * this buffer are all handled in read_file_exact rather than here. */
-   char b[1024];
+   char b[(SESSC_MAX * SESSC_ROW) + 1];
    int n               = 0;
    enum load_result rr = read_file_exact(g_sess_path, b, sizeof b, &n);
    if (rr != LOAD_OK)
@@ -373,7 +403,7 @@ enum load_result sess_load(void)
 
    /* STAGED, NOT PUBLISHED. Nothing below touches the live table until the
     * whole file has parsed. */
-   struct sess_cache stage[MAX_SLOTS];
+   struct sess_cache stage[SESSC_MAX];
    int nstage = 0;
    char *p    = b;
    char *end  = b + n;
@@ -387,7 +417,7 @@ enum load_result sess_load(void)
          p = nl + 1;
          continue; /* a blank line is not a row and is not damage */
       }
-      if (nstage >= MAX_SLOTS)
+      if (nstage >= SESSC_MAX)
          return LOAD_CORRUPT; /* more rows than the table holds */
       struct sess_cache row = {0, 0, 0, 0, 0, 0};
       if (!sess_row_ok(p, nl, &row))
@@ -423,8 +453,7 @@ void sessc_put(int id, const struct dex_session *s, long now)
    mutex_lock(&sessc_lk);
    struct sess_cache *c = sessc_get(id, 1);
    /* ONE CONDITION AND ONE EXIT, rather than three early returns: a `return`
-    * from inside the lock walks away holding a yield-spin with no timeout,
-    * and test/app/lockorder.py refuses one. */
+    * from inside the lock walks away holding a yield-spin with no timeout. */
    if (c && !(c->clock == (long)s->session_seconds && c->state == s->state &&
               c->predicted == s->predicted)) {
       c->clock_t   = now;
