@@ -176,8 +176,19 @@ int form_ins_action(int action, int ix)
             set_status_refused("INSULIN: DELETE FAILED");
          }
          if (fate == DRAFT_DONE) {
+            /* THE WHOLE DRAFT GOES, not just its `edit` flag: the units, type
+             * and instant of the deleted dose would otherwise sit in a form
+             * whose CONFIRM appends, putting the dose straight back on the
+             * next tap -- the same trap form_food_action's delete describes. */
+            ins_draft_new(&g_ins, -1);
+            /* TWICE: the confirmation AND the EDIT form it was opened from.
+             * Both stand for a row that is gone, so one pop leaves the user
+             * in front of LOG INSULIN holding the deleted dose. Two pops land
+             * on the dose table, where the row was. Pops rather than a
+             * nav_go(SCR_INSLOG): the target stays derived from the path
+             * (nav.h), not named here. */
             nav_back();
-            ins_draft_done(&g_ins);
+            nav_back();
          }
          shell_ui_dirty();
       }

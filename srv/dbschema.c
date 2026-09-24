@@ -177,6 +177,24 @@ static const char SCHEMA_V2[] =
 static const char SCHEMA_V3[] =
     "ALTER TABLE user ADD COLUMN pw_kdf INTEGER NOT NULL DEFAULT 1;";
 
+/* ---- V4: THE VIEWER'S THEME ---------------------------------
+ *
+ * 0 is light and 1 is dark, per account: the setting belongs to the person
+ * looking, not to the record being looked at, so a follower reading somebody
+ * else's data sees it in their own theme.
+ *
+ * NOT NULL DEFAULT 0 rather than a nullable "unset". The server renders the
+ * plot GIFs itself and has to know which palette to draw before it can answer
+ * the request, so there is no point in the file at which "no answer" is
+ * useful -- every account has a theme, and light is the one every existing
+ * account is already looking at.
+ *
+ * AND IT IS APPENDED, like every ALTER TABLE ADD COLUMN: a migrated file and
+ * a fresh install both carry it after pw_kdf, which is the order dbcheck.c's
+ * shape for `user` states. */
+static const char SCHEMA_V4[] =
+    "ALTER TABLE user ADD COLUMN theme INTEGER NOT NULL DEFAULT 0;";
+
 /* The version this build understands. Bump it in the same commit as the
  * migration that needs it, and never renumber: the number is written into
  * every database this server has ever opened. */
@@ -188,6 +206,7 @@ const struct migration db_migrations[] = {
     {1, SCHEMA   },
     {2, SCHEMA_V2},
     {3, SCHEMA_V3},
+    {4, SCHEMA_V4},
     /* Add the next step here, with `to` one higher, and raise
      * DB_SCHEMA_VERSION to match. Do NOT edit an earlier step: databases in
      * the field have already run it, and changing it makes this list a

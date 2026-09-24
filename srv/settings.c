@@ -285,6 +285,33 @@ void h_settings(struct req *r, int64_t me, const char *cookie, const char *note)
       sqlite3_finalize(tk);
    }
 
+   /* ---- APPEARANCE ----------------------------------------------
+    *
+    * READ STRAIGHT FROM THE COLUMN, not through theme_of(). Everywhere else
+    * a theme that cannot be read renders as light, which is the right
+    * default for a page whose subject is glucose. Here the stored value IS
+    * the subject: shown as "Light" a database fault presents a setting the
+    * user never chose, and the next Save writes that guess back. So the page
+    * refuses instead, exactly as it does for the time zone below. */
+   int64_t theme_set = THEME_LIGHT;
+   if (db_get_long(r->db, "SELECT theme FROM user WHERE id=?", me,
+                   &theme_set) != DB_GET_VALUE) {
+      sb_free(&s);
+      oops_busy(r);
+      return;
+   }
+   int dark = theme_set == THEME_DARK;
+   sb_add(&s,
+          "<h2>Appearance</h2>"
+          "<form method=post action=\"/settings/theme\">"
+          "<input type=hidden name=csrf value=\"%s\">"
+          "<p><label><input type=radio name=theme value=\"light\"%s> "
+          "Light</label><br>"
+          "<label><input type=radio name=theme value=\"dark\"%s> "
+          "Dark</label></p>"
+          "<button>Save</button></form>",
+          csrf, dark ? "" : " checked", dark ? " checked" : "");
+
    /* Time zone and password. */
    /* The STORED setting, not the resolved one: the box showed the offset the
     * app happened to be reporting, so "follow the phone" looked like a
@@ -489,6 +516,51 @@ void h_settings_post(struct req *r, int64_t me, const char *cookie,
       }
       h_settings(r, me, cookie,
                  ok ? "Time zone saved." : "Could not save the time zone.");
+      return;
+   }
+   if (!strcmp(what, "theme")) {
+      char th[16];
+      /* THE FIELD MUST BE THERE, and it must be one of the two words.
+       *
+       * A radio group submits exactly one of its values, so anything else --
+       * a missing field, a duplicate, a value that is neither -- came from
+       * something that was not this form. The theme decides which palette
+       * every plot GIF is drawn at, so a value outside the pair would be
+       * stored and then read back by plots.c as "not dark", which is a
+       * setting the user did not choose being reported as one they did. */
+      enum form_field fth =
+          form_field(r->body, r->body_len, "theme", th, sizeof th);
+      int want = -1;
+      if (fth == FORM_OK) {
+         if (!strcmp(th, "light"))
+            want = THEME_LIGHT;
+         else if (!strcmp(th, "dark"))
+            want = THEME_DARK;
+      }
+      if (want < 0) {
+         h_settings(r, me, cookie,
+                    "That is not one of the two themes; the appearance was "
+                    "not changed.");
+         return;
+      }
+      sqlite3_stmt *st = db_prep(r->db, "UPDATE user SET theme=? WHERE id=?");
+      int ok           = 0;
+      if (st) {
+         sqlite3_bind_int(st, 1, want);
+         sqlite3_bind_int64(st, 2, me);
+         ok = sqlite3_step(st) == SQLITE_DONE;
+         sqlite3_finalize(st);
+      }
+      /* THE CONFIRMATION IS DRAWN IN THE THEME IT CONFIRMS. r->theme was
+       * resolved for this request before the handler ran, so without this
+       * the page saying "Appearance saved." would still be wearing the
+       * previous theme -- a save reported in words and contradicted by the
+       * page reporting it. Only on success: a refused save must leave the
+       * reader looking at what is actually stored. */
+      if (ok)
+         r->theme = want;
+      h_settings(r, me, cookie,
+                 ok ? "Appearance saved." : "Could not save the appearance.");
       return;
    }
    if (!strcmp(what, "password")) {

@@ -5,9 +5,11 @@
  * plot_render (lib/plot.c) is the exact code the phone draws with --
  * self-contained by design, so this server links it directly and the two
  * plots can never drift apart. It renders at the app's dark palette into an
- * RGBA framebuffer; this file then inverts luminance per pixel, which turns
- * the dark theme into the bright black-and-white look the pages want, and
- * quantises to 16 grays for the GIF.
+ * RGBA framebuffer; this file then quantises luminance per pixel to 16 grays
+ * for the GIF, inverting it for a reader on the light theme and leaving it as
+ * it stands for one on the dark theme. The viewer's theme is therefore the
+ * whole difference between the two images, and it reaches here on the
+ * request (see struct req).
  *
  * Its own file, not more of web.c: this is a renderer with a framebuffer, a
  * palette and an encoder, and web.c is a page builder. They share nothing but
@@ -79,9 +81,14 @@ static const uint8_t dig3x5[10][5] = {
  * "04 22" reads as two numbers), so it gets the one extra glyph. */
 static const uint8_t dash3x5[5] = {0, 0, 7, 0, 0};
 
-/* Draw digit string s onto the INDEXED (post-inversion) image in black
- * (palette index 0), scale sc; width is 4*sc per digit. Clipped. */
-static void img_digits(struct plot_ws *ws, int x, int y, const char *s, int sc)
+/* Draw digit string s onto the INDEXED image at palette index `ink`, scale
+ * sc; width is 4*sc per digit. Clipped.
+ *
+ * THE INK IS THE CALLER'S because the two themes put the background at
+ * opposite ends of the same 16-gray ramp: a label drawn at index 0 reads on
+ * the light plot and vanishes into the dark one. */
+static void img_digits(struct plot_ws *ws, int x, int y, const char *s, int sc,
+                       uint8_t ink)
 {
    for (; *s; s++, x += 4 * sc) {
       if (*s != '-' && (*s < '0' || *s > '9'))
@@ -96,7 +103,7 @@ static void img_digits(struct plot_ws *ws, int x, int y, const char *s, int sc)
                   int px = x + (c * sc) + i;
                   int py = y + (r * sc) + j;
                   if (px >= 0 && px < IMG_W && py >= 0 && py < IMG_H)
-                     ws->img[((size_t)py * IMG_W) + (size_t)px] = 0;
+                     ws->img[((size_t)py * IMG_W) + (size_t)px] = ink;
                }
          }
    }
@@ -171,10 +178,14 @@ static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
    return n;
 }
 
-/* Render (win_start, win_end] over `hours` into a GIF. Returns its size. */
+/* Render (win_start, win_end] over `hours` into a GIF. Returns its size.
+ *
+ * `dark` picks the theme, and it is the one place the two differ: plot_render
+ * draws the app's dark palette either way, so the light image is that
+ * luminance inverted and the dark image is that luminance as it stands. */
 static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
                        int64_t win_start, int64_t win_end, int hours,
-                       int tz_min, uint8_t *out, size_t cap)
+                       int tz_min, int dark, uint8_t *out, size_t cap)
 {
    int ph = IMG_H - XSTRIP; /* plot rect; labels live in the strip below */
    for (size_t i = 0; i < (size_t)IMG_W * IMG_H; i++)
@@ -192,9 +203,9 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
                (struct plot_rect){0, 0, IMG_W, ph}, ws->ppts, np, win_end,
                hours, cfg, trace_white, -1, 0, tz);
 
-   /* invert luminance -> bright mode, 16 gray levels. ITS OWN, not a static:
-    * the palette is written on every call, so a shared one is one more thing
-    * two renders would be writing at once. It is 48 bytes. */
+   /* Luminance -> 16 gray levels, inverted for the light theme. ITS OWN, not
+    * a static: the palette is written on every call, so a shared one is one
+    * more thing two renders would be writing at once. It is 48 bytes. */
    uint8_t gray[16][3];
    for (int i = 0; i < 16; i++)
       gray[i][0] = gray[i][1] = gray[i][2] = (uint8_t)(i * 17);
@@ -203,8 +214,11 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
       int lum    = (((int)(c & 0xFF) * 299) + ((int)((c >> 8) & 0xFF) * 587) +
                     ((int)((c >> 16) & 0xFF) * 114)) /
                    1000;
-      ws->img[i] = (uint8_t)((255 - lum) >> 4);
+      ws->img[i] = (uint8_t)((dark ? lum : 255 - lum) >> 4);
    }
+   /* The axis labels go on at the end opposite the background: index 15 on
+    * the dark image, 0 on the light one. */
+   uint8_t ink = dark ? 15 : 0;
 
    /* Axis labels, through the renderer's OWN mapping (plot_point_xy) so they
     * can never drift from what plot_render drew. */
@@ -212,11 +226,11 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
    struct plot_pt ref = {.t = win_end, .glu = 70};
    if (plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref, win_end, hours,
                      cfg, &lx, &ly))
-      img_digits(ws, 4, ly - 5, "70", 2);
+      img_digits(ws, 4, ly - 5, "70", 2, ink);
    ref.glu = 180;
    if (plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref, win_end, hours,
                      cfg, &lx, &ly))
-      img_digits(ws, 4, ly - 5, "180", 2);
+      img_digits(ws, 4, ly - 5, "180", 2, ink);
    for (int64_t ts = 3600; ts <= (int64_t)hours * 3600; ts += 3600) {
       ref.t       = win_end - ts;
       ref.glu     = 100; /* any in-scale value: only x matters here */
@@ -229,7 +243,7 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
          continue;
       char lbl[4];
       (void)snprintf(lbl, sizeof lbl, "%02d", hh);
-      img_digits(ws, lx - 7, (IMG_H - XSTRIP) + 2, lbl, 2);
+      img_digits(ws, lx - 7, (IMG_H - XSTRIP) + 2, lbl, 2, ink);
    }
    /* The cast is ISO C's, not ours: uint8_t(*)[3] does not convert to
     * const uint8_t(*)[3] implicitly the way a plain pointer would. */
@@ -249,8 +263,11 @@ static uint8_t gifbuf[256 * 1024];
 void h_plot_gif(struct req *r, int64_t owner, int64_t win_start,
                 int64_t win_end, int hours, int tz_min)
 {
+   /* THE READER'S THEME, NOT THE RECORD OWNER'S. `owner` says whose readings
+    * are drawn; r->theme says who is looking at them, and a follower reading
+    * a shared record is entitled to their own palette. */
    size_t n = plot_gif(&g_plot_ws, r->db, owner, win_start, win_end, hours,
-                       tz_min, gifbuf, sizeof gifbuf);
+                       tz_min, r->theme == THEME_DARK, gifbuf, sizeof gifbuf);
    if (!n) {
       /* STAGED, not written here. http_text goes to the socket, and this runs
        * under the page lock -- so a client that stopped reading held every

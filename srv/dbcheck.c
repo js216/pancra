@@ -136,20 +136,21 @@ struct table_index {
 /* THE `user` ROW CARRIES TWO SHAPES, and the order of its columns is not a
  * style choice.
  *
- * pw_kdf IS LAST because `ALTER TABLE ADD COLUMN` appends: a database that
- * has run schema step 3 has it after created_at, and so does a fresh install,
- * which runs the baseline and then that step. Writing it where it reads best
- * in the CREATE refuses every database in existence. Measured.
+ * pw_kdf AND theme ARE LAST, in that order, because `ALTER TABLE ADD COLUMN`
+ * appends: a database that has run schema steps 3 and 4 has them after
+ * created_at, and so does a fresh install, which runs the baseline and then
+ * both steps. Writing either where it reads best in the CREATE refuses every
+ * database in existence. Measured.
  *
- * AND THE SECOND SHAPE IS THE SAME ONE WITHOUT pw_kdf. That column arrives in
- * schema step 3, so a file that has never been stamped does not have it yet
- * and must not be refused for that.
+ * AND THE SECOND SHAPE IS THE SAME ONE WITHOUT EITHER. Those columns arrive
+ * in schema steps 3 and 4, so a file that has never been stamped does not
+ * have them yet and must not be refused for that.
  */
 static const struct table_shape SHAPES[] = {
     {"user",
      "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
      "INTEGER!,tz_offset INTEGER,display_name TEXT,created_at INTEGER!,pw_kdf "
-     "INTEGER!=1",                                                                   "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
+     "INTEGER!=1,theme INTEGER!=0",                                                                   "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
      "INTEGER!,tz_offset INTEGER,display_name TEXT,created_at INTEGER!", "",                                            1},
     {"app",
      "user_id INTEGER#1,key BLOB!,label TEXT,paired_at INTEGER!,last_seen "

@@ -81,6 +81,19 @@ int tz_resolve(struct db *d, int64_t uid, int *have);
  * So this is not "the flag is ignored", it is "0 is the right rendering
  * default and the page that must not use it does not call this". */
 int tz_of(struct db *d, int64_t uid);
+
+/* ---- THE VIEWER'S THEME (THEME_LIGHT / THEME_DARK are proto.h's) ------
+ *
+ * THEME_LIGHT is the answer whenever the database cannot give one, and that
+ * is a rendering default rather than a guess about the account. A page is
+ * worth more than its colours: refusing to draw a record of glucose values
+ * because the palette could not be read is the worse answer, and the SETTINGS
+ * page -- the one place where the stored value is the subject rather than the
+ * decoration -- reads the column itself and says when it could not.
+ *
+ * `uid` of 0 is a signed-out reader (the login form, an invitation), who has
+ * no account to hold a preference. */
+int theme_of(struct db *d, int64_t uid);
 void stamp_local(int64_t t, int tz_min, char *out, size_t cap);
 
 /* The cookie a browser is given, and the check every state-changing form

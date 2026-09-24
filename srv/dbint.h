@@ -65,7 +65,7 @@ extern const int db_nmigrations;
 /* The version this build understands. Bump it in the same commit as the
  * migration that needs it, and never renumber: the number is written into
  * every database this server has ever opened. */
-#define DB_SCHEMA_VERSION 3
+#define DB_SCHEMA_VERSION 4
 
 /* CAN THIS SERVER OPEN A FILE AT SCHEMA VERSION `at`? Answered against the
  * shapes and the orphan rules, with the "in between" versions deliberately

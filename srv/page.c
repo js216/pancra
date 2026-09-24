@@ -63,13 +63,31 @@ void redirect(struct req *r, const char *to, const char *set_cookie)
    /* No body: resp stays NULL, and the flush sends headers alone. */
 }
 
-/* The single-user version's whole stylesheet, kept exactly: one monospace
- * face and nothing else. ("monospace,monospace" is not a typo -- the doubled
- * name dodges a browser quirk that shrinks bare `monospace` text.) The only
- * thing this build adds to a page is the name/email/logout row at the top,
- * which the single-user version had no need of. */
-static const char CSS[] =
+/* The stylesheet, one per theme: one monospace face, and the two colours a
+ * theme is. ("monospace,monospace" is not a typo -- the doubled name dodges a
+ * browser quirk that shrinks bare `monospace` text.)
+ *
+ * THE DARK SHEET SETS `color-scheme` AS WELL AS THE TWO COLOURS, and it earns
+ * its place: it is what makes the browser's own furniture -- form controls,
+ * the scrollbar, the space outside the page -- dark with the page. Without
+ * it the record reads as intended and every <select>, <input> and <button>
+ * on the settings page stays white.
+ *
+ * Links are given explicit colours in the dark sheet because the defaults
+ * (navy, and a purple for visited) are chosen against white and are close to
+ * unreadable on this background.
+ *
+ * AND THE BACKGROUND IS #111111 TO THE BYTE, because that is what the plot
+ * GIFs are. plots.c fills its framebuffer with the app's 0x181818, and the
+ * GIF carries 16 gray levels that are multiples of 17 -- so that fill lands
+ * on 17, which is #111111. A page at any other shade draws a visible
+ * rectangle edge around every plot on it. */
+static const char CSS_LIGHT[] =
     "<style>body{font-family:monospace,monospace}</style>";
+static const char CSS_DARK[] =
+    "<style>:root{color-scheme:dark}"
+    "body{font-family:monospace,monospace;background:#111;color:#e0e0e0}"
+    "a{color:#6cf}a:visited{color:#b9f}</style>";
 
 void page(struct req *r, int code, const char *reason, const char *title,
           const char *body_html)
@@ -91,7 +109,8 @@ void page_refresh(struct req *r, int code, const char *reason,
           title);
    if (refresh)
       sb_add(&s, "<meta http-equiv=\"refresh\" content=\"%d\">\n", refresh);
-   sb_add(&s, "%s\n%s", CSS, body_html);
+   sb_add(&s, "%s\n%s", r->theme == THEME_DARK ? CSS_DARK : CSS_LIGHT,
+          body_html);
    if (s.err) {
       oops(r);
       sb_free(&s);
@@ -266,6 +285,22 @@ int tz_resolve(struct db *d, int64_t uid, int *have)
 int tz_of(struct db *d, int64_t uid)
 {
    return tz_resolve(d, uid, NULL);
+}
+
+int theme_of(struct db *d, int64_t uid)
+{
+   if (uid <= 0)
+      return THEME_LIGHT; /* nobody signed in: no account to hold a choice */
+   int64_t v = 0;
+   if (db_get_long(d, "SELECT theme FROM user WHERE id=?", uid, &v) !=
+       DB_GET_VALUE)
+      return THEME_LIGHT;
+   /* ONLY THE VALUES THIS PROGRAM WRITES. The column is NOT NULL DEFAULT 0
+    * and the form posts one of two words, so anything else in the file came
+    * from something that was not this server -- and the plot renderer reads
+    * this as "skip the inversion or do not", where a third value would be
+    * neither. */
+   return v == THEME_DARK ? THEME_DARK : THEME_LIGHT;
 }
 
 void stamp_local(int64_t t, int tz_min, char *out, size_t cap)

@@ -251,6 +251,11 @@ _Static_assert(NONCE_MAX == WV_LIMIT_NONCE_MAX, "the nonce ceiling moved");
 /* ---- one parsed request ---------------------------------------------- */
 struct db; /* db.h; a request names the database it is about */
 
+/* The two themes a reader can be on: see `theme` in struct req below, and
+ * theme_of() in page.h for how one is resolved. */
+#define THEME_LIGHT 0
+#define THEME_DARK  1
+
 struct req {
    /* WHICH DATABASE this request is about. Handed to the server at startup
     * and copied in here per request, so a handler cannot reach storage
@@ -293,6 +298,17 @@ struct req {
     * follower lost the record at the first click: /units and /plots resolved
     * to the viewer's own (empty) record and showed nothing. */
    char who[32]; /* fits "?who=" + any int64_t */
+   /* THE VIEWER'S THEME: 0 light, 1 dark, resolved once per request from the
+    * signed-in account (see web_route_locked) and read by everything that
+    * renders. It belongs to whoever is LOOKING, so a follower reading a
+    * shared record sees it in their own theme rather than the owner's.
+    *
+    * Carried on the request rather than looked up where it is needed: the
+    * page skeleton and the plot renderer both want it, they are reached
+    * through several layers that have no business taking a database
+    * handle, and one lookup per request cannot disagree with another. A
+    * signed-out page (the login form, an invitation) leaves it 0. */
+   int theme;
 };
 
 #endif

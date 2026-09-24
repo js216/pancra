@@ -264,6 +264,21 @@ static void web_route_locked(struct req *r)
    char cookie[128];
    int sess_failed = 0;
    int64_t me      = web_user(r, cookie, sizeof cookie, &sess_failed);
+   /* THE THEME, ONCE, FOR EVERY RESPONSE BELOW.
+    *
+    * Resolved here rather than in each handler because both things that
+    * render read it -- the page skeleton and the plot GIFs -- and neither is
+    * given a user id. Carried on the request, they cannot disagree about
+    * which account is looking.
+    *
+    * HERE IS AS EARLY AS IT CAN BE: it takes a user, and `me` is the line
+    * above. The two refusals that come before it -- the method gate and the
+    * body check -- answer before anybody is authenticated, deliberately, so
+    * there is no account to ask and they draw at the zero `struct req` was
+    * initialised with, which is THEME_LIGHT. Everything from the
+    * session-failure page down, including the 404s, is drawn in the reader's
+    * own theme. */
+   r->theme = theme_of(r->db, me);
    /* GET and POST are now the only two that reach a route below, and each
     * route is named by the bit it holds rather than by "not the other one":
     * `!get` was the condition that let every unconsidered method mutate. */
