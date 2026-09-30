@@ -163,6 +163,8 @@ int forms_action(int action, int ix);
 
 /* The odds and ends the menus set. */
 void forms_set_label_field(int field);
+/* What the marker picker edits: -1 the selected sensor, INS_SLOW / INS_FAST
+ * an insulin type, MARKPICK_CHG (uimodel.h) the main plot's change points. */
 void forms_set_markpick(int ins_type);
 int forms_markpick(void);
 /* The keypad's mode, for the two flows that re-aim an already-open one. */

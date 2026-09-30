@@ -438,6 +438,15 @@ static int submenu_action(int action, int ix)
  * -- that function is the app's single largest, and the size gate is what
  * stops it growing without bound. Returns 1 when `action` was one of ours.
  */
+/* The marker picker's save when it is not editing a sensor: an insulin
+ * type's style, or the change points'. */
+static int pref_style_set(int marker, int color, int size)
+{
+   if (forms_markpick() == MARKPICK_CHG)
+      return settings_set_chg_style(marker, color, size);
+   return settings_set_ins_style(forms_markpick(), marker, color, size);
+}
+
 static int style_action(int action, int ix)
 {
    /* THE SELECTED DEVICE'S ID, read once. Every change below is asked for by
@@ -453,8 +462,9 @@ static int style_action(int action, int ix)
    } else if (action == MA_MARK_PICK) {
       int mk = ix;
       if (forms_markpick() >= 0) {
-         /* the picker is editing an INSULIN type's marker, not a sensor's */
-         if (settings_set_ins_style(forms_markpick(), mk, -1, 0) != SETTINGS_OK)
+         /* the picker is editing an INSULIN type's marker or the change
+          * points', not a sensor's */
+         if (pref_style_set(mk, -1, 0) != SETTINGS_OK)
             set_status_refused("MARKER NOT SAVED");
       } else if (sensor_set_marker(sel.id, mk) != 0) {
          set_status_refused("MARKER NOT SAVED");
@@ -464,8 +474,7 @@ static int style_action(int action, int ix)
    } else if (action == MA_SIZE_PICK) {
       int sz = ix; /* 1..MARK_SIZE_MAX */
       if (sz >= 1 && sz <= MARK_SIZE_MAX && forms_markpick() >= 0) {
-         if (settings_set_ins_style(forms_markpick(), -1, -1, sz) !=
-             SETTINGS_OK)
+         if (pref_style_set(-1, -1, sz) != SETTINGS_OK)
             set_status_refused("SIZE NOT SAVED");
       } else if (sensor_set_size(sel.id, sz) != 0) {
          set_status_refused("SIZE NOT SAVED");
@@ -506,7 +515,7 @@ static int style_action(int action, int ix)
    } else if (action == MA_COLOR_PICK) {
       int ci = ix;
       if (forms_markpick() >= 0) {
-         if (settings_set_ins_style(forms_markpick(), -1, ci, 0) != SETTINGS_OK)
+         if (pref_style_set(-1, ci, 0) != SETTINGS_OK)
             set_status_refused("COLOUR NOT SAVED");
       } else if (sensor_set_color(sel.id, ci) != 0) {
          set_status_refused("COLOUR NOT SAVED");

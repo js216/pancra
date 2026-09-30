@@ -60,6 +60,11 @@ struct prefs {
    int ins_marker[2]; /* MARK_* per insulin type (INS_SLOW/FAST) */
    int ins_color[2];  /* ui palette index per type */
    int ins_size[2];   /* marker size 1..MARK_SIZE_MAX per type */
+   /* The main plot's CHANGE POINTS, styled like an insulin type: a MARK_*
+    * shape, a palette colour, a size 1..MARK_SIZE_MAX. MARK_HIDE turns the
+    * change band off altogether -- no points, and the plot's scale and
+    * height back to the plain glucose plot's. */
+   int chg_marker, chg_color, chg_size;
    int statbar_val;   /* 1 = the status bar shows the value, 0 = the icon */
    int lockscr_val;   /* 1 = the notification is visible on the lock screen */
    int shortcut[SC_MAX]; /* the main-screen pins, by identity (see below) */
@@ -216,6 +221,9 @@ int settings_set_best_streak(int seconds);
 
 /* One insulin type's plot styling; -1 (or 0 for size) leaves a field alone. */
 int settings_set_ins_style(int type, int marker, int color, int size);
+/* The change points' style, the same way: -1 (0 for size) leaves a part as
+ * it is. */
+int settings_set_chg_style(int marker, int color, int size);
 
 /* The pinned shortcuts, as the operations the UI performs. The list is DENSE
  * -- the button row stops at the first empty slot -- so removal closes the

@@ -210,7 +210,7 @@ int form_ins_action(int action, int ix)
          ins_draft_done(&g_ins);
       }
    } else if (action == MA_INSMARK_OPEN) {
-      forms_set_markpick(ix); /* INS_SLOW / INS_FAST */
+      forms_set_markpick(ix); /* INS_SLOW / INS_FAST / MARKPICK_CHG */
       nav_go(SCR_MARKPICK);
    } else if (action == MA_INSMARK_BACK) {
       forms_set_markpick(-1);

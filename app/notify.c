@@ -194,7 +194,7 @@ static int notify_update(void)
    }
    plot_render((struct plot_fb){g_notify_px, NOTIF_W, NOTIF_W, NOTIF_H},
                (struct plot_rect){0, 0, NOTIF_W, NOTIF_H}, pts, np,
-               realtime_s(), 3, (struct plot_cfg){sp.plot_max, 3}, white_color,
+               realtime_s(), 3, (struct plot_cfg){sp.plot_max, 3, 0}, white_color,
                -1, 0, tz_off_now());
    /* plot_render writes the SCREEN's pixel convention -- raw u32 on a
     * little-endian RGBA surface, i.e. 0xAABBGGRR -- but

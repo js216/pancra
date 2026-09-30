@@ -312,6 +312,7 @@ struct frame_ctx {
    /* Frame-owned storage the renderer BORROWS. Sized from the tails' own
     * bounds so a table that grows cannot silently start truncating here. */
    struct ui_point pts[UI_PTS_MAX];
+   struct ui_chg chg[UI_CHG_MAX]; /* the span's changes: see build_plot */
    struct ui_dev devs[UI_DEVS_MAX];
    struct ui_sensor sens[UI_MAX_SLOTS];
    struct reading hist[NHIST];
@@ -859,6 +860,9 @@ static void build_reading(struct frame_ctx *f, struct screen *m)
  * array (plot_render and plot_hit take points in any order, and the scrub
  * index the UI hands back has to index a single list), plus the streak the
  * plot is captioned with */
+/* A live span has at most one change per reading. */
+_Static_assert(NHIST <= UI_CHG_MAX, "the live history's changes must fit");
+
 static void build_plot(struct frame_ctx *f, struct screen *m)
 {
    const long now = f->now;
@@ -968,6 +972,22 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
    }
    m->plot.hist       = f->pts;
    m->plot.nhist      = nh;
+   /* THE CHANGES, every sensor's: from the log scan on a long span, from the
+    * live history on a short one. The renderer picks whose to draw. */
+   {
+      int nc = 0;
+      if (plong) {
+         const struct ui_chg *pc = plot_changes(&nc);
+         if (nc > UI_CHG_MAX)
+            nc = UI_CHG_MAX;
+         for (int i = 0; i < nc; i++)
+            f->chg[i] = pc[i];
+      } else {
+         nc = plot_changes_live(f->pts, nh, f->chg, UI_CHG_MAX);
+      }
+      m->plot.chg  = f->chg;
+      m->plot.nchg = nc;
+   }
    m->plot.scrub      = f->fv.scrub;
    m->plot.plot_hours = model_plot_hours();
    m->plot.plot_max   = f->prefs.plot_max;
@@ -1315,6 +1335,9 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
       m->ins.ins_size[k]   = f->prefs.ins_size[k];
    }
    m->ins.markpick_ins  = f->fv.markpick_ins;
+   m->prefs.chg_marker  = f->prefs.chg_marker;
+   m->prefs.chg_color   = f->prefs.chg_color;
+   m->prefs.chg_size    = f->prefs.chg_size;
    m->prefs.statbar_val = f->prefs.statbar_val;
    m->prefs.lockscr_val = f->prefs.lockscr_val;
    m->sys.exp_range     = f->mv.exp_range;

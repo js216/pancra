@@ -866,38 +866,99 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
          whenp = whenbuf;
       }
-      /* A FAST DOSE ON THE 3H AND 12H PLOTS SAYS HOW LONG AGO IT WAS:
-       * "18:20  1.5U  FAST 1H30".
+      /* ---- EVERY FIELD A FIXED WIDTH, SO NOTHING MOVES UNDER THE FINGER --
        *
-       * TWENTY CELLS, WHICH IS THE ROW. log_scrub_row keeps its full size
-       * while the three fields' characters and the one cell of air either
-       * side of the middle fit the plot's width: on a 720-wide portrait
-       * screen that is 18 characters, 20 cells. The clock is 5;
-       * the dose with its U is padded to 4, which holds every dose of up to
-       * three characters ("2", "12", "1.5"), so sweeping from one dose to the
-       * next moves the digits and not the field; and "FAST 9H59" is 9. The
-       * age carries no sign because the sign is the one character the row
-       * does not have -- next to the clock, "1H30" can only be an interval.
+       * log_scrub_row pins the time to the left edge and the unit field to
+       * the right, and centres the value between them -- so a field that
+       * changes width from one point to the next slides the unit field, and
+       * the value with it, while the reader is sweeping the trace to read
+       * them. Within each kind of row below, every field is therefore the
+       * same width at every point, numbers right-aligned inside it, and a
+       * value that is absent is blanks of the same width.
        *
-       * UNDER TEN HOURS ONLY. That keeps the age to the four characters it is
-       * given. An older dose on the 12H plot, and a dose stamped in the
-       * future, which has no age, keep the plain row: clock, dose, U FAST.
+       * EIGHTEEN CHARACTERS, the row's budget. log_scrub_row keeps its full
+       * size while the three fields and a cell of air either side of the
+       * middle fit the plot's width: on a 720-wide portrait screen that is
+       * 18 characters. Each layout below is 5 + value + 10 or 9 to the
+       * character. */
+
+      /* INSULIN ON THE 3H AND 12H PLOTS: "22:30  1.5U  FAST 1H30".
        *
-       * A dose of four characters ("16.5") makes the row 21 cells, and
-       * log_scrub_row draws it one size smaller rather than cut it. */
-      static char fastu[16];
-      const long dage = m->now - m->plot.hist[m->plot.scrub].t;
-      if (ins && m->plot.hist[m->plot.scrub].src == INS_FAST &&
-          (m->plot.plot_hours == 3 || m->plot.plot_hours == 12) && dage >= 0 &&
-          dage < 10L * 3600) {
+       * Both types share the layout, so stepping from a FAST dose to a SLOW
+       * one moves nothing either. The dose with its U is four wide, which
+       * holds every dose of up to three characters ("2", "12", "1.5"); the
+       * type is four; and the age is four, right-aligned: "  5M", " 45M",
+       * "1H30". The age carries no sign because the sign is the one
+       * character the row does not have -- next to the clock, "1H30" can
+       * only be an interval.
+       *
+       * THE AGE IS FOR A FAST DOSE UNDER TEN HOURS OLD, which keeps it to its
+       * four characters. A SLOW dose, an older FAST dose and a dose stamped
+       * in the future, which has no age, have blanks in its place. A dose of
+       * four characters ("16.5") is wider than its field, and makes the row
+       * one character too long for the full size. */
+      static char insu[16];
+      if (ins && (m->plot.plot_hours == 3 || m->plot.plot_hours == 12)) {
+         const struct ui_point *d = &m->plot.hist[m->plot.scrub];
+         const int fast           = d->src == INS_FAST;
+         const long dage          = m->now - d->t;
          char iu[16];
-         char ago[8];
-         (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
+         char ago[8] = "";
+         (void)ins_units_str(d->glu, iu, sizeof iu);
          (void)snprintf(gv, sizeof gv, "%.10sU", iu);
          gvw = 4;
-         fmt_ago_hm(dage, ago, sizeof ago);
-         (void)snprintf(fastu, sizeof fastu, "FAST %s", ago);
-         unit = fastu;
+         if (fast && dage >= 0 && dage < 10L * 3600)
+            fmt_ago_hm(dage, ago, sizeof ago);
+         (void)snprintf(insu, sizeof insu, "%s %4s", fast ? "FAST" : "SLOW",
+                        ago);
+         unit = insu;
+      }
+
+      /* GLUCOSE IN mg/dL ON THE 3H, 12H AND 24H PLOTS: "22:30  148  MG/DL
+       * +12" -- how far a CGM reading moved since the same sensor's reading
+       * before it.
+       *
+       * AFTER THE UNIT, where it reads as a change and not as arithmetic on
+       * the value beside it. Signed always, "+0" included, and right-aligned
+       * in four: the history holds readings of 20..600 (INGEST_GLU_MIN..MAX),
+       * so a change is at most 580 and "+580" is the widest. With the clock's
+       * 5 and the value's 3, "MG/DL +580" is 10 and the row is 18.
+       *
+       * ONLY ACROSS ONE READING'S GAP. The previous point is the latest
+       * earlier CGM reading from the same source, and only if it is less than
+       * six minutes older -- the sensor's five-minute cadence and a little
+       * slack. Across a dropout, at a session's first reading, and for a
+       * meter reading, the change is blanks.
+       *
+       * THESE SPANS ONLY, because theirs is the bare clock. From 3D the time
+       * field carries a weekday or a date as well, and ten more characters
+       * would not fit at the full size. mg/dL only, for the same reason: the
+       * mmol/L value and unit are one character wider each. */
+      static char gluu[16];
+      if (!ins && !wt && !fd && !exr && !m->prefs.units &&
+          m->plot.plot_hours < 72) {
+         const struct ui_point *cur = &m->plot.hist[m->plot.scrub];
+         char dv[8]                 = "";
+         int prev                   = -1;
+         if (cur->kind == KIND_CGM)
+            for (int i = 0; i < m->plot.nhist; i++) {
+               const struct ui_point *p = &m->plot.hist[i];
+               if (p->kind != KIND_CGM || p->src != cur->src ||
+                   p->t >= cur->t || cur->t - p->t >= PLOT_CHG_GAP_S)
+                  continue;
+               if (prev < 0 || p->t > m->plot.hist[prev].t)
+                  prev = i;
+            }
+         if (prev >= 0) {
+            int d = cur->glu - m->plot.hist[prev].glu;
+            if (d > 999)
+               d = 999;
+            if (d < -999)
+               d = -999;
+            (void)snprintf(dv, sizeof dv, "%+d", d);
+         }
+         (void)snprintf(gluu, sizeof gluu, "%s %4s", unit, dv);
+         unit = gluu;
       }
       /* THE APP'S ONE READOUT LAYOUT -- when, value, unit, each anchored so
        * that sweeping the trace moves the number and nothing else. See
@@ -1011,6 +1072,62 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    }
    if (ph < 20 * sc)
       ph = 20 * sc;
+   /* ---- THE CHANGE BAND, AT THE SCALE THE GLUCOSE ALREADY HAS ----------
+    *
+    * The plot's scale runs down to PLOT_CHG_FLOOR rather than 50, so each CGM
+    * reading's change since the same sensor's previous one can be drawn on
+    * it (see the change points below). The band that adds is paid for in
+    * HEIGHT, not in scale: the plot grows by exactly the pixels 50 -
+    * PLOT_CHG_FLOOR mg/dL take at the scale computed above, so every glucose
+    * value sits the same distance below the top as it did.
+    *
+    * THE ROOM COMES FROM SPACING ONLY. In portrait, what follows the plot is
+    * the threshold row (34 sc, see the reserve above), then render_info:
+    * its table (73 sc to the button row), the air it puts above the buttons
+    * -- which it gives up when short, down to none -- and the button rows.
+    * So the plot may grow by as much as keeps the buttons, with no air above
+    * them, clear of the system gesture bar -- the bottom 1/24 of the screen,
+    * as the log screens reserve it.
+    *
+    * THAT ALSO KEEPS render_info AT ITS OWN TEXT SIZE. It sizes its text
+    * down when it has less than its whole budget below its first row --
+    * 98 sc and the extra button rows -- and the buttons end 97 sc and those
+    * rows below it. The gesture bar is h/24 and a portrait sc is at most
+    * h/466, so buttons that clear the bar leave the text its budget.
+    *
+    * In landscape the column below the plot holds only the threshold row.
+    * Where that room is short of the band's pixels the band gets what there
+    * is, and the whole scale is that much tighter.
+    *
+    * DELTA MARKER OFF (settings, DISPLAY) is no band at all: the plot keeps
+    * the height and the 50 floor it has without one. */
+   const int chg_on = m->prefs.chg_marker != MARK_HIDE;
+   if (chg_on) {
+      const int top = plot_cfg_max((struct plot_cfg){m->plot.plot_max, 1, 0});
+      const int want =
+          ((ph - 3) * (PLOT_GLU_MIN - PLOT_CHG_FLOOR)) / (top - PLOT_GLU_MIN);
+      int room = 0;
+      if (landscape) {
+         room = (bottom - y - (26 * sc)) - ph;
+      } else {
+         int npin = 0;
+         for (int i = 0; i < SC_MAX; i++)
+            if (m->prefs.shortcut[i] > 0)
+               npin++;
+         int nsc = 0;
+         for (int slot = 0; slot < ui_shortcut_count(); slot++)
+            if (pin_has(&m->prefs, ui_shortcut_id(slot)))
+               nsc++;
+         const int nrows  = pin_rows(npin > nsc ? npin : nsc);
+         const int info_y = y + ph + (34 * sc);
+         const int limit  = fb->height - (fb->height / 24);
+         const int foot   = (((nrows - 1) * 28) + 24) * sc;
+         room = limit - (info_y + (73 * sc) + foot);
+      }
+      if (room < 0)
+         room = 0;
+      ph += want < room ? want : room;
+   }
    int plot_x = cx + (2 * sc);
    int plot_y = y;
    int plot_w = cw - (4 * sc);
@@ -1026,7 +1143,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
  * more than the live window holds. Sized for the LARGER of the two: too
  * small and the older half of a 30-day plot is silently cut off. */
 #define UI_PLOT_MAX (PLOT_LONG_MAX + NINS + NWT)
-   static struct plot_pt pts[UI_PLOT_MAX];
+   static struct plot_pt pts[UI_PLOT_MAX + UI_CHG_MAX];
    int np = m->plot.nhist < UI_PLOT_MAX ? m->plot.nhist : UI_PLOT_MAX;
    for (int i = 0; i < np; i++) {
       pts[i].t   = m->plot.hist[i].t;
@@ -1145,6 +1262,78 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          pts[i].col    = UI_ORPHAN;
       }
    }
+   /* ---- THE CHANGE POINTS: how far a CGM reading moved since the same
+    * sensor's reading before it (m->plot.chg), on every span, as the marker
+    * chosen under DELTA MARKER.
+    *
+    * ONE SENSOR'S AT EACH MOMENT. Every sensor's changes are in the frame,
+    * but drawn in one style two sensors' interleave into one noisy series.
+    * So each moment has one sensor: the primary CGM once it has started --
+    * it is the sensor the big number is -- and before that, the CGM that had
+    * most recently started by then, which is the sensor that was being worn.
+    * A sensor's start is its first reading in the points this span plots.
+    *
+    * NOT SCRUBBABLE: they are appended after the history's own points, and
+    * the touch path picks among those alone (input.c). */
+   int npts = np;
+   if (chg_on && m->plot.nchg > 0) {
+      struct {
+         int src;
+         long start;
+      } st[16];
+      int nst = 0;
+      for (int i = 0; i < np; i++) {
+         const struct ui_point *p = &m->plot.hist[i];
+         if (p->kind != KIND_CGM)
+            continue;
+         int k = 0;
+         while (k < nst && st[k].src != p->src)
+            k++;
+         if (k == nst) {
+            if (nst == (int)(sizeof st / sizeof st[0]))
+               continue;
+            st[nst].src   = p->src;
+            st[nst].start = p->t;
+            nst++;
+         } else if (p->t < st[k].start) {
+            st[k].start = p->t;
+         }
+      }
+      const struct ui_sensor *pcg = primary_cgm(m);
+      int have_pstart             = 0;
+      long pstart                 = 0;
+      for (int k = 0; pcg && k < nst; k++)
+         if (st[k].src == pcg->id) {
+            pstart      = st[k].start;
+            have_pstart = 1;
+         }
+      const uint32_t ccol = ui_sensor_color(m->prefs.chg_color);
+      for (int c = 0; c < m->plot.nchg && npts < UI_PLOT_MAX + UI_CHG_MAX;
+           c++) {
+         const struct ui_chg *d = &m->plot.chg[c];
+         int ref                = -1;
+         if (have_pstart && d->t >= pstart) {
+            ref = pcg->id;
+         } else {
+            long best = 0;
+            for (int k = 0; k < nst; k++)
+               if (st[k].start <= d->t && (ref < 0 || st[k].start > best)) {
+                  best = st[k].start;
+                  ref  = st[k].src;
+               }
+         }
+         if (d->src != ref)
+            continue;
+         pts[npts].t      = d->t;
+         pts[npts].glu    = d->delta;
+         pts[npts].marker = m->prefs.chg_marker;
+         pts[npts].col    = ccol;
+         pts[npts].size   = m->prefs.chg_size;
+         pts[npts].hidden = 0;
+         pts[npts].span   = 0;
+         npts++;
+      }
+   }
    /* The longer the span, the denser the points and the less a fat marker
     * says: at 30D thousands of readings share the width, so half the 7D
     * radius keeps the shape of the trace readable rather than smearing it
@@ -1161,9 +1350,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    /* ONE configuration, drawn with and then recorded for the touch path.
     * Two compound literals would be two things to keep in step, and the touch
     * path cannot see the scale and span the renderer derived. */
-   struct plot_cfg pcfg = {m->plot.plot_max, prad};
+   struct plot_cfg pcfg = {m->plot.plot_max, prad,
+                           chg_on ? PLOT_CHG_FLOOR : 0};
    plot_render((struct plot_fb){px, fb->stride, fb->width, fb->height},
-               (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, np, m->now,
+               (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, npts, m->now,
                m->plot.plot_hours, pcfg, white_color,
                scrub ? m->plot.scrub : -1, UI_HILITE, m->tz_off);
 
@@ -1205,6 +1395,19 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          fmt_glu(edge[i], m->prefs.units, lab, sizeof lab);
          draw_str(px, fb, plot_x + (2 * lsc), ey - (8 * lsc), lsc, lab,
                   UI_DISCLAIM);
+      }
+      /* And zero, the line the change points are read against: no change. */
+      if (chg_on) {
+         char lab[12];
+         int ex = 0;
+         int ey = 0;
+         if (plot_point_xy((struct plot_rect){plot_x, plot_y, plot_w, ph},
+                           (struct plot_pt){m->now, 0, 0, 0, 0, 0, 0}, m->now,
+                           m->plot.plot_hours, pcfg, &ex, &ey)) {
+            fmt_glu(0, m->prefs.units, lab, sizeof lab);
+            draw_str(px, fb, plot_x + (2 * lsc), ey - (8 * lsc), lsc, lab,
+                     UI_DISCLAIM);
+         }
       }
    }
    /* THE IN-RANGE STREAK, upper right, inside the plot.
@@ -1391,8 +1594,12 @@ static const char *banner_of(const struct screen *m, uint32_t *col)
  * the SAME framed button the ADD menu draws, so the two cannot drift into
  * looking like different controls for the same action. */
 
+/* `above`: the blank already above `y` -- the pad under whatever the caller
+ * drew there -- so the table can be centred between it and the buttons; -1
+ * leaves the table where it starts. */
 static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
-                        struct hits *h, int cx, int cw, int y, int sc)
+                        struct hits *h, int cx, int cw, int y, int sc,
+                        int above)
 {
    uint32_t *px = fb->bits;
    /* Fit to the space actually left below the plot, in BOTH axes.
@@ -1460,9 +1667,6 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int lh             = 16 * sc; /* row pitch: matches the settings leading */
    const uint32_t col = UI_TEXT_DIM;
 
-   /* Widest row is a stats row: 4 + 5*6 + a 6-char unit, with each cell up to
-    * 15 now that hc[] is wider. 96 covers it with room to spare. */
-   char row[96];
 
    /* rolling stats table: TIR / AVG / A1C across 1D/3D/7D/30D/90D */
    char tc[5][8];
@@ -1499,23 +1703,22 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int tx    = cx + ((cw - tinkw) / 2);
    if (tx < cx)
       tx = cx;
+   /* THE TABLE'S FOUR ROWS, drawn once the buttons below are placed: see
+    * where they are drawn. The widest is a stats row, 4 + 5*6 + a 6-char
+    * unit with each cell up to 15; 96 covers it with room to spare. */
+   char tab[4][96];
+   (void)snprintf(tab[0], sizeof tab[0], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "",
+                  "1D", "3D", "7D", "30D", "90D", "");
+   (void)snprintf(tab[1], sizeof tab[1], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "TIR",
+                  tc[0], tc[1], tc[2], tc[3], tc[4], "%");
+   (void)snprintf(tab[2], sizeof tab[2], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "AVG",
+                  ac[0], ac[1], ac[2], ac[3], ac[4], UI_LBL(m->prefs.units));
+   (void)snprintf(tab[3], sizeof tab[3], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "A1C",
+                  hc[0], hc[1], hc[2], hc[3], hc[4], "%");
+   const int y_in = y;
    y += 7 * sc;
-   (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "", "1D", "3D",
-                  "7D", "30D", "90D", "");
-   draw_str(px, fb, tx, y, sc, row, UI_MUTED);
-   y += lh;
-   (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "TIR", tc[0],
-                  tc[1], tc[2], tc[3], tc[4], "%");
-   draw_str(px, fb, tx, y, sc, row, col);
-   y += lh;
-   (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "AVG", ac[0],
-                  ac[1], ac[2], ac[3], ac[4], UI_LBL(m->prefs.units));
-   draw_str(px, fb, tx, y, sc, row, col);
-   y += lh;
-   (void)snprintf(row, sizeof row, "%-4s%-5s%-5s%-5s%-5s%-5s%s", "A1C", hc[0],
-                  hc[1], hc[2], hc[3], hc[4], "%");
-   draw_str(px, fb, tx, y, sc, row, col);
-   y += lh;
+   const int ty = y; /* where the table's first row starts, before centring */
+   y += 4 * lh;
 
    /* A big '+' just under the stats table and hard right: the ADD entry point
     * (new device / log insulin / log weight) reachable without a trip through
@@ -1565,10 +1768,13 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * banner's 51*sc was covering the difference, so it only became visible
        * once the banner moved. */
       int foot = ((nrows - 1) * rowpitch) + ph + (3 * sc);
-      int air  = lh;
-      if (y + (2 * sc) + air + foot > fb->height)
+      /* ...AND ABOVE THE SYSTEM GESTURE BAR, the bottom 1/24 of the screen:
+       * a button there is under the swipe that leaves the app. */
+      const int limit = fb->height - (fb->height / 24);
+      int air         = lh;
+      if (y + (2 * sc) + air + foot > limit)
          air = lh / 2;
-      if (y + (2 * sc) + air + foot > fb->height)
+      if (y + (2 * sc) + air + foot > limit)
          air = 0;
       int pyy = y + (2 * sc) + air;
       /* THE '+' SITS ON THE FIRST ROW, always.
@@ -1582,6 +1788,32 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * the group of actions having grown rather than the '+' having
        * wandered. */
       int plusy = pyy;
+      /* THE TABLE, CENTRED IN THE SPACE IT HAS, when the caller says how much
+       * blank is above it (`above`, the pad under whatever is drawn there).
+       * The gap above the header's ink and the gap below the A1C row's ink
+       * to what is next -- the buttons' frames, or, with nothing pinned, the
+       * '+' glyph's first row of ink -- are made equal by moving the table;
+       * the buttons and the '+' stay where the air above them put them, so
+       * this moves the table and nothing else. */
+      {
+         int lift = 0;
+         if (above >= 0) {
+            int btop = pyy - (2 * sc);
+            if (nsc == 0) {
+               const uint8_t *pg = glyph_for('+');
+               int r0            = 0;
+               while (pg && r0 < 7 && !pg[r0])
+                  r0++;
+               btop = plusy + (r0 * psc);
+            }
+            const int gap_above = above + (ty - y_in);
+            const int gap_below = btop - (ty + (3 * lh) + (7 * sc));
+            lift                = (gap_above - gap_below) / 2;
+         }
+         for (int r = 0; r < 4; r++)
+            draw_str(px, fb, tx, ty - lift + (r * lh), sc, tab[r],
+                     r ? col : UI_MUTED);
+      }
       draw_str(px, fb, pxx, plusy, psc, "+", UI_TEXT_DIM);
       /* PINNED BUTTONS share the row(s) to the LEFT of the '+'. They divide
        * whatever the row has left after the plus, so one button is wide and
@@ -1807,7 +2039,7 @@ void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
          int rw   = fb->width - cwid - gw;
          struct bignum_geo g =
              render_bignum(fb, m, h, 0, cwid, y, sc, fb->height);
-         render_info(fb, m, h, 0, cwid, g.y, sc);
+         render_info(fb, m, h, 0, cwid, g.y, sc, -1);
          /* A synthetic geometry for the right column: no number above it, so
           * the tab band starts at the column top and the threshold rows take
           * the COLUMN's margins rather than a bar that is not in this column.
@@ -1827,7 +2059,9 @@ void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
       } else {
          struct bignum_geo g = render_bignum(fb, m, h, 0, fb->width, y, sc, 0);
          y                   = render_glucose(fb, m, h, 0, fb->width, sc, 0, g);
-         render_info(fb, m, h, 0, fb->width, y, sc);
+         /* 18 sc: the pad thresh_row leaves under itself in portrait (see
+          * the reserve in render_glucose). */
+         render_info(fb, m, h, 0, fb->width, y, sc, 18 * sc);
       }
    } else {
       /* Records its own settings target -- see render_noreading. */

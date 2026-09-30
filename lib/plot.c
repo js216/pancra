@@ -326,6 +326,24 @@ static int cfg_max(struct plot_cfg cfg)
    return m;
 }
 
+int plot_cfg_max(struct plot_cfg cfg)
+{
+   return cfg_max(cfg);
+}
+
+/* The bottom of the scale, the same way: 0 means PLOT_GLU_MIN. Held between
+ * -100 and PLOT_GLU_MIN, which keeps it at least 50 below the lowest top
+ * cfg_max allows, so the scale never has zero height. */
+static int cfg_min(struct plot_cfg cfg)
+{
+   int m = cfg.glu_min ? cfg.glu_min : PLOT_GLU_MIN;
+   if (m < -100)
+      m = -100;
+   if (m > PLOT_GLU_MIN)
+      m = PLOT_GLU_MIN;
+   return m;
+}
+
 /* The radius a render will actually use. The clamp lives HERE, with the
  * margin that depends on it: plot_render clamped its own copy and the hit
  * test did not, so a cfg with radius 0 -- which is what a zeroed struct is --
@@ -350,20 +368,19 @@ static int cfg_margin(struct plot_cfg cfg, int w)
 
 /* Map a glucose value to a pixel row inside the frame (clamped to the scale).
  */
-static int glu_to_y(int glu, int y, int h, int glu_max)
+static int glu_to_y(int glu, int y, int h, int glu_min, int glu_max)
 {
    /* Out-of-range readings are capped, not dropped: a value above the scale
     * lands exactly on the plot_max gridline (and below the scale, exactly on
     * the bottom one), so an excursion is still visible and still sits on a row
     * the axis labels explain. plot_hit and plot_point_xy share this mapping, so
     * a capped point stays scrubbable where it is drawn. */
-   if (glu < PLOT_GLU_MIN)
-      glu = PLOT_GLU_MIN;
+   if (glu < glu_min)
+      glu = glu_min;
    if (glu > glu_max)
       glu = glu_max;
    return y + h - 2 -
-          (int)((long)(h - 3) * (glu - PLOT_GLU_MIN) /
-                (glu_max - PLOT_GLU_MIN));
+          (int)((long)(h - 3) * (glu - glu_min) / (glu_max - glu_min));
 }
 
 /* X pixel for a reading `dt` seconds before now (newest at the right edge). */
@@ -401,7 +418,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    int y                = rc.y;
    int w                = rc.w;
    int h                = rc.h;
-   const uint32_t frame = UI_PLOT_FRAME; /* 50/max reference lines + sides   */
+   const uint32_t frame = UI_PLOT_FRAME; /* bottom/top reference lines + sides */
    const uint32_t band  = UI_PLOT_BAND; /* very slight dark-gray shade 70-180 */
    const uint32_t vgrid = UI_PLOT_VGRID; /* faint vertical gridlines         */
    const uint32_t vtick = UI_PLOT_VTICK; /* brighter x-tick at the bottom    */
@@ -409,7 +426,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    /* Reserve enough at each end for the LARGEST marker (radius scaled up to
     * MARK_SIZE_MAX/2, +1 for styled points) so the newest datapoint is not half
     * cut off at the right edge. */
-   struct plot_cfg use = {glu_max, radius};
+   struct plot_cfg use = {glu_max, radius, cfg.glu_min};
    int t_margin        = cfg_margin(use, w);
    /* The rectangle is the boundary's business now (plot_render_check); a span
     * of zero or less is not geometry, it is an empty window. */
@@ -422,12 +439,13 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
     * rather than living in the file. */
    struct clip cl = {x + 1, y + 1, x + w - 2, y + h - 2};
 
-   int y50   = glu_to_y(50, y, h, glu_max);
-   int y_top = glu_to_y(glu_max, y, h, glu_max);
+   const int glu_min = cfg_min(cfg);
+   int y50           = glu_to_y(glu_min, y, h, glu_min, glu_max);
+   int y_top         = glu_to_y(glu_max, y, h, glu_min, glu_max);
 
    /* faint shade behind the 70-180 in-range band */
-   int y_hi = glu_to_y(180, y, h, glu_max);
-   int y_lo = glu_to_y(70, y, h, glu_max);
+   int y_hi = glu_to_y(180, y, h, glu_min, glu_max);
+   int y_lo = glu_to_y(70, y, h, glu_min, glu_max);
    for (int j = y_hi; j <= y_lo; j++)
       for (int i = 1; i < w - 1; i++)
          put(fb, stride, fbw, fbh, x + i, j, band);
@@ -463,7 +481,9 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
          put(fb, stride, fbw, fbh, gx, j, vtick);
    }
 
-   /* gray reference lines at the 50 and max bounds, plus vertical sides */
+   /* gray reference lines at the bottom and top of the scale, plus vertical
+    * sides. `y50` is the bottom whatever the scale's floor is: 50 mg/dL on
+    * the ordinary glucose plot. */
    for (int i = 0; i < w; i++) {
       put(fb, stride, fbw, fbh, x + i, y50, frame);
       put(fb, stride, fbw, fbh, x + i, y_top, frame);
@@ -471,6 +491,14 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
    for (int j = y_top; j <= y50; j++) {
       put(fb, stride, fbw, fbh, x, j, frame);
       put(fb, stride, fbw, fbh, x + w - 1, j, frame);
+   }
+   /* A scale that reaches below zero is carrying CHANGES, and zero is the
+    * line they are read against: no change. Drawn exactly as the 70 and 180
+    * lines are, since all three are levels a value is read against. */
+   if (glu_min < 0) {
+      const int y0 = glu_to_y(0, y, h, glu_min, glu_max);
+      for (int i = 1; i < w - 1; i++)
+         put(fb, stride, fbw, fbh, x + i, y0, edge);
    }
 
    /* Markers may paint only inside the frame; a capped reading sits on the
@@ -505,7 +533,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
          dt0 = span;
       const int bx0    = t_to_x(dt0, x, w, span, t_margin);
       const int bx1    = t_to_x(dt1, x, w, span, t_margin);
-      const int by     = glu_to_y(pts[i].glu, y, h, glu_max);
+      const int by     = glu_to_y(pts[i].glu, y, h, glu_min, glu_max);
       const uint32_t c = pts[i].col ? pts[i].col : color(pts[i].glu);
       int bh           = radius;
       if (bh < 2)
@@ -529,7 +557,7 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
       if (pts[i].hidden) /* HIDE marker: this device is not drawn */
          continue;
       int px = t_to_x(dt, x, w, span, t_margin);
-      int py = glu_to_y(pts[i].glu, y, h, glu_max);
+      int py = glu_to_y(pts[i].glu, y, h, glu_min, glu_max);
       if (i == hi_idx) {
          hx = px;
          hy = py;
@@ -592,7 +620,7 @@ int plot_point_xy(struct plot_rect rc, struct plot_pt p, long now, int hours,
    if (dt > span)
       return 0;
    *ox = t_to_x(dt, x, w, span, t_margin);
-   *oy = glu_to_y(p.glu, y, h, cfg_max(cfg));
+   *oy = glu_to_y(p.glu, y, h, cfg_min(cfg), cfg_max(cfg));
    return 1;
 }
 

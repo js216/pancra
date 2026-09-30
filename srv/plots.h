@@ -17,9 +17,10 @@ struct db;
 
 /* Serve one plot as a GIF: the window (win_start, win_end] over `hours`,
  * rendered by pancra's own plot.c so the web plot cannot drift from the
- * app's. */
+ * app's. `changes` adds each CGM reading's change since the same sensor's
+ * previous one, on a scale extended below zero to hold them. */
 void h_plot_gif(struct req *r, int64_t owner, int64_t win_start,
-                int64_t win_end, int hours, int tz_min);
+                int64_t win_end, int hours, int tz_min, int changes);
 /* ---- WHAT THE ARCHIVE HOLDS, ASKED WITHOUT A LIFETIME CEILING --------
  *
  * Both of these were one function -- plot_days -- which copied

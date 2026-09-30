@@ -8,6 +8,7 @@
 #include "oops.h"
 #include "page.h"
 #include "pair.h"
+#include "plot.h" /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "rowdec.h"
 #include "util.h"
 #include <sqlite3.h>
@@ -124,11 +125,25 @@ struct rd {
  * only this page conflated them.
  *
  * Returns 0 when the scan did not finish: the caller shows "--" rather than a
- * NEWEST reading that is merely the newest of the rows we managed to read. */
+ * NEWEST reading that is merely the newest of the rows we managed to read.
+ *
+ * AND HOW FAR IT MOVED: *out_chg is the newest reading minus the same
+ * sensor's reading before it, and *has_chg says whether there is one -- only
+ * when that reading is less than PLOT_CHG_GAP_S older, one reading's gap,
+ * the rule the app and the plots use. Taken from the same scan: the rows are
+ * kept as they pass, and the pair is found once the newest is known. */
 static int newest_reading(struct db *d, int64_t owner, int64_t *out_t,
-                          int64_t *out_glu)
+                          int64_t *out_glu, int *has_chg, int64_t *out_chg)
 {
+   static struct {
+      int64_t t, glu;
+      int src;
+   } cgm[400];
+   int ncgm = 0;
+   int nsrc = 0;
    *out_t = *out_glu = 0;
+   *has_chg          = 0;
+   *out_chg          = 0;
    sqlite3_stmt *st =
        db_prep(d, "SELECT line FROM logrow WHERE user_id=? AND log='readings'"
                   " ORDER BY bucket DESC, line DESC LIMIT 400");
@@ -148,6 +163,12 @@ static int newest_reading(struct db *d, int64_t owner, int64_t *out_t,
       struct row_reading rr;
       if (!row_decode(ln, (int)strlen(ln), &rr))
          continue;
+      if (rr.kind == ROW_KIND_CGM && ncgm < (int)(sizeof cgm / sizeof cgm[0])) {
+         cgm[ncgm].t   = rr.t;
+         cgm[ncgm].glu = rr.glu;
+         cgm[ncgm].src = rr.src;
+         ncgm++;
+      }
       if (rr.t <= *out_t)
          continue;
       /* REQUIRE AN EXPLICIT CGM. Not "anything but a fingerstick", and not
@@ -162,12 +183,25 @@ static int newest_reading(struct db *d, int64_t owner, int64_t *out_t,
          continue; /* including ROW_KIND_NONE: silence is not a claim */
       *out_t   = rr.t;
       *out_glu = rr.glu;
+      nsrc     = rr.src;
    }
    int ok = db_finished(rc);
    sqlite3_finalize(st);
    if (!ok) {
       *out_t = *out_glu = 0;
       return 0;
+   }
+   /* The same sensor's reading before the newest one, if it is close enough
+    * to make a change. */
+   int64_t prev_t = 0, prev_glu = 0;
+   for (int i = 0; i < ncgm; i++)
+      if (cgm[i].src == nsrc && cgm[i].t < *out_t && cgm[i].t > prev_t) {
+         prev_t   = cgm[i].t;
+         prev_glu = cgm[i].glu;
+      }
+   if (prev_t > 0 && *out_t - prev_t < PLOT_CHG_GAP_S) {
+      *has_chg = 1;
+      *out_chg = *out_glu - prev_glu;
    }
    return 1;
 }
@@ -306,7 +340,10 @@ void h_home(struct req *r, int64_t me, const char *cookie)
     * this printed "--" over a real reading, and -- with the recent table
     * empty for the same reason -- the page went on to say "No readings yet",
     * which is a statement about the user's data that was not true. */
-   if (!newest_reading(r->db, owner, &newest_t, &newest_glu)) {
+   int have_chg    = 0;
+   int64_t chg_glu = 0;
+   if (!newest_reading(r->db, owner, &newest_t, &newest_glu, &have_chg,
+                       &chg_glu)) {
       sb_free(&s);
       oops(r);
       return;
@@ -337,25 +374,38 @@ void h_home(struct req *r, int64_t me, const char *cookie)
     * not it is fresh: with a fresh value it says how current it is, and when
     * stale it says since when. */
    char big[16] = "---";
+   char chg[24]  = "";
    char stamp[40];
    snprintf(stamp, sizeof stamp, "%s", "-");
    char title[64];
    snprintf(title, sizeof title, "Pancra");
    if (newest_t > 0) {
       stamp_local(newest_t, tz, stamp, sizeof stamp);
-      if (now - newest_t <= WEB_FRESH_S)
+      if (now - newest_t <= WEB_FRESH_S) {
          snprintf(big, sizeof big, "%" PRIwire "", newest_glu);
+         if (have_chg)
+            snprintf(chg, sizeof chg, "(%+" PRIwire ")", chg_glu);
+      }
       /* "HH:MM value", so a pinned tab is a glanceable readout -- and the
        * value blanks with the big number, so the tab can never show a
        * reading the page itself refuses to. */
       snprintf(title, sizeof title, "%s %s", stamp + 11, big);
    }
    sb_add(&s, "<div>%s</div>\n", stamp);
+   /* THE CHANGE SITS TO THE RIGHT OF THE NUMBER, a third of its size, on
+    * one baseline: "148 (+14)". Where the two do not fit side by side -- a
+    * phone held upright is narrower than both at these sizes -- the change
+    * wraps under the number rather than push the page sideways or shrink
+    * the number. Blank with the number when the value is stale, and absent
+    * when the reading has no neighbour one gap before it. */
    sb_add(&s,
           "<a href=\"/\" style=\"text-decoration:none;color:inherit\">"
-          "<div style=\"font-size:10em\">%s</div></a>\n"
+          "<div style=\"display:flex;flex-wrap:wrap;align-items:baseline;"
+          "column-gap:.5em\">"
+          "<div style=\"font-size:10em\">%s</div>"
+          "<div style=\"font-size:3em\">%s</div></div></a>\n"
           "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">\n",
-          big);
+          big, chg);
 
    static char pre[48 * 1024];
    size_t k = 0;

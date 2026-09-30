@@ -3,6 +3,7 @@
 // Copyright 2026 Jakob Kastelic
 #include "plotdata.h"
 #include "csvcur.h"  /* the shared CSV cursor; the grammar stays here */
+#include "plot.h"    /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "ingest.h"  /* STORE_GLU_MAX: the plot must be able to show it */
 #include "sensors.h" /* KIND_CGM */
 #include "uimodel.h"
@@ -53,6 +54,95 @@ static struct ui_point g_plong[PLOT_LONG_MAX];
 static unsigned short g_pcoln[PCOL_MAX]; /* cells kept in each column */
 static int g_nplong;
 static long g_plong_end, g_plong_span, g_plong_size;
+
+/* ---- THE CHANGES OF A LONG SPAN -----------------------------------------
+ *
+ * Taken from the RAW readings, because the bucketed points above are a pixel
+ * column apart -- an hour on the 30-day plot -- and a change is between two
+ * readings one gap apart. As the log streams past, each CGM reading is set
+ * against the same sensor's latest reading seen so far, and when that is
+ * less than PLOT_CHG_GAP_S older the difference is a change. Each column
+ * keeps the NEWEST change of each sensor, PCHG_PERCOL sensors deep.
+ *
+ * "Latest seen so far" is the reading before it because the log is written
+ * as readings arrive, which for one sensor is in time order. A backfilled
+ * stretch arrives later and older: it is older than what was seen, so it is
+ * neither measured against it nor allowed to replace it. */
+#define PCHG_SRC 16 /* sensors tracked at once; more are skipped */
+static struct {
+   int src;
+   int glu;
+   long t;
+} g_chg_last[PCHG_SRC];
+static int g_nchg_last;
+static struct ui_chg g_chg_col[PCOL_MAX][PCHG_PERCOL];
+static unsigned char g_nchg_col[PCOL_MAX];
+static struct ui_chg g_pchg[UI_CHG_MAX];
+static int g_npchg;
+
+static void chg_seen(long t, int glu, int src, long from, long end, long span)
+{
+   int k = 0;
+   while (k < g_nchg_last && g_chg_last[k].src != src)
+      k++;
+   if (k == g_nchg_last) {
+      if (g_nchg_last == PCHG_SRC)
+         return;
+      g_chg_last[g_nchg_last].src = src;
+      g_chg_last[g_nchg_last].glu = glu;
+      g_chg_last[g_nchg_last].t   = t;
+      g_nchg_last++;
+      return;
+   }
+   const long gap = t - g_chg_last[k].t;
+   if (gap <= 0)
+      return; /* backfill, or the same instant twice */
+   if (gap < PLOT_CHG_GAP_S && t > from && t <= end) {
+      const int col = (int)(((t - from) * (PCOL_MAX - 1)) / span);
+      if (col >= 0 && col < PCOL_MAX) {
+         const struct ui_chg c = {t, glu - g_chg_last[k].glu, src};
+         int j = 0;
+         while (j < g_nchg_col[col] && g_chg_col[col][j].src != src)
+            j++;
+         if (j < g_nchg_col[col]) {
+            if (t > g_chg_col[col][j].t)
+               g_chg_col[col][j] = c;
+         } else if (g_nchg_col[col] < PCHG_PERCOL) {
+            g_chg_col[col][g_nchg_col[col]++] = c;
+         }
+      }
+   }
+   g_chg_last[k].glu = glu;
+   g_chg_last[k].t   = t;
+}
+
+const struct ui_chg *plot_changes(int *n)
+{
+   *n = g_npchg;
+   return g_pchg;
+}
+
+int plot_changes_live(const struct ui_point *pts, int n, struct ui_chg *out,
+                      int cap)
+{
+   int nc = 0;
+   for (int i = 0; i < n && nc < cap; i++) {
+      if (pts[i].kind != KIND_CGM)
+         continue;
+      for (int j = i + 1; j < n; j++) {
+         if (pts[j].kind != KIND_CGM)
+            continue;
+         if (pts[i].t - pts[j].t >= PLOT_CHG_GAP_S)
+            break; /* newest first: every later one is older still */
+         if (pts[j].src != pts[i].src || pts[j].t >= pts[i].t)
+            continue;
+         out[nc++] = (struct ui_chg){pts[i].t, pts[i].glu - pts[j].glu,
+                                     pts[i].src};
+         break;
+      }
+   }
+   return nc;
+}
 
 static long plot_log_size(const char *path)
 {
@@ -214,6 +304,10 @@ static void plong_build(const char *path, long end, long span)
       g_pcell[i] = 0;
    for (int i = 0; i < PCOL_MAX; i++)
       g_pcoln[i] = 0;
+   for (int i = 0; i < PCOL_MAX; i++)
+      g_nchg_col[i] = 0;
+   g_nchg_last = 0;
+   g_npchg     = 0;
    long from = end - span;
    g_nplong  = 0;
    int cap   = (int)(sizeof g_plong / sizeof g_plong[0]);
@@ -246,6 +340,10 @@ static void plong_build(const char *path, long end, long span)
             int kind = 0;
             if (!plot_store_row(line, &t, &glu, &src, &kind))
                continue;
+            /* Before the window test: the reading a change is taken from
+             * may be just before the window. */
+            if (kind == KIND_CGM)
+               chg_seen(t, glu, src, from, end, span);
             if (t <= from || t > end || glu >= PCELL_GLU)
                continue;
             int col = (int)(((t - from) * (PCOL_MAX - 1)) / span);
@@ -268,6 +366,9 @@ static void plong_build(const char *path, long end, long span)
       }
       close(fd);
    }
+   for (int c = 0; c < PCOL_MAX; c++)
+      for (int j = 0; j < g_nchg_col[c] && g_npchg < UI_CHG_MAX; j++)
+         g_pchg[g_npchg++] = g_chg_col[c][j];
    g_plong_end  = end;
    g_plong_span = span;
    g_plong_size = plot_log_size(path);

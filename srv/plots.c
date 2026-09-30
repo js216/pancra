@@ -16,6 +16,7 @@
  * the record.
  */
 #include "plots.h"
+#include "colors.h" /* UI_PLOT_CHANGE: the change crosses */
 #include "db.h"
 #include "gif.h"
 #include "http.h"
@@ -55,8 +56,17 @@ struct plot_ws {
    uint32_t fbpx[(size_t)IMG_W * IMG_H];
    uint8_t img[(size_t)IMG_W * IMG_H];
    struct plot_pt ppts[PTS_MAX];
+   /* Beside each reading in ppts, and sorted with it: the device that took
+    * it, and whether it is a CGM reading -- the two things a point-to-point
+    * change is taken between. */
+   int src[PTS_MAX];
+   unsigned char cgm[PTS_MAX];
    struct gif_ws gw;
 };
+
+/* THE CHANGES, on the plot that carries them (PLOT_CHG_*, plot.h): plotted at
+ * the later reading's instant as a small gray cross -- the trace is white
+ * dots, so the two read apart at a glance in either theme. */
 
 static uint32_t trace_white(int g)
 {
@@ -153,6 +163,8 @@ static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
       ws->ppts[n].hidden = 0;
       ws->ppts[n].size   = 0;
       ws->ppts[n].col    = 0;
+      ws->src[n]         = rr.src;
+      ws->cgm[n]         = rr.kind == ROW_KIND_CGM;
       n++;
    }
    /* A FULL BUFFER IS A LEGITIMATE END; a failed step is not. Ending early on
@@ -168,12 +180,48 @@ static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
     * row belongs where its timestamp says. */
    for (int i = 1; i < n; i++) {
       struct plot_pt tmp = ws->ppts[i];
+      int tsrc           = ws->src[i];
+      unsigned char tcgm = ws->cgm[i];
       int j              = i - 1;
       while (j >= 0 && ws->ppts[j].t > tmp.t) {
          ws->ppts[j + 1] = ws->ppts[j];
+         ws->src[j + 1]  = ws->src[j];
+         ws->cgm[j + 1]  = ws->cgm[j];
          j--;
       }
       ws->ppts[j + 1] = tmp;
+      ws->src[j + 1]  = tsrc;
+      ws->cgm[j + 1]  = tcgm;
+   }
+   return n;
+}
+
+/* Append the changes (see PLOT_CHG_FLOOR) for the `np` readings in ws, oldest
+ * first. Returns the new point count. */
+static int add_changes(struct plot_ws *ws, int np)
+{
+   int n = np;
+   for (int i = 0; i < np && n < PTS_MAX; i++) {
+      if (!ws->cgm[i])
+         continue;
+      /* The same device's reading before this one: readings are oldest
+       * first, so walk back only as far as the gap allows. */
+      for (int j = i - 1; j >= 0; j--) {
+         if (ws->ppts[i].t - ws->ppts[j].t >= PLOT_CHG_GAP_S)
+            break;
+         if (!ws->cgm[j] || ws->src[j] != ws->src[i] ||
+             ws->ppts[j].t == ws->ppts[i].t)
+            continue;
+         ws->ppts[n].t      = ws->ppts[i].t;
+         ws->ppts[n].glu    = ws->ppts[i].glu - ws->ppts[j].glu;
+         ws->ppts[n].marker = 1; /* a cross */
+         ws->ppts[n].hidden = 0;
+         ws->ppts[n].size   = 1;
+         ws->ppts[n].col    = UI_PLOT_CHANGE;
+         ws->ppts[n].span   = 0;
+         n++;
+         break;
+      }
    }
    return n;
 }
@@ -182,23 +230,32 @@ static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
  *
  * `dark` picks the theme, and it is the one place the two differ: plot_render
  * draws the app's dark palette either way, so the light image is that
- * luminance inverted and the dark image is that luminance as it stands. */
+ * luminance inverted and the dark image is that luminance as it stands.
+ *
+ * `changes` adds the point-to-point changes and extends the scale down to
+ * PLOT_CHG_FLOOR to hold them. The readings are then loaded from one gap before
+ * the window, so its first reading has the one before it to be measured
+ * against; plot_render draws nothing outside the window. */
 static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
                        int64_t win_start, int64_t win_end, int hours,
-                       int tz_min, int dark, uint8_t *out, size_t cap)
+                       int tz_min, int dark, int changes, uint8_t *out,
+                       size_t cap)
 {
    int ph = IMG_H - XSTRIP; /* plot rect; labels live in the strip below */
    for (size_t i = 0; i < (size_t)IMG_W * IMG_H; i++)
       ws->fbpx[i] = 0xFF181818; /* the app's screen background */
-   int np = load_points(ws, d, owner, win_start, win_end);
+   int np = load_points(ws, d, owner,
+                        changes ? win_start - PLOT_CHG_GAP_S : win_start, win_end);
    if (np < 0)
       return 0; /* no image rather than one missing readings, or one that
                  * silently claims the window was empty */
+   if (changes)
+      np = add_changes(ws, np);
    int64_t tz = (int64_t)tz_min * 60;
    /* THE PLOT'S CONFIGURATION, passed rather than set: the scale and the
     * marker radius were process globals, so two windows rendered at once
     * could not have different ones -- and this server renders several. */
-   struct plot_cfg cfg = {PLOT_GLU_MAX, PLOT_PRAD};
+   struct plot_cfg cfg = {PLOT_GLU_MAX, PLOT_PRAD, changes ? PLOT_CHG_FLOOR : 0};
    plot_render((struct plot_fb){ws->fbpx, IMG_W, IMG_W, IMG_H},
                (struct plot_rect){0, 0, IMG_W, ph}, ws->ppts, np, win_end,
                hours, cfg, trace_white, -1, 0, tz);
@@ -231,6 +288,11 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
    if (plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref, win_end, hours,
                      cfg, &lx, &ly))
       img_digits(ws, 4, ly - 5, "180", 2, ink);
+   /* The line the changes are read against. */
+   ref.glu = 0;
+   if (changes && plot_point_xy((struct plot_rect){0, 0, IMG_W, ph}, ref,
+                                win_end, hours, cfg, &lx, &ly))
+      img_digits(ws, 4, ly - 5, "0", 2, ink);
    for (int64_t ts = 3600; ts <= (int64_t)hours * 3600; ts += 3600) {
       ref.t       = win_end - ts;
       ref.glu     = 100; /* any in-scale value: only x matters here */
@@ -261,13 +323,14 @@ static struct plot_ws g_plot_ws;
 static uint8_t gifbuf[256 * 1024];
 
 void h_plot_gif(struct req *r, int64_t owner, int64_t win_start,
-                int64_t win_end, int hours, int tz_min)
+                int64_t win_end, int hours, int tz_min, int changes)
 {
    /* THE READER'S THEME, NOT THE RECORD OWNER'S. `owner` says whose readings
     * are drawn; r->theme says who is looking at them, and a follower reading
     * a shared record is entitled to their own palette. */
    size_t n = plot_gif(&g_plot_ws, r->db, owner, win_start, win_end, hours,
-                       tz_min, r->theme == THEME_DARK, gifbuf, sizeof gifbuf);
+                       tz_min, r->theme == THEME_DARK, changes, gifbuf,
+                       sizeof gifbuf);
    if (!n) {
       /* STAGED, not written here. http_text goes to the socket, and this runs
        * under the page lock -- so a client that stopped reading held every

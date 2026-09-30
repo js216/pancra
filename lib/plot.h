@@ -55,10 +55,19 @@ struct plot_pt {
  * for the same reason. Unlike them it can carry a LENGTH: see `span`. */
 #define PLOT_MARK_E 102
 
-/* Vertical scale runs PLOT_GLU_MIN..(runtime max, default PLOT_GLU_MAX) mg/dL.
- */
+/* Vertical scale runs from the configured bottom (default PLOT_GLU_MIN) to
+ * the configured top (default PLOT_GLU_MAX), mg/dL. */
 #define PLOT_GLU_MIN 50
 #define PLOT_GLU_MAX 300
+
+/* POINT-TO-POINT CHANGES, on the plots that carry them: a CGM reading minus
+ * the same sensor's previous CGM reading, taken only when that one is less
+ * than PLOT_CHG_GAP_S older -- the five-minute cadence and a little slack --
+ * and drawn on a scale extended down to PLOT_CHG_FLOOR. A fall faster than
+ * 30 mg/dL in five minutes is not one a sensor reports; one that comes in
+ * anyway sits on the floor line rather than off the plot. */
+#define PLOT_CHG_FLOOR (-30)
+#define PLOT_CHG_GAP_S 360
 
 /* WHAT ONE PLOT IS, as one value the caller owns.
  *
@@ -78,7 +87,17 @@ struct plot_pt {
 struct plot_cfg {
    int glu_max; /* top of the vertical scale, mg/dL; 0 = PLOT_GLU_MAX */
    int radius;  /* marker half-width in pixels */
+   /* BOTTOM of the vertical scale, mg/dL; 0 = PLOT_GLU_MIN. Below zero only
+    * for a plot that also carries point-to-point CHANGES, which are the only
+    * values on any plot that can be negative: the scale then gets a
+    * reference line at zero. 0 is the ordinary glucose plot. */
+   int glu_min;
 };
+
+/* The top of the vertical scale this cfg draws with, mg/dL: glu_max as the
+ * renderer clamps it, PLOT_GLU_MAX when it is 0. A caller sizing its plot to
+ * a scale needs the scale the renderer will actually use. */
+int plot_cfg_max(struct plot_cfg cfg);
 
 /* Render the readings in `pts` (any order, newest-first is fine) whose
  * timestamps fall within the last `hours` before `now` into the framebuffer

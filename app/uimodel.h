@@ -125,6 +125,16 @@ struct ui_point {
    enum sensor_kind kind;
 }; /* one plotted reading */
 
+/* ONE POINT-TO-POINT CHANGE: a CGM reading minus the same sensor's previous
+ * reading, when that one is less than PLOT_CHG_GAP_S older (plot.h), at the
+ * later reading's instant. The frame carries every sensor's; which sensor's
+ * are drawn is the renderer's choice. */
+struct ui_chg {
+   long t;
+   int delta; /* mg/dL */
+   int src;   /* the sensor's registry id */
+};
+
 /* One configured sensor: everything the list row AND the detail screen need,
  * so the shell hands over a single self-contained snapshot per sensor. */
 struct ui_sensor {
@@ -268,6 +278,9 @@ struct ui_plotview {
    const struct ui_point *hist; /* plot history, newest-first (borrowed) */
    /* plot: point count, scrub cursor (-1 = none), span, vertical max */
    int nhist, scrub, plot_hours, plot_max;
+   /* The changes for this span, any order (borrowed). */
+   const struct ui_chg *chg;
+   int nchg;
    /* Seconds CONTINUOUSLY in range, ending at the newest reading; 0 when the
     * newest reading is out of range, which is also when nothing is drawn.
     * See alarm_streak_s for the rule, including what a gap in the readings
@@ -294,6 +307,9 @@ struct ui_prefs {
                       * datapoint sounds like */
    /* status bar shows the value (vs icon); lock screen shows the notif */
    int statbar_val, lockscr_val;
+   /* The change points' marker on the main plot (settings.h's chg_*):
+    * MARK_HIDE is the change band switched off. */
+   int chg_marker, chg_color, chg_size;
    /* The MA_* codes promoted to the main screen's '+' row, dense, 0 = empty.
     * Mirrors g_shortcut (settings.h). */
    int shortcut[SC_MAX];
@@ -397,6 +413,9 @@ struct ui_insview {
    /* insulin plot styling per type (index INS_SLOW / INS_FAST), and which
     * insulin type the marker picker is editing (-1 = a sensor's) */
    int ins_marker[2], ins_color[2], ins_size[2], markpick_ins;
+/* markpick_ins: -1 the marker picker is editing the selected sensor,
+ * INS_SLOW / INS_FAST an insulin type, MARKPICK_CHG the change points. */
+#define MARKPICK_CHG 2
 };
 
 /* WEIGHT log table (SCR_WTLOG) and entry form (SCR_WEIGHT). `wt` is the
@@ -597,5 +616,11 @@ struct screen {
  * take points in any order, and the scrub index the UI hands back has to
  * index a single list. */
 #define UI_PTS_MAX (PLOT_LONG_MAX + NINS + NWT)
+
+/* Changes one frame can carry. A long span keeps one per sensor per column,
+ * PCHG_PERCOL sensors deep; a live span one per reading, and the live
+ * history is shorter than that (model.c holds the two together). */
+#define PCHG_PERCOL 8
+#define UI_CHG_MAX  (PLOT_COLS * PCHG_PERCOL)
 
 #endif

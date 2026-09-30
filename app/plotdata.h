@@ -32,4 +32,15 @@ const struct ui_point *plot_source_from(const char *path, long now, int hours,
  * datapoint. Exposed so it can be asserted from outside. */
 int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind);
 
+/* THE CHANGES OF THE LAST LONG SPAN plot_source_from built: one per sensor
+ * per column, each the newest reading of that sensor in the column minus the
+ * sensor's reading before it, taken from the raw log as it streamed past. */
+const struct ui_chg *plot_changes(int *n);
+
+/* The changes of a LIVE span: `pts` newest first, as the live history is
+ * kept. Each CGM reading minus the same sensor's next-older reading, if that
+ * one is less than PLOT_CHG_GAP_S older. Returns how many were written. */
+int plot_changes_live(const struct ui_point *pts, int n, struct ui_chg *out,
+                      int cap);
+
 #endif

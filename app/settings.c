@@ -233,6 +233,34 @@ int settings_set_ins_style(int type, int marker, int color, int size)
    return bad ? SETTINGS_UNSAVED : SETTINGS_OK;
 }
 
+int settings_set_chg_style(int marker, int color, int size)
+{
+   mutex_lock(&set_lk);
+   int old_m = g_p.chg_marker;
+   int old_c = g_p.chg_color;
+   int old_s = g_p.chg_size;
+   if (marker >= 0)
+      g_p.chg_marker = marker;
+   if (color >= 0)
+      g_p.chg_color = color;
+   if (size >= 1)
+      g_p.chg_size = size;
+   struct save_job j;
+   set_render_settings(&j);
+   mutex_unlock(&set_lk);
+   int bad = set_write_job(&j) != 0;
+   if (bad) {
+      mutex_lock(&set_lk);
+      if (set_gen_now() == j.gen) { /* see set_int */
+         g_p.chg_marker = old_m;
+         g_p.chg_color  = old_c;
+         g_p.chg_size   = old_s;
+      }
+      mutex_unlock(&set_lk);
+   }
+   return bad ? SETTINGS_UNSAVED : SETTINGS_OK;
+}
+
 /* THE PINNED SHORTCUTS, as the two operations the UI actually performs.
  *
  * The list is DENSE -- the main screen's button row walks it until the first
@@ -344,7 +372,7 @@ void set_render_settings(struct save_job *j)
    int n = snprintf(
        j->buf, sizeof j->buf,
        "v%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d "
-       "%d %d %d %d %d %d %d %d %d\n",
+       "%d %d %d %d %d %d %d %d %d %d %d %d\n",
        SETTINGS_VERSION, g_p.sound_on, g_p.vib_on, g_p.orient, g_p.units,
        g_p.disc, g_p.plot_max, g_p.screen_on, g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
@@ -352,7 +380,8 @@ void set_render_settings(struct save_job *j)
        g_p.nudge_sound, g_p.nudge_vib, g_p.wunits, g_p.shortcut[0],
        g_p.shortcut[1], g_p.shortcut[2], g_p.shortcut[3], g_p.shortcut[4],
        g_p.shortcut[5], g_p.shortcut[6], g_p.shortcut[7], g_p.shortcut[8],
-       g_p.best_streak_s, g_p.steps_on);
+       g_p.best_streak_s, g_p.steps_on, g_p.chg_marker, g_p.chg_color,
+       g_p.chg_size);
    set_job_stamp(j, g_settings_path, &written, n, n > 0 && n < 256);
 }
 
@@ -397,7 +426,7 @@ enum load_result settings_load(void)
            g_settings_path, filever, SETTINGS_VERSION);
       return LOAD_CORRUPT;
    }
-   int v[30] = {
+   int v[33] = {
        g_p.sound_on,      g_p.vib_on,       g_p.orient,      g_p.units,
        g_p.disc,          g_p.plot_max,     g_p.screen_on,   g_p.newdata_mode,
        g_p.ins_marker[0], g_p.ins_color[0], g_p.ins_size[0], g_p.ins_marker[1],
@@ -405,7 +434,8 @@ enum load_result settings_load(void)
        g_p.nudge_sound,   g_p.nudge_vib,    g_p.wunits,      g_p.shortcut[0],
        g_p.shortcut[1],   g_p.shortcut[2],  g_p.shortcut[3], g_p.shortcut[4],
        g_p.shortcut[5],   g_p.shortcut[6],  g_p.shortcut[7], g_p.shortcut[8],
-       g_p.best_streak_s, g_p.steps_on};
+       g_p.best_streak_s, g_p.steps_on,     g_p.chg_marker,  g_p.chg_color,
+       g_p.chg_size};
    /* VERSION 0 AND VERSION 1 SHARE THIS READER, and that is the migration:
     * v1 added the marker and changed nothing else, so a v0 file is read
     * field-for-field as it always was and is rewritten as v1 at the next
@@ -413,7 +443,7 @@ enum load_result settings_load(void)
     * step for it goes -- keyed on `filever`, applied in order, with the v0
     * reader kept for the files already on phones. */
    char *q = vq;
-   for (int i = 0; i < 30; i++) {
+   for (int i = 0; i < 33; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
@@ -511,6 +541,13 @@ enum load_result settings_load(void)
     * loop above stops at the first field the file does not have. Step
     * counting asks for a permission, so it starts off and is opted into. */
    g_p.steps_on = v[29] ? 1 : 0;
+   /* Fields 30-32: the change points' marker, newer than files already on
+    * disk. An older file stops the loop before them and leaves the defaults:
+    * the change band on, as a small white cross. Bounded like the insulin
+    * markers above, for the same reasons. */
+   g_p.chg_marker = (v[30] >= 0 && v[30] < MARK_N) ? v[30] : 1;
+   g_p.chg_color  = (v[31] >= 0 && v[31] < SET_NCOLORS) ? v[31] : 6;
+   g_p.chg_size   = (v[32] >= 1 && v[32] <= MARK_SIZE_MAX) ? v[32] : 1;
    return LOAD_OK;
 }
 

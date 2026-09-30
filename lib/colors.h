@@ -57,6 +57,7 @@
 #define UI_PLOT_VTICK 0xFF666666U /* the brighter x tick along the bottom */
 #define UI_PLOT_EDGE  0xFFAAAAAAU /* a point clipped to the top or bottom    */
 #define UI_PLOT_SCRUB 0xFFFFFFFFU /* the full-height rule under the finger */
+#define UI_PLOT_CHANGE 0xFF808080U /* a point-to-point change: a gray cross */
 #define UI_LOG_FRAME  0xFF444444U /* the log plots' border and baseline      */
 #define UI_LOG_GRID   0xFF2A2A2AU /* their horizontal divisions              */
 #define UI_LOG_CURSOR 0xFF666666U /* their scrub rule */

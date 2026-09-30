@@ -318,7 +318,8 @@ void h_plot_route(struct req *r, int64_t me)
       return;
    }
    if (!strcmp(r->path, "/plot-24h.gif")) {
-      h_plot_gif(r, owner, now - (24L * 3600), now, 24, tz);
+      /* THE LAST 24 HOURS CARRY THE CHANGES; the day plots do not. */
+      h_plot_gif(r, owner, now - (24L * 3600), now, 24, tz, 1);
       return;
    }
    if (!strcmp(r->path, "/data-24h")) {
@@ -355,7 +356,7 @@ void h_plot_route(struct req *r, int64_t me)
           back.tm_mday == d) {
          int64_t day_utc = (int64_t)midnight - ((int64_t)tz * 60);
          if (want_gif)
-            h_plot_gif(r, owner, day_utc, day_utc + 86400, 24, tz);
+            h_plot_gif(r, owner, day_utc, day_utc + 86400, 24, tz, 0);
          else {
             char title[32];
             (void)snprintf(title, sizeof title, "%04d-%02d-%02d", y, mo, d);

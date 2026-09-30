@@ -86,7 +86,8 @@ enum ui_menu {
    MA_INSLOG_OPEN,  /* ADD menu: open the INSULIN LOG table */
    MA_INSLOG_BACK,  /* insulin log: back to the ADD menu */
    MA_INSLOG_PAGE,  /* insulin log: go to page ix (see pager_row) */
-   MA_INSMARK_OPEN, /* ix = INS_SLOW / INS_FAST: pick that type's marker */
+   MA_INSMARK_OPEN, /* ix = INS_SLOW / INS_FAST: pick that type's marker, or
+                     * MARKPICK_CHG: the change points' */
    MA_INS_DELETE,   /* EDIT INSULIN: delete this dose (red) */
    MA_INSMARK_BACK, /* insulin marker picker: back to DISPLAY */
    MA_DISPLAY_OPEN, /* settings: open the DISPLAY submenu */

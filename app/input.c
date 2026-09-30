@@ -683,6 +683,11 @@ int on_input(int fd, int events, void *data)
              * plot aims at glucose -- no dead band over nothing. */
             if (begin) {
                int oy70 = ry + rh;
+               /* THE STRIP'S FLOOR is the 50 line, which is where the frame
+                * ends on a plain plot and where the change band starts on one
+                * that has it: 2 below it is the rectangle's bottom edge in the
+                * first case, so the band is the same one either way. */
+               int oy50 = ry + rh - 2;
                {
                   int oxx            = 0;
                   struct plot_pt ref = {0};
@@ -692,6 +697,11 @@ int on_input(int fd, int events, void *data)
                                      realtime_s(), model_plot_hours(),
                                      input_plot_cfg(), &oxx, &oy70))
                      oy70 = ry + rh; /* degenerate window: all glucose */
+                  ref.glu = PLOT_GLU_MIN;
+                  if (!plot_point_xy((struct plot_rect){rx, ry, rw, rh}, ref,
+                                     realtime_s(), model_plot_hours(),
+                                     input_plot_cfg(), &oxx, &oy50))
+                     oy50 = ry + rh - 2;
                }
                /* A dose only claims the touch if one is actually NEAR the
                 * finger. Asking merely "is there a dose in this window"
@@ -717,7 +727,7 @@ int on_input(int fd, int events, void *data)
                   if (dx <= near_x)
                      have_ins = 1;
                }
-               g_scrub_ins = have_ins && (fy >= (2 * oy70) - (ry + rh));
+               g_scrub_ins = have_ins && (fy >= (2 * oy70) - (oy50 + 2));
             }
             int aim_ins = g_scrub_ins;
             for (int i = 0; i < np_glu; i++)

@@ -441,12 +441,14 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h)
 {
    uint32_t *px = fb->bits;
-   int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = FONT_TITLE(sc);
-   int lh       = 16 * sc;
-   int x        = 4 * sc;
-   int rx       = fb->width - (4 * sc);
-   int y        = (fb->height / 20) + (8 * sc);
+   /* 24 ROWS: the title's 3, ten settings at two each, and the last one's
+    * own line. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 24);
+   int tsc = FONT_TITLE(sc);
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int rx  = fb->width - (4 * sc);
+   int y   = (fb->height / 20) + (8 * sc);
 
    draw_str(px, fb, x, y, tsc, "DISPLAY", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
@@ -504,6 +506,25 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  k);
       y += 2 * lh;
    }
+   /* The main plot's change points, styled the same way; OFF turns the
+    * change band off and gives the plot back its plain scale. */
+   draw_str(px, fb, x, y, sc, "DELTA MARKER", UI_TEXT_DIM);
+   if (m->prefs.chg_marker == MARK_HIDE) {
+      int lw = str_len("OFF") * 6 * sc;
+      draw_str(px, fb, rx - lw, y, sc, "OFF", UI_FAINT);
+   } else {
+      int gr = (2 * sc * m->prefs.chg_size) / MARK_SIZE_DEF;
+      if (gr < sc)
+         gr = sc;
+      if (gr > 5 * sc)
+         gr = 5 * sc;
+      plot_marker_glyph((struct plot_fb){px, fb->stride, fb->width, fb->height},
+                        rx - (6 * sc), y + (3 * sc), gr, m->prefs.chg_marker,
+                        ui_sensor_color(m->prefs.chg_color));
+   }
+   add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_INSMARK_OPEN,
+              MARKPICK_CHG);
+   y += 2 * lh;
    /* Status bar value vs plain app icon; lock-screen visibility; and a
     * way back for a swiped-away notification (it also reappears by
     * itself on the next reading). */
@@ -1054,12 +1075,20 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  ? m->dev.sensors[m->dev.sel].size
                  : MARK_SIZE_DEF;
    }
+   const int chg = m->ins.markpick_ins == MARKPICK_CHG;
+   if (chg) {
+      curm = m->prefs.chg_marker;
+      curc = m->prefs.chg_color;
+      curs = m->prefs.chg_size;
+   }
    uint32_t curcol = ui_sensor_color(curc);
 
    /* short titles: at title scale the full "SLOW INSULIN MARKER" would
     * run under the X */
    const char *ttl = "MARKER";
-   if (ins)
+   if (chg)
+      ttl = "DELTA MARKER";
+   else if (ins)
       ttl = (ity == INS_FAST) ? "FAST MARKER" : "SLOW MARKER";
    draw_str(px, fb, x, y, tsc, ttl, UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
