@@ -624,7 +624,10 @@ void fmt_hms(long epoch, long tz, char *out, int n)
                   t % 60);
 }
 
-void fmt_date(long epoch, long tz, char *out, int n)
+/* The local calendar date and minute of `epoch`, shared by fmt_date and
+ * fmt_date_md so the two formats cannot disagree about which day it is. */
+static void date_parts(long epoch, long tz, long *year, long *mon, long *dday,
+                       long *secs_out)
 {
    long t    = epoch + tz;
    long secs = t % 86400;
@@ -648,12 +651,44 @@ void fmt_date(long epoch, long tz, char *out, int n)
     * What stays here is the SECONDS-OF-DAY half, because that is this
     * function's own business: `secs` has already been floored into [0,86400)
     * above, together with the day count that made it. */
+   civil_ymd(z, year, mon, dday);
+   *secs_out = secs;
+}
+
+void fmt_date(long epoch, long tz, char *out, int n)
+{
    long year = 0;
    long mon  = 0;
    long dday = 0;
-   civil_ymd(z, &year, &mon, &dday);
+   long secs = 0;
+   date_parts(epoch, tz, &year, &mon, &dday, &secs);
    (void)snprintf(out, n, "%04ld-%02ld-%02ld %02ld:%02ld", year, mon, dday,
                   secs / 3600, (secs % 3600) / 60);
+}
+
+void fmt_date_md(long epoch, long tz, char *out, int n)
+{
+   long year = 0;
+   long mon  = 0;
+   long dday = 0;
+   long secs = 0;
+   date_parts(epoch, tz, &year, &mon, &dday, &secs);
+   (void)snprintf(out, n, "%02ld-%02ld %02ld:%02ld", mon, dday, secs / 3600,
+                  (secs % 3600) / 60);
+}
+
+void fmt_ago_hm(long secs, char *out, int n)
+{
+   const long cap = (99L * 3600) + (59L * 60);
+   if (secs < 0)
+      secs = 0;
+   if (secs > cap)
+      secs = cap;
+   long mins = secs / 60;
+   if (mins < 60)
+      (void)snprintf(out, n, "%ldM", mins);
+   else
+      (void)snprintf(out, n, "%ldH%02ld", mins / 60, mins % 60);
 }
 
 void fmt_ago(long now, long then, char *out, int n)

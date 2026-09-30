@@ -866,6 +866,39 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
          whenp = whenbuf;
       }
+      /* A FAST DOSE ON THE 3H AND 12H PLOTS SAYS HOW LONG AGO IT WAS:
+       * "18:20  1.5U  FAST 1H30".
+       *
+       * TWENTY CELLS, WHICH IS THE ROW. log_scrub_row keeps its full size
+       * while the three fields' characters and the one cell of air either
+       * side of the middle fit the plot's width: on a 720-wide portrait
+       * screen that is 18 characters, 20 cells. The clock is 5;
+       * the dose with its U is padded to 4, which holds every dose of up to
+       * three characters ("2", "12", "1.5"), so sweeping from one dose to the
+       * next moves the digits and not the field; and "FAST 9H59" is 9. The
+       * age carries no sign because the sign is the one character the row
+       * does not have -- next to the clock, "1H30" can only be an interval.
+       *
+       * UNDER TEN HOURS ONLY. That keeps the age to the four characters it is
+       * given. An older dose on the 12H plot, and a dose stamped in the
+       * future, which has no age, keep the plain row: clock, dose, U FAST.
+       *
+       * A dose of four characters ("16.5") makes the row 21 cells, and
+       * log_scrub_row draws it one size smaller rather than cut it. */
+      static char fastu[16];
+      const long dage = m->now - m->plot.hist[m->plot.scrub].t;
+      if (ins && m->plot.hist[m->plot.scrub].src == INS_FAST &&
+          (m->plot.plot_hours == 3 || m->plot.plot_hours == 12) && dage >= 0 &&
+          dage < 10L * 3600) {
+         char iu[16];
+         char ago[8];
+         (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
+         (void)snprintf(gv, sizeof gv, "%.10sU", iu);
+         gvw = 4;
+         fmt_ago_hm(dage, ago, sizeof ago);
+         (void)snprintf(fastu, sizeof fastu, "FAST %s", ago);
+         unit = fastu;
+      }
       /* THE APP'S ONE READOUT LAYOUT -- when, value, unit, each anchored so
        * that sweeping the trace moves the number and nothing else. See
        * log_scrub_row, which every plot in the app draws through.

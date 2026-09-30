@@ -37,11 +37,19 @@ void fmt_trend(int tr, char *out, int n);
 void fmt_hms(long epoch, long tz, char *out, int n);
 /* Format epoch seconds as a local date (tz = offset seconds). Pure. */
 void fmt_date(long epoch, long tz, char *out, int n);
+/* The same instant without the year, "MM-DD HH:MM": for a table that has to
+ * give up five columns on a narrow screen. Pure. */
+void fmt_date_md(long epoch, long tz, char *out, int n);
 /* "N S" / "N M" / "N H" / "N D": how long ago `then` was, from `now`. The
  * unit changes as the gap grows, so a row never widens. Pure. */
 void fmt_ago(long now, long then, char *out, int n);
 /* A duration as "N D N H" / "N H N M" / "N M". Pure. */
 void fmt_dur(long seconds, char *out, int n);
+/* An elapsed time to the MINUTE, "45M" under an hour and "1H30" from there,
+ * the minutes always two digits so "1H05" cannot read as "1H5" misplaced.
+ * Negative is taken as 0 and anything past 99H59 as 99H59, so the answer is
+ * never wider than five characters. Pure. */
+void fmt_ago_hm(long secs, char *out, int n);
 
 /* ---- the framebuffer and hit-list primitives ------------------------
  *

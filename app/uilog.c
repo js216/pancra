@@ -169,7 +169,35 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, x, y, sc, "NO DOSES LOGGED YET.", UI_MUTED);
       return;
    }
-   draw_str(px, fb, x, y, sc, "TIME              TYPE  UNITS", UI_MUTED);
+   /* ---- THE COLUMNS, AND THE ONE THING THAT GIVES WAY ----------------
+    *
+    * Left to right: when, the type, the dose right-aligned under UNITS, and
+    * -- for a dose in the last 24 hours -- how long ago it was, right-aligned
+    * at the right margin under AGO. In character cells, with the widest
+    * value each column can hold:
+    *
+    *   "2026-09-29 12:34  FAST 98.999"   29, then 2 of air and "23H59" (5)
+    *   "09-29 12:34  FAST 98.999"        24, then the same 7
+    *
+    * The dose is six wide because the record carries thousandths and caps
+    * the whole part at 99 (insrow.h) -- "98.999" is the widest dose the log
+    * can hold, so it is what the column is sized for.
+    *
+    * 36 CELLS FOR THE FULL DATE, 31 WITHOUT THE YEAR. ui_fit_scale bounds
+    * the scale by width to UI_COLS, which after the two margins leaves at
+    * least 190 sc -- 31 whole cells -- on every screen, so the short form
+    * always fits and the full one fits wherever there are 36. So the YEAR is
+    * what gives way, decided once per screen rather than per row, so a
+    * column never changes shape halfway down a page. The table is the recent
+    * tail of the log with its rows newest first, and every dose of the last
+    * day carries its age beside it, so the year is the column a reader
+    * needs least. */
+   const int full_date = (29 + 2 + 5) * 6 * sc <= rx - x;
+   draw_str(px, fb, x, y, sc,
+            full_date ? "TIME              TYPE  UNITS"
+                      : "TIME         TYPE  UNITS",
+            UI_MUTED);
+   draw_str(px, fb, rx - (str_len("AGO") * 6 * sc), y, sc, "AGO", UI_MUTED);
    y += lh;
 
    /* Rows that fit between the header and a reserved bottom nav line. */
@@ -217,30 +245,40 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       int ti                  = m->ins.ins_nlog - 1 - r;
       const struct ins_rec *d = &m->ins.ins_log[ti];
       char when[20];
-      char row[40];
-      fmt_date(d->t, m->tz_off, when, sizeof when);
+      char row[48];
+      if (full_date)
+         fmt_date(d->t, m->tz_off, when, sizeof when);
+      else
+         fmt_date_md(d->t, m->tz_off, when, sizeof when);
       char iu[16];
       (void)ins_units_str(d->milli, iu, sizeof iu);
-      /* RIGHT-ALIGNED IN THE COLUMN the header names, whatever its width:
-       * "0.5" and "20" are different lengths, and a left-aligned dose column
-       * makes a half-unit look like five. */
-      (void)snprintf(row, sizeof row, "%s  %s %4s", when,
+      /* RIGHT-ALIGNED under the right edge of UNITS, six wide: "0.5" and
+       * "20" are different lengths, and a left-aligned dose column makes a
+       * half-unit look like five. */
+      (void)snprintf(row, sizeof row, "%s  %s %6s", when,
                      d->type == INS_FAST ? "FAST" : "SLOW", iu);
       /* FAST doses in a soft blue, so the two types separate at a glance
        * (0xAABBGGRR: R=0x66 G=0xAA B=0xFF). */
-      draw_str(px, fb, x, y, sc, row,
-               d->type == INS_FAST ? UI_MARK_FAST : UI_TEXT_DIM);
-      /* The pencil is the affordance; the WHOLE row is the target (it
-       * opens this dose in the EDIT INSULIN form). Centre the pencil in
-       * the free column right of UNITS -- glued to the screen edge it
-       * read as a tiny edge-of-screen button. */
-      {
-         int te = x + (29 * 6 * sc); /* right edge of the UNITS column */
-         int ix = te + (((rx - te) - (5 * sc)) / 2);
-         if (ix < te)
-            ix = rx - (6 * sc); /* narrow screen: fall back to the edge */
-         draw_icon(px, fb, ix, y, sc, icon_pencil, UI_MUTED);
+      const uint32_t rc = d->type == INS_FAST ? UI_MARK_FAST : UI_TEXT_DIM;
+      draw_str(px, fb, x, y, sc, row, rc);
+      /* HOW LONG AGO, for a dose in the last 24 hours, in the row's colour.
+       *
+       * FROM THE FRAME'S OWN `now`. The frame is rebuilt on every repaint
+       * and the screen repaints once a second, so the figure is never more
+       * than a second behind the minute it names, with the table held open
+       * or reopened -- and it costs one format per visible row on a repaint
+       * that happens anyway.
+       *
+       * A dose stamped in the future has no "ago" and gets none, rather than
+       * a 0M that would claim it was just taken. */
+      long age = m->now - d->t;
+      if (age >= 0 && age < 86400) {
+         char ago[8];
+         fmt_ago_hm(age, ago, sizeof ago);
+         draw_str(px, fb, rx - (str_len(ago) * 6 * sc), y, sc, ago, rc);
       }
+      /* THE WHOLE ROW is the target: it opens this dose in the EDIT INSULIN
+       * form. */
       add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_INSLOG_EDIT,
                  ti);
       y += lh;

@@ -710,7 +710,12 @@ int kp_commit_number(void)
             milli *= 10;
          if (bad || milli < INS_MILLI_MIN || milli > INS_MILLI_MAX) {
             LOGI("insulin dose out of range, not saved");
-            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE 0..%d",
+            /* THE RANGE THE CHECK ABOVE ENFORCES, from the same two
+             * constants: INS_MILLI_MIN thousandths up to INS_UNITS_MAX whole
+             * units, i.e. "0.001..99". */
+            char lo[16];
+            (void)ins_units_str(INS_MILLI_MIN, lo, sizeof lo);
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE %s..%d", lo,
                            INS_UNITS_MAX);
             g_kp.len = 0;
             shell_ui_dirty();
