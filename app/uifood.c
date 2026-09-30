@@ -44,7 +44,7 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  struct hits *h)
 {
    uint32_t *px = fb->bits;
-   int sc       = ui_fit_scale(fb->width, fb->height, 26);
+   int sc       = ui_fit_scale(fb->width, fb->height, 27);
    int tsc      = FONT_TITLE(sc);
    int lh       = 16 * sc;
    int x        = 4 * sc;
@@ -83,18 +83,49 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
                            ? food_type_name(m->food.food_type)
                            : "CHOOSE...";
    uint32_t tcol     = m->food.food_type != FOOD_TYPE_NONE ? UI_TEXT : UI_MUTED;
+   /* NINE VALUE ROWS: the entry's five, then what the food is made of --
+    * per gram of it, and the food's, not this entry's; CONFIRM writes them
+    * to the food (food.h). Calories lead them, in the FOOD LOG's order.
+    *
+    * THE GAP BETWEEN ROWS SPENDS THE HEIGHT THE SCREEN HAS. It is what is
+    * left above the system gesture bar once the rows and EDIT FOOD's three
+    * buttons are placed, shared out over the nine gaps: never more than a
+    * line, the other forms' spacing, and never less than half a line, which
+    * is what the 27 rows asked of ui_fit_scale pay for. Sized for EDIT FOOD
+    * in both modes, so LOG FOOD and EDIT FOOD lay their rows out alike. */
+   const int vrow  = (7 * tsc) + (8 * sc);
+   const int btn   = 25 * sc;
+   const int fixed = (9 * vrow) + (3 * btn) + (2 * ((3 * lh) / 2));
+   int gap         = (fb->height - (fb->height / 24) - y - fixed) / 9;
+   if (gap > lh)
+      gap = lh;
+   if (gap < lh / 2)
+      gap = lh / 2;
    y = value_row(fb, h, y, sc, "TYPE", tname, tcol, MA_FOOD_EDIT, 0);
-   y += lh;
+   y += gap;
    char gval[16];
    (void)snprintf(gval, sizeof gval, "%d G", m->food.food_g);
    y = value_row(fb, h, y, sc, "GRAMS", gval, UI_TEXT, MA_FOOD_EDIT, 1);
-   y += lh;
+   y += gap;
    y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_FOOD_EDIT, 2);
-   y += lh;
+   y += gap;
    y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_FOOD_EDIT, 3);
-   y += lh;
+   y += gap;
    y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_FOOD_EDIT, 4);
-   y += 2 * lh;
+   y += gap;
+   {
+      static const int order[FOOD_NMACRO]        = {FOOD_KCAL, FOOD_CARBS,
+                                                    FOOD_PROTEIN, FOOD_FAT};
+      static const char *const mlbl[FOOD_NMACRO] = {"CARBS", "PROTEIN", "FAT",
+                                                    "KCAL/G"};
+      for (int r = 0; r < FOOD_NMACRO; r++) {
+         const int k = order[r];
+         char v[16];
+         (void)food_milli_str(m->food.food_macro[k], v, (int)sizeof v);
+         y = value_row(fb, h, y, sc, mlbl[k], v, UI_TEXT, MA_FOOD_EDIT, 5 + k);
+         y += gap;
+      }
+   }
 
    /* Cancel on TOP, the committing button on the BOTTOM -- the app-wide rule
     * the insulin and weight forms both follow. */
@@ -162,6 +193,123 @@ void render_fooddel(struct ANativeWindow_Buffer *fb, const struct screen *m,
                      0);
 }
 
+/* TODAY RUNS FROM 03:00 LOCAL, not from midnight: a late supper belongs to
+ * the day it ended, not to the one that starts while it is being digested.
+ * Each total is the entries' grams times what their food is made of, now --
+ * the numbers are the food's (food.h), so correcting a food corrects every
+ * day it was eaten on. */
+void ui_food_today(const struct screen *m, long *tot)
+{
+   long loc  = m->now + m->tz_off;
+   long from = loc - (((loc % 86400) + 86400) % 86400) + (3L * 3600);
+   if (loc < from)
+      from -= 86400;
+   from -= m->tz_off;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      tot[k] = 0;
+   for (int i = 0; i < m->food.nlog; i++) {
+      const struct food_rec *e = &m->food.log[i];
+      if (e->t < from || e->t >= from + 86400)
+         continue;
+      for (int j = 0; j < m->food.ntypes; j++)
+         if (m->food.types[j].id == e->type)
+            for (int k = 0; k < FOOD_NMACRO; k++)
+               tot[k] += e->g * (long)m->food.types[j].macro[k];
+   }
+}
+
+/* THE BAR IS THE FOOD LOG'S CALORIE BAR, SHRUNK: the same track, the same
+ * green filling towards the goal, the same orange once past it -- inset from
+ * the frame and along the button's bottom edge, 2*sc tall, placed exactly
+ * as the EXERCISE button's settling bar is. INSIDE the button's rectangle:
+ * the caller's row pitch is fixed, and a bar below it would land on the next
+ * control. No goal (0) is no bar. */
+int ui_foodlog_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
+                      int y, int w, int sc, const struct screen *m,
+                      const char *name, uint32_t col)
+{
+   uint32_t *px = fb->bits;
+   const int below =
+       menu_button(fb, h, x, y, w, sc, name, col, MA_FOODLOG_OPEN, 0);
+   const int goal = m->food.goal[FOOD_KCAL];
+   if (goal <= 0)
+      return below;
+   long tot[FOOD_NMACRO];
+   ui_food_today(m, tot);
+   const long v = (tot[FOOD_KCAL] + 500) / 1000;
+   const int bx = x + (3 * sc);
+   const int bw = w - (6 * sc);
+   const int bh = 2 * sc;
+   const int by = below - bh - (2 * sc);
+   long fill    = (v * (long)bw) / goal;
+   if (fill > bw)
+      fill = bw;
+   fill_rect(px, fb, bx, by, bw, bh, UI_FOOD_TRACK);
+   if (fill > 0)
+      fill_rect(px, fb, bx, by, (int)fill, bh,
+                v > goal ? UI_FOOD_OVER : UI_FOOD_FILL);
+   return below;
+}
+
+/* TODAY'S TOTALS against the day's goals, the upper pane of the FOOD LOG.
+ *
+ * Today is ui_food_today's.
+ *
+ * One line per total -- label, today's value, a bar, the goal at the right --
+ * spread evenly down the pane. THE GOAL IS THE TARGET: a tap on it opens the
+ * keypad for that goal. */
+static void food_day_pane(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h, int top,
+                          int height, int sc)
+{
+   uint32_t *px = fb->bits;
+   const int x  = 4 * sc;
+   const int rx = fb->width - (4 * sc);
+   const int cw = 6 * sc;
+   long tot[FOOD_NMACRO];
+   ui_food_today(m, tot);
+   static const int order[FOOD_NMACRO] = {FOOD_KCAL, FOOD_CARBS, FOOD_PROTEIN,
+                                          FOOD_FAT};
+   static const char *const lbl[FOOD_NMACRO] = {"CARBS", "PROTEIN", "FAT",
+                                                "KCAL"};
+   const int pitch                           = height / FOOD_NMACRO;
+   /* columns, in cells: the label's 7, the value's 4, the goal's 4 at the
+    * margin, a cell of air between each, and the bar in what is left */
+   const int vx1 = x + (12 * cw) - sc; /* the value's right edge */
+   const int bx0 = x + (13 * cw);
+   const int bx1 = rx - (5 * cw);
+   for (int r = 0; r < FOOD_NMACRO; r++) {
+      const int k  = order[r];
+      const int ly = top + (r * pitch) + ((pitch - (7 * sc)) / 2);
+      long v       = (tot[k] + 500) / 1000;
+      if (v > 9999)
+         v = 9999;
+      const int goal = m->food.goal[k];
+      char vs[8];
+      char gs[8];
+      (void)snprintf(vs, sizeof vs, "%ld", v);
+      (void)snprintf(gs, sizeof gs, "%d", goal);
+      draw_str(px, fb, x, ly, sc, lbl[k], UI_TEXT_DIM);
+      draw_str(px, fb, vx1 - (((str_len(vs) * 6) - 1) * sc), ly, sc, vs,
+               UI_TEXT);
+      if (bx1 > bx0) {
+         const int bh = 5 * sc;
+         const int by = ly + sc;
+         fill_rect(px, fb, bx0, by, bx1 - bx0, bh, UI_FOOD_TRACK);
+         long fill = goal > 0 ? (v * (long)(bx1 - bx0)) / goal : 0;
+         if (fill > bx1 - bx0)
+            fill = bx1 - bx0;
+         if (fill > 0)
+            fill_rect(px, fb, bx0, by, (int)fill, bh,
+                      v > goal ? UI_FOOD_OVER : UI_FOOD_FILL);
+      }
+      draw_str(px, fb, rx - (((str_len(gs) * 6) - 1) * sc), ly, sc, gs,
+               UI_TEXT);
+      add_hit_ix(h, ui_rect(bx1, top + (r * pitch), fb->width - bx1, pitch),
+                 MA_FOODGOAL, k);
+   }
+}
+
 void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
                     struct hits *h)
 {
@@ -179,6 +327,16 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
               0);
    y += 3 * lh;
 
+   /* TODAY'S TOTALS ON TOP, THE TABLE BELOW THEM: see log_split_of. The
+    * pane takes three tenths of what is below the column header's line, as
+    * the INSULIN LOG's plot does, and the table the rest. */
+   const int pane_h = ((fb->height - (y + lh) - (fb->height / 24)) * 3) / 10;
+   struct log_split sp;
+   log_split_of(fb->height, y, sc, 0, pane_h, &sp);
+   const int nav_y = sp.nav_y;
+   food_day_pane(fb, m, h, sp.plot_top, pane_h, sc);
+   y = sp.hdr_y;
+
    if (m->food.nlog <= 0) {
       draw_str(px, fb, x, y, sc, "NOTHING LOGGED YET.", UI_MUTED);
       return;
@@ -190,10 +348,13 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    draw_str(px, fb, rx - (str_len("G") * 6 * sc), y, sc, "G", UI_MUTED);
    y += lh;
 
-   int avail = fb->height - y - (2 * lh);
+   /* Rows between the header and the pager, and no more than the hit budget
+    * leaves once the pane's four goal targets are counted (see
+    * render_inslog: a target past UI_MAX_HITS is dropped, silently). */
+   int avail = nav_y - y;
    int per   = avail / lh;
-   if (per > UI_MAX_HITS - UI_LOG_FIXED)
-      per = UI_MAX_HITS - UI_LOG_FIXED;
+   if (per > UI_MAX_HITS - UI_LOG_FIXED - FOOD_NMACRO)
+      per = UI_MAX_HITS - UI_LOG_FIXED - FOOD_NMACRO;
    if (per < 1)
       per = 1;
    int npages = (m->food.nlog + per - 1) / per;
@@ -202,6 +363,23 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       page = 0;
    if (page >= npages)
       page = npages - 1;
+   /* THE NAME GETS WHAT THE ROW LEAVES, and is what gives way. fmt_date is
+    * 16 characters, then 2 of gap, and the grams take the last 4 at the
+    * margin; the name has the cells between, up to FOOD_NAME_MAX (20).
+    * ui_fit_scale guarantees UI_COLS (33) cells, so the name always has at
+    * least 11. draw_str clips silently past the edge, so a name padded past
+    * its room would push the quantity -- the one number a food log is read
+    * for -- off the screen without a mark; cut with an explicit precision,
+    * the name loses its tail where the user can see it has one. Worked out
+    * once per screen, so the column is the same on every row.
+    *
+    * THE GRAMS ARE DRAWN SEPARATELY, right-aligned at the margin, so their
+    * column cannot be pushed anywhere by the name beside them. */
+   int namew = ((rx - x) / (6 * sc)) - 16 - 2 - 4;
+   if (namew > FOOD_NAME_MAX)
+      namew = FOOD_NAME_MAX;
+   if (namew < 0)
+      namew = 0;
    for (int r = page * per; r < (page + 1) * per && r < m->food.nlog; r++) {
       /* the tail is oldest-first; the table shows newest first */
       int ti                   = m->food.nlog - 1 - r;
@@ -214,17 +392,7 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * empty column rather than a number nobody can read -- food_type_name
        * answers "" for an id no type has, which is the honest look of a
        * record the vocabulary can no longer name. */
-      /* THE ROW IS BUDGETED TO THE 33 COLUMNS THE LAYOUT TARGETS, and the NAME
-       * is what gives way. fmt_date is 16 characters and a food name runs to
-       * FOOD_NAME_MAX (20), so a row that pads the name to its full width is
-       * 43 columns: draw_str clips silently past the edge, so the quantity --
-       * the one number a food log is read for -- is the part that disappears,
-       * and it disappears without a mark. Truncated with an explicit
-       * precision, the name loses its tail where the user can see it has one.
-       *
-       * THE GRAMS ARE DRAWN SEPARATELY, right-aligned at the margin, so their
-       * column cannot be pushed anywhere by the name beside them. */
-      (void)snprintf(row, sizeof row, "%s  %-11.11s", when,
+      (void)snprintf(row, sizeof row, "%s  %-*.*s", when, namew, namew,
                      food_type_name(e->type));
       draw_str(px, fb, x, y, sc, row, UI_TEXT_DIM);
       (void)snprintf(gp, sizeof gp, "%4ld", e->g);
@@ -237,8 +405,7 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       y += lh;
    }
 
-   pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,
-             MA_FOODLOG_PAGE);
+   pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_FOODLOG_PAGE);
 }
 
 void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,

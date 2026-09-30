@@ -151,6 +151,7 @@ enum ui_menu {
    MA_FOODTYPE_NEW,  /* picker: type a food this list does not have yet */
    MA_FOODTYPE_BACK, /* picker: leave without choosing */
    MA_FOODPAGE,      /* food picker: go to page ix */
+   MA_FOODGOAL,      /* FOOD LOG: set goal ix (food.h's FOOD_CARBS...) */
    MA_FOOD_CONFIRM,  /* LOG FOOD: append the entry */
    MA_FOOD_DISCARD,  /* LOG FOOD: leave without logging */
    /* LOG FOOD fields, mirroring MA_WT_EDIT; ix picks one: 0 type, 1 grams,

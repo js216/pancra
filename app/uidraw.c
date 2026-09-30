@@ -510,19 +510,22 @@ int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
    int below = menu_button(fb, h, x, y, w, sc, lbl, col, MA_EXERCISE, 0);
    /* INSIDE the button's own rectangle, not below it: the row pitch is fixed
     * by the caller's layout, and a bar drawn under the button would either eat
-    * the gap or land on the next control. */
+    * the gap or land on the next control. Inset 3*sc from each side of the
+    * frame and 2*sc above its bottom edge, as the FOOD LOG button's calorie
+    * bar is (ui_foodlog_button), so the two miniature bars sit alike. */
    if (remaining > 0 && settle_s > 0) {
-      int bh   = 2 * sc;
-      int bwid = (w * remaining) / settle_s;
-      if (bwid > w)
-         bwid = w;
+      const int bw = w - (6 * sc);
+      int bh       = 2 * sc;
+      int bwid     = (bw * remaining) / settle_s;
+      if (bwid > bw)
+         bwid = bw;
       if (bwid < 1)
          bwid = 1; /* a bar with a second left is still a bar */
-      /* IN THE LABEL'S COLOUR, which is now the CONTRASTING one. The bar used
-       * to be drawn in the level's colour -- which is the background now, so
-       * it would be a bar of exactly the shade it sits on: invisible, on the
-       * one control whose whole point is a countdown you can watch. */
-      fill_rect(px, fb, x, below - bh - sc, bwid, bh, col);
+      /* IN THE LABEL'S COLOUR, the one that contrasts with the level's
+       * background. In the level's own colour it would be a bar of exactly
+       * the shade it sits on: invisible, on the one control whose whole point
+       * is a countdown you can watch. */
+      fill_rect(px, fb, x + (3 * sc), below - bh - (2 * sc), bwid, bh, col);
    }
    return below;
 }
@@ -1294,6 +1297,22 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
       ax += cellw[i] + g;
    }
    return y + (7 * sc) + pad;
+}
+
+void log_split_of(int height, int y0, int sc, int tabs_h, int pane_h,
+                  struct log_split *out)
+{
+   const int lh     = 16 * sc;
+   const int bottom = height - (height / 24);
+   out->hit_top     = y0 - lh;
+   out->plot_top    = tabs_h > 0 ? y0 - (2 * lh) + tabs_h : out->hit_top;
+   out->tabs_y      = out->plot_top - tabs_h;
+   if (out->tabs_y < out->hit_top)
+      out->tabs_y = out->hit_top;
+   out->hdr_y = y0 + tabs_h + pane_h + (lh / 2);
+   /* pager_row's targets reach lh + 4*sc below its line; this leaves half a
+    * line and 2*sc of air under them */
+   out->nav_y = bottom - lh - (lh / 2) - (6 * sc);
 }
 
 /* ALL FOUR BUTTONS, ALWAYS, AND GREYED WHEN THEY HAVE NOWHERE TO GO.

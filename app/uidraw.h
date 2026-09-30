@@ -154,6 +154,19 @@ int ui_exercise_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
                        int y, int w, int sc, int level, int remaining,
                        int settle_s, const char *name, uint32_t rest_col);
 
+/* TODAY'S TOTALS, in thousandths, indexed FOOD_CARBS... (food.h): each
+ * entry since 03:00 local, its grams times what its food is made of. The
+ * FOOD LOG's pane and the FOOD LOG buttons' bar read the same numbers from
+ * here. See uifood.c. */
+void ui_food_today(const struct screen *m, long *tot);
+
+/* A FOOD LOG button, drawn identically in the ADD menu and on the main
+ * screen: an ordinary button, and while a calorie goal is set, a miniature
+ * of the FOOD LOG's calorie bar along its bottom edge. See uifood.c. */
+int ui_foodlog_button(struct ANativeWindow_Buffer *fb, struct hits *h, int x,
+                      int y, int w, int sc, const struct screen *m,
+                      const char *name, uint32_t col);
+
 /* The same, with the user's configured alarm and nudge bands applied on top --
  * only ever in the direction of MORE alarm, and inclusive at every limit so
  * the number, the banner and the alarm agree. See uidraw.c. */
@@ -230,6 +243,37 @@ void thresh_menu_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
  * reserve before calling. */
 void pager_row(struct ANativeWindow_Buffer *fb, struct hits *h, int x, int rx,
                int y, int sc, int lh, int page, int npages, int code);
+
+/* THE LOG SCREENS' SPLIT: the pane on top, the table below it, the pager at
+ * the bottom.
+ *
+ * The pane is the screen's summary -- span tabs over a plot, or the FOOD
+ * LOG's totals -- and starts just under the title's close band: a plot's tab
+ * labels sit there, a pane without tabs starts there itself. The table's
+ * column header follows the pane after a gap that sets the two apart, its
+ * rows run down to the pager, and the pager sits half a line above the
+ * system gesture bar, which is reserved because these screens reach the
+ * bottom edge.
+ *
+ * THE PANE'S TARGETS START AT `hit_top`, the close band's lower edge: a
+ * target reaching above it would take the taps meant for X. So the tab
+ * band's target runs from `tabs_y` to `plot_top` -- the tab labels' own row
+ * and a little air.
+ *
+ * `tabs_h` is the tab band's drawn height (0 for a pane without tabs),
+ * `pane_h` the plot's or the totals'. The table is what is left: `hdr_y` for
+ * the column header, rows from hdr_y + lh while they stay above `nav_y`, the
+ * pager's line. */
+struct log_split {
+   int hit_top;  /* the highest y a pane target may start at */
+   int tabs_y;   /* the tab band's target top */
+   int plot_top; /* the pane's top, just under the tabs */
+   int hdr_y;    /* the table's column header */
+   int nav_y;    /* the pager */
+};
+
+void log_split_of(int height, int y0, int sc, int tabs_h, int pane_h,
+                  struct log_split *out);
 
 uint32_t white_color(int g);
 /* The big number's colour for `g`, by the fixed medical range. */

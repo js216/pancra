@@ -19,6 +19,7 @@
 #include "meter.h"
 #include "nav.h"
 #include "pairing.h"
+#include "plot.h" /* PLOT_CHG_GAP_S: the change rule the big number shares */
 #include "plotdata.h"
 #include "reconcile.h"
 #include "remote.h" /* the last sync outcome: the syncing module owns it */
@@ -804,10 +805,35 @@ static void build_reading(struct frame_ctx *f, struct screen *m)
    m->reading.glu           = cur.glu;
    m->reading.trend         = cur.trend;
    m->reading.t             = cur.t;
-   m->reading.rssi          = crss.dbm;
-   m->reading.rssi_ok       = crss.ok;
-   m->reading.stale         = cur.stale;
-   m->reading.disc_alarmed  = alarm_disc_latched();
+   /* THE CHANGE SINCE THE READING BEFORE: the current reading's own row in
+    * the history names its sensor, and the history is newest first, so that
+    * sensor's previous CGM reading is the next of its rows going down --
+    * looked for only as far back as one gap. */
+   m->reading.delta      = 0;
+   m->reading.have_delta = 0;
+   {
+      const int nh = hist_count() < NHIST ? hist_count() : NHIST;
+      int i        = 0;
+      while (i < nh && !(hist_at(i).t == cur.t && hist_at(i).kind == KIND_CGM))
+         i++;
+      if (i < nh && cur.t > 0) {
+         const int src = hist_at(i).src;
+         for (int j = i + 1; j < nh; j++) {
+            if (cur.t - hist_at(j).t >= PLOT_CHG_GAP_S)
+               break;
+            if (hist_at(j).kind != KIND_CGM || hist_at(j).src != src ||
+                hist_at(j).t >= cur.t)
+               continue;
+            m->reading.delta      = hist_at(i).glu - hist_at(j).glu;
+            m->reading.have_delta = 1;
+            break;
+         }
+      }
+   }
+   m->reading.rssi         = crss.dbm;
+   m->reading.rssi_ok      = crss.ok;
+   m->reading.stale        = cur.stale;
+   m->reading.disc_alarmed = alarm_disc_latched();
 
    /* The PRIMARY CGM drives the top block -- resolved to ITS link, not
     * hardcoded LINK_CGM (link 0), which just belongs to whichever CGM claimed
@@ -970,8 +996,8 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
       f->pts[nh].kind = KIND_EX;
       nh++;
    }
-   m->plot.hist       = f->pts;
-   m->plot.nhist      = nh;
+   m->plot.hist  = f->pts;
+   m->plot.nhist = nh;
    /* THE CHANGES, every sensor's: from the log scan on a long span, from the
     * live history on a short one. The renderer picks whose to draw. */
    {
@@ -1287,6 +1313,9 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->food.food_orig_t    = f->fv.food_orig.t;
    m->food.food_orig_g    = f->fv.food_orig.g;
    m->food.food_orig_type = f->fv.food_orig.type;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      m->food.food_macro[k] = f->fv.food_macro[k];
+   food_goals_get(m->food.goal);
    /* ONE call for both, so the number and the bar beside it describe the same
     * instant -- see exercise_button_get. */
    exercise_button_get(mono_s(), &m->food.ex_level, &m->food.ex_remaining);

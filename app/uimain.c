@@ -344,14 +344,26 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int bany = y + (2 * sc);
    y += bangap;
 
+   /* THE CHANGE SINCE THE READING BEFORE, in mg/dL: "+12", "-3", "+0" --
+    * the same number the plot's change points and the scrub show. "--" when
+    * there is no reading one gap before this one. Clamped to three digits,
+    * which is wider than any change between readings the history admits. */
    char tr[8];
    /* Sized for the widest formatted age. `a` is clamped below, but the
     * compiler cannot see that, and a genuinely huge value would truncate. */
    char agestr[24];
-   if (m->reading.stale || m->reading.glu < 0 || !m->reading.has_cgm)
+   if (m->reading.stale || m->reading.glu < 0 || !m->reading.has_cgm) {
       (void)snprintf(tr, sizeof tr, "---");
-   else
-      fmt_trend(m->reading.trend, tr, sizeof tr);
+   } else if (!m->reading.have_delta) {
+      (void)snprintf(tr, sizeof tr, "--");
+   } else {
+      int d = m->reading.delta;
+      if (d > 999)
+         d = 999;
+      if (d < -999)
+         d = -999;
+      (void)snprintf(tr, sizeof tr, "%+d", d);
+   }
    long a = m->now - m->reading.t;
    if (a < 0)
       a = 0;
@@ -367,7 +379,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
       (void)snprintf(agestr, sizeof agestr, "%ld S", a);
    else
       (void)snprintf(agestr, sizeof agestr, "%ld M", a / 60);
-   /* PREDICTION, between the trend and the age: the sensor's own forecast for
+   /* PREDICTION, under the change: the sensor's own forecast for
     * the next reading, as ">123" -- the arrow glyph already in the font, so it
     * reads as "heading for" without a word. `predicted` is a 10-bit field
     * whose 0x3ff (1023) means "no prediction", and no real value exceeds
@@ -392,7 +404,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
       (void)snprintf(pred, sizeof pred, ">--");
    }
    /* Signal strength moved to each device's own menu (SIGNAL STRENGTH); the
-    * main readout shows units / trend / prediction / age. */
+    * main readout shows change / prediction / units / age. */
    int uw     = str_len(UI_LBL(m->prefs.units));
    int aw     = str_len(agestr);
    int pw     = str_len(pred);
@@ -509,20 +521,21 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int gh    = 7 * sc;     /* a label glyph is 7 rows tall */
    int num_h = 7 * bigsc3; /* the FOOTPRINT's glyph height, not the string's */
    int vlh   = gh + (2 * sc); /* tight line pitch */
-   /* Column anchors: UNITS keeps its historical spot (two rows above the
-    * number's bottom row); the AGE drops down to sit vertically centred on
-    * the progress bar -- the value and the bar that visualises it read as
-    * one row. TREND and PREDICTION divide the space between them into three,
-    * so the column stays evenly spaced now that it holds four values rather
-    * than three. */
-   int units_y = y + num_h - gh - (2 * vlh);
+   /* THE COLUMN, top to bottom: the change since the reading before, the
+    * prediction, the unit, the age -- where the reading is heading first,
+    * then what it is measured in, then how old it is. The top line sits two
+    * rows above the number's bottom row; the AGE drops down to sit
+    * vertically centred on the progress bar -- the value and the bar that
+    * visualises it read as one row -- and the two between divide the space
+    * into three, so the four are evenly spaced. */
+   int tr_y    = y + num_h - gh - (2 * vlh);
    int agev_y  = bar_y + ((bar_h - gh) / 2);
-   int vspan   = agev_y - units_y;
-   int tr_y    = units_y + (vspan / 3);
-   int pred_y  = units_y + ((2 * vspan) / 3);
-   draw_str(px, fb, colx, units_y, sc, UI_LBL(m->prefs.units), UI_TEXT_DIM);
+   int vspan   = agev_y - tr_y;
+   int pred_y  = tr_y + (vspan / 3);
+   int units_y = tr_y + ((2 * vspan) / 3);
    draw_str(px, fb, colx, tr_y, sc, tr, UI_TEXT_DIM);
    draw_str(px, fb, colx, pred_y, sc, pred, UI_TEXT_DIM);
+   draw_str(px, fb, colx, units_y, sc, UI_LBL(m->prefs.units), UI_TEXT_DIM);
    draw_str(px, fb, colx, agev_y, sc, agestr, UI_TEXT_DIM);
    /* Settings hamburger: a modest 3-bar icon CENTERED (both axes) in the empty
     * space above the three values. Its hit box is the ONLY way to open settings
@@ -532,8 +545,8 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    int ham_bh = 2 * sc; /* bar thickness */
    int ham_gp = 2 * sc; /* gap between bars */
    int ham_h  = (3 * ham_bh) + (2 * ham_gp);
-   int sp_top = y;             /* top of the empty space */
-   int sp_bot = units_y - gap; /* just above the first value */
+   int sp_top = y;          /* top of the empty space */
+   int sp_bot = tr_y - gap; /* just above the first value */
    int ham_y  = sp_top + (((sp_bot - sp_top) - ham_h) / 2); /* v-centre */
    if (ham_y < sp_top)
       ham_y = sp_top;
@@ -543,7 +556,7 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
                 UI_TEXT_DIM);
    /* The settings hit zone is the WHOLE band right of the number -- from
     * the number's ink edge to the screen edge, from the band top down
-    * through the entire units row -- so it cannot be missed. The number
+    * through the column's first row -- so it cannot be missed. The number
     * keeps its own pixels (they open the DEVICES screen). */
    int hx0 = bx3 + (foot_ink * bigsc3) + sc;
    /* Bounded by THIS COLUMN, not by the whole screen. In landscape the number
@@ -553,13 +566,14 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
     * that looks present and is not. Identical in portrait, where the column IS
     * the screen. */
    int hamslot =
-       add_hit(h, ui_rect(hx0, y, (cx + cw) - hx0, (units_y + (7 * sc)) - y),
+       add_hit(h, ui_rect(hx0, y, (cx + cw) - hx0, (tr_y + (7 * sc)) - y),
                ACT_OPEN_SETTINGS, 0);
    /* ...but the pressed highlight lights the hamburger GLYPH alone (plus a
-    * little breathing room) -- the zone also contains the units label, and
-    * a lit MG/DL would read as if the units were about to change. Through the
-    * slot the band actually got: if it was dropped there is no band to narrow,
-    * and the last box on the list is a different control entirely. */
+    * little breathing room) -- the zone also contains the change beside the
+    * number, and lighting it would read as if the number were a control.
+    * Through the slot the band actually got: if it was dropped there is no band
+    * to narrow, and the last box on the list is a different control entirely.
+    */
    add_glow(h, hamslot,
             ui_rect(ham_x - (2 * sc), ham_y - (2 * sc), ham_w + (4 * sc),
                     ham_h + (4 * sc)));
@@ -1122,7 +1136,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          const int info_y = y + ph + (34 * sc);
          const int limit  = fb->height - (fb->height / 24);
          const int foot   = (((nrows - 1) * 28) + 24) * sc;
-         room = limit - (info_y + (73 * sc) + foot);
+         room             = limit - (info_y + (73 * sc) + foot);
       }
       if (room < 0)
          room = 0;
@@ -1281,6 +1295,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          int src;
          long start;
       } st[16];
+
       int nst = 0;
       for (int i = 0; i < np; i++) {
          const struct ui_point *p = &m->plot.hist[i];
@@ -1350,11 +1365,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    /* ONE configuration, drawn with and then recorded for the touch path.
     * Two compound literals would be two things to keep in step, and the touch
     * path cannot see the scale and span the renderer derived. */
-   struct plot_cfg pcfg = {m->plot.plot_max, prad,
-                           chg_on ? PLOT_CHG_FLOOR : 0};
+   struct plot_cfg pcfg = {m->plot.plot_max, prad, chg_on ? PLOT_CHG_FLOOR : 0};
    plot_render((struct plot_fb){px, fb->stride, fb->width, fb->height},
-               (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, npts, m->now,
-               m->plot.plot_hours, pcfg, white_color,
+               (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, npts,
+               m->now, m->plot.plot_hours, pcfg, white_color,
                scrub ? m->plot.scrub : -1, UI_HILITE, m->tz_off);
 
    /* THE RANGE'S OWN EDGES, NAMED.
@@ -1667,7 +1681,6 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int lh             = 16 * sc; /* row pitch: matches the settings leading */
    const uint32_t col = UI_TEXT_DIM;
 
-
    /* rolling stats table: TIR / AVG / A1C across 1D/3D/7D/30D/90D */
    char tc[5][8];
    char ac[5][8];
@@ -1707,8 +1720,8 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * where they are drawn. The widest is a stats row, 4 + 5*6 + a 6-char
     * unit with each cell up to 15; 96 covers it with room to spare. */
    char tab[4][96];
-   (void)snprintf(tab[0], sizeof tab[0], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "",
-                  "1D", "3D", "7D", "30D", "90D", "");
+   (void)snprintf(tab[0], sizeof tab[0], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "", "1D",
+                  "3D", "7D", "30D", "90D", "");
    (void)snprintf(tab[1], sizeof tab[1], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "TIR",
                   tc[0], tc[1], tc[2], tc[3], tc[4], "%");
    (void)snprintf(tab[2], sizeof tab[2], "%-4s%-5s%-5s%-5s%-5s%-5s%s", "AVG",
@@ -1905,6 +1918,12 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
                       fb, h, bx, pyy - (2 * sc) + (r * rowpitch), bwid, sc,
                       m->food.ex_level, m->food.ex_remaining, EX_SETTLE_S, lbl,
                       UI_TEXT_DIM);
+               /* FOOD LOG carries the day's calorie bar, drawn by the same
+                * function as the ADD menu's copy. */
+               else if (code == MA_FOODLOG_OPEN)
+                  (void)ui_foodlog_button(fb, h, bx,
+                                          pyy - (2 * sc) + (r * rowpitch), bwid,
+                                          sc, m, lbl, UI_TEXT_DIM);
                /* THE SAME BULLET THE ADD MENU DRAWS, off the same test: the
                 * pinned copy of a button and the one in the menu must never
                 * disagree about what they are saying. */

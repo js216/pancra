@@ -167,11 +167,15 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
    add_hit_ix(h, ui_rect(gm, cy, hw, ch), MA_BACKSPACE, 0);
    add_hit_ix(h, ui_rect(gm + hw, cy, hw, ch), MA_OK, 0);
    for (int i = 0; i < n; i++) {
-      int kx      = gm + ((i % UI_LABEL_COLS) * cw);
-      int ky      = y + ((i / UI_LABEL_COLS) * ch);
-      char lbl[2] = {ui_label_chars[i], 0};
-      draw_str(px, fb, kx + ((cw - (6 * ksc)) / 2), ky + ((ch - (7 * ksc)) / 2),
-               ksc, lbl, UI_TEXT);
+      int kx       = gm + ((i % UI_LABEL_COLS) * cw);
+      int ky       = y + ((i / UI_LABEL_COLS) * ch);
+      char lbl[2]  = {ui_label_chars[i], 0};
+      const int lx = kx + ((cw - (6 * ksc)) / 2);
+      const int ly = ky + ((ch - (7 * ksc)) / 2);
+      if (lbl[0] == ' ')
+         draw_icon(px, fb, lx, ly, ksc, icon_space, UI_TEXT);
+      else
+         draw_str(px, fb, lx, ly, ksc, lbl, UI_TEXT);
       add_hit_ix(h, ui_rect(kx, ky, cw, ch), MA_CHAR, i);
    }
    /* DEL and OK share the last row; their targets were recorded above. */

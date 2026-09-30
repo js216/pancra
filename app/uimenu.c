@@ -367,9 +367,10 @@ void render_alarm(struct ANativeWindow_Buffer *fb, const struct screen *m,
    menu_row(fb, h, y, sc, lh, "VIBRATION", m->prefs.nudge_vib ? "ON" : "OFF",
             m->prefs.nudge_vib ? UI_OK : UI_TEXT, MA_NUDGE_VIB, 0);
    y += 2 * lh;
-   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
-            ui_newdata_lbl[(unsigned)m->prefs.newdata_mode % (unsigned)ND_MODE_N],
-            m->prefs.newdata_mode ? UI_OK : UI_TEXT, MA_NEWDATA, 0);
+   menu_row(
+       fb, h, y, sc, lh, "NEW DATAPOINT",
+       ui_newdata_lbl[(unsigned)m->prefs.newdata_mode % (unsigned)ND_MODE_N],
+       m->prefs.newdata_mode ? UI_OK : UI_TEXT, MA_NEWDATA, 0);
 }
 
 /* ---- EXPORT DATA menu (opened from SETTINGS' EXPORT DATA button) ---- */
@@ -1011,8 +1012,12 @@ void render_addmenu(struct ANativeWindow_Buffer *fb, const struct screen *m,
       if (ui_shortcut_sect(i) != SC_SECT_VIEW)
          continue;
       int on = sc_on(m, i);
-      int ny = menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1),
-                           UI_TEXT, ui_shortcut_code(i), 0);
+      /* FOOD LOG carries the day's calorie bar; see ui_foodlog_button. */
+      int ny = ui_shortcut_code(i) == MA_FOODLOG_OPEN
+                   ? ui_foodlog_button(fb, h, x, y, lbw, sc, m,
+                                       ui_shortcut_label(i, 1), UI_TEXT)
+                   : menu_button(fb, h, x, y, lbw, sc, ui_shortcut_label(i, 1),
+                                 UI_TEXT, ui_shortcut_code(i), 0);
       /* cbx and the same target rectangle the LOG boxes use, so the whole
        * PIN column sits on one axis under its header rather than stepping
        * left halfway down the screen. */

@@ -25,6 +25,10 @@ static int g_foodlog_page;
 struct food_draft {
    long t;
    int type; /* a food_type id; FOOD_TYPE_NONE = nothing chosen yet */
+   /* WHAT THE CHOSEN FOOD IS MADE OF, as the form shows it: seeded from the
+    * food whenever one is chosen, and written back to the FOOD, not to this
+    * entry, on CONFIRM -- the numbers are a property of the food (food.h). */
+   int macro[FOOD_NMACRO];
    int g;
    /* DID A PERSON TYPE THAT NUMBER, or did this form suggest it?
     *
@@ -43,7 +47,8 @@ struct food_draft {
    struct food_rec orig;
 };
 static struct food_draft g_food = {
-    0, FOOD_TYPE_NONE, 0, 0, -1, {0, 0, 0}
+    0, FOOD_TYPE_NONE, {0, 0, 0, 0},
+      0, 0, -1, {0, 0, 0}
 };
 
 /* FOOD actions, split out like form_wt_action so menu_action stays small.
@@ -193,19 +198,32 @@ int form_food_action(int action, int ix)
        * not one either -- food_append refuses both, but by then the user is
        * off the screen that could fix it. So the form checks what it can say
        * something useful about and stays put; food_append remains the
-       * authority on the bounds, and its refusal is reported the same way. */
+       * authority on the bounds, and its refusal is reported the same way.
+       *
+       * WHAT THE FOOD IS MADE OF IS WRITTEN FIRST, to the food itself, and
+       * only when it changed. First, because a failure there leaves nothing
+       * written and the form still up: CONFIRM again retries both. The other
+       * order would save the entry, fail the food, and leave a form whose
+       * second CONFIRM appends the entry a second time. */
+      int cur[FOOD_NMACRO];
+      int changed = 0;
+      if (g_food.type != FOOD_TYPE_NONE &&
+          food_type_macros(g_food.type, cur) == 0)
+         for (int k = 0; k < FOOD_NMACRO; k++)
+            if (cur[k] != g_food.macro[k])
+               changed = 1;
       if (g_food.type == FOOD_TYPE_NONE) {
          set_status_refused("CHOOSE A FOOD FIRST");
       } else if (g_food.g < FOOD_MIN_G) {
          set_status_refused("ENTER HOW MANY GRAMS");
+      } else if (changed &&
+                 food_type_set_macros(g_food.type, g_food.macro) != 0) {
+         set_status_refused("FOOD VALUES NOT SAVED");
       } else if (g_food.edit >= 0
                      ? food_update(&g_food.orig, g_food.t, g_food.type,
                                    g_food.g, form_zone(0, g_food.t)) != 0
                      : food_append(g_food.t, g_food.type, g_food.g,
                                    form_zone(0, g_food.t)) != 0) {
-         /* PERSISTENCE FAILED, SO THE FORM STAYS. Navigating away here would
-          * discard a draft whose write did not happen -- the failure items
-          * 136-138 are about, in a form written after them. */
          set_status_refused("FOOD NOT SAVED");
       } else {
          nav_back();
@@ -232,6 +250,14 @@ int form_food_action(int action, int ix)
       nav_back();
    } else if (action == MA_FOODPAGE) {
       g_foodtype_page = ix;
+   } else if (action == MA_FOODGOAL) {
+      /* A goal row on the FOOD LOG: the keypad for that goal, back to the
+       * log on OK or X. */
+      enum keypad_mode mode = kp_goal_field(ix);
+      if (mode != KP_NONE) {
+         nav_go(SCR_KEYPAD);
+         forms_kp_open(mode, SCR_FOODLOG);
+      }
    } else {
       return 0;
    }
@@ -254,7 +280,8 @@ int form_food_action(int action, int ix)
 void forms_food_open(long t)
 {
    g_food = (struct food_draft){
-       t, FOOD_TYPE_NONE, 0, 0, -1, {0, 0, 0}
+       t, FOOD_TYPE_NONE, {0, 0, 0, 0},
+         0, 0, -1, {0, 0, 0}
    };
 }
 
@@ -267,7 +294,8 @@ void forms_food_edit(int i)
    g_food.edit = i;
    g_food.t    = row.t;
    g_food.type = row.type;
-   g_food.g    = (int)row.g;
+   (void)food_type_macros(row.type, g_food.macro);
+   g_food.g = (int)row.g;
    /* THE ROW'S OWN PORTION IS AN ANSWER, not a suggestion: somebody typed it
     * when they logged the meal. Changing the food on an edit therefore leaves
     * it alone, exactly as it does after the user types one. */
@@ -277,6 +305,9 @@ void forms_food_edit(int i)
 void forms_food_type_set(int type_id)
 {
    g_food.type = type_id;
+   /* The food's own numbers, whatever the form showed for the one before:
+    * they belong to the food, so choosing another food shows its. */
+   (void)food_type_macros(type_id, g_food.macro);
    /* SEEDED FROM THE LAST TIME THIS FOOD WAS EATEN. A person eats the same
     * things in the same amounts, and a form that starts at zero asks them to
     * retype a number they have typed before, every time.
@@ -304,6 +335,12 @@ long *form_food_instant(void)
 /* GRAMS, and the flag that says a PERSON typed them. The picker seeds the
  * portion with what this food was last logged with, and a suggestion must
  * never overwrite an answer -- see g_food.g_typed. */
+void form_food_set_macro(int which, int milli)
+{
+   if (which >= 0 && which < FOOD_NMACRO)
+      g_food.macro[which] = milli;
+}
+
 void form_food_set_grams(int grams)
 {
    g_food.g       = grams;
@@ -312,11 +349,13 @@ void form_food_set_grams(int grams)
 
 void form_food_view(struct forms_view *out)
 {
-   out->food_t        = g_food.t;
-   out->food_type     = g_food.type;
-   out->food_g        = g_food.g;
-   out->food_edit     = g_food.edit;
-   out->food_orig     = g_food.orig;
+   out->food_t    = g_food.t;
+   out->food_type = g_food.type;
+   out->food_g    = g_food.g;
+   out->food_edit = g_food.edit;
+   out->food_orig = g_food.orig;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      out->food_macro[k] = g_food.macro[k];
    out->foodtype_page = g_foodtype_page;
    out->foodlog_page  = g_foodlog_page;
 }

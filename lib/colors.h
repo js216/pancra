@@ -51,18 +51,18 @@
 
 /* ---- plot chrome (lib/plot.c and the log plots) ------------------------ */
 /* the 50/max reference lines and the sides */
-#define UI_PLOT_FRAME 0xFF555555U
-#define UI_PLOT_BAND  0xFF262626U /* the in-range shade behind 70-180        */
-#define UI_PLOT_VGRID 0xFF2E2E2EU /* faint vertical gridlines */
-#define UI_PLOT_VTICK 0xFF666666U /* the brighter x tick along the bottom */
-#define UI_PLOT_EDGE  0xFFAAAAAAU /* a point clipped to the top or bottom    */
-#define UI_PLOT_SCRUB 0xFFFFFFFFU /* the full-height rule under the finger */
+#define UI_PLOT_FRAME  0xFF555555U
+#define UI_PLOT_BAND   0xFF262626U /* the in-range shade behind 70-180        */
+#define UI_PLOT_VGRID  0xFF2E2E2EU /* faint vertical gridlines */
+#define UI_PLOT_VTICK  0xFF666666U /* the brighter x tick along the bottom */
+#define UI_PLOT_EDGE   0xFFAAAAAAU /* a point clipped to the top or bottom    */
+#define UI_PLOT_SCRUB  0xFFFFFFFFU /* the full-height rule under the finger */
 #define UI_PLOT_CHANGE 0xFF808080U /* a point-to-point change: a gray cross */
-#define UI_LOG_FRAME  0xFF444444U /* the log plots' border and baseline      */
-#define UI_LOG_GRID   0xFF2A2A2AU /* their horizontal divisions              */
-#define UI_LOG_CURSOR 0xFF666666U /* their scrub rule */
-#define UI_HILITE     0xFFAAAAAAU /* the scrubbed point, greyed out          */
-#define UI_ORPHAN     0xFF8A8AA0U /* pre-registry points: no sensor to credit */
+#define UI_LOG_FRAME   0xFF444444U /* the log plots' border and baseline      */
+#define UI_LOG_GRID    0xFF2A2A2AU /* their horizontal divisions              */
+#define UI_LOG_CURSOR  0xFF666666U /* their scrub rule */
+#define UI_HILITE      0xFFAAAAAAU /* the scrubbed point, greyed out          */
+#define UI_ORPHAN 0xFF8A8AA0U /* pre-registry points: no sensor to credit */
 
 /* ---- markers for the things logged by hand ----------------------------- */
 #define UI_MARK_FOOD 0xFF66DDFFU /* a meal on the glucose plot */
@@ -73,6 +73,9 @@
 #define UI_BAR_AGE    0xFF444444U /* the track the reading-age bar runs in   */
 #define UI_BAR_STREAK 0xFF333333U /* the track under the in-range streak */
 #define UI_BAR_FILL   0xFF9A9A9AU /* how much of that streak has been run    */
+#define UI_FOOD_TRACK 0xFF303030U /* a day's total's bar, unfilled */
+#define UI_FOOD_FILL  0xFF55AA55U /* how much of the goal has been eaten */
+#define UI_FOOD_OVER  0xFF3399E6U /* ...and past it: amber */
 
 /* ---- sync and status --------------------------------------------------- */
 #define UI_SYNC_STALE 0xFFAA8844U /* pushed, but not lately */

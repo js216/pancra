@@ -221,8 +221,7 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * are, so this figure and the last bar of a day-bucketed tab are the same
     * arithmetic over the same rows. */
    if (!m->food.steps_on) {
-      draw_str(px, fb, x, y, sc, "STEP COUNT OFF, PRESS HERE TO ENABLE",
-               UI_MUTED);
+      draw_str(px, fb, x, y, sc, "STEPS OFF, PRESS HERE TO ENABLE", UI_MUTED);
       add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh + (3 * sc)),
                  MA_STEPS_TOGGLE, 0);
    } else {
@@ -243,20 +242,19 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, x, y, sc, "NOTHING LOGGED YET.", UI_MUTED);
       return;
    }
-   /* THREE COLUMNS, and the header spaces them to where the rows put them:
-    * the instant is 16 characters, the level word and its number take 11 with
-    * the padding below, and the length follows. */
-   /* THE SCREEN IS SPLIT: table above, minutes-per-day below, laid out from
-    * the bottom exactly as the weight log's is -- the plot takes a fixed
-    * share and the table gets what is left, so neither can crowd the other
-    * out on a tall or a short screen. The system gesture bar is reserved for
-    * the same reason it is there: this screen reaches the bottom edge. */
-   int sysbar   = fb->height / 24;
-   int plot_h   = (fb->height * 2) / 5;
-   int tabs_h   = 2 * lh;
-   int plot_top = fb->height - plot_h - sysbar;
-   int tabs_y   = plot_top - tabs_h;
-   int nav_y    = tabs_y - (2 * lh) - (6 * sc);
+   /* THE MINUTES-PER-DAY PLOT ON TOP, THE TABLE BELOW IT: see
+    * log_split_of. The plot is a fixed two fifths of the screen, as the
+    * weight log's is, so neither can crowd the other out on a tall or a
+    * short screen. */
+   int tabs_h = 2 * lh;
+   int plot_h = (fb->height * 2) / 5;
+   struct log_split sp;
+   log_split_of(fb->height, y, sc, tabs_h, plot_h, &sp);
+   int plot_top = sp.plot_top;
+   int tabs_y   = sp.tabs_y;
+   tabs_h       = plot_top - tabs_y; /* the target, clipped to hit_top */
+   int nav_y    = sp.nav_y;
+   y            = sp.hdr_y;
 
    /* THREE COLUMNS, and the header spaces them to where the rows put them:
     * the instant is 16 characters, the level word and its number take 11 with

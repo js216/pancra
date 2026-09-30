@@ -596,6 +596,68 @@ int kp_commit_number(void)
          g_kp.len = 0;
          keypad_close();
       }
+   } else if (kp_food_macro(g_kp.mode) >= 0) { /* "0.454", "3.89" */
+      if (g_kp.len > 0) {
+         /* A FRACTION OF THE FOOD'S WEIGHT, or kcal per gram: at most three
+          * decimal places, like an insulin dose, and refused -- not clamped
+          * -- when outside what food.h stores. */
+         const int k = kp_food_macro(g_kp.mode);
+         long v      = 0;
+         int scale   = 0;
+         int dot     = 0;
+         int bad     = 0;
+         for (int i = 0; i < g_kp.len; i++) {
+            char ch = g_kp.entry[i];
+            if (ch == '.') {
+               if (dot)
+                  bad = 1;
+               dot = 1;
+            } else if (!dot || scale < 3) {
+               v = (v * 10) + (ch - '0');
+               if (dot)
+                  scale++;
+            } else {
+               bad = 1; /* a fourth decimal place */
+            }
+         }
+         while (scale++ < 3)
+            v *= 10;
+         if (bad || v > 0x7fffffffL || !food_macro_ok(k, (int)v)) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "%s",
+                           k == FOOD_KCAL ? "KCAL/G MUST BE 0..9.999"
+                                          : "MUST BE 0..1");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         form_food_set_macro(k, (int)v);
+         g_kp.len = 0;
+         keypad_close();
+      }
+   } else if (kp_food_goal(g_kp.mode) >= 0) { /* whole grams, or kcal */
+      if (g_kp.len > 0) {
+         const int k = kp_food_goal(g_kp.mode);
+         long v      = 0;
+         for (int i = 0; i < g_kp.len; i++)
+            v = (v * 10) + (g_kp.entry[i] - '0');
+         if (!food_goal_ok(k, (int)v)) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "%s",
+                           k == FOOD_KCAL ? "GOAL MUST BE 0..9999"
+                                          : "GOAL MUST BE 1..999");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         /* THE ONE WRITE, and a refusal stays on the keypad: the goal is what
+          * it was, and the number typed is still the one to try again. */
+         if (food_goal_set(k, (int)v) != 0) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "GOAL NOT SAVED");
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         g_kp.len = 0;
+         keypad_close();
+      }
    } else if (g_kp.mode == KP_EX_DUR) { /* whole minutes, no decimal point */
       if (g_kp.len > 0) {
          long v = 0;
@@ -715,8 +777,8 @@ int kp_commit_number(void)
              * units, i.e. "0.001..99". */
             char lo[16];
             (void)ins_units_str(INS_MILLI_MIN, lo, sizeof lo);
-            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE %s..%d", lo,
-                           INS_UNITS_MAX);
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "UNITS MUST BE %s..%d",
+                           lo, INS_UNITS_MAX);
             g_kp.len = 0;
             shell_ui_dirty();
             return COMMIT_STAY; /* stay: cleared entry is the refusal */

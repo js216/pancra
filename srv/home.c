@@ -139,6 +139,7 @@ static int newest_reading(struct db *d, int64_t owner, int64_t *out_t,
       int64_t t, glu;
       int src;
    } cgm[400];
+
    int ncgm = 0;
    int nsrc = 0;
    *out_t = *out_glu = 0;
@@ -251,6 +252,148 @@ static int load_recent(struct db *d, int64_t owner, int64_t today,
    int ok = (n >= cap) || db_finished(rc);
    sqlite3_finalize(st);
    return ok ? n : -1;
+}
+
+/* ---- the dose log, replayed ----
+ *
+ * The log is append-only ASSERTIONS (see pancra's insulin.h): each row
+ * names a dose by id, and a later row for the same id corrects or retracts
+ * it. So the file is replayed rather than read -- last assertion per id
+ * wins, del removes -- which is also why an edit made today can change what
+ * a row from March says. */
+struct dose {
+   int64_t id, t;
+   int type, milli; /* thousandths of a unit: see insrow.h */
+};
+
+/* HOW LONG AGO, as the phone's insulin log says it -- "45m", "1h30" --
+ * in this site's lower case. Capped at 99h59, which no caller reaches: they
+ * show the last day. */
+static void ago_hm(int64_t secs, char *out, size_t n)
+{
+   const int64_t cap = (99L * 3600) + (59L * 60);
+   if (secs < 0)
+      secs = 0;
+   if (secs > cap)
+      secs = cap;
+   const int64_t mins = secs / 60;
+   if (mins < 60)
+      snprintf(out, n, "%" PRIwire "m", mins);
+   else
+      snprintf(out, n, "%" PRIwire "h%02" PRIwire, mins / 60, mins % 60);
+}
+
+/* THE LIVE DOSES, newest first, into a malloc'd array the caller frees:
+ * the count, or -1 when the replay could not be completed in memory. A log
+ * that could not be read counts as an empty one. */
+static int load_doses(struct db *db, int64_t owner, struct dose **out)
+{
+   /* NO LIFETIME CEILING. With a `static struct dose d[4096]` the replay
+    * below simply SKIPS a dose once it is full -- so an account with more
+    * than 4096 live doses (four a day is eleven years, and a pump user
+    * reaches it far sooner) quietly stops showing the newest
+    * ones, on a page that presented itself as the whole log. The array grows
+    * instead, and the one thing that can still stop it -- the allocator
+    * saying no -- is answered with an error rather than a short list. */
+   struct dose *d = 0;
+   int nd = 0, cap = 0, oom = 0;
+
+   sqlite3_stmt *st = db_prep(db, "SELECT line FROM logrow WHERE user_id=?"
+                                  " AND log='insulin' ORDER BY bucket, line");
+   if (st) {
+      sqlite3_bind_int64(st, 1, owner);
+      int64_t legacy = 0;
+      int irc;
+      while ((irc = sqlite3_step(st)) == SQLITE_ROW) {
+         const char *ln = (const char *)sqlite3_column_text(st, 0);
+         if (!ln || *ln < '0' || *ln > '9')
+            continue;
+         /* ---- ONE DECODER, THE PHONE'S ---------------------
+          *
+          * A hand-written clone of app/insulin.c's reader -- same dialect
+          * select, same field order, same negative ids for the legacy rows --
+          * drifts from it in ways that change what a reader is shown:
+          *
+          *   strtoll takes a numeric PREFIX, so "12abc" is 12 and "abc" is
+          *   0, while the phone requires a field to be exactly a number;
+          *
+          *   treating every nonzero `del` as a retraction where the phone
+          *   accepts only 1 makes a row with del=2 a live dose on one screen
+          *   and a retracted one on the other.
+          *
+          * A viewer of a medical record must not invent entries its own
+          * writer would not accept, and must not disagree with the device
+          * about what was injected. lib/insrow.c is the one reader, and the
+          * ranges live there with it. */
+         struct ins_row row;
+         if (!ins_row_decode(ln, ln + strlen(ln), -(legacy + 1), &row))
+            continue;
+         if (row.id < 0)
+            legacy++; /* the four-field dialect: ids by file order */
+         int64_t id = row.id;
+         int del    = row.del;
+         int64_t t  = row.t;
+         int type   = row.type;
+         int milli  = row.milli;
+         int at     = -1;
+         for (int i = 0; i < nd; i++)
+            if (d[i].id == id) {
+               at = i;
+               break;
+            }
+         if (del) {
+            if (at >= 0) {
+               for (int i = at + 1; i < nd; i++)
+                  d[i - 1] = d[i];
+               nd--;
+            }
+            continue;
+         }
+         if (at < 0) {
+            if (nd == cap) {
+               /* Doubling, from a page's worth: the same policy sb uses, for
+                * the same reason -- a log with years in it must not be
+                * quadratic to replay. */
+               int ncap        = cap ? cap * 2 : 256;
+               struct dose *nx = realloc(d, (size_t)ncap * sizeof *d);
+               if (!nx) {
+                  oom = 1;
+                  break;
+               }
+               d   = nx;
+               cap = ncap;
+            }
+            at = nd++;
+         }
+         d[at].id    = id;
+         d[at].t     = t;
+         d[at].type  = type;
+         d[at].milli = milli;
+      }
+      if (!db_finished(irc) && !oom)
+         nd = 0; /* an incomplete dose list is not a dose list */
+      sqlite3_finalize(st);
+   }
+   /* THE ONE REMAINING TRUNCATION, SAID OUT LOUD. A partial medical record
+    * rendered as a complete one is the failure this whole item is about, so
+    * the caller produces no page at all. */
+   if (oom) {
+      free(d);
+      return -1;
+   }
+
+   /* newest first, like every other list here */
+   for (int i = 1; i < nd; i++) {
+      struct dose tmp = d[i];
+      int j           = i - 1;
+      while (j >= 0 && d[j].t < tmp.t) {
+         d[j + 1] = d[j];
+         j--;
+      }
+      d[j + 1] = tmp;
+   }
+   *out = d;
+   return nd;
 }
 
 void h_home(struct req *r, int64_t me, const char *cookie)
@@ -374,10 +517,10 @@ void h_home(struct req *r, int64_t me, const char *cookie)
     * not it is fresh: with a fresh value it says how current it is, and when
     * stale it says since when. */
    char big[16] = "---";
-   char chg[24]  = "";
+   char chg[24] = "";
    char stamp[40];
    snprintf(stamp, sizeof stamp, "%s", "-");
-   char title[64];
+   char title[96];
    snprintf(title, sizeof title, "Pancra");
    if (newest_t > 0) {
       stamp_local(newest_t, tz, stamp, sizeof stamp);
@@ -386,10 +529,13 @@ void h_home(struct req *r, int64_t me, const char *cookie)
          if (have_chg)
             snprintf(chg, sizeof chg, "(%+" PRIwire ")", chg_glu);
       }
-      /* "HH:MM value", so a pinned tab is a glanceable readout -- and the
-       * value blanks with the big number, so the tab can never show a
-       * reading the page itself refuses to. */
-      snprintf(title, sizeof title, "%s %s", stamp + 11, big);
+      /* "HH:MM value (+change)", so a pinned tab is a glanceable readout --
+       * and the value and the change blank with the big number, so the tab
+       * can never show a reading the page itself refuses to. */
+      if (chg[0])
+         snprintf(title, sizeof title, "%s %s %s", stamp + 11, big, chg);
+      else
+         snprintf(title, sizeof title, "%s %s", stamp + 11, big);
    }
    sb_add(&s, "<div>%s</div>\n", stamp);
    /* THE CHANGE SITS TO THE RIGHT OF THE NUMBER, a third of its size, on
@@ -403,9 +549,44 @@ void h_home(struct req *r, int64_t me, const char *cookie)
           "<div style=\"display:flex;flex-wrap:wrap;align-items:baseline;"
           "column-gap:.5em\">"
           "<div style=\"font-size:10em\">%s</div>"
-          "<div style=\"font-size:3em\">%s</div></div></a>\n"
-          "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">\n",
+          "<div style=\"font-size:3em\">%s</div></div></a>\n",
           big, chg);
+
+   /* THE LAST DAY'S DOSES, under the number and headed like the readings'
+    * days, one per line: date and time, units, kind, and how long ago --
+    * 30 characters, inside the 31 the readings' font is sized to fit. The
+    * whole log is one tap further, on the units page. */
+   {
+      struct dose *d = 0;
+      int nd         = load_doses(r->db, owner, &d);
+      if (nd < 0) {
+         sb_free(&s);
+         oops(r);
+         return;
+      }
+      sb_add(&s, "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">"
+                 "\n<b>Units</b>\n");
+      int shown = 0;
+      for (int i = 0; i < nd; i++) {
+         if (d[i].t > now || d[i].t <= now - 86400)
+            continue;
+         char when[40];
+         stamp_local(d[i].t, tz, when, sizeof when);
+         char iu[16];
+         (void)ins_units_str(d[i].milli, iu, sizeof iu);
+         char ago[16];
+         ago_hm(now - d[i].t, ago, sizeof ago);
+         sb_add(&s, "%s %5s  %s  %5s\n", when + 5, iu,
+                d[i].type == 1 ? "fast" : "slow", ago);
+         shown++;
+      }
+      if (!shown)
+         sb_add(&s, "(none in the last 24 h)\n");
+      sb_add(&s, "<a href=\"/units%s\">More ...</a>\n</pre>\n", r->who);
+      free(d);
+   }
+
+   sb_add(&s, "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">\n");
 
    static char pre[48 * 1024];
    size_t k = 0;
@@ -476,10 +657,8 @@ void h_home(struct req *r, int64_t me, const char *cookie)
    sb_raw(&s, pre, k);
    sb_add(&s,
           "</pre>\n"
-          "<a href=\"/units%s\">Units ...</a>\n"
-          "<br>\n"
           "<a href=\"/plots%s\">Plots ...</a>\n",
-          r->who, r->who);
+          r->who);
    if (foot_attr) {
       char esc[300] = {0};
       html_esc(esc, sizeof esc, owneremail);
@@ -548,129 +727,18 @@ void h_home(struct req *r, int64_t me, const char *cookie)
    sb_free(&s);
 }
 
-/* ---- the dose log: raw records, newest first, and nothing else ----
+/* ---- the dose log page: raw records, newest first, and nothing else ----
  *
  * Deliberately plain, like the single-user version: a table of what was
- * entered, in the order it happened. No plot, no totals.
- *
- * The log is append-only ASSERTIONS now (see pancra's insulin.h): each row
- * names a dose by id, and a later row for the same id corrects or retracts
- * it. So the file is replayed rather than read -- last assertion per id
- * wins, del removes -- which is also why an edit made today can change what
- * a row from March says. */
-struct dose {
-   int64_t id, t;
-   int type, milli; /* thousandths of a unit: see insrow.h */
-};
-
+ * entered, in the order it happened. No plot, no totals. */
 void h_units(struct req *r, int64_t owner)
 {
-   int tz = tz_of(r->db, owner);
-   /* NO LIFETIME CEILING. With a `static struct dose d[4096]` the replay
-    * below simply SKIPS a dose once it is full -- so an account with more
-    * than 4096 live doses (four a day is eleven years, and a pump user
-    * reaches it far sooner) quietly stops showing the newest
-    * ones, on a page that presented itself as the whole log. The array grows
-    * instead, and the one thing that can still stop it -- the allocator
-    * saying no -- is answered with an error rather than a short list. */
+   int tz         = tz_of(r->db, owner);
    struct dose *d = 0;
-   int nd = 0, cap = 0, oom = 0;
-
-   sqlite3_stmt *st =
-       db_prep(r->db, "SELECT line FROM logrow WHERE user_id=?"
-                      " AND log='insulin' ORDER BY bucket, line");
-   if (st) {
-      sqlite3_bind_int64(st, 1, owner);
-      int64_t legacy = 0;
-      int irc;
-      while ((irc = sqlite3_step(st)) == SQLITE_ROW) {
-         const char *ln = (const char *)sqlite3_column_text(st, 0);
-         if (!ln || *ln < '0' || *ln > '9')
-            continue;
-         /* ---- ONE DECODER, THE PHONE'S ---------------------
-          *
-          * A hand-written clone of app/insulin.c's reader -- same dialect
-          * select, same field order, same negative ids for the legacy rows --
-          * drifts from it in ways that change what a reader is shown:
-          *
-          *   strtoll takes a numeric PREFIX, so "12abc" is 12 and "abc" is
-          *   0, while the phone requires a field to be exactly a number;
-          *
-          *   treating every nonzero `del` as a retraction where the phone
-          *   accepts only 1 makes a row with del=2 a live dose on one screen
-          *   and a retracted one on the other.
-          *
-          * A viewer of a medical record must not invent entries its own
-          * writer would not accept, and must not disagree with the device
-          * about what was injected. lib/insrow.c is the one reader, and the
-          * ranges live there with it. */
-         struct ins_row row;
-         if (!ins_row_decode(ln, ln + strlen(ln), -(legacy + 1), &row))
-            continue;
-         if (row.id < 0)
-            legacy++; /* the four-field dialect: ids by file order */
-         int64_t id = row.id;
-         int del    = row.del;
-         int64_t t  = row.t;
-         int type   = row.type;
-         int milli  = row.milli;
-         int at     = -1;
-         for (int i = 0; i < nd; i++)
-            if (d[i].id == id) {
-               at = i;
-               break;
-            }
-         if (del) {
-            if (at >= 0) {
-               for (int i = at + 1; i < nd; i++)
-                  d[i - 1] = d[i];
-               nd--;
-            }
-            continue;
-         }
-         if (at < 0) {
-            if (nd == cap) {
-               /* Doubling, from a page's worth: the same policy sb uses, for
-                * the same reason -- a log with years in it must not be
-                * quadratic to replay. */
-               int ncap        = cap ? cap * 2 : 256;
-               struct dose *nx = realloc(d, (size_t)ncap * sizeof *d);
-               if (!nx) {
-                  oom = 1;
-                  break;
-               }
-               d   = nx;
-               cap = ncap;
-            }
-            at = nd++;
-         }
-         d[at].id    = id;
-         d[at].t     = t;
-         d[at].type  = type;
-         d[at].milli = milli;
-      }
-      if (!db_finished(irc) && !oom)
-         nd = 0; /* an incomplete dose list is not a dose list */
-      sqlite3_finalize(st);
-   }
-   /* THE ONE REMAINING TRUNCATION, SAID OUT LOUD. A partial medical record
-    * rendered as a complete one is the failure this whole item is about, so
-    * the page is not produced at all. */
-   if (oom) {
-      free(d);
+   int nd         = load_doses(r->db, owner, &d);
+   if (nd < 0) {
       oops(r);
       return;
-   }
-
-   /* newest first, like every other list here */
-   for (int i = 1; i < nd; i++) {
-      struct dose tmp = d[i];
-      int j           = i - 1;
-      while (j >= 0 && d[j].t < tmp.t) {
-         d[j + 1] = d[j];
-         j--;
-      }
-      d[j + 1] = tmp;
    }
 
    struct sb s = {0};

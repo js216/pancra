@@ -98,7 +98,17 @@ enum keypad_mode {
    KP_EX_TIME = 23,
    KP_EX_YEAR = 24,
    KP_EX_DUR  = 25,
-   KP_NMODES  = 26
+   /* What a food is made of (food.h), on the LOG/EDIT FOOD form. */
+   KP_FOOD_CARBS = 26,
+   KP_FOOD_PROT  = 27,
+   KP_FOOD_FAT   = 28,
+   KP_FOOD_KCAL  = 29,
+   /* The day's goals, from the FOOD LOG. */
+   KP_GOAL_CARBS = 30,
+   KP_GOAL_PROT  = 31,
+   KP_GOAL_FAT   = 32,
+   KP_GOAL_KCAL  = 33,
+   KP_NMODES     = 34
 };
 
 /* WHICH UNIT THE ENTRY CARRIES -- a name, not a yes/no.
@@ -214,6 +224,11 @@ int kp_is_year(enum keypad_mode mode);
  * (Row 0 of the form is TYPE, which opens the picker rather than a keypad, so
  * the dispatcher maps it before reaching here.) */
 enum keypad_mode kp_food_field(int ix);
+/* The FOOD LOG's goal rows, indexed like food.h's macros (FOOD_CARBS...). */
+enum keypad_mode kp_goal_field(int ix);
+/* Which food.h macro index a macro or goal mode edits, or -1. */
+int kp_food_macro(enum keypad_mode mode);
+int kp_food_goal(enum keypad_mode mode);
 /* The EDIT EXERCISE form's rows, minus the LEVEL row the caller handles
  * itself: 0 time, 1 date, 2 year. KP_NONE for anything else. */
 enum keypad_mode kp_ex_field(int ix);

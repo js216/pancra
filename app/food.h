@@ -78,10 +78,36 @@
 /* The id a type never has. Entries carrying it are damage. */
 #define FOOD_TYPE_NONE 0
 
+/* ---- WHAT A FOOD IS MADE OF --------------------------------------------
+ *
+ * PER GRAM OF THE FOOD, and a property of the FOOD, not of any one entry:
+ * PORRIDGE is 0.12 carbohydrate whichever morning it was eaten, so changing
+ * it changes it for every entry that names PORRIDGE, past ones included. That
+ * is why the numbers live on the type, in foodtypes.csv, and an entry is still
+ * only "when, which food, how many grams".
+ *
+ * THOUSANDTHS, like an insulin dose (insrow.h): the fractions are written as a
+ * person writes them, "0.454", and a value that has to round-trip through a
+ * text file exactly cannot be a binary float. Carbohydrate, protein and fat
+ * are fractions of the food's weight, 0..1; energy is kcal per gram, 0..9.999
+ * -- pure fat is about 9, the most a food can be. A new food is all zeros
+ * until somebody says otherwise. */
+enum { FOOD_CARBS, FOOD_PROTEIN, FOOD_FAT, FOOD_KCAL, FOOD_NMACRO };
+
+#define FOOD_FRAC_MAX 1000 /* a fraction's thousandths: 1.000, all of it */
+#define FOOD_KCAL_MAX 9999 /* kcal per gram, thousandths: 9.999 */
+
 struct food_type {
    int id; /* >= 1, assigned in arrival order and never reused */
    char name[FOOD_NAME_MAX + 1];
+   int macro[FOOD_NMACRO]; /* thousandths, see above */
 };
+
+/* 1 when `milli` is a value macro `which` can hold. */
+int food_macro_ok(int which, int milli);
+/* A thousandths value as a person writes it -- "0.454", "0.5", "0" -- the
+ * form both foodtypes.csv and the screens use. Returns the length written. */
+int food_milli_str(int milli, char *out, int cap);
 
 struct food_rec {
    long t;   /* entry instant, epoch seconds */
@@ -144,6 +170,35 @@ int food_type_copy(struct food_type *out, int cap);
  * the oldest. */
 int food_type_add(const char *name);
 
+/* Set what food `id` is made of, for every entry that names it. Rewrites the
+ * food's row in foodtypes.csv (rewrite-and-rename: a crash never truncates
+ * the vocabulary). 0 on success, -1 on an unknown id, a value out of range or
+ * a write that failed -- and then nothing has changed. */
+int food_type_set_macros(int id, const int macro[FOOD_NMACRO]);
+/* What food `id` is made of, into `out`: 0, or -1 (and zeros) for an id the
+ * vocabulary does not have. */
+int food_type_macros(int id, int out[FOOD_NMACRO]);
+
+/* ---- THE DAY'S GOALS --------------------------------------------------
+ *
+ * What the FOOD LOG measures a day's eating against: whole kcal and whole
+ * grams of carbohydrate, protein and fat, indexed like the macros. A PERSON'S
+ * numbers rather than a device's, so they sync (foodgoals.csv) and come back
+ * with a restore. Until they are set they are the reference daily values
+ * printed on food labels: 2000 kcal, 275 g carbohydrate, 50 g protein, 78 g
+ * fat. */
+#define FOOD_GOAL_KCAL_MAX 9999 /* kcal a day */
+#define FOOD_GOAL_G_MAX    999  /* grams a day */
+/* 1 when `v` is a goal `which` can hold: 1..the maximum above, and for kcal
+ * also 0, which means no calorie goal is set -- the FOOD LOG buttons then
+ * carry no calorie bar. */
+int food_goal_ok(int which, int v);
+void food_goals_get(int out[FOOD_NMACRO]);
+/* Set one goal, durably. 0 on success, -1 when out of range or not written --
+ * and then the goal is what it was. */
+int food_goal_set(int which, int v);
+const char *food_goals_path(void);
+
 /* ---- the entries ---- */
 
 int food_count(void);
@@ -169,12 +224,12 @@ int food_copy(struct food_rec *out, int cap);
 
 const char *food_path(void);
 const char *food_types_path(void);
-/* Point both files at the data directory. 1 when EVERY path fitted, 0 when one
- * did not -- and then none of them is usable, see data_path in util.h. */
+/* Point the three files at the data directory. 1 when EVERY path fitted, 0 when
+ * one did not -- and then none of them is usable, see data_path in util.h. */
 int food_paths(const char *dir);
 
-/* Load both files. 0 read whole (or nothing to read), -1 what was loaded is
- * INCOMPLETE -- weight_load carries the full argument for why those are
+/* Load the three files. 0 read whole (or nothing to read), -1 what was loaded
+ * is INCOMPLETE -- weight_load carries the full argument for why those are
  * different answers and why a prefix is kept rather than discarded.
  *
  * THE VOCABULARY LOADS FIRST, because an entry naming a type is only checkable

@@ -226,6 +226,7 @@ struct forms_view {
    int food_type; /* the chosen type ID, not an index: see ui_foodview */
    int food_g, food_edit;
    struct food_rec food_orig;
+   int food_macro[FOOD_NMACRO]; /* what the chosen food is made of */
    /* The EDIT EXERCISE draft: the instant and level it holds, whether it is
     * open at all (`ex_edit` < 0 = not), and the row it is correcting. */
    long ex_t;

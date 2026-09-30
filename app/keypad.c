@@ -62,6 +62,19 @@ static const struct kp_info g_modes[KP_NMODES] = {
      * session nobody timed to the second is not one anybody types that way. */
     [KP_EX_DUR]    = {"MINUTES",      5, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_FOOD_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    /* WHAT A FOOD IS MADE OF: a fraction of its weight, "0.454", or kcal per
+     * gram, "3.89". Five slots hold a digit, the point and three decimals,
+     * which is every value food.h stores. */
+    [KP_FOOD_CARBS] = {"CARBS",        5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_PROT]  = {"PROTEIN",      5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_FAT]   = {"FAT",          5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_KCAL]  = {"KCAL/G",       5, 0, KP_UNIT_NONE, 1, 0, 0},
+    /* THE DAY'S GOALS, whole numbers: grams in three slots, kcal in four --
+     * exactly food.h's ceilings. */
+    [KP_GOAL_CARBS] = {"CARBS GOAL",   3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_PROT]  = {"PROTEIN GOAL", 3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_FAT]   = {"FAT GOAL",     3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_KCAL]  = {"KCAL GOAL",    4, 0, KP_UNIT_NONE, 0, 0, 0},
 };
 
 /* A mode this build does not define draws nothing and takes nothing. NOT the
@@ -128,7 +141,11 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_FOOD_G:
       case KP_FOOD_DATE:
       case KP_FOOD_TIME:
-      case KP_FOOD_YEAR: return KP_FORM_FOOD;
+      case KP_FOOD_YEAR:
+      case KP_FOOD_CARBS:
+      case KP_FOOD_PROT:
+      case KP_FOOD_FAT:
+      case KP_FOOD_KCAL: return KP_FORM_FOOD;
       case KP_EX_DATE:
       case KP_EX_TIME:
       case KP_EX_YEAR:
@@ -146,6 +163,10 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_NUDGE_LOW:
       case KP_NUDGE_HIGH:
       case KP_SYNC_CODE:
+      case KP_GOAL_CARBS:
+      case KP_GOAL_PROT:
+      case KP_GOAL_FAT:
+      case KP_GOAL_KCAL:
       case KP_NMODES: return KP_FORM_NONE;
    }
    return KP_FORM_NONE;
@@ -173,9 +194,11 @@ int kp_is_year(enum keypad_mode mode)
 
 enum keypad_mode kp_food_field(int ix)
 {
-   /* ITS OWN calendar fields, like the weight form's: see keypad.h. */
-   static const enum keypad_mode f[] = {KP_FOOD_G, KP_FOOD_TIME, KP_FOOD_DATE,
-                                        KP_FOOD_YEAR};
+   /* ITS OWN calendar fields, like the weight form's: see keypad.h. Then what
+    * the food is made of, in the order the form lists them. */
+   static const enum keypad_mode f[] = {
+       KP_FOOD_G,     KP_FOOD_TIME, KP_FOOD_DATE, KP_FOOD_YEAR,
+       KP_FOOD_CARBS, KP_FOOD_PROT, KP_FOOD_FAT,  KP_FOOD_KCAL};
 
    if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
       return KP_NONE;
@@ -213,4 +236,32 @@ int kp_has_dot(enum keypad_mode mode, int mmol_units)
     * whole numbers, mmol/L is "5.5". A weight always does. As two
     * expressions in two files, the two disagree. */
    return k->dot_always || (k->thresh && mmol_units);
+}
+
+enum keypad_mode kp_goal_field(int ix)
+{
+   /* Indexed like food.h's macros: FOOD_CARBS, FOOD_PROTEIN, FOOD_FAT,
+    * FOOD_KCAL. */
+   static const enum keypad_mode f[] = {KP_GOAL_CARBS, KP_GOAL_PROT,
+                                        KP_GOAL_FAT, KP_GOAL_KCAL};
+
+   if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
+      return KP_NONE;
+   return f[ix];
+}
+
+int kp_food_macro(enum keypad_mode mode)
+{
+   for (int k = 0; k < 4; k++)
+      if (kp_food_field(4 + k) == mode)
+         return k;
+   return -1;
+}
+
+int kp_food_goal(enum keypad_mode mode)
+{
+   for (int k = 0; k < 4; k++)
+      if (kp_goal_field(k) == mode)
+         return k;
+   return -1;
 }

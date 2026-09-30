@@ -92,6 +92,9 @@ int form_wt_take_tenths(int tenths);
  * assignment that follows. */
 void form_ins_set_units(int milli);
 void form_food_set_grams(int grams);
+/* What the chosen food is made of, as the form shows it: food.h's macro
+ * index and thousandths. Written to the food on CONFIRM. */
+void form_food_set_macro(int which, int milli);
 
 /* This workflow's part of the frame's snapshot. Each fills only its own
  * fields, so a field can be traced to exactly one writer. */

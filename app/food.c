@@ -9,6 +9,8 @@
 
 #include "csvcur.h" /* the shared CSV cursor; the grammar stays here */
 #include "dexlibc.h"
+#include "insrow.h" /* ins_units_str: thousandths as a person writes them */
+#include "loadresult.h"
 #include "log.h"    /* LOGW: an edit that landed but could not be re-read */
 #include "thread.h" /* food_lk: the log is published, not filled in place */
 #include "util.h"
@@ -63,8 +65,60 @@ static struct mutex food_lk = MUTEX_INIT;
 
 static char g_food_path[256];
 static char g_ftype_path[256];
-static const char g_food_hdr[]  = "# unix_time,type_id,grams,tz_offset_s\n";
-static const char g_ftype_hdr[] = "# type_id,name\n";
+static const char g_food_hdr[] = "# unix_time,type_id,grams,tz_offset_s\n";
+static const char g_ftype_hdr[] =
+    "# type_id,name,carbs,protein,fat,kcal_per_g\n";
+static char g_goal_path[256];
+
+/* THE GOALS, under food_lk like the rest of this module's state: the frame
+ * reads them on the main thread and a restore reloads them on the sync
+ * worker. */
+static int g_goals[FOOD_NMACRO] = {275, 50, 78, 2000};
+
+int food_macro_ok(int which, int milli)
+{
+   if (which < 0 || which >= FOOD_NMACRO || milli < 0)
+      return 0;
+   return milli <= (which == FOOD_KCAL ? FOOD_KCAL_MAX : FOOD_FRAC_MAX);
+}
+
+int food_milli_str(int milli, char *out, int cap)
+{
+   /* insrow.h's formatter is a thousandths formatter that happens to live
+    * with the insulin record: a dose is written the same way. */
+   return ins_units_str(milli, out, cap);
+}
+
+/* "0.454" -> 454: digits, then at most one '.' and three more. Anything else
+ * -- a sign, a fourth decimal, a stray character, nothing at all -- is not a
+ * value this file writes. 1 on success. */
+static int milli_parse(const char *s, int *out)
+{
+   long v    = 0;
+   int nd    = 0;
+   int dot   = 0;
+   int scale = 0;
+   for (; *s; s++) {
+      if (*s == '.' && !dot) {
+         dot = 1;
+      } else if (*s >= '0' && *s <= '9' && (!dot || scale < 3) && nd < 9) {
+         v = (v * 10) + (*s - '0');
+         nd++;
+         if (dot)
+            scale++;
+      } else {
+         return 0;
+      }
+   }
+   if (nd == 0)
+      return 0;
+   while (scale++ < 3)
+      v *= 10;
+   if (v > 0x7fffffffL)
+      return 0;
+   *out = (int)v;
+   return 1;
+}
 
 /* ---------------- the vocabulary ---------------- */
 
@@ -157,8 +211,11 @@ static int order_at(int i)
 
 struct food_type food_type_at(int i)
 {
-   struct food_type z = {0, {0}};
-   const int r        = order_at(i);
+   struct food_type z = {
+       0, {0},
+        {0, 0, 0, 0}
+   };
+   const int r = order_at(i);
    if (r < 0)
       return z;
    return g_ft[r];
@@ -191,7 +248,11 @@ int food_type_copy(struct food_type *out, int cap)
    int n = g_nft < cap ? g_nft : cap;
    for (int i = 0; i < n; i++) {
       const int r = order_at(i);
-      out[i]      = (r >= 0) ? g_ft[r] : (struct food_type){0, {0}};
+      out[i]      = (r >= 0) ? g_ft[r]
+                             : (struct food_type){
+                                   0, {0},
+                                    {0, 0, 0, 0}
+      };
    }
    mutex_unlock(&food_lk);
    return n;
@@ -263,12 +324,15 @@ static int name_ok(const char *n)
 /* Take a type into memory. Used by the loader and by food_type_add, so the
  * id bookkeeping has one home: g_next_id must always be past every id in the
  * table, or a load followed by an add would mint an id that already exists. */
-static int ft_take_in(struct food_state *s, int id, const char *name)
+static int ft_take_in(struct food_state *s, int id, const char *name,
+                      const int macro[FOOD_NMACRO])
 {
    if (s->nft >= NFOODTYPE)
       return -1;
    s->ft[s->nft].id = id;
-   int i            = 0;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      s->ft[s->nft].macro[k] = macro ? macro[k] : 0;
+   int i = 0;
    for (; name[i] && i < FOOD_NAME_MAX; i++)
       s->ft[s->nft].name[i] = name[i];
    s->ft[s->nft].name[i] = 0;
@@ -283,7 +347,7 @@ static int ft_take_in(struct food_state *s, int id, const char *name)
  * once at the end -- see food_load. */
 static int ft_take(int id, const char *name)
 {
-   int r = ft_take_in(&g_live, id, name);
+   int r = ft_take_in(&g_live, id, name, 0);
    if (r >= 0)
       order_publish(); /* a new food joins the list; see order_build_in */
    return r;
@@ -310,7 +374,9 @@ int food_type_add(const char *name)
    if (full)
       return -1;
    char b[FOOD_NAME_MAX + 32];
-   int n = snprintf(b, sizeof b, "%d,%s\n", id, name);
+   /* A NEW FOOD IS MADE OF NOTHING YET: its four values are written as zeros,
+    * so every row of the file has the same shape. */
+   int n = snprintf(b, sizeof b, "%d,%s,0,0,0,0\n", id, name);
    n     = clampn(n, sizeof b);
    /* WRITTEN BEFORE IT IS TAKEN. A type that is in memory but not on disk
     * disappears at the next launch, and the entries logged against it in the
@@ -328,7 +394,9 @@ int food_type_add(const char *name)
    return r;
 }
 
-/* One row of the vocabulary: "<id>,<name>". */
+/* One row of the vocabulary: "<id>,<name>,<carbs>,<protein>,<fat>,<kcal/g>".
+ * A row that stops after the name was written before foods had values, and
+ * reads as all zeros; a row with some but not all four is damage. */
 static int ft_parse_line(struct food_state *s, const char *p, const char *e)
 {
    if (p < e && *p == '#')
@@ -342,6 +410,19 @@ static int ft_parse_line(struct food_state *s, const char *p, const char *e)
       return -1; /* no separator: this is not a row, it is a fragment */
    char nm[FOOD_NAME_MAX + 1];
    csv_str(&c, nm, (int)sizeof nm);
+   int macro[FOOD_NMACRO] = {0, 0, 0, 0};
+   if (csv_sep(&c)) {
+      for (int k = 0; k < FOOD_NMACRO; k++) {
+         char f[16];
+         if (k && !csv_sep(&c))
+            return -1;
+         csv_str(&c, f, (int)sizeof f);
+         if (!milli_parse(f, &macro[k]) || !food_macro_ok(k, macro[k]))
+            return -1;
+      }
+      if (c.p != c.e)
+         return -1; /* a fifth value: not a row this app writes */
+   }
    /* AN ID OF 0 IS NOT A TYPE (FOOD_TYPE_NONE), and a name that would not
     * survive a round trip through this format did not come from food_type_add
     * -- both mean the file has been edited or damaged. */
@@ -354,7 +435,7 @@ static int ft_parse_line(struct food_state *s, const char *p, const char *e)
     * means every entry using it is ambiguous. The first is kept. */
    if (ft_row_in(s, (int)id) >= 0)
       return -1;
-   if (ft_take_in(s, (int)id, nm) < 0)
+   if (ft_take_in(s, (int)id, nm, macro) < 0)
       return -1; /* the vocabulary is full: the rest of the file is lost */
    return 1;
 }
@@ -554,6 +635,7 @@ static int slurp_lines(struct food_state *s, const char *path,
 
 /* THE STAGING STATE, private to the loader. Static because it is large and
  * this runs on a service thread; never published as anything but a copy. */
+static int goals_load(void);
 static struct food_state g_stage;
 
 /* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
@@ -601,6 +683,7 @@ static int food_load_staged(void)
     * a log that empties itself depending on the order two files are read. */
    int a = slurp_lines(s, g_ftype_path, ft_parse_line);
    int b = slurp_lines(s, g_food_path, fd_parse_line);
+   int c = goals_load();
    fd_sort_in(s);
    order_build_in(s);
    mutex_lock(&food_lk);
@@ -610,7 +693,7 @@ static int food_load_staged(void)
     * reported as one answer because they describe one thing -- the food
     * history -- and a caller that could act on "the types are fine but the
     * entries are not" would have nothing different to do about it. */
-   return (a < 0 || b < 0) ? -1 : 0;
+   return (a < 0 || b < 0 || c < 0) ? -1 : 0;
 }
 
 int food_append(long t, int type, long g, long tz)
@@ -783,6 +866,8 @@ int food_paths(const char *dir)
       ok = 0;
    if (!(data_path(g_ftype_path, sizeof g_ftype_path, dir, "/foodtypes.csv")))
       ok = 0;
+   if (!(data_path(g_goal_path, sizeof g_goal_path, dir, "/foodgoals.csv")))
+      ok = 0;
    return ok;
 }
 
@@ -794,4 +879,178 @@ const char *food_path(void)
 const char *food_types_path(void)
 {
    return g_ftype_path;
+}
+
+/* ---- what a food is made of ---- */
+
+struct ft_edit {
+   int id;
+   char name[FOOD_NAME_MAX + 1];
+   int macro[FOOD_NMACRO];
+};
+
+/* The row whose leading field is the id. */
+static int ft_edit_matches(const char *line, const char *end, void *ctx)
+{
+   const struct ft_edit *e = ctx;
+   if (line >= end || *line == '#')
+      return 0;
+   struct csv_cur c;
+   csv_open(&c, line, end);
+   return csv_num(&c, 0) == e->id && csv_sep(&c);
+}
+
+static int ft_edit_format(char *out, int cap, void *ctx)
+{
+   const struct ft_edit *e = ctx;
+   char v[FOOD_NMACRO][16];
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      (void)food_milli_str(e->macro[k], v[k], (int)sizeof v[k]);
+   return snprintf(out, (size_t)cap, "%d,%s,%s,%s,%s,%s", e->id, e->name, v[0],
+                   v[1], v[2], v[3]);
+}
+
+int food_type_set_macros(int id, const int macro[FOOD_NMACRO])
+{
+   if (!macro)
+      return -1;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      if (!food_macro_ok(k, macro[k]))
+         return -1;
+   struct ft_edit e = {
+       id, "", {0, 0, 0, 0}
+   };
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      e.macro[k] = macro[k];
+   mutex_lock(&food_lk);
+   int row = ft_row_of(id);
+   if (row >= 0)
+      str_snapshot(e.name, (int)sizeof e.name, g_ft[row].name);
+   mutex_unlock(&food_lk);
+   if (row < 0)
+      return -1;
+   struct log_edit ed;
+   ed.matches = ft_edit_matches;
+   ed.format  = ft_edit_format;
+   ed.ctx     = &e;
+   if (log_edit_last(g_ftype_path, &ed) != 0)
+      return -1;
+   record_mutated(); /* a synced record changed: see util.h */
+   /* THE TABLE FOLLOWS THE FILE, by id: a restore may have republished the
+    * vocabulary between the read above and here, and the row the id names is
+    * the one the file now says this about. */
+   mutex_lock(&food_lk);
+   row = ft_row_of(id);
+   if (row >= 0)
+      for (int k = 0; k < FOOD_NMACRO; k++)
+         g_ft[row].macro[k] = macro[k];
+   mutex_unlock(&food_lk);
+   return 0;
+}
+
+/* ---- the day's goals ---- */
+
+static const int g_goal_def[FOOD_NMACRO] = {275, 50, 78, 2000};
+static const char g_goal_hdr[]           = "# carbs_g,protein_g,fat_g,kcal\n";
+
+int food_goal_ok(int which, int v)
+{
+   if (which < 0 || which >= FOOD_NMACRO)
+      return 0;
+   if (which == FOOD_KCAL)
+      return v >= 0 && v <= FOOD_GOAL_KCAL_MAX;
+   return v >= 1 && v <= FOOD_GOAL_G_MAX;
+}
+
+void food_goals_get(int out[FOOD_NMACRO])
+{
+   mutex_lock(&food_lk);
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      out[k] = g_goals[k];
+   mutex_unlock(&food_lk);
+}
+
+/* The file is the header and one row of four whole numbers. A missing file is
+ * the defaults; a row that is not four in-range numbers leaves them too, and
+ * says so -- it did not come from food_goal_set. */
+static int goals_load(void)
+{
+   char b[128];
+   int n               = 0;
+   int v[FOOD_NMACRO]  = {0, 0, 0, 0};
+   int ok              = 0;
+   enum load_result rr = read_file_exact(g_goal_path, b, (int)sizeof b, &n);
+   if (rr == LOAD_OK && n > 0) {
+      const char *p = b;
+      const char *e = b + n;
+      while (p < e) {
+         const char *q = p;
+         while (q < e && *q != '\n')
+            q++;
+         if (q > p && *p != '#') {
+            struct csv_cur c;
+            csv_open(&c, p, q);
+            ok = 1;
+            for (int k = 0; k < FOOD_NMACRO && ok; k++) {
+               if (k && !csv_sep(&c))
+                  ok = 0;
+               enum csv_field why = CSV_FIELD_OK;
+               long x             = csv_num(&c, &why);
+               if (why != CSV_FIELD_OK || !food_goal_ok(k, (int)x))
+                  ok = 0;
+               else
+                  v[k] = (int)x;
+            }
+            if (c.p != c.e)
+               ok = 0;
+            break;
+         }
+         p = q + 1;
+      }
+   }
+   mutex_lock(&food_lk);
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      g_goals[k] = ok ? v[k] : g_goal_def[k];
+   mutex_unlock(&food_lk);
+   if (rr == LOAD_OK && n > 0 && !ok) {
+      LOGW("food: %s is not four goals; using the defaults", g_goal_path);
+      return -1;
+   }
+   return (rr == LOAD_OK || rr == LOAD_ABSENT) ? 0 : -1;
+}
+
+int food_goal_set(int which, int v)
+{
+   if (!food_goal_ok(which, v))
+      return -1;
+   int g[FOOD_NMACRO];
+   food_goals_get(g);
+   g[which] = v;
+   char b[sizeof g_goal_hdr + 64];
+   int n = snprintf(b, sizeof b, "%s%d,%d,%d,%d\n", g_goal_hdr, g[0], g[1],
+                    g[2], g[3]);
+   if (n <= 0 || n >= (int)sizeof b)
+      return -1;
+   if (atomic_replace(g_goal_path, b, n) != REPLACE_OK)
+      return -1;
+   record_mutated(); /* a synced record changed: see util.h */
+   mutex_lock(&food_lk);
+   g_goals[which] = v;
+   mutex_unlock(&food_lk);
+   return 0;
+}
+
+const char *food_goals_path(void)
+{
+   return g_goal_path;
+}
+
+int food_type_macros(int id, int out[FOOD_NMACRO])
+{
+   mutex_lock(&food_lk);
+   int row = ft_row_of(id);
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      out[k] = row >= 0 ? g_ft[row].macro[k] : 0;
+   mutex_unlock(&food_lk);
+   return row >= 0 ? 0 : -1;
 }

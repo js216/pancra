@@ -263,6 +263,10 @@ struct ui_reading {
    long session_seconds; /* current session length from the driver */
    /* current reading (glu < 0 => no reading yet) */
    int glu, trend, rssi, rssi_ok, stale;
+   /* HOW FAR THE CURRENT READING MOVED since the same sensor's reading before
+    * it, mg/dL, when that one is less than PLOT_CHG_GAP_S older (plot.h) --
+    * the rule the plot's change points and the scrub use. */
+   int delta, have_delta;
    int disc_alarmed; /* stale-data alarm latched (drives the STALE banner) */
    /* session facts from the driver (sess_state: the PRIMARY's SENSOR_STATE_*
     * from its last 4e; the sensor's own verdict outranks arithmetic) */
@@ -454,6 +458,10 @@ struct ui_foodview {
     * values -- it is what food_delete will actually remove. */
    long food_orig_t, food_orig_g;
    int food_orig_type;
+   /* What the chosen food is made of, as the form holds it (food.h's
+    * thousandths, indexed FOOD_CARBS...), and the day's goals. */
+   int food_macro[FOOD_NMACRO];
+   int goal[FOOD_NMACRO];
    /* The EXERCISE button: what it shows, and how much of the settling period
     * is left. `ex_remaining` is 0 when nothing is pending, which is also what
     * makes the progress bar disappear. */

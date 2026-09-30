@@ -53,6 +53,7 @@ extern const uint8_t icon_pg_next[7];  /* pager: one page on              */
 extern const uint8_t icon_pg_first[7]; /* pager: jump to the first page   */
 extern const uint8_t icon_pg_last[7];  /* pager: jump to the last page    */
 extern const uint8_t icon_nolink[7];   /* DISCONNECT (stale-data) alarm */
+extern const uint8_t icon_space[7];    /* the SPACE key, U+2423 */
 extern const uint8_t icon_box[7];      /* checkbox, empty */
 extern const uint8_t icon_boxck[7];    /* checkbox, checked */
 extern const uint8_t icon_boxfill[7];  /* checkbox, solid (the PRIMARY pick) */

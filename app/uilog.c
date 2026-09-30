@@ -169,6 +169,20 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
       draw_str(px, fb, x, y, sc, "NO DOSES LOGGED YET.", UI_MUTED);
       return;
    }
+   /* THE PLOT ON TOP, THE TABLE BELOW IT: see log_split_of. The plot takes
+    * three tenths of what is below the column header's line and the table
+    * the rest -- the table is what this screen exists for, and the plot is
+    * the summary above it. */
+   int tabs_h = 2 * lh;
+   int plot_h = ((fb->height - (y + lh) - (fb->height / 24)) * 3) / 10;
+   struct log_split sp;
+   log_split_of(fb->height, y, sc, tabs_h, plot_h, &sp);
+   int plot_top = sp.plot_top;
+   int tabs_y   = sp.tabs_y;
+   tabs_h       = plot_top - tabs_y; /* the target, clipped to hit_top */
+   int nav_y    = sp.nav_y;
+   y            = sp.hdr_y;
+
    /* ---- THE COLUMNS, AND THE ONE THING THAT GIVES WAY ----------------
     *
     * Left to right: when, the type, the dose right-aligned under UNITS, and
@@ -200,7 +214,6 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    draw_str(px, fb, rx - (str_len("AGO") * 6 * sc), y, sc, "AGO", UI_MUTED);
    y += lh;
 
-   /* Rows that fit between the header and a reserved bottom nav line. */
    /* CAP THE ROWS BY THE HIT BUDGET, not just by height.
     *
     * Each row records a touch target, and add_hit silently DROPS everything
@@ -211,23 +224,6 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * (title/close plus the pagination pair) and let the pages absorb the
     * rest: fewer rows per page is a visible, honest consequence; an
     * untappable control is not. */
-   /* THE SCREEN IS SPLIT SEVENTY / THIRTY IN THE TABLE'S FAVOUR, laid out
-    * from the bottom: the plot takes its share and the table gets the rest,
-    * and the system gesture bar is reserved because this screen reaches the
-    * bottom edge.
-    *
-    * OF WHAT IS BELOW THE HEADER, not of the whole screen. Two fifths of the
-    * screen height left the table with fewer rows than the plot had pixels,
-    * on a screen whose reason for existing is the list of doses -- the plot
-    * is the summary beside it. Measuring from `y` makes the ratio mean what
-    * it says whatever the title and column header cost. */
-   int sysbar   = fb->height / 24;
-   int plot_h   = ((fb->height - y - sysbar) * 3) / 10;
-   int tabs_h   = 2 * lh;
-   int plot_top = fb->height - plot_h - sysbar;
-   int tabs_y   = plot_top - tabs_h;
-   int nav_y    = tabs_y - (2 * lh) - (6 * sc);
-
    int avail = nav_y - y;
    int per   = (avail > 0) ? avail / lh : 1;
    if (per > UI_MAX_HITS - UI_LOG_FIXED)
@@ -742,30 +738,18 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
       return;
    }
 
-   /* THE SCREEN IS SPLIT: table above, trend below. The plot gets the bottom
-    * ~40% and everything else is laid out against what is left, so the table
-    * cannot grow into the plot on a tall screen nor the plot squeeze the
-    * table to nothing on a short one. */
-   /* RESERVE THE SYSTEM GESTURE BAR. The activity draws edge to edge, so the
-    * phone's own navigation pill sits ON TOP of the bottom of this surface --
-    * the plot's bottom edge and its date labels were rendering underneath it.
-    * Everything else in the app happens to stop short of the bottom; this
-    * screen is the first to reach it, so it is the first to collide. */
-   int sysbar   = fb->height / 24;
-   int plot_h   = (fb->height * 2) / 5;
-   int tabs_h   = 2 * lh; /* the span tabs */
-   int plot_top = fb->height - plot_h - sysbar;
-   int tabs_y   = plot_top - tabs_h;
-   /* 6*sc, not 2: the nav box runs from nav_y - 3*sc for lh + 7*sc, i.e. to
-    * nav_y + lh + 4*sc, so a 2*sc gap left its bottom 2*sc inside the tab row
-    * -- and ui_hit_idx scans backwards, so the TAB won and the bottom sliver
-    * of the "next page" arrow silently changed the plot's span instead. */
-   /* The blank line goes BELOW the pagination, not above it: the page counter
-    * belongs to the TABLE it pages, and a gap between them grouped it with
-    * the plot instead -- the one thing it has nothing to do with. */
-   int nav_y = tabs_y - (2 * lh) - (6 * sc);
-   /* A blank line between the table and the pagination row, so the two halves
-    * of this screen read as two things rather than one crowded column. */
+   /* THE TREND ON TOP, THE TABLE BELOW IT: see log_split_of. The plot is a
+    * fixed two fifths of the screen, so the table cannot grow into it on a
+    * tall screen nor the plot squeeze the table to nothing on a short one. */
+   int tabs_h = 2 * lh; /* the span tabs */
+   int plot_h = (fb->height * 2) / 5;
+   struct log_split sp;
+   log_split_of(fb->height, y, sc, tabs_h, plot_h, &sp);
+   int plot_top = sp.plot_top;
+   int tabs_y   = sp.tabs_y;
+   tabs_h       = plot_top - tabs_y; /* the target, clipped to hit_top */
+   int nav_y    = sp.nav_y;
+   y            = sp.hdr_y;
 
    draw_str(px, fb, x, y, sc, "TIME              WEIGHT", UI_MUTED);
    y += lh;

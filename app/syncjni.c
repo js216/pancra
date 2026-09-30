@@ -307,6 +307,9 @@ void syncjni_register_logs(void)
         * only, so a single bucket costs nothing, exactly as for slots
         * below. */
        {"foodtypes", food_types_path(), 0},
+       /* THE DAY'S GOALS, one row rewritten whole: a single bucket for the
+        * same reasons as the vocabulary above. */
+       {"foodgoals", food_goals_path(), 0},
        /* THE PROVENANCE TABLE IS NOT BUCKETED EITHER, for the reason written
         * above: its rows are "<id>,<type>,<address>,..." and row_bucket splits
         * on the LEADING field read as a UTC day. Every id this app can mint is
@@ -355,10 +358,10 @@ void syncjni_register_logs(void)
  * Cheap either way: an open/lseek pair per file and a counter, no reading. */
 int64_t syncjni_state_stamp(void)
 {
-   const char *paths[] = {store_path(),      insulin_path(),    weight_path(),
-                          food_path(),       food_types_path(), exercise_path(),
-                          sensors_path(),    slots_path(),      steps_path(),
-                          cal_rescale_path()};
+   const char *paths[] = {store_path(),    insulin_path(),    weight_path(),
+                          food_path(),     food_types_path(), food_goals_path(),
+                          exercise_path(), sensors_path(),    slots_path(),
+                          steps_path(),    cal_rescale_path()};
    int64_t total       = 0;
    for (int i = 0; i < (int)(sizeof paths / sizeof paths[0]); i++) {
       if (!paths[i] || !paths[i][0])
