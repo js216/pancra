@@ -11,7 +11,8 @@
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
-#include <stdio.h> /* snprintf */
+#include <stdio.h>  /* snprintf */
+#include <stdlib.h> /* realloc, free: the log in memory grows with the file */
 
 static char g_steps_path[256];
 static const char g_steps_hdr[] = "# unix_time,steps,tz_offset_s\n";
@@ -20,28 +21,57 @@ static const char g_steps_hdr[] = "# unix_time,steps,tz_offset_s\n";
  * reason as insulin.c's and weight.c's: a restore rewrites the file and
  * reloads it on the SYNC WORKER while the main thread draws the plot out of
  * the tail. So the tail is one object behind a leaf lock and a load publishes
- * a separately-built one with a single assignment. */
+ * a separately-built one by swapping the two under it.
+ *
+ * THE WHOLE LOG, on the heap, so the exercise plot's longest tabs reach back
+ * to the first window. `cap` is what `r` has room for; it grows by doubling. */
 struct step_tail {
-   struct step_rec r[NSTEPS];
-   int n;
+   struct step_rec *r;
+   int n, cap;
 };
 
 static struct step_tail g_live;
 static struct step_tail g_stage;
 static struct mutex steptail_lk = MUTEX_INIT;
 
-/* Append to a tail, dropping the OLDEST when it is full. Steps are a rolling
- * picture rather than a permanent record the app must hold entire -- the file
- * keeps everything, and the plot's longest span is thirty days. */
+/* BUMPED ON EVERY CHANGE TO g_live, under steptail_lk, so a reader holding a
+ * copy can tell whether it is still current. Starts at 1 so a reader's
+ * zeroed generation never matches. */
+static unsigned g_gen = 1;
+
+/* Append to a tail, growing it; only when the allocator refuses is the
+ * OLDEST dropped instead -- the file keeps everything either way. */
 static void step_push(struct step_tail *t, const struct step_rec *r)
 {
-   if (t->n < NSTEPS) {
+   if (t->n == t->cap) {
+      int c              = t->cap ? t->cap * 2 : 1024;
+      struct step_rec *p = realloc(t->r, (size_t)c * sizeof *p);
+      if (p) {
+         t->r   = p;
+         t->cap = c;
+      }
+   }
+   if (t->n < t->cap) {
       t->r[t->n++] = *r;
       return;
    }
-   for (int i = 1; i < NSTEPS; i++)
+   if (t->n == 0)
+      return; /* no room for even one window */
+   for (int i = 1; i < t->n; i++)
       t->r[i - 1] = t->r[i];
-   t->r[NSTEPS - 1] = *r;
+   t->r[t->n - 1] = *r;
+}
+
+/* THE STAGED LOG BECOMES THE LIVE ONE BY A SWAP under the leaf lock: the old
+ * live rows land in the stage, whose buffer the next load reuses. */
+static void step_publish(struct step_tail *t)
+{
+   mutex_lock(&steptail_lk);
+   struct step_tail old = g_live;
+   g_live               = *t;
+   *t                   = old;
+   g_gen++;
+   mutex_unlock(&steptail_lk);
 }
 
 int steps_count(void)
@@ -62,17 +92,34 @@ struct step_rec steps_at(int i)
    return r;
 }
 
-int steps_copy(struct step_rec *out, int cap)
+int steps_snapshot(struct step_rec **buf, int *cap, int *n, unsigned *gen)
 {
-   int n = 0;
-   if (!out || cap <= 0)
-      return 0;
+   if (!buf || !cap || !n || !gen)
+      return -1;
    mutex_lock(&steptail_lk);
-   n = g_live.n < cap ? g_live.n : cap;
-   for (int i = 0; i < n; i++)
-      out[i] = g_live.r[i];
+   if (*gen == g_gen) {
+      mutex_unlock(&steptail_lk);
+      return 0;
+   }
+   int rc   = 1;
+   int want = g_live.n;
+   if (want > *cap) {
+      struct step_rec *p = realloc(*buf, (size_t)want * sizeof *p);
+      if (p) {
+         *buf = p;
+         *cap = want;
+      } else {
+         rc = -1;
+      }
+   }
+   const int k    = want < *cap ? want : *cap;
+   const int from = g_live.n - k; /* the newest k */
+   for (int i = 0; i < k; i++)
+      (*buf)[i] = g_live.r[from + i];
+   *n   = k;
+   *gen = g_gen;
    mutex_unlock(&steptail_lk);
-   return n;
+   return rc;
 }
 
 const char *steps_path(void)
@@ -142,9 +189,7 @@ static int steps_load_staged(void)
    const int fd        = open(g_steps_path, O_RDONLY, 0);
    if (fd < 0) {
       /* A log that is not there is a published result too: see weight.c. */
-      mutex_lock(&steptail_lk);
-      g_live = *t;
-      mutex_unlock(&steptail_lk);
+      step_publish(t);
       return errno == ENOENT ? 0 : -1;
    }
    char buf[1024];
@@ -182,9 +227,7 @@ static int steps_load_staged(void)
    }
    close(fd);
    /* PUBLISHED WHOLE. */
-   mutex_lock(&steptail_lk);
-   g_live = *t;
-   mutex_unlock(&steptail_lk);
+   step_publish(t);
    return (n < 0 || damaged) ? -1 : 0;
 }
 
@@ -207,6 +250,7 @@ int steps_append(long t, int n, long tz)
    /* THE FILE FIRST, THE TAIL UNDER THE LOCK. */
    mutex_lock(&steptail_lk);
    step_push(&g_live, &r);
+   g_gen++;
    mutex_unlock(&steptail_lk);
    record_mutated(); /* a synced record changed: see util.h */
    return 0;

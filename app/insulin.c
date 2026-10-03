@@ -19,7 +19,8 @@
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
-#include <stdio.h> /* snprintf, SEEK_END */
+#include <stdio.h>  /* snprintf, SEEK_END */
+#include <stdlib.h> /* realloc, free: the log in memory grows with the file */
 
 /* ---- THE TAIL IS A VALUE, AND IT IS PUBLISHED ---------------
  *
@@ -49,14 +50,43 @@
  * takes every one of them -- that is a repaint waiting on flash, which is the
  * ANR shape this app has already been killed for. One log at a time, each
  * coherent, is the trade; see pancra_logs_reload in app/reading.c. */
+/* THE WHOLE LOG, on the heap: every live dose the file holds, so the table
+ * pages back to the first one. `cap` is what both arrays have room for; they
+ * grow together, by doubling, as doses arrive. */
 struct ins_tail {
-   struct ins_rec r[NINS];
-   long id[NINS]; /* index-parallel to r; moved in lockstep by ins_sort */
-   int n;
+   struct ins_rec *r;
+   long *id; /* index-parallel to r; moved in lockstep by ins_sort */
+   int n, cap;
    long next; /* next id to mint */
 };
 
 static struct ins_tail g_live;
+
+/* BUMPED ON EVERY CHANGE TO g_live, under ins_lk, so a reader holding a copy
+ * can tell whether it is still current. Starts at 1 so a reader's zeroed
+ * generation never matches. */
+static unsigned g_gen = 1;
+
+/* Room for `need` doses in both arrays; 0, or -1 when the allocator refused
+ * (and then neither array has moved past what both can hold). */
+static int ins_reserve(struct ins_tail *t, int need)
+{
+   if (need <= t->cap)
+      return 0;
+   int c = t->cap ? t->cap : 256;
+   while (c < need)
+      c *= 2;
+   struct ins_rec *r = realloc(t->r, (size_t)c * sizeof *r);
+   if (!r)
+      return -1;
+   t->r    = r;
+   long *i = realloc(t->id, (size_t)c * sizeof *i);
+   if (!i)
+      return -1;
+   t->id  = i;
+   t->cap = c;
+   return 0;
+}
 
 /* A LEAF. Taken innermost, never held across a call into another module and
  * never across file I/O: insulin_append writes its row FIRST and only then
@@ -81,16 +111,50 @@ struct ins_rec ins_at(int i)
    return z;
 }
 
-int ins_copy(struct ins_rec *out, int cap)
+int ins_snapshot(struct ins_rec **buf, int *cap, int *n, unsigned *gen)
 {
-   int n = 0;
-   if (!out || cap <= 0)
-      return 0;
+   if (!buf || !cap || !n || !gen)
+      return -1;
    mutex_lock(&ins_lk);
-   for (; n < cap && n < g_live.n; n++)
-      out[n] = g_live.r[n];
+   if (*gen == g_gen) {
+      mutex_unlock(&ins_lk);
+      return 0;
+   }
+   int rc   = 1;
+   int want = g_live.n;
+   if (want > *cap) {
+      struct ins_rec *p = realloc(*buf, (size_t)want * sizeof *p);
+      if (p) {
+         *buf = p;
+         *cap = want;
+      } else {
+         rc = -1;
+      }
+   }
+   const int k    = want < *cap ? want : *cap;
+   const int from = g_live.n - k; /* the newest k */
+   for (int i = 0; i < k; i++)
+      (*buf)[i] = g_live.r[from + i];
+   *n   = k;
+   *gen = g_gen;
    mutex_unlock(&ins_lk);
-   return n;
+   return rc;
+}
+
+int ins_first_since(long t)
+{
+   mutex_lock(&ins_lk);
+   int lo = 0;
+   int hi = g_live.n;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (g_live.r[mid].t < t)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   mutex_unlock(&ins_lk);
+   return lo;
 }
 
 static char g_ins_path[256];
@@ -113,71 +177,50 @@ const char *insulin_type_name(int type)
    return type == INS_FAST ? "FAST" : "SLOW";
 }
 
-/* ---- OVERFLOW EVICTS THE OLDEST BY TIME, NOT THE OLDEST BY ARRIVAL ------
+/* ---- EVERY DOSE IS TAKEN; ONLY A REFUSED ALLOCATION EVICTS -------------
  *
- * Dropping element ZERO and leaving the caller's ins_sort() to tidy up
- * discards whichever row was PUSHED first -- the oldest one only when the
- * file happens to be in chronological order. It very often is not: rows
- * arrive in FILE order, and users legitimately backdate a dose they forgot to
- * log, and import history from another app, both of which append rows whose
- * dose times are older than everything already held.
+ * The copy in memory is the whole log, so a dose normally just goes on the
+ * end and the caller's ins_sort files it.
  *
- * WHAT THAT LOOKS LIKE ON THE PHONE. A full tail, a backdated import, and the
- * doses from the last few days vanish from the list -- one per imported row --
- * while the month-old imported ones stay. The file still has every dose, so
- * the next launch brings the recent ones back for as long as the tail has room
- * again: it reads as a display bug that heals itself, which is the hardest
- * kind to be believed about. On a dose log it is worse than that, because
- * "what did I take yesterday" is the question this list exists to answer.
+ * WHEN THE ALLOCATOR SAYS NO, the copy keeps the NEWEST doses BY TIME, not
+ * the newest by arrival. Rows arrive in FILE order, and users legitimately
+ * backdate a dose they forgot to log, and import history from another app,
+ * both of which append rows whose dose times are older than everything
+ * already held; dropping whichever was pushed first would lose yesterday's
+ * doses to keep month-old ones, and "what did I take yesterday" is the
+ * question this list exists to answer. Equivalently -- and this is how to
+ * read the code -- push the dose, sort, drop element zero:
  *
- * THE RULE NOW: the tail holds the NEWEST NINS doses BY TIME. Equivalently --
- * and this is how to read the code -- push the dose, sort, drop element zero.
- * Written out rather than done that way because the arrays have no spare slot
- * and a load pushes once per assertion:
+ *   - the arriving dose is strictly older than every dose held: it IS what
+ *     sort-then-drop would discard, so it is not taken at all.
+ *   - otherwise: find the oldest dose HELD (by time, ties to the earliest
+ *     arrival, exactly as the stable sort would), drop it, take the new one.
  *
- *   - room to spare: take it, and let the caller's sort file it.
- *   - full, and the arriving dose is strictly older than every dose held: it
- *     IS what sort-then-drop would discard, so it is not taken at all. It
- *     displaces nobody.
- *   - full, otherwise: find the oldest dose HELD (by time, ties to the
- *     earliest arrival, exactly as the stable sort would), drop it, take the
- *     new one.
- *
- * WHY THIS DOES NOT DISTURB ASSERTION REPLAY, which is the thing to be careful
- * of here. The file is a log of assertions replayed in FILE order, last one
- * per id wins, and a retraction can name a dose asserted thousands of rows
- * earlier. Three properties keep that intact, and none of them lives in this
- * function:
+ * WHY THIS DOES NOT DISTURB ASSERTION REPLAY. The file is a log of
+ * assertions replayed in FILE order, last one per id wins, and a retraction
+ * can name a dose asserted thousands of rows earlier. Three properties keep
+ * that intact, and none of them lives in this function:
  *
  *   - ins_apply mints and advances the tail's `next` from EVERY assertion it
- *     sees,
- *     before it ever reaches this function -- so an id space stays strictly
- *     increasing whether or not the dose it names fits in the window. A push
+ *     sees, before it ever reaches this function -- so an id space stays
+ *     strictly increasing whether or not the dose it names is held. A push
  *     refused here can never cause an id to be minted twice.
- *   - ins_apply looks the id up with ins_slot FIRST, so an amendment to a dose
- *     that IS in the tail still edits it in place and never arrives here.
- *   - a retraction whose dose is not in the tail is already a no-op, and was
- *     whatever the eviction rule: the tail is a bounded window and the dose
- *     it names is outside it. Eviction cannot resurrect anything, because it
- *     REMOVES; what would resurrect a deleted dose is a later row read as an
- *     assertion that it exists, which is ins_parse_assert's `del` check, not
- *     this.
- *
- * One honest limit, unchanged by this and worth naming: ins_apply's edit path
- * writes over the record in place, so an amendment that moves a dose's time
- * far into the past leaves the tail holding a dose older than one this
- * function had refused. The tail is still the last-wins state of every id it
- * holds; it is just not, in that one case, exactly the newest NINS by time.
- * Re-evaluating eviction on an edit would mean an amendment could push a dose
- * out of the list, which is a worse surprise than a slightly wide window. */
+ *   - ins_apply looks the id up FIRST, so an amendment to a dose that is held
+ *     still edits it in place and never arrives here.
+ *   - a retraction whose dose is not held is a no-op. Eviction cannot
+ *     resurrect anything, because it REMOVES; what would resurrect a deleted
+ *     dose is a later row read as an assertion that it exists, which is
+ *     ins_parse_assert's `del` check, not this. */
 static void ins_push(struct ins_tail *t, const struct ins_rec *r, long id)
 {
-   if (t->n < NINS) {
+   if (t->n < t->cap || ins_reserve(t, t->n + 1) == 0) {
       t->id[t->n] = id;
       t->r[t->n]  = *r;
       t->n++;
       return;
    }
+   if (t->n == 0)
+      return; /* no room for even one dose */
    int oldest = 0;
    for (int i = 1; i < t->n; i++)
       if (t->r[i].t < t->r[oldest].t)
@@ -282,9 +325,14 @@ static int ins_parse_assert(const char *p, const char *e, long legacy_id,
 /* Replay one assertion onto the tail: last one per id wins. */
 static void ins_apply(struct ins_tail *t, const struct ins_assert *a)
 {
-   if (a->id >= t->next)
+   /* AN ID AT OR PAST `next` HAS NEVER BEEN SEEN: minted ids only grow, so
+    * nothing held can carry it, and the scan -- the whole log, once per
+    * row, on a replay of years -- is skipped. Every other id, negative ones
+    * included, is looked up. */
+   const int fresh = a->id >= t->next;
+   if (fresh)
       t->next = a->id + 1;
-   int at = ins_slot(t, a->id);
+   int at = fresh ? -1 : ins_slot(t, a->id);
    if (a->del) {
       if (at >= 0)
          ins_drop(t, at);
@@ -306,10 +354,22 @@ static void ins_apply(struct ins_tail *t, const struct ins_assert *a)
  * caller is told, so the app can say so rather than presenting a silently short
  * history as complete. store_load has answered this way since the same defect
  * was found in it. */
-/* THE STAGING TAIL. Static rather than automatic because it is 6 KB and this
- * runs on a service tick's thread; private to the loader, which is the only
- * thing that touches it, and never published as anything but a copy. */
+/* THE STAGING TAIL, private to the loader, which is the only thing that
+ * fills it. */
 static struct ins_tail g_stage;
+
+/* THE STAGED LOG BECOMES THE LIVE ONE BY A SWAP under the leaf lock: the old
+ * live doses land in the stage, whose buffers the next load reuses, so a
+ * load allocates only when the log has outgrown both. */
+static void ins_publish(struct ins_tail *t)
+{
+   mutex_lock(&ins_lk);
+   struct ins_tail old = g_live;
+   g_live              = *t;
+   *t                  = old;
+   g_gen++;
+   mutex_unlock(&ins_lk);
+}
 
 /* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
  *
@@ -349,14 +409,12 @@ static int insulin_load_staged(void)
        * means the empty tail has
        * to be published here or a deleted log would go on being displayed --
        * exactly what a restore-to-empty must not leave behind. */
-      mutex_lock(&ins_lk);
-      g_live = *t;
-      mutex_unlock(&ins_lk);
+      ins_publish(t);
       return errno == ENOENT ? 0 : -1;
    }
-   /* Stream the whole file a line at a time (sensors.c pattern): the tail
-    * buffer keeps only the last NINS doses, so memory stays bounded no matter
-    * how many years -- or how many corrections -- the file has grown. */
+   /* Stream the whole file a line at a time (sensors.c pattern): only the
+    * live doses are held, never the file's bytes, however many corrections
+    * it has grown. */
    char buf[1024];
    char line[128];
    int llen    = 0;
@@ -402,17 +460,13 @@ static int insulin_load_staged(void)
    }
    close(fd);
    ins_sort(t);
-   /* PUBLISHED WHOLE, OR NOT AT ALL. One assignment under the
-    * leaf lock: a reader holds the log from before this call or the log from
-    * after it.
+   /* PUBLISHED WHOLE, OR NOT AT ALL. One swap under the leaf lock: a reader
+    * holds the log from before this call or the log from after it.
     *
-    * A DAMAGED FILE IS STILL PUBLISHED, and that is the same rule as before
-    * -- a prefix of the record beats a blank screen, and the caller is told.
-    * What is new is that the prefix becomes visible all at once rather than
-    * a row at a time. */
-   mutex_lock(&ins_lk);
-   g_live = *t;
-   mutex_unlock(&ins_lk);
+    * A DAMAGED FILE IS STILL PUBLISHED -- a prefix of the record beats a
+    * blank screen, and the caller is told -- and the prefix becomes visible
+    * all at once rather than a row at a time. */
+   ins_publish(t);
    return (n < 0 || damaged) ? -1 : 0;
 }
 
@@ -469,6 +523,7 @@ int insulin_append(long t, int type, int milli, long tz)
    g_live.next = id + 1;
    ins_push(&g_live, &r, id);
    ins_sort(&g_live); /* a backdated dose files into place immediately */
+   g_gen++;
    mutex_unlock(&ins_lk);
    return 0;
 }
@@ -496,7 +551,8 @@ int insulin_update(const struct ins_rec *orig, long t, int type, int milli,
     * THE TAIL IS RE-FOUND UNDER IT. The slot cannot be carried across the
     * write: a restore publishing in between would leave `at` pointing at a
     * different dose in a different tail. Re-matching by CONTENT is what the
-    * function already does, and doing it twice is cheap on 256 rows. */
+    * function already does; it is a scan from the newest end, which is where
+    * an edited dose almost always is. */
    mutex_lock(&ins_lk);
    int at  = ins_match(orig);
    long id = (at >= 0) ? g_live.id[at] : 0;
@@ -512,6 +568,7 @@ int insulin_update(const struct ins_rec *orig, long t, int type, int milli,
       g_live.r[at].type  = type;
       g_live.r[at].milli = milli;
       ins_sort(&g_live);
+      g_gen++;
    }
    mutex_unlock(&ins_lk);
    return 0;
@@ -536,8 +593,10 @@ int insulin_delete(const struct ins_rec *orig)
       return -1;
    mutex_lock(&ins_lk);
    at = ins_match(orig); /* re-found: see insulin_update */
-   if (at >= 0)
+   if (at >= 0) {
       ins_drop(&g_live, at);
+      g_gen++;
+   }
    mutex_unlock(&ins_lk);
    return 0;
 }

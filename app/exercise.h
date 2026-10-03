@@ -72,9 +72,6 @@
  * digit run cannot parse as a plausible date. */
 #define EX_T_MAX 32503680000L
 
-/* In-memory tail only -- the file keeps everything. */
-#define NEX 256
-
 struct ex_rec {
    long t;    /* entry instant, epoch seconds */
    int level; /* EX_MIN_LEVEL..EX_MAX_LEVEL */
@@ -114,8 +111,11 @@ struct ex_rec {
 int ex_count(void);
 /* The i-th, oldest first. Out of range yields a zeroed record. */
 struct ex_rec ex_at(int i);
-/* Copy up to `cap` of them, oldest first; returns how many were copied. */
-int ex_copy(struct ex_rec *out, int cap);
+/* The frame's copy, refreshed only when the log has changed: see
+ * wt_snapshot in weight.h, which this answers exactly as. */
+int ex_snapshot(struct ex_rec **buf, int *cap, int *n, unsigned *gen);
+/* The index of the first row at or after `t` (ex_count() when none is). */
+int ex_first_since(long t);
 
 const char *exercise_path(void);
 /* Point it at the data directory; the filename lives here. 1 when the path

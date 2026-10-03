@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0
-// weight.c --- Body-weight log: an editable CSV + in-memory tail
+// weight.c --- Body-weight log: an editable CSV + its copy in memory
 // Copyright 2026 Jakob Kastelic
 
 /* See weight.h. Freestanding like insulin.c, whose shape this follows
@@ -15,7 +15,8 @@
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
-#include <stdio.h> /* snprintf, SEEK_END */
+#include <stdio.h>  /* snprintf, SEEK_END */
+#include <stdlib.h> /* realloc, free: the log in memory grows with the file */
 
 /* ---- THE TAIL IS A VALUE, AND IT IS PUBLISHED ---------------
  *
@@ -26,13 +27,38 @@
  * A reader landing mid-load sees an empty log, or a short one, or rows the
  * count says are there and the previous contents actually left. So the tail
  * is one object behind a leaf lock, and a load builds a separate one and
- * publishes it with a single assignment. */
+ * publishes it by swapping the two under the lock.
+ *
+ * THE WHOLE LOG, on the heap: every row the file holds, so the table pages
+ * back to the first weigh-in. `cap` is what `r` has room for; it grows by
+ * doubling as rows arrive. */
 struct wt_tail {
-   struct wt_rec r[NWT];
-   int n;
+   struct wt_rec *r;
+   int n, cap;
 };
 
 static struct wt_tail g_live;
+
+/* BUMPED ON EVERY CHANGE TO g_live, under wt_lk, so a reader holding a copy
+ * can tell whether it is still current without comparing the rows. Starts at
+ * 1 so a reader's zeroed generation never matches. */
+static unsigned g_gen = 1;
+
+/* Room for `need` rows; 0, or -1 when the allocator refused. */
+static int wt_reserve(struct wt_tail *t, int need)
+{
+   if (need <= t->cap)
+      return 0;
+   int c = t->cap ? t->cap : 256;
+   while (c < need)
+      c *= 2;
+   struct wt_rec *p = realloc(t->r, (size_t)c * sizeof *p);
+   if (!p)
+      return -1;
+   t->r   = p;
+   t->cap = c;
+   return 0;
+}
 
 /* A LEAF: taken innermost, never held across another module's call and never
  * across file I/O -- every writer here appends or rewrites the file first
@@ -74,16 +100,50 @@ struct wt_rec wt_newest(void)
    return z;
 }
 
-int wt_copy(struct wt_rec *out, int cap)
+int wt_snapshot(struct wt_rec **buf, int *cap, int *n, unsigned *gen)
 {
-   int n = 0;
-   if (!out || cap <= 0)
-      return 0;
+   if (!buf || !cap || !n || !gen)
+      return -1;
    mutex_lock(&wt_lk);
-   for (; n < cap && n < g_live.n; n++)
-      out[n] = g_live.r[n];
+   if (*gen == g_gen) {
+      mutex_unlock(&wt_lk);
+      return 0;
+   }
+   int rc   = 1;
+   int want = g_live.n;
+   if (want > *cap) {
+      struct wt_rec *p = realloc(*buf, (size_t)want * sizeof *p);
+      if (p) {
+         *buf = p;
+         *cap = want;
+      } else {
+         rc = -1;
+      }
+   }
+   const int k    = want < *cap ? want : *cap;
+   const int from = g_live.n - k; /* the newest k */
+   for (int i = 0; i < k; i++)
+      (*buf)[i] = g_live.r[from + i];
+   *n   = k;
+   *gen = g_gen;
    mutex_unlock(&wt_lk);
-   return n;
+   return rc;
+}
+
+int wt_first_since(long t)
+{
+   mutex_lock(&wt_lk);
+   int lo = 0;
+   int hi = g_live.n;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (g_live.r[mid].t < t)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   mutex_unlock(&wt_lk);
+   return lo;
 }
 
 static char g_wt_path[256];
@@ -126,49 +186,35 @@ int wt_to_tenths(long g, int units)
    return (int)((g + 50L) / 100L);
 }
 
-/* ---- OVERFLOW EVICTS THE OLDEST BY TIME, NOT THE OLDEST BY ARRIVAL ------
+/* ---- EVERY ROW IS TAKEN; ONLY A REFUSED ALLOCATION EVICTS ---------------
  *
- * Dropping element ZERO and letting the caller's wt_sort() tidy up discards
- * whichever row was PUSHED first -- which is the oldest row only when the file
- * happens to be in chronological order. It very often is not. Rows arrive in
- * FILE order, and a user who imports a scale's history, or types in a weigh-in
- * they forgot to log last month, appends rows whose timestamps are older than
- * everything already in the tail.
+ * The copy in memory is the whole log, so a row normally just goes on the
+ * end and the caller's wt_sort files it.
  *
- * WHAT THAT LOOKS LIKE ON THE PHONE. A full tail, a backdated import, and the
- * weigh-ins from the last few days disappear from the table -- one per
- * imported row -- while the imported month-old ones sit there instead. Nothing
- * is lost from the file, so a restart brings the recent ones back for as long
- * as the tail has room again; it reads exactly like a display bug that fixes
- * itself, which is the hardest kind to be believed about.
+ * WHEN THE ALLOCATOR SAYS NO, the copy keeps the NEWEST rows BY TIME, not the
+ * newest by arrival. Rows arrive in FILE order, and a user who imports a
+ * scale's history, or types in a weigh-in they forgot to log last month,
+ * appends rows whose timestamps are older than everything already held;
+ * dropping whichever row was pushed first would throw away recent weigh-ins
+ * to keep month-old ones. Equivalently -- and this is how to read the code --
+ * insert the row, sort, drop element zero:
  *
- * THE RULE: the tail holds the NEWEST NWT rows BY TIME. Equivalently --
- * and this is how to read the code -- insert the row, sort, drop element zero.
- * Written out rather than actually done that way because the array has no
- * spare slot and the load pushes thousands of times:
- *
- *   - room to spare: take the row, and let the caller's sort file it.
- *   - full, and the new row is strictly older than every row held: the new row
- *     IS what the sort-then-drop would discard, so it is simply not taken. It
- *     displaces nobody.
- *   - full, otherwise: find the oldest row HELD (by time, ties resolved to the
+ *   - the new row is strictly older than every row held: it IS what the
+ *     sort-then-drop would discard, so it is simply not taken.
+ *   - otherwise: find the oldest row HELD (by time, ties resolved to the
  *     earliest arrival, exactly as a stable sort would), drop that one, take
  *     the new row.
  *
  * A tie goes to the ARRIVING row, which is the same answer "append, stable
- * sort, drop [0]" gives: among equal timestamps the stable sort leaves the
- * earlier arrival first, so the earlier arrival is the one dropped.
- *
- * The scan is linear over a 256-entry array and runs only once the tail is
- * full, which on a load is once per row past the first NWT. That is a few
- * thousand comparisons on a log of years -- far cheaper than shifting the
- * whole array on every one of them. */
+ * sort, drop [0]" gives. Nothing is lost from the file either way. */
 static void wt_push(struct wt_tail *t, const struct wt_rec *r)
 {
-   if (t->n < NWT) {
+   if (t->n < t->cap || wt_reserve(t, t->n + 1) == 0) {
       t->r[t->n++] = *r;
       return;
    }
+   if (t->n == 0)
+      return; /* no room for even one row */
    int oldest = 0;
    for (int i = 1; i < t->n; i++)
       if (t->r[i].t < t->r[oldest].t)
@@ -264,6 +310,19 @@ static int wt_parse_line(struct wt_tail *t, const char *p, const char *e)
  * it is static for the same reason -- this runs on a service thread). */
 static struct wt_tail g_stage;
 
+/* THE STAGED LOG BECOMES THE LIVE ONE BY A SWAP under the leaf lock: the old
+ * live rows land in the stage, whose buffer the next load reuses, so a load
+ * allocates only when the log has outgrown both. */
+static void wt_publish(struct wt_tail *t)
+{
+   mutex_lock(&wt_lk);
+   struct wt_tail old = g_live;
+   g_live             = *t;
+   *t                 = old;
+   g_gen++;
+   mutex_unlock(&wt_lk);
+}
+
 /* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
  *
  * g_stage is a static -- the tail can be thousands of rows and this runs on a
@@ -297,14 +356,11 @@ static int weight_load_staged(void)
       /* A LOG THAT IS NOT THERE IS A PUBLISHED RESULT TOO: the zeroing used
        * to happen to the live tail, so this path emptied it on the way past
        * and a restore-to-empty must still do that. */
-      mutex_lock(&wt_lk);
-      g_live = *t;
-      mutex_unlock(&wt_lk);
+      wt_publish(t);
       return errno == ENOENT ? 0 : -1;
    }
-   /* Stream the whole file a line at a time (the insulin.c pattern): the tail
-    * keeps only the last NWT rows, so memory stays bounded however many years
-    * the file has grown. */
+   /* Stream the whole file a line at a time (the insulin.c pattern): only
+    * the rows are held, never the file's bytes. */
    char buf[1024];
    char line[96];
    int llen    = 0;
@@ -342,13 +398,10 @@ static int weight_load_staged(void)
    }
    close(fd);
    wt_sort(t);
-   /* PUBLISHED WHOLE: one assignment under the leaf lock, so a
-    * reader holds the log from before this call or the one after it. A
-    * damaged file still publishes its prefix -- unchanged rule -- and the
-    * caller is still told. */
-   mutex_lock(&wt_lk);
-   g_live = *t;
-   mutex_unlock(&wt_lk);
+   /* PUBLISHED WHOLE: one swap under the leaf lock, so a reader holds the
+    * log from before this call or the one after it. A damaged file still
+    * publishes its prefix, and the caller is still told. */
+   wt_publish(t);
    return (n < 0 || damaged) ? -1 : 0;
 }
 
@@ -374,6 +427,7 @@ int weight_append(long t, long g, long tz)
    mutex_lock(&wt_lk);
    wt_push(&g_live, &r);
    wt_sort(&g_live);
+   g_gen++;
    mutex_unlock(&wt_lk);
    record_mutated(); /* a synced record changed: see util.h */
    return 0;
@@ -411,11 +465,8 @@ static int wt_edit_format(char *out, int cap, void *ctx)
  * same pair wt_edit_matches uses -- the instant AND the value, because either
  * alone can repeat -- and then edits or removes it.
  *
- * WHAT IT CANNOT DO, and what that costs: a delete leaves the tail one row
- * short of the NWT it could hold, because the row that should be pulled in to
- * replace it is older than anything in memory and only the file has it. The
- * next successful load fills it. One missing OLD row for one session is a
- * different order of wrong from a table that contradicts the file. */
+ * The copy in memory is the whole log unless an allocation was refused, so
+ * the row is normally there to find. */
 /* CALLER HOLDS wt_lk. */
 static void wt_tail_patch(const struct wt_rec *orig, int del, long t, long g)
 {
@@ -433,8 +484,8 @@ static void wt_tail_patch(const struct wt_rec *orig, int del, long t, long g)
       }
       return;
    }
-   /* Not in the tail at all -- the user edited a row older than the newest
-    * NWT, which the table cannot show anyway. Nothing to do. */
+   /* Not held at all -- only possible when a refused allocation left the
+    * copy short of the file, and the next successful load fills it. */
 }
 
 static int wt_rewrite(const struct wt_rec *orig, int del, long t, long g,
@@ -466,9 +517,17 @@ static int wt_rewrite(const struct wt_rec *orig, int del, long t, long g,
     * if the reload does not produce a tail, restore the copy and apply the
     * very edit that just went to disk. Memory then agrees with the file by
     * construction rather than by a second I/O that may not happen. */
-   struct wt_tail save;
+   /* A DEEP COPY: the rows live on the heap, and the reload below swaps the
+    * live buffer away. When even the copy cannot be allocated the reload
+    * still runs; only the fallback is lost. */
+   struct wt_tail save = {0, 0, 0};
    mutex_lock(&wt_lk);
-   save = g_live;
+   const int have_save = wt_reserve(&save, g_live.n) == 0;
+   if (have_save) {
+      for (int i = 0; i < g_live.n; i++)
+         save.r[i] = g_live.r[i];
+      save.n = g_live.n;
+   }
    mutex_unlock(&wt_lk);
 #ifdef APP_FAULTS
    /* THE ONE MOMENT THIS FAILURE CAN BE ARRANGED, and the only way a test can
@@ -478,14 +537,18 @@ static int wt_rewrite(const struct wt_rec *orig, int del, long t, long g,
    if (weight_fault_before_reload)
       weight_fault_before_reload();
 #endif
-   if (weight_load() != 0) {
+   if (weight_load() != 0 && have_save) {
       mutex_lock(&wt_lk);
-      g_live = save;
+      struct wt_tail prefix = g_live;
+      g_live                = save;
+      save                  = prefix;
       wt_tail_patch(orig, del, t, g);
+      g_gen++;
       mutex_unlock(&wt_lk);
       LOGW("weight: the log was rewritten but could not be re-read; the "
            "table was updated from the edit itself");
    }
+   free(save.r);
    return 0;
 }
 

@@ -65,6 +65,24 @@ int model_plot_hours(void);
 
 void model_set_plot_hours(int hours);
 
+/* THE LOG ENTRIES THE MAIN PLOT CARRIES, as an index range per log:
+ * entries first[k] .. end[k]-1 of the dose, weight, food and exercise logs
+ * (PLOG_INS...), oldest first.
+ *
+ * ONE ANSWER FOR TWO CALLERS. build_model appends these to the frame's
+ * points and the scrub's hit test rebuilds the same list to pick from; the
+ * index the hit test returns reads the frame's array, so both must take the
+ * same entries in the same order. They ask at slightly different instants,
+ * which is why the span's start is floored to the hour and an hour of
+ * margin added: the range moves only on the hour, not with every second
+ * between the frame and the touch.
+ *
+ * At most PLOT_LOG_MAX entries per log, the newest: a span is a few weeks at
+ * most, and the cap keeps an absurd one from taking the whole array. */
+enum { PLOG_INS, PLOG_WT, PLOG_FOOD, PLOG_EX, PLOG_N };
+
+void model_plot_logs(long now, int hours, int first[PLOG_N], int end[PLOG_N]);
+
 /* Fill `m` with everything one frame needs. Main thread. */
 void build_model(struct screen *m);
 

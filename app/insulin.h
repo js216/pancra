@@ -54,10 +54,6 @@
  * purpose (backdating and small future-dating are legitimate user entries);
  * it exists so a corrupt digit run can never parse as a plausible dose. */
 
-/* In-memory tail only -- the file keeps everything. 256 rows is over two
- * months of a heavy 4-dose day. */
-#define NINS 256
-
 struct ins_rec {
    long t;   /* dose instant, epoch seconds */
    int type; /* INS_SLOW / INS_FAST */
@@ -78,15 +74,18 @@ struct ins_rec {
 int ins_count(void);
 /* The i-th, oldest first; out of range yields a zeroed record. */
 struct ins_rec ins_at(int i);
-/* Copy up to `cap`, oldest first; returns how many were copied. */
-int ins_copy(struct ins_rec *out, int cap);
+/* The frame's copy, refreshed only when the log has changed: see
+ * wt_snapshot in weight.h, which this answers exactly as. */
+int ins_snapshot(struct ins_rec **buf, int *cap, int *n, unsigned *gen);
+/* The index of the first dose at or after `t` (ins_count() when none is). */
+int ins_first_since(long t);
 const char *insulin_path(void);
 /* Point it at the data directory; the filename lives here. */
 /* 1 when every path this module persists to fitted; 0 when one did
  * not, and then NONE of them is usable -- see data_path in util.h. */
 int insulin_paths(const char *dir);
 
-/* Load the tail of the log (the last NINS plausible rows). Safe on a fresh
+/* Load the log (every live, plausible dose). Safe on a fresh
  * install: a missing file is an empty log. */
 /* 0 read whole (or nothing to read), -1 a read failed partway: whatever
  * parsed is kept, and the caller says the record is incomplete. */

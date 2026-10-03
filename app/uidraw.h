@@ -286,8 +286,15 @@ int thresh_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
  * off? `ishigh` picks which end. */
 int thresh_off(int mgdl, int ishigh);
 const char *ui_bucket_label(int b);
+/* One "NAME   <big value>" row; the right half -- the value's side -- is
+ * the target. Returns the y below the row. */
 int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
               const char *name, const char *val, uint32_t vcol, int code,
               int ix);
+/* The same row with the WHOLE width as its target, for a form where every
+ * row opens its value and nothing else shares the line. */
+int value_row_wide(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                   int sc, const char *name, const char *val, uint32_t vcol,
+                   int code, int ix);
 
 #endif

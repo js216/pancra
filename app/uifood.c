@@ -101,28 +101,29 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
       gap = lh;
    if (gap < lh / 2)
       gap = lh / 2;
-   y = value_row(fb, h, y, sc, "TYPE", tname, tcol, MA_FOOD_EDIT, 0);
+   y = value_row_wide(fb, h, y, sc, "TYPE", tname, tcol, MA_FOOD_EDIT, 0);
    y += gap;
    char gval[16];
    (void)snprintf(gval, sizeof gval, "%d G", m->food.food_g);
-   y = value_row(fb, h, y, sc, "GRAMS", gval, UI_TEXT, MA_FOOD_EDIT, 1);
+   y = value_row_wide(fb, h, y, sc, "GRAMS", gval, UI_TEXT, MA_FOOD_EDIT, 1);
    y += gap;
-   y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_FOOD_EDIT, 2);
+   y = value_row_wide(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_FOOD_EDIT, 2);
    y += gap;
-   y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_FOOD_EDIT, 3);
+   y = value_row_wide(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_FOOD_EDIT, 3);
    y += gap;
-   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_FOOD_EDIT, 4);
+   y = value_row_wide(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_FOOD_EDIT, 4);
    y += gap;
    {
       static const int order[FOOD_NMACRO]        = {FOOD_KCAL, FOOD_CARBS,
                                                     FOOD_PROTEIN, FOOD_FAT};
-      static const char *const mlbl[FOOD_NMACRO] = {"CARBS", "PROTEIN", "FAT",
-                                                    "KCAL/G"};
+      static const char *const mlbl[FOOD_NMACRO] = {"CARBS G/G", "PROTEIN G/G",
+                                                    "FAT G/G", "KCAL/G"};
       for (int r = 0; r < FOOD_NMACRO; r++) {
          const int k = order[r];
          char v[16];
          (void)food_milli_str(m->food.food_macro[k], v, (int)sizeof v);
-         y = value_row(fb, h, y, sc, mlbl[k], v, UI_TEXT, MA_FOOD_EDIT, 5 + k);
+         y = value_row_wide(fb, h, y, sc, mlbl[k], v, UI_TEXT, MA_FOOD_EDIT,
+                            5 + k);
          y += gap;
       }
    }
@@ -207,10 +208,22 @@ void ui_food_today(const struct screen *m, long *tot)
    from -= m->tz_off;
    for (int k = 0; k < FOOD_NMACRO; k++)
       tot[k] = 0;
-   for (int i = 0; i < m->food.nlog; i++) {
+   /* THE DAY'S ENTRIES ONLY: the log is oldest first, so they start at the
+    * first one at or after `from`, found by halving -- this runs every frame
+    * on the main screen, and the log is years long. */
+   int lo = 0;
+   int hi = m->food.nlog;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (m->food.log[mid].t < from)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   for (int i = lo; i < m->food.nlog; i++) {
       const struct food_rec *e = &m->food.log[i];
-      if (e->t < from || e->t >= from + 86400)
-         continue;
+      if (e->t >= from + 86400)
+         break;
       for (int j = 0; j < m->food.ntypes; j++)
          if (m->food.types[j].id == e->type)
             for (int k = 0; k < FOOD_NMACRO; k++)

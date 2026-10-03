@@ -48,13 +48,10 @@
  * is REFUSED rather than quietly stripped of them. */
 #define FOOD_NAME_MAX 20
 
-/* How many distinct foods the vocabulary holds. Generous for a personal list
- * -- the point of the cap is that the picker is a menu somebody scrolls, not
- * a database. */
-#define NFOODTYPE 64
-
-/* In-memory tail of the entry log; the file keeps everything. */
-#define NFOOD 256
+/* How many distinct foods the vocabulary holds: more than a person names in
+ * a lifetime of logging, and small enough to keep whole in memory -- the
+ * picker pages through it. */
+#define NFOODTYPE 1024
 
 /* Grams in one entry.
  *
@@ -212,15 +209,15 @@ struct food_rec food_at(int i);
  * every time. The entry form seeds itself from this the moment a food is
  * picked (forms.c).
  *
- * NEWEST FIRST, and the tail is the only place it looks: the log holds
- * everything but this is a convenience, not a fact anybody depends on, and
- * reading the whole file on a form open would put disk I/O on a tap. A food
- * last eaten more than NFOOD entries ago therefore answers 0 -- which is the
- * same answer as "never", and means the same thing to the caller: nothing to
- * suggest. 0 is not a portion (FOOD_MIN_G is 1), so it cannot be confused with
- * a real one. */
+ * NEWEST FIRST, from the copy in memory, which is the whole log: reading the
+ * file on a form open would put disk I/O on a tap. 0 is not a portion
+ * (FOOD_MIN_G is 1), so "never" cannot be confused with a real one. */
 long food_last_grams(int type_id);
-int food_copy(struct food_rec *out, int cap);
+/* The frame's copy, refreshed only when the log has changed: see
+ * wt_snapshot in weight.h, which this answers exactly as. */
+int food_snapshot(struct food_rec **buf, int *cap, int *n, unsigned *gen);
+/* The index of the first entry at or after `t` (food_count() when none is). */
+int food_first_since(long t);
 
 const char *food_path(void);
 const char *food_types_path(void);

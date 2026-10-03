@@ -1145,18 +1145,12 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int plot_x = cx + (2 * sc);
    int plot_y = y;
    int plot_w = cw - (4 * sc);
-   /* WHAT THE PLOT WILL DRAW is UI_PLOT_MAX below, and it is derived rather
-    * than written down: PLOT_LONG_MAX for the glucose points a long span can
-    * return, plus NINS for the doses and NWT for the weights, which the shell
-    * appends after them in the SAME m->plot.hist array. Capping at the glucose
-    * figure alone drops every dose whose index lands past it -- with the
-    * history full, the steady state after a fortnight, that is all of them, and
-    * before that the newest ones, so a dose logged minutes ago is missing from
-    * the plot while older ones still show. */
-/* A LONG span returns up to PLOT_LONG_MAX points (plotdata.h), which is far
- * more than the live window holds. Sized for the LARGER of the two: too
- * small and the older half of a 30-day plot is silently cut off. */
-#define UI_PLOT_MAX (PLOT_LONG_MAX + NINS + NWT)
+   /* WHAT THE PLOT WILL DRAW is UI_PLOT_MAX below: UI_PTS_MAX, the glucose
+    * points a long span can return plus the four logs' entries the model
+    * appends after them in the SAME m->plot.hist array. Capping at the
+    * glucose figure alone would drop every entry whose index lands past it,
+    * so a dose logged minutes ago would be missing from the plot. */
+#define UI_PLOT_MAX UI_PTS_MAX
    static struct plot_pt pts[UI_PLOT_MAX + UI_CHG_MAX];
    int np = m->plot.nhist < UI_PLOT_MAX ? m->plot.nhist : UI_PLOT_MAX;
    for (int i = 0; i < np; i++) {

@@ -1412,9 +1412,10 @@ void chk_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), code, 0);
 }
 
-int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
-              const char *name, const char *val, uint32_t vcol, int code,
-              int ix)
+/* The target runs from `hx` to the right edge. */
+static int value_row_from(struct ANativeWindow_Buffer *fb, struct hits *h,
+                          int y, int sc, const char *name, const char *val,
+                          uint32_t vcol, int code, int ix, int hx)
 {
    uint32_t *px = fb->bits;
    int rx       = fb->width - (4 * sc);
@@ -1424,10 +1425,24 @@ int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
             UI_TEXT_DIM);
    draw_str(px, fb, rx - vw, y, vsc, val, vcol);
    add_hit_ix(h,
-              ui_rect(fb->width / 2, y - (4 * sc), fb->width / 2,
-                      (7 * vsc) + (8 * sc)),
+              ui_rect(hx, y - (4 * sc), fb->width - hx, (7 * vsc) + (8 * sc)),
               code, ix);
    return y + (7 * vsc) + (8 * sc);
+}
+
+int value_row(struct ANativeWindow_Buffer *fb, struct hits *h, int y, int sc,
+              const char *name, const char *val, uint32_t vcol, int code,
+              int ix)
+{
+   return value_row_from(fb, h, y, sc, name, val, vcol, code, ix,
+                         fb->width / 2);
+}
+
+int value_row_wide(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                   int sc, const char *name, const char *val, uint32_t vcol,
+                   int code, int ix)
+{
+   return value_row_from(fb, h, y, sc, name, val, vcol, code, ix, 0);
 }
 
 /* One stepper block with PER-DIGIT vertical arrows:

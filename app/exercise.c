@@ -12,7 +12,8 @@
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
-#include <stdio.h> /* snprintf */
+#include <stdio.h>  /* snprintf */
+#include <stdlib.h> /* realloc, free: the log in memory grows with the file */
 
 /* ---- THE TAIL IS A VALUE, AND IT IS PUBLISHED ---------------
  *
@@ -20,13 +21,38 @@
  * RESTORE rewrites exercise.csv and reloads it, and once that reload runs
  * it runs on the SYNC WORKER while the main thread draws
  * the log out of the tail. So the tail is one object behind a leaf lock and
- * a load publishes a separately-built one with a single assignment. */
+ * a load publishes a separately-built one by swapping the two under it.
+ *
+ * THE WHOLE LOG, on the heap: every row the file holds, so the table pages
+ * back to the first session. `cap` is what `r` has room for; it grows by
+ * doubling as rows arrive. */
 struct ex_tail {
-   struct ex_rec r[NEX];
-   int n;
+   struct ex_rec *r;
+   int n, cap;
 };
 
 static struct ex_tail g_live;
+
+/* BUMPED ON EVERY CHANGE TO g_live, under extail_lk, so a reader holding a
+ * copy can tell whether it is still current. Starts at 1 so a reader's
+ * zeroed generation never matches. */
+static unsigned g_gen = 1;
+
+/* Room for `need` rows; 0, or -1 when the allocator refused. */
+static int ex_reserve(struct ex_tail *t, int need)
+{
+   if (need <= t->cap)
+      return 0;
+   int c = t->cap ? t->cap : 256;
+   while (c < need)
+      c *= 2;
+   struct ex_rec *p = realloc(t->r, (size_t)c * sizeof *p);
+   if (!p)
+      return -1;
+   t->r   = p;
+   t->cap = c;
+   return 0;
+}
 
 /* A LEAF, and NOT ex_lk below: that one guards the BUTTON's pending state
  * and is held across a decision, while this one is taken around the tail
@@ -55,27 +81,64 @@ struct ex_rec ex_at(int i)
    return z;
 }
 
-int ex_copy(struct ex_rec *out, int cap)
+int ex_snapshot(struct ex_rec **buf, int *cap, int *n, unsigned *gen)
 {
-   if (!out || cap <= 0)
-      return 0;
+   if (!buf || !cap || !n || !gen)
+      return -1;
    mutex_lock(&extail_lk);
-   int n = g_live.n < cap ? g_live.n : cap;
-   for (int i = 0; i < n; i++)
-      out[i] = g_live.r[i];
+   if (*gen == g_gen) {
+      mutex_unlock(&extail_lk);
+      return 0;
+   }
+   int rc   = 1;
+   int want = g_live.n;
+   if (want > *cap) {
+      struct ex_rec *p = realloc(*buf, (size_t)want * sizeof *p);
+      if (p) {
+         *buf = p;
+         *cap = want;
+      } else {
+         rc = -1;
+      }
+   }
+   const int k    = want < *cap ? want : *cap;
+   const int from = g_live.n - k; /* the newest k */
+   for (int i = 0; i < k; i++)
+      (*buf)[i] = g_live.r[from + i];
+   *n   = k;
+   *gen = g_gen;
    mutex_unlock(&extail_lk);
-   return n;
+   return rc;
 }
 
-/* The newest NEX rows BY TIME -- weight.c's wt_push, and the long argument for
- * why "newest by time" rather than "last seen" is there. An import of older
- * rows must not evict today's. */
+int ex_first_since(long t)
+{
+   mutex_lock(&extail_lk);
+   int lo = 0;
+   int hi = g_live.n;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (g_live.r[mid].t < t)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   mutex_unlock(&extail_lk);
+   return lo;
+}
+
+/* Every row is taken; only when the allocator refuses does the copy keep
+ * the newest rows BY TIME instead -- weight.c's wt_push, and the long
+ * argument for why "newest by time" rather than "last seen" is there. An
+ * import of older rows must not evict today's. */
 static void ex_push(struct ex_tail *t, const struct ex_rec *r)
 {
-   if (t->n < NEX) {
+   if (t->n < t->cap || ex_reserve(t, t->n + 1) == 0) {
       t->r[t->n++] = *r;
       return;
    }
+   if (t->n == 0)
+      return; /* no room for even one row */
    int oldest = 0;
    for (int i = 1; i < t->n; i++)
       if (t->r[i].t < t->r[oldest].t)
@@ -173,6 +236,18 @@ static int ex_parse_line(struct ex_tail *t, const char *p, const char *e)
 /* THE STAGING TAIL, private to the loader (see insulin.c). */
 static struct ex_tail g_stage;
 
+/* THE STAGED LOG BECOMES THE LIVE ONE BY A SWAP under the leaf lock: the old
+ * live rows land in the stage, whose buffer the next load reuses. */
+static void ex_publish(struct ex_tail *t)
+{
+   mutex_lock(&extail_lk);
+   struct ex_tail old = g_live;
+   g_live             = *t;
+   *t                 = old;
+   g_gen++;
+   mutex_unlock(&extail_lk);
+}
+
 /* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
  *
  * g_stage is a static -- the tail can be thousands of rows and this runs on a
@@ -204,9 +279,7 @@ static int exercise_load_staged(void)
    int fd            = open(g_ex_path, O_RDONLY, 0);
    if (fd < 0) {
       /* A log that is not there is a published result too: see weight.c. */
-      mutex_lock(&extail_lk);
-      g_live = *t;
-      mutex_unlock(&extail_lk);
+      ex_publish(t);
       return errno == ENOENT ? 0 : -1;
    }
    char buf[1024];
@@ -239,9 +312,7 @@ static int exercise_load_staged(void)
    close(fd);
    ex_sort(t);
    /* PUBLISHED WHOLE. */
-   mutex_lock(&extail_lk);
-   g_live = *t;
-   mutex_unlock(&extail_lk);
+   ex_publish(t);
    /* THE BUTTON IS A VIEW OF WHAT WAS JUST PUBLISHED. At launch that is what
     * relights a session the process was killed in the middle of -- the row is
     * open, so a session IS running, and without this the only control that
@@ -352,6 +423,7 @@ int exercise_append(long t, int level, long tz)
    mutex_lock(&extail_lk);
    ex_push(&g_live, &r);
    ex_sort(&g_live);
+   g_gen++;
    mutex_unlock(&extail_lk);
    record_mutated(); /* a synced record changed: see util.h */
    return 0;
@@ -418,10 +490,8 @@ static int ex_edit_format(char *out, int cap, void *ctx)
  * it applies is the one already on disk. It finds the row by the same key the
  * matcher above uses, then edits or removes it.
  *
- * A DELETE LEAVES THE TAIL ONE ROW SHORT of what it could hold: the row that
- * should be pulled in is older than anything in memory and only the file has
- * it. The next successful load fills it. One missing old row for one session
- * is a different order of wrong from a table that contradicts the file. */
+ * The copy in memory is the whole log unless an allocation was refused, so
+ * the row is normally there to find. */
 /* CALLER HOLDS extail_lk. */
 static void ex_tail_patch(const struct ex_rec *orig, int del, long t, int level,
                           long tz, long dur)
@@ -442,7 +512,8 @@ static void ex_tail_patch(const struct ex_rec *orig, int del, long t, int level,
       }
       return;
    }
-   /* Older than the newest NEX rows: not in the tail, nothing to do. */
+   /* Not held at all -- only possible when a refused allocation left the
+    * copy short of the file, and the next successful load fills it. */
 }
 
 static int ex_rewrite(const struct ex_rec *orig, int del, long t, int level,
@@ -462,18 +533,30 @@ static int ex_rewrite(const struct ex_rec *orig, int del, long t, int level,
     * showed an empty log after a successful edit. It matters most here --
     * closing a session is a rewrite, so an unnoticed stale tail leaves a
     * session drawn as still running. */
-   struct ex_tail save;
+   /* A DEEP COPY: the rows live on the heap, and the reload below swaps the
+    * live buffer away. When even the copy cannot be allocated the reload
+    * still runs; only the fallback is lost. */
+   struct ex_tail save = {0, 0, 0};
    mutex_lock(&extail_lk);
-   save = g_live;
+   const int have_save = ex_reserve(&save, g_live.n) == 0;
+   if (have_save) {
+      for (int i = 0; i < g_live.n; i++)
+         save.r[i] = g_live.r[i];
+      save.n = g_live.n;
+   }
    mutex_unlock(&extail_lk);
-   if (exercise_load() != 0) {
+   if (exercise_load() != 0 && have_save) {
       mutex_lock(&extail_lk);
-      g_live = save;
+      struct ex_tail prefix = g_live;
+      g_live                = save;
+      save                  = prefix;
       ex_tail_patch(orig, del, t, level, tz, dur);
+      g_gen++;
       mutex_unlock(&extail_lk);
       LOGW("exercise: the log was rewritten but could not be re-read; the "
            "table was updated from the edit itself");
    }
+   free(save.r);
    return 0;
 }
 

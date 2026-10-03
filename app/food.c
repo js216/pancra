@@ -17,7 +17,8 @@
 #if __STDC_HOSTED__
 #include <errno.h> /* ENOENT: a missing file is not a read failure */
 #endif
-#include <stdio.h> /* snprintf */
+#include <stdio.h>  /* snprintf */
+#include <stdlib.h> /* realloc, free: the log in memory grows with the file */
 
 /* ---- THE WHOLE LOG IS ONE OBJECT, AND IT IS PUBLISHED -------
  *
@@ -39,8 +40,11 @@ struct food_state {
    struct food_type ft[NFOODTYPE];
    int nft;
    int next_id;
-   struct food_rec fd[NFOOD];
-   int nfd;
+   /* THE WHOLE ENTRY LOG, on the heap: every row the file holds, so the
+    * table pages back to the first entry. `fdcap` is what `fd` has room for;
+    * it grows by doubling as rows arrive. */
+   struct food_rec *fd;
+   int nfd, fdcap;
    /* THE PICKER'S ORDER, part of the state rather than beside it: it indexes
     * `ft`, so an order published against a different vocabulary names the
     * wrong food. */
@@ -49,6 +53,27 @@ struct food_state {
 };
 
 static struct food_state g_live = {.next_id = 1};
+
+/* BUMPED ON EVERY CHANGE TO THE LIVE ENTRIES, under food_lk, so a reader
+ * holding a copy can tell whether it is still current. Starts at 1 so a
+ * reader's zeroed generation never matches. */
+static unsigned g_gen = 1;
+
+/* Room for `need` entries; 0, or -1 when the allocator refused. */
+static int fd_reserve(struct food_state *s, int need)
+{
+   if (need <= s->fdcap)
+      return 0;
+   int c = s->fdcap ? s->fdcap : 256;
+   while (c < need)
+      c *= 2;
+   struct food_rec *p = realloc(s->fd, (size_t)c * sizeof *p);
+   if (!p)
+      return -1;
+   s->fd    = p;
+   s->fdcap = c;
+   return 0;
+}
 
 /* A LEAF: taken innermost, never held across another module's call and never
  * across file I/O. See app/thread.h. */
@@ -165,18 +190,41 @@ static int milli_parse(const char *s, int *out)
 static void order_build_in(struct food_state *s)
 {
    int freq[NFOODTYPE] = {0};
-   for (int i = 0; i < s->nfd; i++)
+   /* AN ENTRY'S ROW BY ITS ID, looked up directly: this runs on every entry
+    * logged, over the whole log, and a search of the vocabulary per entry
+    * would multiply years of entries by every food ever named. Ids are
+    * minted from 1 upward, so they index a table as long as the largest;
+    * when even that cannot be allocated, the search is the fallback. */
+   int maxid = 0;
+   for (int t = 0; t < s->nft; t++)
+      if (s->ft[t].id > maxid)
+         maxid = s->ft[t].id;
+   int *row = malloc(((size_t)maxid + 1) * sizeof *row);
+   if (row) {
+      for (int k = 0; k <= maxid; k++)
+         row[k] = -1;
       for (int t = 0; t < s->nft; t++)
-         if (s->ft[t].id == s->fd[i].type) {
-            freq[t]++;
-            break;
-         }
+         if (s->ft[t].id > 0)
+            row[s->ft[t].id] = t;
+      for (int i = 0; i < s->nfd; i++) {
+         const int id = s->fd[i].type;
+         if (id > 0 && id <= maxid && row[id] >= 0)
+            freq[row[id]]++;
+      }
+      free(row);
+   } else {
+      for (int i = 0; i < s->nfd; i++)
+         for (int t = 0; t < s->nft; t++)
+            if (s->ft[t].id == s->fd[i].type) {
+               freq[t]++;
+               break;
+            }
+   }
    for (int i = 0; i < s->nft; i++)
       s->order[i] = i;
-   /* INSERTION SORT, and deliberately: the vocabulary is at most NFOODTYPE
-    * (64) entries and this runs when one of them changes, not per frame. It
-    * is stable, which is what makes equal counts keep insertion order without
-    * a second comparison. */
+   /* INSERTION SORT, and deliberately: it runs when the vocabulary or the log
+    * changes, not per frame, and it is stable, which is what makes equal
+    * counts keep insertion order without a second comparison. */
    for (int i = 1; i < s->nft; i++) {
       const int cur = s->order[i];
       int j         = i - 1;
@@ -481,26 +529,63 @@ long food_last_grams(int type_id)
    return g;
 }
 
-int food_copy(struct food_rec *out, int cap)
+int food_snapshot(struct food_rec **buf, int *cap, int *n, unsigned *gen)
 {
-   if (!out || cap <= 0)
-      return 0;
+   if (!buf || !cap || !n || !gen)
+      return -1;
    mutex_lock(&food_lk);
-   int n = g_nfd < cap ? g_nfd : cap;
-   for (int i = 0; i < n; i++)
-      out[i] = g_fd[i];
+   if (*gen == g_gen) {
+      mutex_unlock(&food_lk);
+      return 0;
+   }
+   int rc   = 1;
+   int want = g_nfd;
+   if (want > *cap) {
+      struct food_rec *p = realloc(*buf, (size_t)want * sizeof *p);
+      if (p) {
+         *buf = p;
+         *cap = want;
+      } else {
+         rc = -1;
+      }
+   }
+   const int k    = want < *cap ? want : *cap;
+   const int from = g_nfd - k; /* the newest k */
+   for (int i = 0; i < k; i++)
+      (*buf)[i] = g_fd[from + i];
+   *n   = k;
+   *gen = g_gen;
    mutex_unlock(&food_lk);
-   return n;
+   return rc;
 }
 
-/* The newest NFOOD rows BY TIME -- weight.c's wt_push carries the argument for
- * why that is not the same as "the last NFOOD seen". */
+int food_first_since(long t)
+{
+   mutex_lock(&food_lk);
+   int lo = 0;
+   int hi = g_nfd;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (g_fd[mid].t < t)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   mutex_unlock(&food_lk);
+   return lo;
+}
+
+/* Every row is taken; only when the allocator refuses does the copy keep
+ * the newest rows BY TIME instead -- weight.c's wt_push carries the argument
+ * for why that is not the same as "the last ones seen". */
 static void fd_push_in(struct food_state *s, const struct food_rec *r)
 {
-   if (s->nfd < NFOOD) {
+   if (s->nfd < s->fdcap || fd_reserve(s, s->nfd + 1) == 0) {
       s->fd[s->nfd++] = *r;
       return;
    }
+   if (s->nfd == 0)
+      return; /* no room for even one row */
    int oldest = 0;
    for (int i = 1; i < s->nfd; i++)
       if (s->fd[i].t < s->fd[oldest].t)
@@ -537,6 +622,7 @@ static void fd_push(const struct food_rec *r)
     * does not publish at all, which is what makes it usable on the loader's
     * own state, where the order is built once at the end.) */
    fd_push_in(&g_live, r);
+   g_gen++;
    order_publish();
 }
 
@@ -634,9 +720,22 @@ static int slurp_lines(struct food_state *s, const char *path,
 }
 
 /* THE STAGING STATE, private to the loader. Static because it is large and
- * this runs on a service thread; never published as anything but a copy. */
+ * this runs on a service thread. */
 static int goals_load(void);
 static struct food_state g_stage;
+
+/* THE STAGED STATE BECOMES THE LIVE ONE BY A SWAP under the leaf lock: the
+ * old live state lands in the stage, whose entry buffer the next load
+ * reuses, so a load allocates only when the log has outgrown both. */
+static void food_publish(struct food_state *s)
+{
+   mutex_lock(&food_lk);
+   struct food_state old = g_live;
+   g_live                = *s;
+   *s                    = old;
+   g_gen++;
+   mutex_unlock(&food_lk);
+}
 
 /* THE STAGING BUFFER IS SHARED, so parse-and-publish is one critical section.
  *
@@ -665,7 +764,7 @@ int food_load(void)
 static int food_load_staged(void)
 {
    /* BUILT SEPARATELY, PUBLISHED AT ONCE. Nothing below touches
-    * the live state until the assignment at the end, so a reader on the main
+    * the live state until the swap at the end, so a reader on the main
     * thread holds the food log from before this call or the one after it --
     * never a vocabulary without its entries, or entries whose types have not
     * been read yet.
@@ -686,9 +785,7 @@ static int food_load_staged(void)
    int c = goals_load();
    fd_sort_in(s);
    order_build_in(s);
-   mutex_lock(&food_lk);
-   g_live = *s;
-   mutex_unlock(&food_lk);
+   food_publish(s);
    /* EITHER file being short means what the user is shown is short. They are
     * reported as one answer because they describe one thing -- the food
     * history -- and a caller that could act on "the types are fine but the
@@ -769,10 +866,8 @@ static int fd_edit_format(char *out, int cap, void *ctx)
  * it applies is the one already on disk. It finds the row by the same key the
  * matcher above uses, then edits or removes it.
  *
- * A DELETE LEAVES THE TAIL ONE ROW SHORT of what it could hold: the row that
- * should be pulled in is older than anything in memory and only the file has
- * it. The next successful load fills it. One missing old row for one session
- * is a different order of wrong from a table that contradicts the file. */
+ * The copy in memory is the whole log unless an allocation was refused, so
+ * the row is normally there to find. */
 /* CALLER HOLDS food_lk. */
 static void fd_tail_patch(const struct food_rec *orig, int del, long t,
                           int type, long g)
@@ -796,7 +891,8 @@ static void fd_tail_patch(const struct food_rec *orig, int del, long t,
       order_publish();
       return;
    }
-   /* Older than the newest NFOOD rows: not in the tail, nothing to do. */
+   /* Not held at all -- only possible when a refused allocation left the
+    * copy short of the file, and the next successful load fills it. */
 }
 
 static int fd_rewrite(const struct food_rec *orig, int del, long t, int type,
@@ -820,14 +916,29 @@ static int fd_rewrite(const struct food_rec *orig, int del, long t, int type,
    /* THE WHOLE STATE IS SAVED, not just the entries: food_load republishes
     * the vocabulary and the picker's order too, so restoring the rows alone
     * would leave them beside a table built from a load that failed. */
-   struct food_state save;
+   /* A DEEP COPY of the entries, which live on the heap and which the
+    * reload below swaps away. When even the copy cannot be allocated the
+    * reload still runs; only the fallback is lost. Static: the state is
+    * large, and only the main thread edits. */
+   static struct food_state save;
    mutex_lock(&food_lk);
-   save = g_live;
+   struct food_rec *keep = save.fd;
+   int keepcap           = save.fdcap;
+   save                  = g_live;
+   save.fd               = keep;
+   save.fdcap            = keepcap;
+   const int have_save   = fd_reserve(&save, g_nfd) == 0;
+   if (have_save)
+      for (int i = 0; i < g_nfd; i++)
+         save.fd[i] = g_fd[i];
    mutex_unlock(&food_lk);
-   if (food_load() != 0) {
+   if (food_load() != 0 && have_save) {
       mutex_lock(&food_lk);
-      g_live = save;
+      struct food_state prefix = g_live;
+      g_live                   = save;
+      save                     = prefix;
       fd_tail_patch(orig, del, t, type, g);
+      g_gen++;
       mutex_unlock(&food_lk);
       LOGW("food: the log was rewritten but could not be re-read; the table "
            "was updated from the edit itself");

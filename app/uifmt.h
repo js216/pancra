@@ -215,14 +215,19 @@ struct log_pt {
    long t;
    long v;
    int series;
+   /* The entry this point is, as an index into the frame's copy of its log,
+    * for a plot whose points are entries (insulin): the scrub reads the
+    * entry back through it. Plots whose points are totals leave it alone. */
+   int ix;
 };
 
 /* The most points any log plot will draw.
  *
- * Sized by the two hungriest cases, not by the tails: the exercise plot's 24 H
- * tab buckets a whole day into five-minute steps (288 of them), and its longer
- * tabs carry TWO series of up to 256 days each. */
-#define UI_LOG_PTS 512
+ * Sized by the hungriest case: the exercise plot's longer tabs carry TWO
+ * series of one point per DAY, so this is 2048 days -- five and a half
+ * years -- of each. A span holding more keeps its newest days (ex_points);
+ * the insulin plot thins a span holding more doses evenly (ins_points). */
+#define UI_LOG_PTS 4096
 
 /* The characters the rename keypad offers, in grid order. Exposed so the shell
  * can map an MA_CHAR code back to the character that was tapped. */

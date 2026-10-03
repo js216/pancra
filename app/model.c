@@ -210,6 +210,24 @@ void model_set_plot_hours(int hours)
    g_plot_hours = hours;
 }
 
+void model_plot_logs(long now, int hours, int first[PLOG_N], int end[PLOG_N])
+{
+   long from = now - ((long)hours * 3600);
+   from -= ((from % 3600) + 3600) % 3600;
+   from -= 3600;
+   end[PLOG_INS]    = ins_count();
+   first[PLOG_INS]  = ins_first_since(from);
+   end[PLOG_WT]     = wt_count();
+   first[PLOG_WT]   = wt_first_since(from);
+   end[PLOG_FOOD]   = food_count();
+   first[PLOG_FOOD] = food_first_since(from);
+   end[PLOG_EX]     = ex_count();
+   first[PLOG_EX]   = ex_first_since(from);
+   for (int k = 0; k < PLOG_N; k++)
+      if (end[k] - first[k] > PLOT_LOG_MAX)
+         first[k] = end[k] - PLOT_LOG_MAX;
+}
+
 static char g_lines[MAX_LINES][MAX_COLS + 1];
 static int g_nlines;
 
@@ -317,12 +335,25 @@ struct frame_ctx {
    struct ui_dev devs[UI_DEVS_MAX];
    struct ui_sensor sens[UI_MAX_SLOTS];
    struct reading hist[NHIST];
-   struct ins_rec inslog[NINS];
-   struct wt_rec wtlog[NWT];
+   /* THE FOUR LOGS, whole, in heap buffers that grow with them and are
+    * refreshed only when the log's generation moves (wt_snapshot): a frame
+    * every second must not copy years of rows that have not changed. */
+   struct ins_rec *inslog;
+   int inscap, insn;
+   unsigned insgen;
+   struct wt_rec *wtlog;
+   int wtcap, wtn;
+   unsigned wtgen;
    struct food_type ftypes[NFOODTYPE];
-   struct food_rec foodlog[NFOOD];
-   struct ex_rec exlog[NEX];
-   struct step_rec steps[NSTEPS];
+   struct food_rec *foodlog;
+   int foodcap, foodn;
+   unsigned foodgen;
+   struct ex_rec *exlog;
+   int excap, exn;
+   unsigned exgen;
+   struct step_rec *steps;
+   int stepscap, stepsn;
+   unsigned stepsgen;
    char mac[24];
    char entry[64]; /* checked against forms_view::entry below */
 };
@@ -922,8 +953,12 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * plot_render and plot_hit take points in any order, so appending
     * after the newest-first glucose is fine. They are NEVER in g_hist,
     * so they cannot leak into stats or the remote push. */
-   int nins = ins_count();
-   for (int i = 0; i < nins && nh < UI_PTS_MAX; i++) {
+   /* Only the entries in the span, and the same ones the scrub's hit test
+    * picks from: see model_plot_logs. */
+   int lfirst[PLOG_N];
+   int lend[PLOG_N];
+   model_plot_logs(now, model_plot_hours(), lfirst, lend);
+   for (int i = lfirst[PLOG_INS]; i < lend[PLOG_INS] && nh < UI_PTS_MAX; i++) {
       struct ins_rec ir = ins_at(i);
       f->pts[nh].t      = ir.t;
       /* THOUSANDTHS, carried through the plot point unchanged: the scrub
@@ -939,8 +974,7 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * renders them in whichever display unit is set at the time, exactly as
     * the weight table does. Like the doses these are never in g_hist, so they
     * cannot leak into TIR, the average or the remote push. */
-   int nwt = wt_count();
-   for (int i = 0; i < nwt && nh < UI_PTS_MAX; i++) {
+   for (int i = lfirst[PLOG_WT]; i < lend[PLOG_WT] && nh < UI_PTS_MAX; i++) {
       struct wt_rec wr = wt_at(i);
       f->pts[nh].t     = wr.t;
       f->pts[nh].glu   = (int)wr.g; /* grams; WT_MAX_G is 400000, fits an int */
@@ -954,8 +988,8 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * the scrub reads the real value back out of hist. `src` carries the TYPE
     * ID so the scrub can name the food; an id the vocabulary no longer holds
     * renders as an empty name rather than a number. */
-   int nfd = food_count();
-   for (int i = 0; i < nfd && nh < UI_PTS_MAX; i++) {
+   for (int i = lfirst[PLOG_FOOD]; i < lend[PLOG_FOOD] && nh < UI_PTS_MAX;
+        i++) {
       struct food_rec fr = food_at(i);
       f->pts[nh].t       = fr.t;
       f->pts[nh].glu     = (int)fr.g; /* grams; FOOD_MAX_G fits an int */
@@ -974,15 +1008,15 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * still up. Without that test a session the app was killed during would
     * grow a rule for ever, which is a claim about exercise that never
     * happened rather than about one still happening. */
-   int nex     = ex_count();
-   int ex_live = 0;
+   const int nex = lend[PLOG_EX];
+   int ex_live   = 0;
    {
       int lvl = 0;
       int rem = 0;
       exercise_button_get(mono_s(), &lvl, &rem);
       ex_live = lvl != 0;
    }
-   for (int i = 0; i < nex && nh < UI_PTS_MAX; i++) {
+   for (int i = lfirst[PLOG_EX]; i < nex && nh < UI_PTS_MAX; i++) {
       struct ex_rec er = ex_at(i);
       long dur         = er.dur;
       if (dur == 0 && i == nex - 1 && ex_live) {
@@ -1282,14 +1316,18 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    /* A COPY, into frame-owned storage: the tail is reloaded whenever a dose
     * is logged or edited, and a frame that borrowed it would be drawing an
     * array rewritten underneath it. */
-   m->ins.ins_nlog    = ins_copy(f->inslog, NINS);
+   if (ins_snapshot(&f->inslog, &f->inscap, &f->insn, &f->insgen) < 0)
+      LOGW("model: no memory for the whole insulin log; showing the newest");
+   m->ins.ins_nlog    = f->insn;
    m->ins.ins_log     = f->inslog;
    m->ins.inslog_page = f->fv.inslog_page;
    m->ins.inslog_tab  = f->fv.inslog_tab;
    /* A COPY, into frame-owned storage: the tail is reloaded whenever a weight
     * is logged or edited, and a frame that borrowed it would be drawing an
     * array rewritten underneath it. */
-   m->wt.nwt       = wt_copy(f->wtlog, NWT);
+   if (wt_snapshot(&f->wtlog, &f->wtcap, &f->wtn, &f->wtgen) < 0)
+      LOGW("model: no memory for the whole weight log; showing the newest");
+   m->wt.nwt       = f->wtn;
    m->wt.wt        = f->wtlog;
    m->wt.wt_page   = f->fv.wtlog_page;
    m->wt.wt_t      = f->fv.wt_t;
@@ -1322,13 +1360,17 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    /* A COPY, into frame-owned storage, for the reason the insulin and weight
     * tails are copied: the tail is reloaded whenever an entry is logged, and
     * a frame borrowing it would draw an array being rewritten underneath. */
-   m->food.nlog     = food_copy(f->foodlog, NFOOD);
+   if (food_snapshot(&f->foodlog, &f->foodcap, &f->foodn, &f->foodgen) < 0)
+      LOGW("model: no memory for the whole food log; showing the newest");
+   m->food.nlog     = f->foodn;
    m->food.log      = f->foodlog;
    m->food.log_page = f->fv.foodlog_page;
    /* The exercise tail, copied for the same reason: exercise_button_tick can
     * commit a record from the SERVICE thread between frames, which reloads
     * it. */
-   m->food.nexlog     = ex_copy(f->exlog, NEX);
+   if (ex_snapshot(&f->exlog, &f->excap, &f->exn, &f->exgen) < 0)
+      LOGW("model: no memory for the whole exercise log; showing the newest");
+   m->food.nexlog     = f->exn;
    m->food.exlog      = f->exlog;
    m->food.exlog_page = f->fv.exlog_page;
    m->food.exlog_tab  = f->fv.exlog_tab;
@@ -1336,10 +1378,12 @@ static void build_forms(struct frame_ctx *f, struct screen *m)
    m->food.steps_live = steps_live();
    /* A COPY, into frame-owned storage, like every other log tail: the sampler
     * appends from a service tick while this frame is being drawn. */
-   m->food.nsteps = steps_copy(f->steps, NSTEPS);
+   if (steps_snapshot(&f->steps, &f->stepscap, &f->stepsn, &f->stepsgen) < 0)
+      LOGW("model: no memory for the whole step log; showing the newest");
+   m->food.nsteps = f->stepsn;
    m->food.steps  = f->steps;
-   /* THE RUNNING ROW, named by its position in the copy above. ex_copy keeps
-    * the tail's order (oldest first), so the running session -- which is
+   /* THE RUNNING ROW, named by its position in the copy above. ex_snapshot
+    * keeps the tail's order (oldest first), so the running session -- which is
     * always the newest row -- is the last one copied; the instant is compared
     * so a tail that was truncated or has moved cannot mislabel a neighbour. */
    m->food.exlog_act = -1;

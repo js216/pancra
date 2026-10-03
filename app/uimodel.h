@@ -619,11 +619,16 @@ struct screen {
 #define PLOT_PERCOL   64 /* distinct values kept per column */
 #define PLOT_LONG_MAX (PLOT_COLS * PLOT_PERCOL)
 
-/* Points one frame can carry: the long-span glucose ceiling plus every dose
- * and weight, because all three ride in ONE array -- plot_render and plot_hit
- * take points in any order, and the scrub index the UI hands back has to
- * index a single list. */
-#define UI_PTS_MAX (PLOT_LONG_MAX + NINS + NWT)
+/* The most entries of ONE log -- doses, weights, food, exercise -- the main
+ * plot carries: the newest in the span (model_plot_logs). 2048 is a month
+ * of seventy entries a day. */
+#define PLOT_LOG_MAX 2048
+
+/* Points one frame can carry: the long-span glucose ceiling plus the four
+ * logs' entries, because all of them ride in ONE array -- plot_render and
+ * plot_hit take points in any order, and the scrub index the UI hands back
+ * has to index a single list. */
+#define UI_PTS_MAX (PLOT_LONG_MAX + (4 * PLOT_LOG_MAX))
 
 /* Changes one frame can carry. A long span keeps one per sensor per column,
  * PCHG_PERCOL sensors deep; a live span one per reading, and the live

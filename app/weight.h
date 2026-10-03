@@ -49,16 +49,12 @@
  * run cannot parse as a plausible date. */
 #define WT_T_MAX 32503680000L
 
-/* In-memory tail only -- the file keeps everything. 256 daily weigh-ins is
- * eight months, and the table pages through the tail. */
-#define NWT 256
-
 struct wt_rec {
    long t; /* entry instant, epoch seconds */
    long g; /* grams */
 };
 
-/* THE TAIL IS PRIVATE. As `extern struct wt_rec g_wt[NWT]` plus a count,
+/* THE TAIL IS PRIVATE. As `extern struct wt_rec g_wt[]` plus a count,
  * every reader depends on the representation (an array, oldest first, this
  * long), on the invariant (sorted), and on the lifetime (valid until the next
  * load, which the weight screen triggers) -- and any of them can write to it.
@@ -75,16 +71,25 @@ struct wt_rec wt_at(int i);
 /* The newest, or a zeroed record when there is none -- what the LOG WEIGHT
  * form pre-populates from. */
 struct wt_rec wt_newest(void);
-/* Copy up to `cap` of them, oldest first; returns how many were copied. For
- * the frame, which needs a snapshot that cannot change while it is drawn. */
-int wt_copy(struct wt_rec *out, int cap);
+/* THE FRAME'S COPY, refreshed only when the log has changed.
+ *
+ * `*buf` is the caller's heap buffer of `*cap` records, grown here to fit;
+ * `*n` and `*gen` say what it holds. When `*gen` is still the log's current
+ * generation nothing is copied and 0 is returned; otherwise the whole log is
+ * copied, oldest first, and 1 is returned. -1 means the buffer could not
+ * grow: it then holds the NEWEST records that fit, which is the honest
+ * subset to draw. */
+int wt_snapshot(struct wt_rec **buf, int *cap, int *n, unsigned *gen);
+/* The index of the first record at or after `t` (wt_count() when none is):
+ * where a plot of the span from `t` starts. */
+int wt_first_since(long t);
 const char *weight_path(void);
 /* Point it at the data directory; the filename lives here. */
 /* 1 when every path this module persists to fitted; 0 when one did
  * not, and then NONE of them is usable -- see data_path in util.h. */
 int weight_paths(const char *dir);
 
-/* Load the tail of the log (the last NWT plausible rows). Safe on a fresh
+/* Load the log (every plausible row). Safe on a fresh
  * install: a missing file is an empty log. */
 /* 0 read whole (or nothing to read), -1 a read failed partway: whatever
  * parsed is kept, and the caller says the record is incomplete. */

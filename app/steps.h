@@ -37,14 +37,6 @@
  * INS_T_MAX and WT_T_MAX. */
 #define STEP_T_MAX 32503680000L
 
-/* In-memory tail; the file keeps everything.
- *
- * 4096 windows. Only non-empty ones are stored, and a walked day fills on the
- * order of a hundred, so this holds months rather than the fourteen days
- * 4096 consecutive windows would come to. The longest span the plot offers is
- * 30 days, which is what the tail has to cover for the chart to be honest. */
-#define NSTEPS 4096
-
 struct step_rec {
    /* WHEN THE WINDOW ENDED, which is when the count was taken. Naming the end
     * rather than the start means a row is never about the future: the steps
@@ -58,8 +50,9 @@ struct step_rec {
 int steps_count(void);
 /* The i-th, oldest first; out of range yields a zeroed record. */
 struct step_rec steps_at(int i);
-/* Copy up to `cap` of them, oldest first; returns how many were copied. */
-int steps_copy(struct step_rec *out, int cap);
+/* The frame's copy, refreshed only when the log has changed: see
+ * wt_snapshot in weight.h, which this answers exactly as. */
+int steps_snapshot(struct step_rec **buf, int *cap, int *n, unsigned *gen);
 
 const char *steps_path(void);
 /* Point it at the data directory; the filename lives here. 1 when the path

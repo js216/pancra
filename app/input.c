@@ -593,8 +593,13 @@ int on_input(int fd, int events, void *data)
             /* Insulin doses ride along, in the SAME order the model
              * appends them, so the returned index maps onto m->plot.hist. */
             int np_glu = np;
-            int nins   = ins_count();
-            for (int i = 0; i < nins && np < UI_PTS_MAX; i++) {
+            /* The span's entries of each log, the ones build_model took:
+             * see model_plot_logs. */
+            int lfirst[PLOG_N];
+            int lend[PLOG_N];
+            model_plot_logs(realtime_s(), model_plot_hours(), lfirst, lend);
+            for (int i = lfirst[PLOG_INS];
+                 i < lend[PLOG_INS] && np < UI_PTS_MAX; i++) {
                struct ins_rec ir = ins_at(i);
                pts[np].t         = ir.t;
                pts[np].glu       = 60; /* the renderer's fixed insulin y */
@@ -613,8 +618,8 @@ int on_input(int fd, int events, void *data)
              * be scrubbed. They share the doses' y, so they fall inside
              * the same bottom band and the aiming rule below picks them up
              * without any extra case. */
-            int nwt = wt_count();
-            for (int i = 0; i < nwt && np < UI_PTS_MAX; i++) {
+            for (int i = lfirst[PLOG_WT]; i < lend[PLOG_WT] && np < UI_PTS_MAX;
+                 i++) {
                struct wt_rec wr = wt_at(i);
                pts[np].t        = wr.t;
                pts[np].glu      = 60; /* the renderer's fixed bottom-line y */
@@ -637,8 +642,8 @@ int on_input(int fd, int events, void *data)
              * -- exactly as the weights above do. Without this the F markers
              * drew perfectly and could not be selected, which is the bug the
              * weights had and the comment above records. */
-            int nfd = food_count();
-            for (int i = 0; i < nfd && np < UI_PTS_MAX; i++) {
+            for (int i = lfirst[PLOG_FOOD];
+                 i < lend[PLOG_FOOD] && np < UI_PTS_MAX; i++) {
                struct food_rec fr = food_at(i);
                pts[np].t          = fr.t;
                pts[np].glu        = 60; /* the renderer's fixed bottom line */
@@ -659,8 +664,8 @@ int on_input(int fd, int events, void *data)
              * DRAWN and not where it is, and the hit test picks by position;
              * a span here would be a second copy of a number this array has
              * no other use for. */
-            int nexr = ex_count();
-            for (int i = 0; i < nexr && np < UI_PTS_MAX; i++) {
+            for (int i = lfirst[PLOG_EX]; i < lend[PLOG_EX] && np < UI_PTS_MAX;
+                 i++) {
                struct ex_rec er = ex_at(i);
                pts[np].t        = er.t;
                pts[np].glu      = 60; /* the renderer's fixed bottom line */

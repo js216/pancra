@@ -296,8 +296,10 @@ void render_inslog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int trow  = 14 * sc;
    int laby  = plot_top - trow + ((trow - (7 * sc)) / 2);
    int scrub = m->log_scrub;
-   if (scrub >= 0 && scrub < npt && scrub < m->ins.ins_nlog) {
-      const struct ins_rec *d = &m->ins.ins_log[scrub];
+   /* The scrub names a POINT; the point names its dose. */
+   if (scrub >= 0 && scrub < npt && pts[scrub].ix >= 0 &&
+       pts[scrub].ix < m->ins.ins_nlog) {
+      const struct ins_rec *d = &m->ins.ins_log[pts[scrub].ix];
       char when[24];
       char line[48];
       fmt_date(d->t, m->tz_off, when, sizeof when);
@@ -1326,8 +1328,28 @@ int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
                               (m->ins.ins_nlog > 0) ? m->ins.ins_log[0].t : 0);
    if (from)
       *from = f;
-   int n = 0;
-   for (int i = 0; i < m->ins.ins_nlog && n < cap; i++) {
+   /* THE SPAN'S DOSES ONLY: the log is oldest first, so they are the run
+    * from the first dose at or after `f` to the end. */
+   int lo = 0;
+   int hi = m->ins.ins_nlog;
+   while (lo < hi) {
+      const int mid = lo + ((hi - lo) / 2);
+      if (m->ins.ins_log[mid].t < f)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   const int first = lo;
+   const int count = m->ins.ins_nlog - first;
+   if (count <= 0 || cap <= 0)
+      return 0;
+   /* MORE DOSES THAN POINTS -- years of them on ALL -- ARE THINNED EVENLY,
+    * so the plot still spans the whole period rather than only its newest
+    * part. The newest dose is always kept. Each point carries its dose's
+    * index, which is how the scrub reads the right one back. */
+   const int stride = (count + cap - 1) / cap;
+   int n            = 0;
+   for (int i = m->ins.ins_nlog - 1; i >= first && n < cap; i -= stride) {
       const struct ins_rec *d = &m->ins.ins_log[i];
       out[n].t                = d->t;
       /* THOUSANDTHS on the axis, so a 0.5 U dose sits half a unit up rather
@@ -1335,7 +1357,14 @@ int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
        * ins_units_str, so the axis still reads in units. */
       out[n].v      = d->milli;
       out[n].series = (d->type == INS_FAST) ? 1 : 0;
+      out[n].ix     = i;
       n++;
+   }
+   /* collected newest first; the plot joins a series in time order */
+   for (int a = 0, b = n - 1; a < b; a++, b--) {
+      const struct log_pt tmp = out[a];
+      out[a]                  = out[b];
+      out[b]                  = tmp;
    }
    return n;
 }
@@ -1449,6 +1478,7 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
          out[i].t      = start + (i * width);
          out[i].v      = 0;
          out[i].series = 1;
+         out[i].ix     = -1; /* a bucket, not an entry */
       }
       int got = 0;
       for (int i = 0; i < m->food.nsteps; i++) {
@@ -1523,9 +1553,11 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
       out[i].t          = d0 + (i * 86400);
       out[i].v          = 0;
       out[i].series     = 0;
+      out[i].ix         = -1; /* a day's total, not an entry */
       out[n + i].t      = out[i].t;
       out[n + i].v      = 0;
       out[n + i].series = 1;
+      out[n + i].ix     = -1;
    }
    for (int i = 0; i < m->food.nexlog; i++) {
       const long secs = ex_secs_of(m, i);
