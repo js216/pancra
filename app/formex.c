@@ -117,12 +117,14 @@ int form_ex_action(int action, int ix)
              (g_ex.level >= EX_MAX_LEVEL) ? EX_MIN_LEVEL : g_ex.level + 1;
       } else {
          enum keypad_mode mode = kp_ex_field(ix - 1);
-         /* THE DURATION OF A RUNNING SESSION IS NOT A FIELD. It is `now`
+         /* THE DURATION OF A RUNNING SESSION IS NOT A FIELD, and neither is
+          * its stop, which is the duration said as a time. It is `now`
           * minus a start that is still moving, and the end press writes it --
           * so a number typed here is overwritten seconds later, and offering
           * the keypad promises an edit that cannot survive. Say why rather
           * than opening a pad whose CONFIRM would be undone. */
-         if (mode == KP_EX_DUR && exercise_row_running(&g_ex.orig)) {
+         if ((mode == KP_EX_DUR || mode == KP_EX_STOP) &&
+             exercise_row_running(&g_ex.orig)) {
             set_status_refused("EXERCISE STILL ACTIVE");
             mode = KP_NONE;
          }
@@ -218,7 +220,8 @@ void forms_ex_edit(int i)
 
 /* ---- WHAT THE FRAME ASKS OF THIS WORKFLOW ----------------------------
  *
- * The keypad edits this form's INSTANT and its DURATION. It cannot create a
+ * The keypad edits this form's INSTANT and its DURATION -- the latter as
+ * minutes or as a stop time. It cannot create a
  * record and it cannot set the level: the button and its settling rule are the
  * only writer of a row (uiex.c says why at length), and the level is three
  * values to tap through rather than a number to type. */

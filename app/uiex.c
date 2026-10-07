@@ -102,20 +102,24 @@ void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y = value_row(fb, h, y, sc, "LEVEL", lv,
                  ui_ex_color(m->food.ex_form_level, UI_TEXT), MA_EX_EDIT, 0);
    y += lh;
-   y = value_row(fb, h, y, sc, "TIME", timep, UI_TEXT, MA_EX_EDIT, 1);
+   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_EX_EDIT, 1);
    y += lh;
    y = value_row(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_EX_EDIT, 2);
    y += lh;
-   y = value_row(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_EX_EDIT, 3);
+   y = value_row(fb, h, y, sc, "START", timep, UI_TEXT, MA_EX_EDIT, 3);
    y += lh;
-   /* HOW LONG IT LASTED, in minutes, and "--" when the log does not know.
+   /* STOP AND MINUTES ARE ONE FACT, start + duration, shown both ways: the
+    * stop is derived, so editing the start or the minutes moves it, and
+    * typing a stop sets the minutes.
     *
+    * HOW LONG IT LASTED, in minutes, and "--" when the log does not know.
     * A row is written when the level SETTLES, which is its start, so nothing
     * knows the length until the session ends -- 0 is the column's own "not
     * known" (exercise.h) and it has to read as that rather than as a
-    * zero-minute session. This is the one field on this form the button
-    * cannot supply, which is why it is here. */
+    * zero-minute session, with no stop either. These are the fields on this
+    * form the button cannot supply, which is why they are here. */
    char durp[12];
+   char stopp[8];
    /* CLAMPED FOR THE RENDERER ONLY. exercise_update refuses anything past
     * EX_DUR_MAX, so a row this large cannot be written -- but the frame is
     * built from whatever the file held, and a screen must not be the place a
@@ -123,19 +127,29 @@ void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
    long durm = m->food.ex_form_dur / 60;
    if (durm > EX_DUR_MAX / 60)
       durm = EX_DUR_MAX / 60;
-   if (durm > 0)
+   if (durm > 0) {
       (void)snprintf(durp, sizeof durp, "%ld", durm);
-   else
+      char st[20];
+      fmt_date(m->food.ex_t + (durm * 60), m->tz_off, st, sizeof st);
+      str_snapshot(stopp, sizeof stopp, (str_len(st) > 11) ? st + 11 : "");
+   } else {
       (void)snprintf(durp, sizeof durp, "--");
-   /* A RUNNING SESSION HAS NO LENGTH YET, and this row says so instead of
-    * offering to collect one. The end press is what writes it -- so the field
-    * is not a control here (action -1, no tap target) and reads ACTIVE in the
-    * colour the rest of the app uses for something in progress. It becomes an
-    * ordinary editable number the moment the button goes back to zero. */
+      (void)snprintf(stopp, sizeof stopp, "--");
+   }
+   /* A RUNNING SESSION HAS NO LENGTH YET, and these rows say so instead of
+    * offering to collect one. The end press is what writes it -- so neither
+    * field is a control here (action -1, no tap target) and both read ACTIVE
+    * in the colour the rest of the app uses for something in progress. They
+    * become ordinary editable values the moment the button goes back to
+    * zero. */
    if (m->food.ex_running) {
+      y = value_row(fb, h, y, sc, "STOP", "ACTIVE", UI_BUSY, -1, 0);
+      y += lh;
       y = value_row(fb, h, y, sc, "MINUTES", "ACTIVE", UI_BUSY, -1, 0);
    } else {
-      y = value_row(fb, h, y, sc, "MINUTES", durp, UI_TEXT, MA_EX_EDIT, 4);
+      y = value_row(fb, h, y, sc, "STOP", stopp, UI_TEXT, MA_EX_EDIT, 4);
+      y += lh;
+      y = value_row(fb, h, y, sc, "MINUTES", durp, UI_TEXT, MA_EX_EDIT, 5);
    }
    /* WHY THE LAST CONFIRM WAS REFUSED, in the air that already separates the
     * fields from the buttons -- it COSTS NO ROW, so the budget above stands

@@ -108,7 +108,10 @@ enum keypad_mode {
    KP_GOAL_PROT  = 31,
    KP_GOAL_FAT   = 32,
    KP_GOAL_KCAL  = 33,
-   KP_NMODES     = 34
+   /* The EDIT EXERCISE form's STOP: a time of day, typed like the start's,
+    * that sets the duration rather than the instant. */
+   KP_EX_STOP = 34,
+   KP_NMODES  = 35
 };
 
 /* WHICH UNIT THE ENTRY CARRIES -- a name, not a yes/no.
@@ -230,7 +233,8 @@ enum keypad_mode kp_goal_field(int ix);
 int kp_food_macro(enum keypad_mode mode);
 int kp_food_goal(enum keypad_mode mode);
 /* The EDIT EXERCISE form's rows, minus the LEVEL row the caller handles
- * itself: 0 time, 1 date, 2 year. KP_NONE for anything else. */
+ * itself: 0 year, 1 date, 2 start, 3 stop, 4 minutes. KP_NONE for anything
+ * else. */
 enum keypad_mode kp_ex_field(int ix);
 
 #endif

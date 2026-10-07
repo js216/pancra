@@ -829,7 +829,42 @@ int kp_commit_number(void)
  * validating the second depends on the first having been accepted. */
 int kp_commit_datetime(void)
 {
-   if (kp_is_date(g_kp.mode) || kp_is_time(g_kp.mode)) {
+   if (g_kp.mode == KP_EX_STOP) {
+      if (g_kp.len == 4) {
+         int a = ((g_kp.entry[0] - '0') * 10) + (g_kp.entry[1] - '0');
+         int b = ((g_kp.entry[2] - '0') * 10) + (g_kp.entry[3] - '0');
+         long *tp  = form_ex_instant();
+         long *dur = form_ex_duration();
+         if (!tp || !dur) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "NO ENTRY OPEN");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         if (a > 23 || b > 59) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "NOT A TIME (HHMM)");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         /* THE STOP IS THE DURATION, said as a time of day: the first instant
+          * after the start that shows HHMM -- the start's own day, or the next
+          * one when HHMM is not after the start's time. */
+         long stop = civil_reaim(*tp, CIVIL_EDIT_TIME, a, b, form_zone, 0).t;
+         if (stop <= *tp)
+            stop = civil_reaim(*tp + 86400, CIVIL_EDIT_TIME, a, b, form_zone, 0)
+                       .t;
+         if (stop <= *tp || stop - *tp > EX_DUR_MAX) {
+            (void)snprintf(g_kp.err, sizeof g_kp.err, "NOT AFTER THE START");
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         *dur     = stop - *tp;
+         g_kp.len = 0;
+         keypad_close();
+      }
+   } else if (kp_is_date(g_kp.mode) || kp_is_time(g_kp.mode)) {
       if (g_kp.len == 4) {
          int a = ((g_kp.entry[0] - '0') * 10) + (g_kp.entry[1] - '0');
          int b = ((g_kp.entry[2] - '0') * 10) + (g_kp.entry[3] - '0');

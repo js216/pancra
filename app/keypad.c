@@ -55,7 +55,8 @@ static const struct kp_info g_modes[KP_NMODES] = {
     [KP_FOOD_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_FOOD_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_EX_DATE]   = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_EX_TIME]   = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_TIME]   = {"START (HHMM)", 4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_STOP]   = {"STOP (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
     [KP_EX_YEAR]   = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* MINUTES, five slots: EX_DUR_MAX is seven days, which is 10080 of them.
      * Whole minutes and no decimal point -- the column is seconds, but a
@@ -149,6 +150,7 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_EX_DATE:
       case KP_EX_TIME:
       case KP_EX_YEAR:
+      case KP_EX_STOP:
       case KP_EX_DUR: return KP_FORM_EXERCISE;
       /* Every other mode is not a form field, and says so rather than
        * defaulting into somebody's timestamp. */
@@ -210,8 +212,8 @@ enum keypad_mode kp_ex_field(int ix)
    /* ITS OWN calendar fields, like every other form's: see keypad.h. The
     * level is cycled rather than typed, so it is not in this list; the
     * duration is typed, and it is. */
-   static const enum keypad_mode f[] = {KP_EX_TIME, KP_EX_DATE, KP_EX_YEAR,
-                                        KP_EX_DUR};
+   static const enum keypad_mode f[] = {KP_EX_YEAR, KP_EX_DATE, KP_EX_TIME,
+                                        KP_EX_STOP, KP_EX_DUR};
 
    if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
       return KP_NONE;
