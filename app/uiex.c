@@ -48,7 +48,7 @@ static const char *ex_level_word(int level)
       case 2: return "MODERATE";
       case 3: return "HARD";
       default:
-         /* Not reachable from a loaded record -- ex_parse_rec refuses anything
+         /* Not reachable from a loaded record -- ex_row_decode refuses anything
           * outside the domain -- but a form field is a live value and this is
           * what an out-of-range one should look like: obviously wrong, not
           * plausibly something. */

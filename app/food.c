@@ -7,7 +7,7 @@
  * on the way in, and the newest rows kept by TIME rather than by arrival. */
 #include "food.h"
 
-#include "csvcur.h" /* the shared CSV cursor; the grammar stays here */
+#include "csvcur.h"
 #include "dexlibc.h"
 #include "insrow.h" /* ins_units_str: thousandths as a person writes them */
 #include "loadresult.h"
@@ -100,49 +100,11 @@ static char g_goal_path[256];
  * worker. */
 static int g_goals[FOOD_NMACRO] = {275, 50, 78, 2000};
 
-int food_macro_ok(int which, int milli)
-{
-   if (which < 0 || which >= FOOD_NMACRO || milli < 0)
-      return 0;
-   return milli <= (which == FOOD_KCAL ? FOOD_KCAL_MAX : FOOD_FRAC_MAX);
-}
-
 int food_milli_str(int milli, char *out, int cap)
 {
    /* insrow.h's formatter is a thousandths formatter that happens to live
     * with the insulin record: a dose is written the same way. */
    return ins_units_str(milli, out, cap);
-}
-
-/* "0.454" -> 454: digits, then at most one '.' and three more. Anything else
- * -- a sign, a fourth decimal, a stray character, nothing at all -- is not a
- * value this file writes. 1 on success. */
-static int milli_parse(const char *s, int *out)
-{
-   long v    = 0;
-   int nd    = 0;
-   int dot   = 0;
-   int scale = 0;
-   for (; *s; s++) {
-      if (*s == '.' && !dot) {
-         dot = 1;
-      } else if (*s >= '0' && *s <= '9' && (!dot || scale < 3) && nd < 9) {
-         v = (v * 10) + (*s - '0');
-         nd++;
-         if (dot)
-            scale++;
-      } else {
-         return 0;
-      }
-   }
-   if (nd == 0)
-      return 0;
-   while (scale++ < 3)
-      v *= 10;
-   if (v > 0x7fffffffL)
-      return 0;
-   *out = (int)v;
-   return 1;
 }
 
 /* ---------------- the vocabulary ---------------- */
@@ -341,34 +303,6 @@ static int name_eq(const char *a, const char *b)
    return a[i] == 0 && b[i] == 0;
 }
 
-/* Is this a name that can be written to a CSV row and read back unchanged?
- *
- * ',' and '\n' are the field separator and the row terminator, so a name
- * holding either would not survive the round trip: the comma would split one
- * name into two fields and the newline would split one row into two. A name
- * holding a '#' at the start would be read back as the header comment.
- *
- * REFUSED, NOT REPAIRED. Stripping the character would store a name the user
- * did not type and cannot type again to match; escaping it would make this the
- * only field in the app's file formats that needs an unescaper. The keypad
- * offers no comma, so in practice this rejects only what arrives from a file
- * that something else wrote. */
-static int name_ok(const char *n)
-{
-   if (!n || !n[0])
-      return 0;
-   if (n[0] == '#')
-      return 0;
-   int i = 0;
-   for (; n[i]; i++) {
-      if (n[i] == ',' || n[i] == '\n' || n[i] == '\r')
-         return 0;
-      if (i >= FOOD_NAME_MAX)
-         return 0; /* longer than the field holds */
-   }
-   return 1;
-}
-
 /* Take a type into memory. Used by the loader and by food_type_add, so the
  * id bookkeeping has one home: g_next_id must always be past every id in the
  * table, or a load followed by an add would mint an id that already exists. */
@@ -403,7 +337,7 @@ static int ft_take(int id, const char *name)
 
 int food_type_add(const char *name)
 {
-   if (!name_ok(name))
+   if (!food_name_ok(name))
       return -1;
    /* THE VOCABULARY IS READ UNDER THE LOCK AND THE FILE IS WRITTEN WITHOUT
     * IT: the leaf is never held across an append. A restore publishing in
@@ -451,39 +385,17 @@ static int ft_parse_line(struct food_state *s, const char *p, const char *e)
       return 0; /* the header */
    if (p >= e)
       return 0; /* a trailing newline, or an editor's blank line */
-   struct csv_cur c;
-   csv_open(&c, p, e);
-   long id = csv_num(&c, 0);
-   if (!csv_sep(&c))
-      return -1; /* no separator: this is not a row, it is a fragment */
+   int id;
    char nm[FOOD_NAME_MAX + 1];
-   csv_str(&c, nm, (int)sizeof nm);
-   int macro[FOOD_NMACRO] = {0, 0, 0, 0};
-   if (csv_sep(&c)) {
-      for (int k = 0; k < FOOD_NMACRO; k++) {
-         char f[16];
-         if (k && !csv_sep(&c))
-            return -1;
-         csv_str(&c, f, (int)sizeof f);
-         if (!milli_parse(f, &macro[k]) || !food_macro_ok(k, macro[k]))
-            return -1;
-      }
-      if (c.p != c.e)
-         return -1; /* a fifth value: not a row this app writes */
-   }
-   /* AN ID OF 0 IS NOT A TYPE (FOOD_TYPE_NONE), and a name that would not
-    * survive a round trip through this format did not come from food_type_add
-    * -- both mean the file has been edited or damaged. */
-   if (id <= FOOD_TYPE_NONE || id > 0x7fffffffL)
-      return -1;
-   if (!name_ok(nm))
+   int macro[FOOD_NMACRO];
+   if (!food_type_decode(p, e, &id, nm, macro))
       return -1;
    /* A DUPLICATE ID IS DAMAGE, and it has to be caught here rather than
     * tolerated: entries reference types by id, so two types sharing one id
     * means every entry using it is ambiguous. The first is kept. */
-   if (ft_row_in(s, (int)id) >= 0)
+   if (ft_row_in(s, id) >= 0)
       return -1;
-   if (ft_take_in(s, (int)id, nm, macro) < 0)
+   if (ft_take_in(s, id, nm, macro) < 0)
       return -1; /* the vocabulary is full: the rest of the file is lost */
    return 1;
 }
@@ -631,37 +543,17 @@ static void fd_sort(void)
    fd_sort_in(&g_live);
 }
 
-/* ONE READER FOR ONE ROW SHAPE.
- *
- * No `why` on any field: as in exercise.c, every answer the cursor could give
- * is already a rejection here. An absent or non-numeric field reads 0, and 0
- * fails `t <= 0`, `type == FOOD_TYPE_NONE` and `g < FOOD_MIN_G` alike; an
- * over-long digit run keeps its leading digits, which cannot land inside a
- * plausible epoch, a live type id, or a plausible portion. */
+/* An entry the shared decoder accepts, naming a type this vocabulary has. */
 static int fd_parse_rec(const struct food_state *s, const char *p,
                         const char *e, struct food_rec *r)
 {
-   struct csv_cur c;
-   csv_open(&c, p, e);
-   r->t = csv_num(&c, 0);
-   csv_sep(&c);
-   long ty = csv_num(&c, 0);
-   csv_sep(&c);
-   r->g = csv_num(&c, 0);
-   if (r->t <= 0 || r->t >= FOOD_T_MAX)
-      return 0;
-   if (r->g < FOOD_MIN_G || r->g > FOOD_MAX_G)
-      return 0;
-   if (ty <= FOOD_TYPE_NONE)
+   if (!food_entry_decode(p, e, r))
       return 0;
    /* THE TYPE MUST EXIST, which is why the vocabulary loads first. An entry
     * naming a type that is not there is a meal the app cannot name -- it would
     * draw as a blank row with a weight beside it, which reads as a rendering
     * bug rather than as the missing data it is. Reported as damage instead. */
-   if (ft_row_in(s, (int)ty) < 0)
-      return 0;
-   r->type = (int)ty;
-   return 1;
+   return ft_row_in(s, r->type) >= 0;
 }
 
 static int fd_parse_line(struct food_state *s, const char *p, const char *e)

@@ -104,6 +104,8 @@ int csrf_guard(struct req *r, const char *cookie);
 /* The pages themselves. */
 void h_home(struct req *r, int64_t me, const char *cookie);
 void h_units(struct req *r, int64_t owner);
+void h_exercise(struct req *r, int64_t owner);
+void h_food(struct req *r, int64_t owner);
 void h_settings(struct req *r, int64_t me, const char *cookie,
                 const char *note);
 /* `what` is the path after "/settings/"; CSRF is the caller's job. */

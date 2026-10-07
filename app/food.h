@@ -39,78 +39,15 @@
  * The other tier is insulin.h's, and it is the only one: a dose is not a
  * preference, so that log is never rewritten and keeps its own history. */
 
-/* A food name, in characters, not counting the terminator.
- *
- * Bounded because it is typed on the letter keypad and drawn in a menu row
- * beside a value column -- and because it is written into a CSV field, which
- * is the constraint that actually bites. See food_type_add: the separator and
- * the row terminator are the two characters a name may not contain, and a name
- * is REFUSED rather than quietly stripped of them. */
-#define FOOD_NAME_MAX 20
-
+#include "foodrow.h" /* the domain, the records and their decoders */
 /* How many distinct foods the vocabulary holds: more than a person names in
  * a lifetime of logging, and small enough to keep whole in memory -- the
  * picker pages through it. */
 #define NFOODTYPE 1024
 
-/* Grams in one entry.
- *
- * The lower bound is 1 rather than 0 for the same reason the exercise log has
- * no zero: an entry of nothing is not an entry.
- *
- * THE UPPER BOUND IS A PORTION SIZE, and it is meant to be. A kilogram in one
- * sitting is not a meal anybody logs; three digits covers every real portion
- * with room to spare, and what falls outside them is a slipped finger or a
- * corrupt digit run rather than lunch. Keeping the ceiling at the size of a
- * plausible meal is what lets the keypad offer three slots and every readout
- * that prints grams reserve three columns -- a looser bound costs width on
- * screens that have none to spare, to hold space no entry ever uses. */
-#define FOOD_MIN_G 1L
-#define FOOD_MAX_G 999L
-
-/* Epoch bound on an entry instant: same rationale and value as INS_T_MAX,
- * WT_T_MAX and EX_T_MAX. */
-#define FOOD_T_MAX 32503680000L
-
-/* The id a type never has. Entries carrying it are damage. */
-#define FOOD_TYPE_NONE 0
-
-/* ---- WHAT A FOOD IS MADE OF --------------------------------------------
- *
- * PER GRAM OF THE FOOD, and a property of the FOOD, not of any one entry:
- * PORRIDGE is 0.12 carbohydrate whichever morning it was eaten, so changing
- * it changes it for every entry that names PORRIDGE, past ones included. That
- * is why the numbers live on the type, in foodtypes.csv, and an entry is still
- * only "when, which food, how many grams".
- *
- * THOUSANDTHS, like an insulin dose (insrow.h): the fractions are written as a
- * person writes them, "0.454", and a value that has to round-trip through a
- * text file exactly cannot be a binary float. Carbohydrate, protein and fat
- * are fractions of the food's weight, 0..1; energy is kcal per gram, 0..9.999
- * -- pure fat is about 9, the most a food can be. A new food is all zeros
- * until somebody says otherwise. */
-enum { FOOD_CARBS, FOOD_PROTEIN, FOOD_FAT, FOOD_KCAL, FOOD_NMACRO };
-
-#define FOOD_FRAC_MAX 1000 /* a fraction's thousandths: 1.000, all of it */
-#define FOOD_KCAL_MAX 9999 /* kcal per gram, thousandths: 9.999 */
-
-struct food_type {
-   int id; /* >= 1, assigned in arrival order and never reused */
-   char name[FOOD_NAME_MAX + 1];
-   int macro[FOOD_NMACRO]; /* thousandths, see above */
-};
-
-/* 1 when `milli` is a value macro `which` can hold. */
-int food_macro_ok(int which, int milli);
 /* A thousandths value as a person writes it -- "0.454", "0.5", "0" -- the
  * form both foodtypes.csv and the screens use. Returns the length written. */
 int food_milli_str(int milli, char *out, int cap);
-
-struct food_rec {
-   long t;   /* entry instant, epoch seconds */
-   int type; /* a food_type id */
-   long g;   /* grams */
-};
 
 /* ---- the vocabulary ---- */
 

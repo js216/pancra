@@ -3,6 +3,8 @@
  * Copyright 2026 Jakob Kastelic
  */
 #include "db.h"
+#include "exrow.h" /* the exercise log's one decoder */
+#include "foodrow.h" /* the food log's and its vocabulary's decoders */
 #include "http.h"
 #include "insrow.h" /* the insulin log's one decoder */
 #include "oops.h"
@@ -283,6 +285,17 @@ static void ago_hm(int64_t secs, char *out, size_t n)
       snprintf(out, n, "%" PRIwire "h%02" PRIwire, mins / 60, mins % 60);
 }
 
+/* The column after a timestamp on the home page: "(8h41 ago)", padded to
+ * the widest, "(99h59 ago)", so the columns after it line up. */
+static void ago_col(int64_t secs, char *out, size_t n)
+{
+   char hm[16];
+   ago_hm(secs, hm, sizeof hm);
+   char col[24];
+   snprintf(col, sizeof col, "(%s ago)", hm);
+   snprintf(out, n, "%-11s", col);
+}
+
 /* THE LIVE DOSES, newest first, into a malloc'd array the caller frees:
  * the count, or -1 when the replay could not be completed in memory. A log
  * that could not be read counts as an empty one. */
@@ -394,6 +407,216 @@ static int load_doses(struct db *db, int64_t owner, struct dose **out)
    }
    *out = d;
    return nd;
+}
+
+/* ---- the exercise log ----
+ *
+ * Unlike the dose log this one is rewritten in place on the phone (see
+ * exrow.h), and a sync replaces a whole bucket, so every row here is a
+ * record as it stands: nothing to replay. */
+
+/* The level as the phone names it, in this site's lower case. */
+static const char *ex_word(int level)
+{
+   switch (level) {
+      case 1: return "light";
+      case 2: return "moderate";
+      case 3: return "hard";
+      default: return "?";
+   }
+}
+
+/* HOW LONG IT LASTED, as ago_hm writes a span, but uncapped: a row may claim
+ * up to EX_DUR_MAX, which is past ago_hm's 99h59. At most "168h00", six
+ * characters. A zero duration is "--": the session is running, or its end
+ * was never recorded (exrow.h), and either way its length is not known. */
+static void ex_dur_str(long secs, char *out, size_t n)
+{
+   if (secs > EX_DUR_MAX)
+      secs = EX_DUR_MAX; /* ex_row_decode refuses more; this bounds the text */
+   const long mins = secs / 60;
+   if (mins <= 0)
+      snprintf(out, n, "--");
+   else if (mins < 60)
+      snprintf(out, n, "%ldm", mins);
+   else
+      snprintf(out, n, "%ldh%02ld", mins / 60, mins % 60);
+}
+
+/* THE ENTRIES, newest first, into a malloc'd array the caller frees: the
+ * count, or -1 when the log could not be read whole or held in memory. A row
+ * the phone's decoder refuses -- a header, a damaged line -- is not one. */
+static int load_exercise(struct db *db, int64_t owner, struct ex_rec **out)
+{
+   struct ex_rec *x = 0;
+   int nx = 0, cap = 0;
+
+   sqlite3_stmt *st = db_prep(db, "SELECT line FROM logrow WHERE user_id=?"
+                                  " AND log='exercise' ORDER BY bucket, line");
+   if (!st)
+      return -1;
+   sqlite3_bind_int64(st, 1, owner);
+   int rc;
+   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+      const char *ln = (const char *)sqlite3_column_text(st, 0);
+      if (!ln || *ln < '0' || *ln > '9')
+         continue;
+      struct ex_rec row;
+      if (!ex_row_decode(ln, ln + strlen(ln), &row))
+         continue;
+      if (nx == cap) {
+         int ncap          = cap ? cap * 2 : 256;
+         struct ex_rec *nw = realloc(x, (size_t)ncap * sizeof *x);
+         if (!nw) {
+            sqlite3_finalize(st);
+            free(x);
+            return -1;
+         }
+         x   = nw;
+         cap = ncap;
+      }
+      x[nx++] = row;
+   }
+   int ok = db_finished(rc);
+   sqlite3_finalize(st);
+   if (!ok) {
+      free(x);
+      return -1;
+   }
+
+   for (int i = 1; i < nx; i++) {
+      struct ex_rec tmp = x[i];
+      int j             = i - 1;
+      while (j >= 0 && x[j].t < tmp.t) {
+         x[j + 1] = x[j];
+         j--;
+      }
+      x[j + 1] = tmp;
+   }
+   *out = x;
+   return nx;
+}
+
+/* ---- the food log ----
+ *
+ * Two logs, as on the phone (food.h): the entries name a food by id, and the
+ * vocabulary gives the id its name. Both are rewritten in place, so, like the
+ * exercise log, every row is a record as it stands. */
+
+struct meal {
+   int64_t t;
+   long g;
+   char name[FOOD_NAME_MAX + 1];
+};
+
+/* Every row of one log, in bucket order, through `take`; 1 when the log was
+ * read whole, 0 when it was not or `take` failed. */
+static int each_line(struct db *db, int64_t owner, const char *log,
+                     int (*take)(const char *ln, void *ctx), void *ctx)
+{
+   sqlite3_stmt *st = db_prep(db, "SELECT line FROM logrow WHERE user_id=?"
+                                  " AND log=? ORDER BY bucket, line");
+   if (!st)
+      return 0;
+   sqlite3_bind_int64(st, 1, owner);
+   sqlite3_bind_text(st, 2, log, -1, SQLITE_STATIC);
+   int rc, ok = 1;
+   while (ok && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+      const char *ln = (const char *)sqlite3_column_text(st, 0);
+      if (ln && *ln >= '0' && *ln <= '9')
+         ok = take(ln, ctx);
+   }
+   ok = ok && db_finished(rc);
+   sqlite3_finalize(st);
+   return ok;
+}
+
+struct ftypes {
+   struct food_type *v;
+   int n, cap;
+};
+
+/* A DUPLICATE ID KEEPS THE FIRST, as the phone's loader does. */
+static int take_ftype(const char *ln, void *ctx)
+{
+   struct ftypes *ft = ctx;
+   struct food_type t;
+   if (!food_type_decode(ln, ln + strlen(ln), &t.id, t.name, t.macro))
+      return 1;
+   for (int i = 0; i < ft->n; i++)
+      if (ft->v[i].id == t.id)
+         return 1;
+   if (ft->n == ft->cap) {
+      int ncap             = ft->cap ? ft->cap * 2 : 256;
+      struct food_type *nw = realloc(ft->v, (size_t)ncap * sizeof *nw);
+      if (!nw)
+         return 0;
+      ft->v   = nw;
+      ft->cap = ncap;
+   }
+   ft->v[ft->n++] = t;
+   return 1;
+}
+
+struct meals {
+   const struct ftypes *ft;
+   struct meal *v;
+   int n, cap;
+};
+
+/* AN ENTRY WHOSE FOOD IS NOT IN THE VOCABULARY IS NOT SHOWN: the phone
+ * refuses it as damage, and a meal without a name is not one to show. */
+static int take_meal(const char *ln, void *ctx)
+{
+   struct meals *m = ctx;
+   struct food_rec r;
+   if (!food_entry_decode(ln, ln + strlen(ln), &r))
+      return 1;
+   const char *name = 0;
+   for (int i = 0; i < m->ft->n && !name; i++)
+      if (m->ft->v[i].id == r.type)
+         name = m->ft->v[i].name;
+   if (!name)
+      return 1;
+   if (m->n == m->cap) {
+      int ncap        = m->cap ? m->cap * 2 : 256;
+      struct meal *nw = realloc(m->v, (size_t)ncap * sizeof *nw);
+      if (!nw)
+         return 0;
+      m->v   = nw;
+      m->cap = ncap;
+   }
+   m->v[m->n].t = r.t;
+   m->v[m->n].g = r.g;
+   snprintf(m->v[m->n].name, sizeof m->v[m->n].name, "%s", name);
+   m->n++;
+   return 1;
+}
+
+/* THE MEALS, newest first, named, into a malloc'd array the caller frees:
+ * the count, or -1 when either log could not be read whole or held. */
+static int load_meals(struct db *db, int64_t owner, struct meal **out)
+{
+   struct ftypes ft = {0};
+   struct meals m   = {&ft, 0, 0, 0};
+   int ok = each_line(db, owner, "foodtypes", take_ftype, &ft) &&
+            each_line(db, owner, "food", take_meal, &m);
+   free(ft.v);
+   if (!ok) {
+      free(m.v);
+      return -1;
+   }
+   for (int i = 1; i < m.n; i++) {
+      struct meal tmp = m.v[i];
+      int j           = i - 1;
+      while (j >= 0 && m.v[j].t < tmp.t) {
+         m.v[j + 1] = m.v[j];
+         j--;
+      }
+      m.v[j + 1] = tmp;
+   }
+   *out = m.v;
+   return m.n;
 }
 
 void h_home(struct req *r, int64_t me, const char *cookie)
@@ -553,9 +776,8 @@ void h_home(struct req *r, int64_t me, const char *cookie)
           big, chg);
 
    /* THE LAST DAY'S DOSES, under the number and headed like the readings'
-    * days, one per line: date and time, units, kind, and how long ago --
-    * 30 characters, inside the 31 the readings' font is sized to fit. The
-    * whole log is one tap further, on the units page. */
+    * days, one per line: date and time, how long ago, units, kind. The whole
+    * log is one tap further, on the units page. */
    {
       struct dose *d = 0;
       int nd         = load_doses(r->db, owner, &d);
@@ -574,16 +796,94 @@ void h_home(struct req *r, int64_t me, const char *cookie)
          stamp_local(d[i].t, tz, when, sizeof when);
          char iu[16];
          (void)ins_units_str(d[i].milli, iu, sizeof iu);
-         char ago[16];
-         ago_hm(now - d[i].t, ago, sizeof ago);
-         sb_add(&s, "%s %5s  %s  %5s\n", when + 5, iu,
-                d[i].type == 1 ? "fast" : "slow", ago);
+         char ago[24];
+         ago_col(now - d[i].t, ago, sizeof ago);
+         sb_add(&s, "%s %s %5s  %s\n", when + 5, ago, iu,
+                d[i].type == 1 ? "fast" : "slow");
          shown++;
       }
       if (!shown)
          sb_add(&s, "(none in the last 24 h)\n");
       sb_add(&s, "<a href=\"/units%s\">More ...</a>\n</pre>\n", r->who);
       free(d);
+   }
+
+   /* THE LAST SIX HOURS OF EXERCISE, under the doses and laid out like them:
+    * date and time, how long ago it finished, level, and how long it lasted.
+    * The window is measured from the finish too, so a long session is shown
+    * until six hours after it ended.
+    *
+    * THE RUNNING SESSION is the phone's (exercise_active): the newest entry,
+    * and only while it has no end. It is shown whenever it started, as
+    * "(active)". An older entry with no end never got one -- the app was
+    * killed mid-session -- and has no finish to count from: "(no end)". The
+    * whole log is on the exercise page. */
+   {
+      struct ex_rec *x = 0;
+      int nx           = load_exercise(r->db, owner, &x);
+      if (nx < 0) {
+         sb_free(&s);
+         oops(r);
+         return;
+      }
+      sb_add(&s, "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">"
+                 "\n<b>Exercise</b>\n");
+      int shown = 0;
+      for (int i = 0; i < nx; i++) {
+         const int active  = (i == 0 && x[i].dur == 0);
+         const int64_t end = (int64_t)x[i].t + x[i].dur;
+         if (x[i].t > now || (!active && end <= now - (6L * 3600)))
+            continue;
+         char when[40];
+         stamp_local(x[i].t, tz, when, sizeof when);
+         char dur[24];
+         ex_dur_str(x[i].dur, dur, sizeof dur);
+         char ago[24];
+         if (active)
+            snprintf(ago, sizeof ago, "%-11s", "(active)");
+         else if (x[i].dur == 0)
+            snprintf(ago, sizeof ago, "%-11s", "(no end)");
+         else
+            ago_col(now - end, ago, sizeof ago);
+         sb_add(&s, "%s %s  %-8s  %6s\n", when + 5, ago, ex_word(x[i].level),
+                dur);
+         shown++;
+      }
+      if (!shown)
+         sb_add(&s, "(none in the last 6 h)\n");
+      sb_add(&s, "<a href=\"/exercise%s\">More ...</a>\n</pre>\n", r->who);
+      free(x);
+   }
+
+   /* THE LAST SIX HOURS OF FOOD, under the exercise: date and time, how
+    * long ago, grams, and the whole name. */
+   {
+      struct meal *m = 0;
+      int nm         = load_meals(r->db, owner, &m);
+      if (nm < 0) {
+         sb_free(&s);
+         oops(r);
+         return;
+      }
+      sb_add(&s, "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">"
+                 "\n<b>Food</b>\n");
+      int shown = 0;
+      for (int i = 0; i < nm; i++) {
+         if (m[i].t > now || m[i].t <= now - (6L * 3600))
+            continue;
+         char when[40];
+         stamp_local(m[i].t, tz, when, sizeof when);
+         char esc[(FOOD_NAME_MAX * 6) + 8]; /* html_esc keeps 8 spare */
+         html_esc(esc, sizeof esc, m[i].name);
+         char ago[24];
+         ago_col(now - m[i].t, ago, sizeof ago);
+         sb_add(&s, "%s %s  %3ldg  %s\n", when + 5, ago, m[i].g, esc);
+         shown++;
+      }
+      if (!shown)
+         sb_add(&s, "(none in the last 6 h)\n");
+      sb_add(&s, "<a href=\"/food%s\">More ...</a>\n</pre>\n", r->who);
+      free(m);
    }
 
    sb_add(&s, "<pre style=\"font-size:min(1em,calc((100vw - 20px)/31))\">\n");
@@ -758,4 +1058,62 @@ void h_units(struct req *r, int64_t owner)
    sub_page(r, "Units", s.p ? s.p : "");
    sb_free(&s);
    free(d);
+}
+
+/* ---- the exercise log page: every entry, newest first ---- */
+void h_exercise(struct req *r, int64_t owner)
+{
+   int tz           = tz_of(r->db, owner);
+   struct ex_rec *x = 0;
+   int nx           = load_exercise(r->db, owner, &x);
+   if (nx < 0) {
+      oops(r);
+      return;
+   }
+
+   struct sb s = {0};
+   sb_add(&s, "<pre>\n");
+   if (!nx)
+      sb_add(&s, "(nothing logged)\n");
+   /* ONE ENTRY PER LINE: date, time, level, duration. */
+   for (int i = 0; i < nx; i++) {
+      char when[64];
+      stamp_local(x[i].t, tz, when, sizeof when);
+      char dur[24];
+      ex_dur_str(x[i].dur, dur, sizeof dur);
+      sb_add(&s, "%s  %-8s  %6s\n", when, ex_word(x[i].level), dur);
+   }
+   sb_add(&s, "</pre>\n");
+   sub_page(r, "Exercise", s.p ? s.p : "");
+   sb_free(&s);
+   free(x);
+}
+
+/* ---- the food log page: every meal, newest first ---- */
+void h_food(struct req *r, int64_t owner)
+{
+   int tz         = tz_of(r->db, owner);
+   struct meal *m = 0;
+   int nm         = load_meals(r->db, owner, &m);
+   if (nm < 0) {
+      oops(r);
+      return;
+   }
+
+   struct sb s = {0};
+   sb_add(&s, "<pre>\n");
+   if (!nm)
+      sb_add(&s, "(nothing logged)\n");
+   /* ONE MEAL PER LINE: date, time, grams, food. */
+   for (int i = 0; i < nm; i++) {
+      char when[64];
+      stamp_local(m[i].t, tz, when, sizeof when);
+      char esc[160];
+      html_esc(esc, sizeof esc, m[i].name);
+      sb_add(&s, "%s  %3ldg  %s\n", when, m[i].g, esc);
+   }
+   sb_add(&s, "</pre>\n");
+   sub_page(r, "Food", s.p ? s.p : "");
+   sb_free(&s);
+   free(m);
 }

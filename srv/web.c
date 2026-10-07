@@ -95,6 +95,8 @@ static const struct web_rule WEB_RULES[] = {
     {WEB_EXACT,  "/logout",    HTTP_M_POST             },
     {WEB_EXACT,  "/",          HTTP_M_GET              },
     {WEB_EXACT,  "/units",     HTTP_M_GET              },
+    {WEB_EXACT,  "/exercise",  HTTP_M_GET              },
+    {WEB_EXACT,  "/food",      HTTP_M_GET              },
     {WEB_EXACT,  "/settings",  HTTP_M_GET              },
     /* Every state change the settings page offers: pair, unpair, tz, password,
      * delete, signout-all, share, revoke-link, revoke. One rule, because they
@@ -398,6 +400,18 @@ static void web_route_locked(struct req *r)
       int64_t owner = viewed_owner(r, me, NULL);
       if (owner)
          h_units(r, owner);
+      return;
+   }
+   if (!strcmp(r->path, "/exercise") && get) {
+      int64_t owner = viewed_owner(r, me, NULL);
+      if (owner)
+         h_exercise(r, owner);
+      return;
+   }
+   if (!strcmp(r->path, "/food") && get) {
+      int64_t owner = viewed_owner(r, me, NULL);
+      if (owner)
+         h_food(r, owner);
       return;
    }
    if (!strcmp(r->path, "/settings") && get) {
