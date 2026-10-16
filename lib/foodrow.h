@@ -16,9 +16,9 @@
  *
  * Bounded because it is typed on the letter keypad and drawn in a menu row
  * beside a value column -- and because it is written into a CSV field, which
- * is the constraint that actually bites. See food_type_add: the separator and
- * the row terminator are the two characters a name may not contain, and a name
- * is REFUSED rather than quietly stripped of them. */
+ * is the constraint that actually bites. See food_name_ok: the separator, the
+ * row terminators and a leading '#' are what a name may not contain, and a
+ * name is REFUSED rather than quietly stripped of them. */
 #define FOOD_NAME_MAX 20
 
 /* Grams in one entry.
@@ -42,6 +42,23 @@
 
 /* The id a type never has. Entries carrying it are damage. */
 #define FOOD_TYPE_NONE 0
+
+/* How many distinct foods the vocabulary holds: more than a person names in
+ * a lifetime of logging, and small enough to keep whole in memory -- the
+ * picker pages through it. Rows past it are not part of the vocabulary. */
+#define NFOODTYPE 1024
+
+/* THE DAY'S GOALS (foodgoals.csv): whole kcal and whole grams of
+ * carbohydrate, protein and fat, indexed like the macros. */
+#define FOOD_GOAL_KCAL_MAX 9999 /* kcal a day */
+#define FOOD_GOAL_G_MAX    999  /* grams a day */
+/* The calorie goal until one is set: the reference daily value printed on
+ * food labels. */
+#define FOOD_GOAL_KCAL_DEF 2000
+
+/* The longest line, newline excluded, of either food file. A longer line is
+ * damage and is skipped whole: a cut-off prefix is never decoded. */
+#define FOOD_LINE_MAX 127
 
 /* ---- WHAT A FOOD IS MADE OF --------------------------------------------
  *
@@ -79,10 +96,11 @@ struct food_rec {
 
 /* Is this a name that can be written to a CSV row and read back unchanged?
  *
- * ',' and '\n' are the field separator and the row terminator, so a name
- * holding either would not survive the round trip: the comma would split one
- * name into two fields and the newline would split one row into two. A name
- * holding a '#' at the start would be read back as the header comment.
+ * ',' and '\n' are the field separator and the row terminator ('\r' too, for
+ * a file an editor saved), so a name holding any of them would not survive
+ * the round trip: the comma would split one name into two fields and a line
+ * end would split one row into two. A name starting with '#', an empty name,
+ * and one longer than FOOD_NAME_MAX are refused as well.
  *
  * REFUSED, NOT REPAIRED. Stripping the character would store a name the user
  * did not type and cannot type again to match; escaping it would make this the
@@ -91,8 +109,18 @@ struct food_rec {
  * that something else wrote. */
 int food_name_ok(const char *n);
 
-/* Decode ONE entry row, from `p` to `e` (the end of the LINE). 1 when its
- * instant, grams and type id are in range, 0 otherwise. */
+/* 1 when `v` is a goal `which` can hold: 1..the maximum above, and for kcal
+ * also 0, which means no calorie goal is set -- the FOOD LOG buttons then
+ * carry no calorie bar. */
+int food_goal_ok(int which, int v);
+
+/* Decode the goals row "<carbs>,<protein>,<fat>,<kcal>" into out: 1 when it
+ * is four whole numbers each food_goal_ok, and nothing after them. */
+int food_goals_decode(const char *p, const char *e, int out[FOOD_NMACRO]);
+
+/* Decode ONE entry row, from `p` to `e` (the end of the LINE). 1 when every
+ * field is a whole number and its instant, grams and type id are in range, 0
+ * otherwise. */
 int food_entry_decode(const char *p, const char *e, struct food_rec *r);
 
 /* Decode ONE vocabulary row. A row that stops after the name was written

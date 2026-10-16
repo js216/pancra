@@ -25,6 +25,11 @@ void sub_page(struct req *r, const char *title, const char *body_html)
    struct sb s = {0};
    sb_add(&s, "<a href=\"/%s\">&lt;- Main</a>\n<h2>%s</h2>\n%s", r->who, title,
           body_html);
+   if (s.err) {
+      sb_free(&s);
+      oops(r);
+      return;
+   }
    page(r, 200, "OK", title, s.p ? s.p : "");
    sb_free(&s);
 }

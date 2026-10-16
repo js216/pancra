@@ -33,23 +33,34 @@ void dexble_init(const char *data_dir);
 
 /* Pair/connect a Dexcom sensor on `link`. */
 void dexble_pair(int link, const char *mac, const char *code);
-/* Ask the OS to bond with `mac` NOW, so the system pairing dialog appears as a
- * consequence of the user's tap rather than minutes later when the stack
- * happens to hit an encrypted characteristic. See the comment block above
- * Ble.createBond for why auto-accepting the dialog is not available to us.
+/* dexble_pair, only while the link has not been forgotten since the session
+ * read that gave `gen` (driver_start_if). */
+void dexble_pair_if(int link, const char *mac, const char *code, unsigned gen);
+/* The code the sensor at `mac` was paired with on `link` (see drv_code_save):
+ * saved when a pairing is committed, and the one a re-pairing of that sensor
+ * must use. */
+int dexble_code_save(int link, const char *mac, const char *code);
+int dexble_code_load(int link, const char *mac, char *code,
+                     int n); /* 1 if a usable code is on file for this
+                              * address (0 once the sensor refused it) */
+/* The code a code file holds for the sensor at `mac`, on any link, from
+ * memory, for the CODE row and the advert path's candidate test: 1 when a
+ * file names that sensor (its code is empty when the sensor refused it). */
+int dexble_code_for(const char *mac, char *code, int n);
+/* 1 when `link` has a code file naming an address, from memory: the CODE
+ * row asks it every frame. */
+int dexble_code_file(int link);
+/* The address a code was saved for on `link`, into `mac` (18 bytes or more):
+ * 1 when one was. */
+int dexble_code_owner(int link, char *mac, int n);
+/* Ask the OS to bond with `mac` NOW -- the meter pairing flow does, so the
+ * system pairing dialog appears as a consequence of the user's tap rather
+ * than minutes later when the stack happens to hit an encrypted
+ * characteristic. A CGM raises its own request after the J-PAKE. See the
+ * "OS-level bonding" comment block in Ble.java for why auto-accepting the
+ * dialog is not available to us.
  * Returns 1 if the request went out (or the device was already bonded). */
 int dexble_create_bond(const char *mac);
-/* ASK FOR THAT BOND WHEN `link` NEXT CONNECTS, not now.
- *
- * The OS cannot complete a pairing that has no connection under it: asked at
- * commit time the request dies in under a second and Android reports it as a
- * wrong PIN, naming the one thing that was never involved. Deferring it to the
- * connect keeps the prompt tied to the tap that asked for it -- a few seconds
- * later -- and drops only the attempt that could not have worked.
- *
- * One request per call: the connect that fires it clears it, so a reconnect
- * does not ask again. `link` < 0 cancels. */
-void dexble_bond_on_connect(int link, const char *mac);
 /* For the latest OS bond state seen for an address, include bondtable.h --
  * dexble_bond_state is declared there, beside the setter that feeds it. */
 void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */

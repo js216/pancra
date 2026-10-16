@@ -115,7 +115,88 @@ long tz_offset_at(JNIEnv *env, long at)
    return off;
 }
 
+/* TWO LEVELS, one word per entry, direct-mapped: an index (plus one, so a
+ * zero word is empty) times TZ_OFF_SPAN, plus the offset biased by
+ * TZ_OFF_BIAS to be non-negative. A word is written and read whole, so a
+ * reader never sees one entry's key with another's offset. Real offsets lie
+ * within +-14 h, well inside the span.
+ *
+ * THE DAY LEVEL answers for a whole UTC day when the offset at its first and
+ * last second agree: no zone changes offset twice within one day, so the
+ * offset is then the same throughout. A day whose two ends differ holds a
+ * transition and is marked TZ_MIXED; its instants are answered by the
+ * quarter-hour level, since every transition falls on a quarter hour. A log
+ * screen asks about every record it holds, and the day level keeps that to
+ * two questions to Android per day of history. */
+#define TZ_SLOTS     256U
+#define TZ_DAY_SLOTS 4096U
+#define TZ_OFF_SPAN  1048576ULL
+#define TZ_OFF_BIAS  524288L
+#define TZ_MIXED     (TZ_OFF_SPAN - 1U)
+static _Atomic unsigned long long g_tz_shown[TZ_SLOTS];
+static _Atomic unsigned long long g_tz_day[TZ_DAY_SLOTS];
+
+/* The value kept in `slot` for `key`, into *val: 1 when it is there. */
+static int tz_word_get(_Atomic unsigned long long *slot, unsigned long long key,
+                       unsigned long long *val)
+{
+   const unsigned long long w =
+       atomic_load_explicit(slot, memory_order_relaxed);
+   if (!w || w / TZ_OFF_SPAN != key)
+      return 0;
+   *val = w % TZ_OFF_SPAN;
+   return 1;
+}
+
+static void tz_word_put(_Atomic unsigned long long *slot,
+                        unsigned long long key, unsigned long long val)
+{
+   atomic_store_explicit(slot, (key * TZ_OFF_SPAN) + val, memory_order_relaxed);
+}
+
+static int tz_off_ok(long off)
+{
+   return off > -TZ_OFF_BIAS && off < TZ_OFF_BIAS;
+}
+
+long tz_shown_at(JNIEnv *env, long at)
+{
+   if (at <= 0)
+      return tz_off_now();
+   unsigned long long v           = 0;
+   const unsigned long long day   = ((unsigned long long)at / 86400U) + 1U;
+   _Atomic unsigned long long *ds = &g_tz_day[day % TZ_DAY_SLOTS];
+   if (!tz_word_get(ds, day, &v)) {
+      /* The day's first and last second; never 0, which asks for the current offset. */
+      const long d0 = (long)((day - 1U) * 86400U);
+      const long a  = tz_offset_at(env, d0 > 0 ? d0 : 1);
+      const long b  = tz_offset_at(env, d0 + 86399);
+      if (tz_off_ok(a) && tz_off_ok(b)) {
+         v = (a == b) ? (unsigned long long)(a + TZ_OFF_BIAS) : TZ_MIXED;
+         tz_word_put(ds, day, v);
+      } else {
+         v = TZ_MIXED;
+      }
+   }
+   if (v != TZ_MIXED)
+      return (long)v - TZ_OFF_BIAS;
+   const unsigned long long key     = ((unsigned long long)at / 900U) + 1U;
+   _Atomic unsigned long long *slot = &g_tz_shown[key % TZ_SLOTS];
+   if (tz_word_get(slot, key, &v))
+      return (long)v - TZ_OFF_BIAS;
+   const long off = tz_offset_at(env, at);
+   if (tz_off_ok(off)) {
+      const long biased = off + TZ_OFF_BIAS; /* non-negative: tz_off_ok */
+      tz_word_put(slot, key, (unsigned long long)biased);
+   }
+   return off;
+}
+
 void tz_refresh(JNIEnv *env)
 {
+   for (unsigned i = 0; i < TZ_SLOTS; i++)
+      atomic_store_explicit(&g_tz_shown[i], 0U, memory_order_relaxed);
+   for (unsigned i = 0; i < TZ_DAY_SLOTS; i++)
+      atomic_store_explicit(&g_tz_day[i], 0U, memory_order_relaxed);
    tz_set(tz_offset_at(env, 0));
 }

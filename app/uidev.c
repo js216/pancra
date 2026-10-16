@@ -48,45 +48,63 @@ static int device_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * genuinely never synced it reads NEVER rather than mislabelling a
     * datapoint age. */
    long agot = (s->have_rec && s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
+   /* A CGM NOT YET HEARD FROM BUT WHOSE SIGNAL HAS BEEN SEEN: the age is the
+    * signal sample's. */
+   if (agot <= 0 && s->kind == KIND_CGM && s->rssi_ok && s->rssi_t > 0)
+      agot = s->rssi_t;
    fmt_ago(m->now, agot, ago, sizeof ago);
    /* The countdown needs the sensor's OWN clock, so it is drawn only when one
     * has arrived; a sensor warming up without one still reads WARM through the
     * status string below, which sensor_in_warmup also decides. */
-   /* AND ONLY WHILE THERE IS SOMETHING LEFT TO COUNT. sensor_warming_now
-    * answers on the STATE byte alone, which is right for "is this sensor
-    * warming up" and not enough to subtract from: a cached session
-    * (sessc_restore) projects the clock forward for up to a day while keeping
-    * the state it was stored with, so a sensor that went out of range in
-    * warm-up comes back with state 0x02 and a clock past the hour -- and the
-    * countdown below would render WARM -10:00. Past the hour the row falls
-    * through to the ordinary state line, which still reads WARM. */
+   /* Warm-up ends when the sensor reports a state past it, so past the hour
+    * the countdown goes on into the negative ("WARM -1:30") until a response
+    * says otherwise, as on the home screen. */
    if (s->have_rec && s->kind == KIND_CGM &&
        sensor_warming_now(s->sess_state, s->session_seconds) &&
-       s->session_seconds > 0 && s->session_seconds < SENSOR_WARMUP_S) {
-      /* Warmup: time REMAINING, not "NEVER" -- the wait is by design and
-       * the countdown says when data starts. With the sensor's own clock
-       * it is exact to the second (matching the official reader); off the
-       * pairing instant it is an estimate, and the '~' says so. */
+       s->session_seconds > 0) {
+      /* Warmup: the time left, and past the hour the overrun, not
+       * "NEVER" -- the wait is by design. The sensor's own clock makes it
+       * exact to the second, matching the official reader. */
       /* WARM, like every other state here, then the countdown in the
        * place the age occupies on the other rows -- so the column still
        * lines up while warming up. */
       long r = SENSOR_WARMUP_S - s->session_seconds;
-      (void)snprintf(val, sizeof val, "WARM %d:%02d", (int)(r / 60),
-                     (int)(r % 60));
+      /* AT MOST TEN CHARACTERS, the row's widest value, so the name beside
+       * it keeps its room however long the overrun: m:ss for the first ten
+       * minutes past the hour, then whole minutes, then whole hours. */
+      long ar = (r < 0) ? -r : r;
+      if (r >= 0 || ar < 600)
+         (void)snprintf(val, sizeof val, "WARM %s%d:%02d", (r < 0) ? "-" : "",
+                        (int)(ar / 60), (int)(ar % 60));
+      else if (ar < 3600)
+         (void)snprintf(val, sizeof val, "WARM -%dM", (int)(ar / 60));
+      else
+         (void)snprintf(val, sizeof val, "WARM -%ldH",
+                        (ar / 3600) > 999 ? 999L : ar / 3600);
    } else {
       (void)snprintf(val, sizeof val, "%s %s",
                      dev_state_abbrev(s->status, abbuf, sizeof abbuf), ago);
    }
    /* Three leading spaces: the second cell holds this device's plot marker
     * (its shape, colour and size), so the list answers "which trace is
-    * which" at a glance. No '>' for the primary any more -- the PRIMARY
-    * column at the right says that now, and two marks for one fact on one
+    * which" at a glance. The primary gets no mark of its own here: the
+    * PRIMARY column at the right says it, and two marks for one fact on one
     * row is noise. */
    /* Holds the three-space prefix plus a full label (sizeof s->label, which
-    * grew to 20 for the long OneTouch default names) plus the terminator.
-    * Undersizing it truncated the MAC tail that tells two meters apart. */
+    * is 20 for the long OneTouch default names) plus the terminator. An
+    * undersized buffer would cut the MAC tail that tells two meters apart. */
    char name[4 + sizeof s->label];
    (void)snprintf(name, sizeof name, "   %s", s->label);
+   /* THE NAME STOPS BEFORE THE VALUE: a label the user typed can be long
+    * enough to reach the value at the narrowest width, and the two would
+    * overprint. Cut, at full size, to the cells left of the value with a
+    * cell between them. */
+   {
+      const int cell = 6 * g->sc;
+      const int room = (g->vrx - (str_len(val) * cell) - (10 * g->sc)) / cell;
+      if (room >= 4 && room < (int)sizeof name)
+         name[room] = 0;
+   }
    menu_row_at(fb, h, y, g->sc, g->lh, g->vrx, name, val,
                s->connected ? UI_OK : UI_FAINT, MA_SENSOR, i);
    /* The PRIMARY checkbox, for a CGM whose session is not over. Recorded
@@ -507,20 +525,25 @@ void render_devices(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (m->dev.pend_type > 0) {
       /* An ARMED pairing: registered intent, no sensor on the air yet. The
        * row is the visible promise that the code was accepted and the app is
-       * watching. Tapping it opens the STOP WAITING? confirmation -- the row
+       * watching. Tapping it opens the CGM PENDING confirmation -- the row
        * wears a device's clothes, so a finger reaching for the new sensor
        * must not be able to throw the pairing away on the way past. */
       char pn[24];
       (void)snprintf(pn, sizeof pn, " %s", sensor_type_name(m->dev.pend_type));
-      /* WHAT THE WAIT IS WAITING FOR. "PENDING..." alone cannot be acted on:
-       * it reads the same whether no sensor has appeared yet or several have
-       * and the app will not choose between them. The second case is the one
-       * with something to do about it, so it says so. */
-      char pv[16];
-      if (m->dev.pend_seen >= 2)
+      /* WHAT THE WAIT IS WAITING FOR. No sensor on the air yet and several
+       * the app will not choose between are different waits, and only the
+       * second has something for the user to do, so it says so. */
+      char pv[24];
+      if (m->dev.pend_seen >= 2) {
          (void)snprintf(pv, sizeof pv, "PICK 1 OF %d", m->dev.pend_seen);
-      else
-         (void)snprintf(pv, sizeof pv, "PENDING...");
+      } else {
+         /* HOW LONG IT HAS WAITED, as the CGM PENDING screen says it: a
+          * wait with no elapsed time on it looks like one that is not
+          * running. */
+         char ago[12];
+         fmt_ago(m->now, m->dev.pend_since, ago, sizeof ago);
+         (void)snprintf(pv, sizeof pv, "PENDING (%s)", ago);
+      }
       menu_row(fb, h, y, sc, lh, pn, pv, UI_WARN, MA_PEND_CANCEL, 0);
       y += lh;
    }
@@ -771,8 +794,8 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
             stcol, -1, 0);
    y += g->lh;
    {
-      char rs[16]; /* link RSSI (moved off the main screen). No age here -- LAST
-                    * SYNC sits right beside it and carries the time. */
+      char rs[16]; /* link RSSI. No age here -- LAST SEEN sits right below
+                    * it and carries the time. */
       if (s->rssi_ok && s->rssi_t > 0)
          (void)snprintf(rs, sizeof rs, "%d DB", s->rssi);
       else
@@ -782,13 +805,19 @@ static int sensor_status_rows(struct ANativeWindow_Buffer *fb,
    }
    {
       /* LAST SEEN: the most recent time we heard from this device -- a meter's
-       * last connect/sync, a CGM's last reading. Directly under SIGNAL
-       * STRENGTH, whose value is the signal captured at that same moment. */
+       * last connect/sync, a CGM's last reading, or the signal sample if that
+       * is newer. Directly under SIGNAL STRENGTH. */
       char when[20];
       char rel[12];
       char val[48]; /* "<date up to 19> (<rel up to 11> AGO)" + NUL */
       long seen =
           (s->have_rec && s->kind == KIND_BGM) ? s->meter_sync_t : s->last_any;
+      /* A SIGNAL STRENGTH IS A SIGHTING. The row above shows one only when
+       * the radio heard this device (a link's sample is dropped when the link
+       * changes device), so LAST SEEN is never older than it -- which matters
+       * most while a new sensor pairs and has no reading yet. */
+      if (s->rssi_ok && s->rssi_t > seen)
+         seen = s->rssi_t;
       if (seen > 0) {
          fmt_date(seen, m->tz_off, when, sizeof when);
          fmt_ago(m->now, seen, rel, sizeof rel);
@@ -1287,8 +1316,12 @@ void render_cal(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * then re-open a menu without setting it) therefore produced a blank screen
     * that ignored all input: force-stop required. */
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_CAL_BACK, 0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
 
    /* Confirmation for the value just typed on the keypad. The write is the most
@@ -1333,8 +1366,12 @@ void render_rescale(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y        = (fb->height / 20) + (8 * sc);
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_RESCALE_BACK,
               0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
    draw_str(px, fb, x, y, tsc, "RESCALE", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
@@ -1492,7 +1529,7 @@ void render_olddev(struct ANativeWindow_Buffer *fb, const struct screen *m,
       const struct ui_sensor *s = &m->dev.sensors[idxs[r]];
       char val[20];
       long agot =
-          (s->have_rec && s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
+          (s->have_rec && s->kind == KIND_BGM) ? s->meter_sync_t : s->last_any;
       if (agot > 0)
          fmt_date(agot, m->tz_off, val, sizeof val);
       else

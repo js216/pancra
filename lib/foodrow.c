@@ -16,7 +16,7 @@ int food_macro_ok(int which, int milli)
 
 /* "0.454" -> 454: digits, then at most one '.' and three more. Anything else
  * -- a sign, a fourth decimal, a stray character, nothing at all -- is not a
- * value this file writes. 1 on success. */
+ * value this format holds. 1 on success. */
 static int milli_parse(const char *s, int *out)
 {
    long v    = 0;
@@ -45,6 +45,37 @@ static int milli_parse(const char *s, int *out)
    return 1;
 }
 
+int food_goal_ok(int which, int v)
+{
+   if (which < 0 || which >= FOOD_NMACRO)
+      return 0;
+   if (which == FOOD_KCAL)
+      return v >= 0 && v <= FOOD_GOAL_KCAL_MAX;
+   return v >= 1 && v <= FOOD_GOAL_G_MAX;
+}
+
+int food_goals_decode(const char *p, const char *e, int out[FOOD_NMACRO])
+{
+   struct csv_cur c;
+   csv_open(&c, p, e);
+   int v[FOOD_NMACRO] = {0, 0, 0, 0};
+   for (int k = 0; k < FOOD_NMACRO; k++) {
+      if (k && !csv_sep(&c))
+         return 0;
+      enum csv_field why = CSV_FIELD_EMPTY;
+      const long x       = csv_num(&c, &why);
+      if (why != CSV_FIELD_OK || x < 0 || x > FOOD_GOAL_KCAL_MAX ||
+          !food_goal_ok(k, (int)x))
+         return 0;
+      v[k] = (int)x;
+   }
+   if (!csv_at_end(&c))
+      return 0;
+   for (int k = 0; k < FOOD_NMACRO; k++)
+      out[k] = v[k];
+   return 1;
+}
+
 int food_name_ok(const char *n)
 {
    if (!n || !n[0])
@@ -61,20 +92,32 @@ int food_name_ok(const char *n)
    return 1;
 }
 
-/* No `why` on any field: as in exrow.c, every answer the cursor could give
- * is already a rejection here. An absent or non-numeric field reads 0, and 0
- * fails `t <= 0`, `type == FOOD_TYPE_NONE` and `g < FOOD_MIN_G` alike; an
- * over-long digit run keeps its leading digits, which cannot land inside a
- * plausible epoch, a type id, or a plausible portion. */
+/* "<t>,<type>,<grams>[,<tz>]". Every field is a whole number (the offset
+ * may be negative) and ends at a separator or the line's end, as in exrow.c:
+ * an over-long digit run is refused rather than read as its leading digits
+ * (csvcur.h), and so is "t,12.5,...". The offset is not kept here, only
+ * checked. */
 int food_entry_decode(const char *p, const char *e, struct food_rec *r)
 {
    struct csv_cur c;
    csv_open(&c, p, e);
-   r->t = csv_num(&c, 0);
-   csv_sep(&c);
-   long ty = csv_num(&c, 0);
-   csv_sep(&c);
-   r->g = csv_num(&c, 0);
+   enum csv_field w = CSV_FIELD_EMPTY;
+   r->t             = csv_num(&c, &w);
+   if (w != CSV_FIELD_OK || !csv_sep(&c))
+      return 0;
+   long ty = csv_num(&c, &w);
+   if (w != CSV_FIELD_OK || !csv_sep(&c))
+      return 0;
+   r->g = csv_num(&c, &w);
+   if (w != CSV_FIELD_OK)
+      return 0;
+   if (csv_sep(&c)) {
+      (void)csv_num(&c, &w);
+      if (w != CSV_FIELD_OK)
+         return 0;
+   }
+   if (!csv_at_end(&c))
+      return 0;
    if (r->t <= 0 || r->t >= FOOD_T_MAX)
       return 0;
    if (r->g < FOOD_MIN_G || r->g > FOOD_MAX_G)
@@ -90,10 +133,13 @@ int food_type_decode(const char *p, const char *e, int *id_out, char *name_out,
 {
    struct csv_cur c;
    csv_open(&c, p, e);
-   long id = csv_num(&c, 0);
-   if (!csv_sep(&c))
+   enum csv_field w = CSV_FIELD_EMPTY;
+   long id          = csv_num(&c, &w);
+   if (w != CSV_FIELD_OK || !csv_sep(&c))
       return 0; /* no separator: this is not a row, it is a fragment */
-   char nm[FOOD_NAME_MAX + 1];
+   /* ONE BYTE WIDER THAN A NAME, so a name longer than FOOD_NAME_MAX
+    * reaches food_name_ok still too long, and is refused there. */
+   char nm[FOOD_NAME_MAX + 2];
    csv_str(&c, nm, (int)sizeof nm);
    int macro[FOOD_NMACRO] = {0, 0, 0, 0};
    if (csv_sep(&c)) {
@@ -110,14 +156,19 @@ int food_type_decode(const char *p, const char *e, int *id_out, char *name_out,
    }
    /* AN ID OF 0 IS NOT A TYPE (FOOD_TYPE_NONE), and a name that would not
     * survive a round trip through this format did not come from food_type_add
-    * -- both mean the file has been edited or damaged. */
-   if (id <= FOOD_TYPE_NONE || id > 0x7fffffffL)
+    * -- both mean the file has been edited or damaged. The largest int is
+    * refused too: the loader mints the next id as the largest seen plus one,
+    * and that must still be an int. */
+   if (id <= FOOD_TYPE_NONE || id >= 0x7fffffffL)
       return 0;
    if (!food_name_ok(nm))
       return 0;
    *id_out = (int)id;
-   for (int i = 0; i <= FOOD_NAME_MAX; i++)
+   for (int i = 0; i <= FOOD_NAME_MAX; i++) {
       name_out[i] = nm[i];
+      if (!nm[i])
+         break; /* csv_str terminates within nm; nothing past it is set */
+   }
    for (int k = 0; k < FOOD_NMACRO; k++)
       macro_out[k] = macro[k];
    return 1;

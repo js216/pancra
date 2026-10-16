@@ -6,7 +6,7 @@
  * successful run both sides hold exactly the same rows, and one small request
  * proves it.
  *
- * The record is a set of named LOGS. A log is a set of ROWS; a row is one
+ * The record is a set of named LOGS. A log is a list of ROWS; a row is one
  * line of text and ITS BYTES ARE ITS IDENTITY -- nothing here reformats,
  * reorders or normalises a row, because the server hashes exactly the bytes
  * it is given and the two hashes have to agree. Rows are partitioned into
@@ -332,9 +332,9 @@ enum dline digest_line(const char **p, char *name, int ncap, int64_t *count,
                        char hash[17]);
 
 /* The canonical text of one bucket of `log_idx` -- its rows, sorted,
- * de-duplicated, newline-terminated -- which is the text whose hash the two
- * sides of a sync compare. NUL-terminated; returns the length written, or -1
- * if the bucket does not exist or does not fit `cap`.
+ * newline-terminated, a row written twice appearing twice -- which is the text
+ * whose hash the two sides of a sync compare. NUL-terminated; returns the
+ * length written, or -1 if the bucket does not exist or does not fit `cap`.
  *
  * Declared here for the same reason digest_line above is: the agreement it
  * encodes is with a REMOTE implementation, and the only way to hold it to

@@ -689,6 +689,19 @@ enum bind_mac driver_bind_mac(int link, const char *mac)
    return r;
 }
 
+enum bind_mac driver_bind_mac_if(int link, const char *mac, unsigned gen)
+{
+   if (!dex_link_ok(link) || !mac || !mac[0])
+      return BIND_NOT_SAVED;
+   long now = mono_s();
+   driver_lock();
+   enum bind_mac r = (g_dctx[link].forget_gen == gen)
+                         ? bind_locked(link, mac, now)
+                         : BIND_NOT_SAVED;
+   driver_unlock();
+   return r;
+}
+
 void driver_bind_retry(void)
 {
    long now = mono_s();
@@ -710,6 +723,15 @@ void driver_bind_retry(void)
    driver_unlock();
 }
 
+void driver_bind_drop(int link)
+{
+   if (!dex_link_ok(link))
+      return;
+   driver_lock();
+   g_bind_pending[link][0] = 0;
+   driver_unlock();
+}
+
 void driver_get_cal(const struct dex_ctx *dc, struct dex_cal *out)
 {
    *out = dc->cal;
@@ -724,6 +746,7 @@ void driver_get_session(const struct dex_ctx *dc, struct dex_session *out)
    out->mac[i]       = 0;
    out->bonded       = dc->g_bonded;
    out->paired       = dc->have_key;
+   out->forget_gen   = dc->forget_gen;
    out->have_reading = (dc->str.clock != 0);
    /* LIVE session time: the sensor's clock at the last response, projected
     * forward by the ELAPSED time since. Responses arrive minutes apart, but

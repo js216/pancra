@@ -37,7 +37,7 @@ struct ex_draft {
    long t;
    int level; /* EX_MIN_LEVEL..EX_MAX_LEVEL */
    /* HOW LONG IT LASTED, in SECONDS, and 0 means "not known" -- the same
-    * column exercise.h describes, held in the same unit so nothing here has
+    * column exrow.h describes, held in the same unit so nothing here has
     * to convert twice. The form types it in minutes. */
    long dur;
    int edit; /* index being edited, < 0 = not editing anything */
@@ -221,18 +221,20 @@ void forms_ex_edit(int i)
 /* ---- WHAT THE FRAME ASKS OF THIS WORKFLOW ----------------------------
  *
  * The keypad edits this form's INSTANT and its DURATION -- the latter as
- * minutes or as a stop time. It cannot create a
- * record and it cannot set the level: the button and its settling rule are the
- * only writer of a row (uiex.c says why at length), and the level is three
- * values to tap through rather than a number to type. */
+ * minutes or as a stop time. It cannot create a record and it cannot set the
+ * level: the button and its settling rule are the only writer of a row
+ * (uiex.c says why at length), and the level is three values to tap through
+ * rather than a number to type. */
 
 long *form_ex_instant(void)
 {
    return &g_ex.t;
 }
 
-/* SECONDS, which is the unit the log stores; the keypad collects minutes and
- * kp_commit_number does the one multiplication. */
+/* SECONDS, which is the unit the log stores. The keypad collects either
+ * minutes (kp_commit_number) or a stop time (kp_commit_datetime), and both
+ * are turned into seconds counted from the start, so the stop lands on the
+ * minute the form shows. */
 long *form_ex_duration(void)
 {
    return &g_ex.dur;

@@ -44,7 +44,8 @@
  * The other tier is insulin.h's, and it is the only one: a dose is not a
  * preference, so that log is never rewritten and keeps its own history. */
 
-#include "exrow.h" /* the domain, the record and its one decoder */
+/* The domain, the record and its one decoder. */
+#include "exrow.h" /* IWYU pragma: export */
 
 /* How long a value must stay put before it is written, in seconds.
  *

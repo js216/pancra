@@ -77,7 +77,7 @@ enum ui_screen {
    SCR_MARKPICK,   /* the combined marker-shape and colour picker */
    SCR_METERHELP,  /* OneTouch: how-to-connect + Scan button */
    SCR_PAIRCONF,   /* confirm pairing the picked device: YES / NO */
-   /* confirm giving up on an armed pairing: KEEP WAITING / STOP WAITING */
+   /* confirm giving up on an armed pairing: KEEP WAITING / STOP */
    SCR_PENDCANCEL,
    /* confirm pulling the server's record back down onto this phone */
    SCR_SYNCRESTORE,
@@ -219,7 +219,7 @@ struct ui_sensor {
     * becomes unreachable. A field one character short of its longest value is
     * a lookup that silently misses. */
    char status[16];
-   char mac[20], model[24], fw[24], serial[24], code[8];
+   char mac[20], model[24], fw[24], serial[24], code[9];
    /* What the OS Bluetooth list calls this device ("DXCMrb"), from its
     * advertisements. Empty until one is heard. */
    char adv_name[9];
@@ -561,6 +561,10 @@ struct screen {
    int log_scrub;
    long now;    /* realtime_s() at frame time */
    long tz_off; /* local timezone offset (seconds) */
+   /* The offset in force at instant `t`, which fmt_date, fmt_date_md, the
+    * scrub readout and the exercise log's TODAY line and day tabs read in; 0
+    * when the frame has none, and then tz_off. */
+   long (*tz_at)(long t);
    /* THE STATUS TEXT, COPIED INTO THE FRAME rather than pointed at.
     *
     * As a `const char *` it aims straight at the shared g_status buffer that

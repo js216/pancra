@@ -5,6 +5,8 @@
 #include "model.h"
 #include "alarm.h"
 #include "alarmlogic.h"
+#include "blejni.h" /* dexble_env: the frame's dates ask Android their offset */
+#include "bletrans.h"  /* dexble_code_for, dexble_code_file: the CODE row */
 #include "bondtable.h" /* the OS bond state a device row shows */
 #include "calib.h"
 #include "clock.h"
@@ -40,6 +42,7 @@
 #include "uimodel.h"
 #include "util.h"
 #include "weight.h"
+#include <jni.h> /* JNIEnv: frame_tz_at asks on the drawing thread */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -654,10 +657,10 @@ static void fill_sensor(struct frame_ctx *f, struct ui_sensor *u, int i,
       u->glu   = f->newest[i].glu;
       u->trend = f->newest[i].trend;
    }
-   /* WHAT THE "LAST SEEN" ROW SHOWS, and only that row. The walk above
-    * searches the display window, which is a few thousand rows deep; a device
-    * retired weeks ago has none of its readings left in it and reads "--"
-    * while the log on disk still holds every one.
+   /* WHAT THE "LAST SEEN" ROW AND THE OLD DEVICES LIST SHOW, and only those.
+    * The walk above searches the display window, which is a few thousand
+    * rows deep; a device retired weeks ago has none of its readings left in
+    * it and reads "--" while the log on disk still holds every one.
     *
     * A FIELD OF ITS OWN, not a wider `last`. `last` decides whether a sensor
     * is CONNECTED and whether it has ever reported at all (the PAIRING
@@ -710,16 +713,15 @@ static void fill_sensor(struct frame_ctx *f, struct ui_sensor *u, int i,
          u->rssi_ok = haveit;
          u->rssi_t  = rwhen;
       }
-      /* The pairing code is the GLOBAL last-entered one (settings.h),
-       * not a per-device secret we persist -- so only show it on a LIVE CGM
-       * (where it is at least the code in current use). An OLD device would
-       * otherwise display a live sensor's code, which is why both G7s appeared
-       * to share one. */
-      if (!sl->old) {
-         /* FROM THE FRAME'S OWN COPY (ps, taken once in build_model), not a
-          * fresh one: this runs per slot inside the frame loop, so a copy
-          * here is both repeated work and a second instant -- one row could
-          * show a code the row above it does not. */
+      /* THE CODE ROW, on a LIVE CGM only: the code a code file holds for
+       * this sensor, which is the one a re-pair of it uses, and nothing when
+       * the sensor refused it. With no file for it and none on its link it
+       * shows the code typed last (settings.h), as the re-pair does. An OLD
+       * device shows none. */
+      if (!sl->old && !dexble_code_for(sl->mac, u->code, (int)sizeof u->code) &&
+          !dexble_code_file(snap_shell_link_for_slot(f, i))) {
+         /* The code typed last from the frame's own copy (f->prefs, taken
+          * once in build_model), so every row shows the same one. */
          str_snapshot(u->code, sizeof u->code, f->prefs.code_str);
       }
       /* WARMUP: a freshly paired sensor delivers nothing for about its first
@@ -1508,6 +1510,15 @@ static void build_status(struct frame_ctx *f, struct screen *m)
    m->dev.ndev = nd;
 }
 
+/* The offset at an instant for the frame's dates (uimodel.h): asked of
+ * Android on the drawing thread, through tzoff.c's per-day and quarter-hour
+ * cache. */
+static long frame_tz_at(long t)
+{
+   JNIEnv *env = dexble_env();
+   return env ? tz_shown_at(env, t) : tz_off_now();
+}
+
 void build_model(struct screen *m)
 {
    /* ONE READING of the preferences and the identity for the WHOLE frame.
@@ -1543,6 +1554,7 @@ void build_model(struct screen *m)
    m->log_scrub = f->fv.log_scrub;
    m->now       = now;
    m->tz_off    = tz_off_now();
+   m->tz_at     = frame_tz_at;
 
    build_reading(f, m);
    build_plot(f, m);

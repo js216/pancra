@@ -144,14 +144,17 @@ static int load_points(struct plot_ws *ws, struct db *d, int64_t owner,
    sqlite3_bind_int64(st, 3, (t1 / 86400) + 1);
    int n  = 0;
    int rc = SQLITE_DONE;
+   /* A ROW STORED TWICE IS ONE READING, as the phone loads it: identical
+    * rows come out next to each other, and the copy is skipped. */
+   char prev[ROW_MAX + 1] = "";
    while (n < PTS_MAX && (rc = sqlite3_step(st)) == SQLITE_ROW) {
       const char *ln = (const char *)sqlite3_column_text(st, 0);
-      if (!ln)
+      if (!ln || strcmp(ln, prev) == 0)
          continue;
-      /* THE SAME DECODER the pages use (rowdec.h). This walked commas by
-       * hand and took whatever prefix strtol could find, so a corrupt field
-       * was plotted as a number and a row that stopped early was plotted as
-       * zeroes -- on a graph, where a reader has no way to tell. */
+      snprintf(prev, sizeof prev, "%s", ln);
+      /* THE SAME DECODER the pages use (rowdec.h): a corrupt field or a row
+       * that stops early is skipped, never plotted -- on a graph a reader has
+       * no way to tell a bad point from a real one. */
       struct row_reading rr;
       if (!row_decode(ln, (int)strlen(ln), &rr))
          continue;
@@ -244,18 +247,20 @@ static size_t plot_gif(struct plot_ws *ws, struct db *d, int64_t owner,
    int ph = IMG_H - XSTRIP; /* plot rect; labels live in the strip below */
    for (size_t i = 0; i < (size_t)IMG_W * IMG_H; i++)
       ws->fbpx[i] = 0xFF181818; /* the app's screen background */
-   int np = load_points(ws, d, owner,
-                        changes ? win_start - PLOT_CHG_GAP_S : win_start, win_end);
+   int np = load_points(
+       ws, d, owner, changes ? win_start - PLOT_CHG_GAP_S : win_start, win_end);
    if (np < 0)
       return 0; /* no image rather than one missing readings, or one that
                  * silently claims the window was empty */
    if (changes)
       np = add_changes(ws, np);
    int64_t tz = (int64_t)tz_min * 60;
-   /* THE PLOT'S CONFIGURATION, passed rather than set: the scale and the
-    * marker radius were process globals, so two windows rendered at once
-    * could not have different ones -- and this server renders several. */
-   struct plot_cfg cfg = {PLOT_GLU_MAX, PLOT_PRAD, changes ? PLOT_CHG_FLOOR : 0};
+   /* THE PLOT'S CONFIGURATION, passed per call: this server renders several
+    * windows at once, so the scale, the marker radius and the floor are
+    * arguments of the render, not process globals. A changes plot adds its
+    * floor. */
+   struct plot_cfg cfg = {PLOT_GLU_MAX, PLOT_PRAD,
+                          changes ? PLOT_CHG_FLOOR : 0};
    plot_render((struct plot_fb){ws->fbpx, IMG_W, IMG_W, IMG_H},
                (struct plot_rect){0, 0, IMG_W, ph}, ws->ppts, np, win_end,
                hours, cfg, trace_white, -1, 0, tz);
@@ -328,9 +333,9 @@ void h_plot_gif(struct req *r, int64_t owner, int64_t win_start,
    /* THE READER'S THEME, NOT THE RECORD OWNER'S. `owner` says whose readings
     * are drawn; r->theme says who is looking at them, and a follower reading
     * a shared record is entitled to their own palette. */
-   size_t n = plot_gif(&g_plot_ws, r->db, owner, win_start, win_end, hours,
-                       tz_min, r->theme == THEME_DARK, changes, gifbuf,
-                       sizeof gifbuf);
+   size_t n =
+       plot_gif(&g_plot_ws, r->db, owner, win_start, win_end, hours, tz_min,
+                r->theme == THEME_DARK, changes, gifbuf, sizeof gifbuf);
    if (!n) {
       /* STAGED, not written here. http_text goes to the socket, and this runs
        * under the page lock -- so a client that stopped reading held every

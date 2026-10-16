@@ -9,7 +9,8 @@
  *
  * Everything here therefore depends on ONE thing being identical in both
  * implementations: the canonical text of a bucket -- rows sorted bytewise,
- * each terminated by a newline. sqlite's default TEXT collation IS bytewise,
+ * each terminated by a newline, a row the phone wrote twice appearing twice.
+ * sqlite's default TEXT collation IS bytewise,
  * so `ORDER BY line` is exactly the order the app must sort in. If that ever
  * stops being true the digests silently stop matching, which is why the
  * queries below spell out the ordering rather than relying on the primary
@@ -403,9 +404,14 @@ void h_bucket_put(struct req *r, const char *log, int64_t bucket)
    }
    sqlite3_stmt *del = db_prep(
        r->db, "DELETE FROM logrow WHERE user_id=? AND log=? AND bucket=?");
-   sqlite3_stmt *ins = db_prep(r->db, "INSERT OR IGNORE INTO"
-                                      " logrow(user_id,log,bucket,line)"
-                                      " VALUES(?,?,?,?)");
+   /* EVERY LINE IS KEPT, the same text as often as it comes: `n` numbers
+    * the copies of one text in this bucket, counted from the ones this PUT
+    * has already stored (the bucket was emptied first). */
+   sqlite3_stmt *ins = db_prep(r->db, "INSERT INTO"
+                                      " logrow(user_id,log,bucket,line,n)"
+                                      " VALUES(?1,?2,?3,?4,(SELECT count(*)"
+                                      " FROM logrow WHERE user_id=?1 AND"
+                                      " log=?2 AND bucket=?3 AND line=?4))");
    if (!del || !ins) {
       if (del)
          sqlite3_finalize(del);

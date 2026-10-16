@@ -154,7 +154,11 @@ int log_pick(const struct log_pt *p, int n, long from, long now, int px0,
 extern const uint32_t ui_ins_col[UI_INS_SERIES];
 int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from);
 long exday_from_of(int tab, long now, long oldest_ex, long oldest_step);
-long ex_day_floor(long t, long tz_off);
+/* The civil day of `t` as a day count, read in the offset in force at `t`:
+ * the EXERCISE LOG's TODAY line asks this, and its plot's day buckets
+ * (ex_day_start, ex_day_of) agree with it, so the total and the point beside
+ * it count the same rows. */
+long ex_civil_day(const struct screen *m, long t);
 
 /* THE EXERCISE LOG'S PLOT POINTS: series 0 is exercise, series 1 is the step
  * count. The picker asks for them here so a finger resolves against exactly

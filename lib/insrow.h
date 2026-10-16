@@ -66,16 +66,22 @@
  * injected at, it is a corrupted field. */
 #define INS_T_MAX 32503680000L
 
+/* The longest line of the insulin log, newline excluded. A longer line is
+ * damage and is skipped whole: a cut-off prefix is never decoded. */
+#define INS_LINE_MAX 127
+
 /* ONE ASSERTION ABOUT ONE DOSE.
  *
  * `id` names the dose. A row in the ORIGINAL four-field dialect carries no
  * id, so the replay gives it a negative one by file order -- the two spaces
  * cannot collide, however the file was assembled.
  *
- * `del` retracts the dose named by `id`; when it is set, `t`, `type` and
- * `units` describe the dose being retracted and are not required to be
- * anything in particular (the phone writes them so the row still reads on its
- * own; the log is a history, not a diff). */
+ * `del` retracts the dose named by `id`. In the file a retraction row still
+ * carries the dose's time, type and units, so it reads on its own (the log is
+ * a history, not a diff); the time and type must each be a whole number or
+ * empty and the units a decimal or empty (a lone '-' or '.' reads as empty),
+ * their ranges are not checked, and the decoder fills `t` and sets `type` and
+ * `milli` to 0. */
 struct ins_row {
    long id;
    int del;
@@ -95,10 +101,14 @@ int ins_units_str(int milli, char *out, int cap);
  * `legacy_id` is the id to give a four-field row -- callers pass a negative,
  * decreasing number.
  *
- * 1 when the row is an assertion this format allows, 0 when it is not: a
- * missing field, a field that is not exactly a number, a retraction flag that
- * is neither 0 nor 1, an id of zero, or a time / type / dose out of range. A
- * refused row is data neither half may render.
+ * 1 when the row is an assertion this format allows, 0 when it is not: an
+ * id or retraction flag that is missing, not exactly a number, or out of
+ * range (a retraction flag must be 0 or 1, an id nonzero), or, for a dose
+ * that is not a retraction, a time, type or dose that is.
+ * Every field before the tz ends at its comma. `written` must be a whole
+ * number or empty (a lone '-' reads as empty) and is not otherwise read; the
+ * trailing tz is not read or checked. A refused row is data neither half may
+ * render.
  */
 int ins_row_decode(const char *p, const char *e, long legacy_id,
                    struct ins_row *out);

@@ -792,6 +792,16 @@ int sensor_slot_by_mac(const char *identity)
    return at;
 }
 
+int sensor_ever_streamed(const char *identity)
+{
+   int seen = 0;
+   reg_lock();
+   for (int i = 0; i < g_nsrec && !seen; i++)
+      seen = g_srec[i].activation > 0 && !strcmp(g_srec[i].identity, identity);
+   reg_unlock();
+   return seen;
+}
+
 int sensor_hidden_ids(int *out, int max)
 {
    /* The ids of slots whose marker is MARK_HIDE (the device is OFF the plot),

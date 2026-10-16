@@ -234,7 +234,7 @@ static int exercise_load_staged(void)
       return errno == ENOENT ? 0 : -1;
    }
    char buf[1024];
-   char line[96];
+   char line[EX_LINE_MAX + 1];
    int llen    = 0;
    int over    = 0; /* over-long line: skip, never parse a truncation */
    int damaged = 0;
@@ -406,8 +406,8 @@ int exercise_append(long t, int level, long tz)
  * about an existing dose. */
 /* WHAT MAKES A LINE THE ROW BEING EDITED, and what the replacement says. The
  * rewrite itself is log_edit_last's (util.h): two passes, a temporary, a
- * durable publish, and the tombstone when a delete empties the file. This
- * A per-file copy of all of that is what this avoids. */
+ * durable publish, and the tombstone when a delete empties the file, shared
+ * by every log of this tier. */
 struct ex_edit {
    struct ex_rec orig; /* the row the user is editing */
    long t;             /* what it becomes (unused for a delete) */
@@ -631,7 +631,7 @@ int exercise_end(long now)
    /* A SESSION OF ZERO SECONDS IS NOT A SESSION, and a negative one is a
     * clock that moved under us. Both leave the row open, which reads as "no
     * end was recorded" -- true, and better than a length that is a fiction.
-    * The upper bound is EX_DUR_MAX for the reason exercise.h gives. */
+    * The upper bound is EX_DUR_MAX for the reason exrow.h gives. */
    if (dur <= 0 || dur > EX_DUR_MAX)
       return -1;
    return ex_rewrite(&open_row, 0, open_row.t, open_row.level, open_row.tz,

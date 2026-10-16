@@ -26,9 +26,9 @@
  * So the file carries a VERSION (PRAGMA user_version, which sqlite stores in
  * the header and costs nothing) and this is a list of ordered steps:
  *
- *   - each step runs in ITS OWN TRANSACTION, together with the bump of
- *     user_version, so a failure leaves the database at a whole version, not
- *     halfway into a step;
+ *   - every pending step, each with its bump of user_version, runs in ONE
+ *     transaction together with the after-check, so a failure leaves the
+ *     database exactly as it was found, not halfway through the run;
  *   - steps run in order, and only the ones this file has not yet had;
  *   - a file from the FUTURE -- a version this build does not know -- is
  *     REFUSED. It was written by a newer server, and an older binary reading
@@ -74,10 +74,9 @@ static const char SCHEMA[] =
     "  code TEXT NOT NULL, expires_at INTEGER NOT NULL,"
     "  tries INTEGER NOT NULL DEFAULT 0);"
 
-    /* The replica. `line` is part of the primary key, so re-PUTting a row the
-     * server already holds is a no-op rather than a duplicate -- the same
-     * idempotence store gets from its dedup scan, but as an index lookup
-     * rather than a walk of the whole file. */
+    /* The replica as step 1 creates it, one row per (user, log, bucket,
+     * text); step 5 adds `n` to the key so a bucket keeps every copy the
+     * phone wrote. */
     "CREATE TABLE IF NOT EXISTS logrow ("
     "  user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,"
     "  log TEXT NOT NULL, bucket INTEGER NOT NULL, line TEXT NOT NULL,"
@@ -195,6 +194,28 @@ static const char SCHEMA_V3[] =
 static const char SCHEMA_V4[] =
     "ALTER TABLE user ADD COLUMN theme INTEGER NOT NULL DEFAULT 0;";
 
+/* ---- V5: A BUCKET HOLDS ITS ROWS AS OFTEN AS THE PHONE WROTE THEM ------
+ *
+ * A row's bytes are its identity, and the phone can write the same bytes
+ * twice -- the same food, grams and minute logged twice is two meals, and
+ * the replica and a restore must hold both. `n` numbers the copies of one
+ * text within its bucket (0, 1, ...), so the key is unique while every copy
+ * is kept.
+ *
+ * A TABLE REBUILD, because a column cannot be added to a WITHOUT ROWID
+ * table's primary key in place. A step-4 table holds one copy of each text,
+ * so its rows enter as n = 0. */
+static const char SCHEMA_V5[] =
+    "CREATE TABLE logrow_v5 ("
+    "  user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,"
+    "  log TEXT NOT NULL, bucket INTEGER NOT NULL, line TEXT NOT NULL,"
+    "  n INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, log, bucket, line, n)) WITHOUT ROWID;"
+    "INSERT INTO logrow_v5(user_id,log,bucket,line,n)"
+    "  SELECT user_id,log,bucket,line,0 FROM logrow;"
+    "DROP TABLE logrow;"
+    "ALTER TABLE logrow_v5 RENAME TO logrow;";
+
 /* The version this build understands. Bump it in the same commit as the
  * migration that needs it, and never renumber: the number is written into
  * every database this server has ever opened. */
@@ -207,6 +228,7 @@ const struct migration db_migrations[] = {
     {2, SCHEMA_V2},
     {3, SCHEMA_V3},
     {4, SCHEMA_V4},
+    {5, SCHEMA_V5},
     /* Add the next step here, with `to` one higher, and raise
      * DB_SCHEMA_VERSION to match. Do NOT edit an earlier step: databases in
      * the field have already run it, and changing it makes this list a

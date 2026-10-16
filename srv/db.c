@@ -29,64 +29,38 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void unstamp(struct db *d, int to)
-{
-   char bump[64];
-   (void)snprintf(bump, sizeof bump, "PRAGMA user_version=%d;", to);
-   if (db_exec(d, "BEGIN IMMEDIATE;") && db_exec(d, bump) &&
-       db_exec(d, "COMMIT;"))
-      return;
-   (void)db_exec(d, "ROLLBACK;");
-   fprintf(stderr,
-           "sync: %s was refused, and its schema version could NOT be put back "
-           "to %d.\n"
-           "  It is now marked as further along than it is. Restore a backup, "
-           "or set\n"
-           "  `PRAGMA user_version=%d;` by hand with the server stopped, "
-           "before the next start\n"
-           "  reads it as a file that has already passed the checks it has "
-           "not.\n",
-           d->path, to, to);
-}
-
-/* Bring the file up to DB_SCHEMA_VERSION, one transaction per step.
+/* Bring the file up to DB_SCHEMA_VERSION.
  *
- * 1 when the database is at this build's version afterwards; 0 when a step
- * failed or when the file is NEWER than this build understands.
+ * 1 when the database is at this build's version afterwards (with `repair`,
+ * when it passed the version and version-0 shape checks); 0 when a step
+ * failed, a check refused the file, or the file is NEWER than this build
+ * understands.
  *
- * A REFUSED FILE IS LEFT AT THE VERSION THE RUN STARTED FROM, not at the last
- * step that happened to commit, and that distinction only became visible when
- * there was more than one step. Every step's SQL is transactional with its own
- * version bump, but the after-check -- the only place the INDEXES are compared
- * -- can run only at the final version, because SHAPES and INDEXES describe
- * the far end. So with steps 1 and 2, a file whose `user(email)` index is
- * wrong sails through step 1 (all IF NOT EXISTS, nothing to notice), commits,
- * and is stamped version 1; step 2 then fails the index check and rolls
- * itself back, leaving the file marked as having passed a gate it has not.
- * The NEXT start reads a version-1 file, skips the `at == 0` branch below --
- * which is where the column collations and the orphan-row scan live -- and
- * refuses it again on the index alone, having lost the ability to say
- * anything about the rest. That is exactly the failure the note on the
- * after-check describes, arriving by a different door once the list grew.
+ * EVERY PENDING STEP, EVERY VERSION BUMP AND THE AFTER-CHECK ARE ONE
+ * TRANSACTION. Some steps cannot be run twice (an ALTER TABLE ... ADD COLUMN
+ * fails on a column that is already there), and the after-check -- the only
+ * place the INDEXES are compared -- can run only at the final version,
+ * because SHAPES and INDEXES describe the far end. Committed step by step, a
+ * later failure (a full disk during step 5's table copy, an index the
+ * after-check refuses) would leave earlier steps applied under a version
+ * stamp that says otherwise, and every later start would re-run a step that
+ * cannot be re-run. As one transaction, any failure rolls back to the file
+ * exactly as it was found, and the next start asks the same questions of the
+ * same file.
  *
- * So an abandoned run puts the stamp back. What it CANNOT undo is a table an
- * earlier step created in a file that had none -- those steps committed and
- * are not being replayed backwards. That is harmless and is the honest limit
- * of this: every statement in the baseline is IF NOT EXISTS, so the next start
- * re-runs it as a no-op, re-runs the version-0 checks in full, and refuses in
- * the same place with the same reason. The claim is "not adopted", not "byte
- * for byte as found". */
-/* `repair` is threaded through from db_open_repair and does exactly one
- * thing: it suppresses the orphan-row refusal below, so the fsck verb can
- * open the file whose orphan rows it exists to remove. Every other check
- * still applies. */
+ * `repair` is threaded through from db_open_repair: the file is checked for a
+ * version this build understands and, at version 0, for its shape -- and no
+ * step runs. fsck needs only sqlite's own catalogue and its foreign-key
+ * check, which work at every version; the orphan refusals below are what the
+ * repair exists to clear, and the ordinary open after it brings the cleaned
+ * file forward. A repair that stopped half way therefore never leaves a file
+ * stamped current with its orphans still in it. */
 static int migrate(struct db *d, int repair)
 {
    sqlite3 *h = db_handle(d);
    int at     = 0;
    if (!version_supported(h, d->path, &at))
       return 0;
-   const int began = at; /* what a refusal must leave behind */
    /* BEFORE ANYTHING IS STAMPED. A file that already holds a table of a
     * shape this build does not understand is not a version-0 file waiting
     * for the baseline -- it is a database from somewhere else, and the
@@ -99,91 +73,77 @@ static int migrate(struct db *d, int repair)
     * had one. */
    if (at == 0 && !schema_shapes_ok(h, d->path, 0))
       return 0;
+   if (repair)
+      return 1;
    /* ...and the DATA that goes with it. A file that has never been stamped by
     * this build is the only one that can already contain rows the cascades
     * say cannot exist; see no_orphan_rows for why this is not paid on every
     * start. Deliberately AFTER the shape check, so a file that is the wrong
     * shape is told about its shape rather than about the rows in it. */
-   if (at == 0 && !repair && !no_orphan_rows(h, d->path))
+   if (at == 0 && !no_orphan_rows(h, d->path))
       return 0;
-   int ran = 0;
+   /* ...and a stamped file the steps cannot finish: step 5 copies `logrow`
+    * under its foreign key, so one orphan there fails it. Asked before any
+    * step, the same question db_verify asks of a backup, so the refusal says
+    * `logrow` holds orphans rather than reporting a failed statement. */
+   if (at > 0 && at < DB_SCHEMA_VERSION && !schema_usable(h, d->path, at))
+      return 0;
+   /* A file that needs no step: every table this build queries exists and
+    * looks the way this build queries it. */
+   if (at == DB_SCHEMA_VERSION)
+      return schema_shapes_ok(h, d->path, 1);
+   if (!db_exec(d, "BEGIN IMMEDIATE;"))
+      return 0;
    for (int i = 0; i < db_nmigrations; i++) {
       if (db_migrations[i].to <= at)
          continue;
-      /* THE STEP AND THE VERSION BUMP ARE ONE TRANSACTION. Apart, a crash
-       * between them leaves a database that has had the change and does not
-       * say so -- and the next start runs the step again. */
       char bump[64];
       (void)snprintf(bump, sizeof bump, "PRAGMA user_version=%d;",
                      db_migrations[i].to);
-      if (!db_exec(d, "BEGIN IMMEDIATE;") ||
-          !db_exec(d, db_migrations[i].sql) || !db_exec(d, bump)) {
+      if (!db_exec(d, db_migrations[i].sql) || !db_exec(d, bump)) {
          fprintf(stderr, "sync: schema step %d failed: %s\n",
                  db_migrations[i].to, sqlite3_errmsg(h));
+         if (sqlite3_extended_errcode(h) == SQLITE_CONSTRAINT_FOREIGNKEY)
+            fprintf(stderr, "  The file holds orphan rows. With the server "
+                            "stopped, `sync fsck fix` removes them.\n");
          (void)db_exec(d, "ROLLBACK;");
-         goto abandon;
+         return 0;
       }
-      /* ...AND SO IS THE CHECK, on the last step. THIS IS WHAT "NOT STAMPED"
-       * MEANS.
-       *
-       * Run the after-check once the final COMMIT has happened and a file it
-       * refuses has nevertheless had its user_version written -- and the
-       * properties only the after-check can see (the indexes, with their
-       * UNIQUE flags, their partial-ness and their collations) are exactly
-       * the ones that decide whether one email address in two spellings is
-       * one account or two. Such a file is refused, correctly, and left
-       * marked as this build's. The next start
-       * then found a version-1 file, skipped the version-0 gate entirely --
-       * which is where the column collations and the orphan-row scan live --
-       * and refused it again for the index alone, having lost the ability to
-       * say anything about the rest.
-       *
-       * Inside the transaction, sqlite reports the schema as this connection
-       * has just changed it, so the check sees the migrated shape and a
-       * failure rolls the whole thing -- tables, indexes and version stamp --
-       * back to the file as it was found. A database that does not match is
-       * then exactly as unadopted as before it was opened. */
-      if (db_migrations[i].to == DB_SCHEMA_VERSION &&
-          !schema_shapes_ok(h, d->path, 1)) {
-         (void)db_exec(d, "ROLLBACK;");
-         goto abandon;
-      }
-      if (!db_exec(d, "COMMIT;")) {
-         fprintf(stderr, "sync: schema step %d failed to commit: %s\n",
-                 db_migrations[i].to, sqlite3_errmsg(h));
-         (void)db_exec(d, "ROLLBACK;");
-         goto abandon;
-      }
-      at  = db_migrations[i].to;
-      ran = 1;
    }
-   /* ...and after, for a file that needed no step at all: every table this
-    * build queries exists and looks the way this build queries it. (When a
-    * step did run, the same check has already run inside its transaction --
-    * repeating it here would only ask the same question of the same file.) */
-   if (!ran && !schema_shapes_ok(h, d->path, 1))
+   /* THE AFTER-CHECK IS INSIDE THE TRANSACTION. sqlite reports the schema as
+    * this connection has just changed it, so the check sees the migrated
+    * shape, and a failure rolls the whole thing -- tables, indexes and
+    * version stamp -- back to the file as it was found. The properties only
+    * this check can see (the indexes, with their UNIQUE flags, partial-ness
+    * and collations) are the ones that decide whether one email address in
+    * two spellings is one account or two, and a file that fails them must
+    * not be left marked as this build's. */
+   if (!schema_shapes_ok(h, d->path, 1)) {
+      (void)db_exec(d, "ROLLBACK;");
       return 0;
-   return at == DB_SCHEMA_VERSION;
-
-abandon:
-   /* Only when an EARLIER step has already committed. Otherwise `at` is still
-    * `began` and the write would be a no-op that could only fail. */
-   if (at != began)
-      unstamp(d, began);
-   return 0;
+   }
+   if (!db_exec(d, "COMMIT;")) {
+      fprintf(stderr, "sync: schema steps failed to commit: %s\n",
+              sqlite3_errmsg(h));
+      (void)db_exec(d, "ROLLBACK;");
+      return 0;
+   }
+   return 1;
 }
 
-/* THE ONE DOOR THAT SKIPS THE ORPHAN GATE, and nothing else skips.
+/* THE ONE DOOR THAT SKIPS THE ORPHAN GATE (and, with it, the schema steps).
  *
  * db_open refuses a database holding rows whose owner is gone -- which means
  * the repair that exists to REMOVE those rows could never open the file it is
  * for. `repair` is 1 only from db_open_repair, which the fsck verb calls and
  * nothing else does.
  *
- * It skips exactly one check. The schema shapes, the version support and
- * every pragma are applied as usual: a file of the wrong shape or from a
- * newer build is still refused, because a repair that ran against one of
- * those would be a repair guessing at a layout it does not know. */
+ * It skips the orphan checks and runs no schema step (see migrate). The
+ * version support, the version-0 shape check and every pragma are applied as
+ * usual: a version-0 file of the wrong shape, or a file from a newer build,
+ * is still refused, because a repair that ran against one of those would be a
+ * repair guessing at a layout it does not know.
+ */
 
 static struct db *db_open_mode(const char *path, int repair)
 {

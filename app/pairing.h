@@ -71,9 +71,11 @@ int pairing_pending(void);
  * been waiting -- a wait with no elapsed time on it looks the same as a wait
  * that is not happening. 0 when nothing is armed. */
 long pairing_pend_since(void);
-/* How many candidates of any family are on the air while a pairing is armed.
- * Two or more is why an armed pairing can sit there: the app will not choose
- * between them, and the row that says PENDING should say so. */
+/* How many candidates are on the air while a pairing is armed, leaving out
+ * the ones the user said NO to -- the same count the tick asks by. Two or
+ * more is why an armed pairing can sit there: the app will not choose
+ * between them, and the row that says PENDING should say so. Main thread
+ * only: the declined set is main-thread state. */
 int pairing_candidates_waiting(void);
 /* THE NAME ANDROID SHOWS for this address, learned from its advertisements --
  * "DXCMrb" and the like. 1 when one is known. It is what ties a device row
@@ -82,6 +84,13 @@ int pairing_candidates_waiting(void);
 int pairing_adv_name(const char *mac, char *out, int cap);
 int pairing_smart(void);
 void pairing_arm(int type); /* 0 = disarm */
+/* A sensor an armed wait does not commit to on its own -- one the user said
+ * NO to on the confirmation, or one just disconnected -- until a new code is
+ * typed or the user picks it. */
+void pairing_decline(const char *mac);
+/* The device a refused commit left waiting -- the slot it registered, or the
+ * sensor's own live slot -- or 0. */
+int pairing_pending_device(void);
 
 /* The candidate list, for the device list screen and the pipe-health row.
  * Copied out under the list lock -- the scan keeps churning it. */
@@ -99,6 +108,11 @@ struct pair_cand {
 int pairing_candidates(struct pair_cand *out, int cap);
 int pairing_candidate_count(void);
 void pairing_forget_candidates(void);
+/* Drop one address from the candidate list: a device the user has just
+ * disconnected, or a candidate a commit refused (wrong advertised name, or a
+ * retired sensor that once streamed), so a pairing already armed does not
+ * pick it up again from an advert heard earlier. */
+void pairing_forget_candidate(const char *mac);
 /* Propose the candidate at this row for the confirmation screen. Returns 0
  * when the row is gone -- the list reorders by live signal under the finger. */
 int pairing_pick(int idx);

@@ -85,16 +85,15 @@
  *          set_lk    (setfile.c)      msess_lk  (metersess.c)
  *          cal_lk    (calib.c)        mrt_lk    (meterstore.c)
  *          bond_lk   (bondtable.c)    g_cfg_lk  (sync.c)
- *          bondmac_lk (dexble.c)      g_devlist_lk (pairing.c)
- *          rssi_lk   (linkinfo.c)     g_status_lk (model.c)
- *          g_sched_lk (remote.c)      g_rstat_lk (remote.c)
- *          tag_lk    (devtag.c)       steptail_lk (steps.c)
- *          sessc_lk  (sesscache.c)
+ *          g_devlist_lk (pairing.c)   rssi_lk   (linkinfo.c)
+ *          g_status_lk (model.c)      g_sched_lk (remote.c)
+ *          g_rstat_lk (remote.c)      tag_lk    (devtag.c)
+ *          steptail_lk (steps.c)      sessc_lk  (sesscache.c)
  *          ins_lk    (insulin.c)      wt_lk     (weight.c)
  *          food_lk   (food.c)         extail_lk (exercise.c)
  *          ex_lk     (exercise.c)
  *          dis_lk (linkinfo.c)        mdis_lk (meter.c)
- *          append_lk (util.c)
+ *          append_lk (util.c)         g_code_mem_lk (dexble.c)
  *
  *      THE LOG LOCKS are the newest of them -- ins_lk, wt_lk, food_lk, ex_lk
  *      and extail_lk, with steptail_lk beside them. Each guards
@@ -158,7 +157,9 @@
  *      build_model, and every leaf the builder touches is therefore nested
  *      inside it -- bond_lk, rssi_lk, cal_lk, mrt_lk, msess_lk, sessc_lk,
  *      ins_lk, wt_lk, food_lk, ex_lk, extail_lk, steptail_lk, g_rstat_lk,
- *      g_status_lk, set_lk and g_devlist_lk. None of them takes another lock,
+ *      g_status_lk, set_lk, g_devlist_lk and g_code_mem_lk (the CODE row,
+ *      through fill_sensor; the driver lock also holds it, through
+ *      code_mem_fill). None of them takes another lock,
  *      so none can close a cycle; they are named here because "leaf" says
  *      what a lock does NOT do and this says where it is actually held.
  *

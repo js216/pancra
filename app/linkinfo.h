@@ -35,9 +35,17 @@
 int src_for_link(int link);
 
 /* PER-LINK SIGNAL STRENGTH, last known. The measurement arrives here; the
- * frame reads it. 1 when this link has ever reported one. */
-void linkinfo_note_rssi(int link, int dbm, long when);
+ * frame reads it. */
+int linkinfo_note_rssi(int link, int dbm,
+                       long when); /* 0: asked in an earlier epoch, dropped */
+/* A signal reading is being asked for on `link`: its answer belongs to the
+ * device the link holds now (see linkinfo_forget_rssi). */
+void linkinfo_rssi_asked(int link);
+/* 1 when this link has reported one since it last changed device. */
 int linkinfo_rssi(int link, int *dbm, long *when);
+/* Drop the link's signal sample: it belongs to the device the link is being
+ * taken from, and the next device on the link has not been heard yet. */
+void linkinfo_forget_rssi(int link);
 
 /* The LIVE connection's signal strength, as one number for the main screen's
  * single readout, and stamped onto a stored row when the driver says the

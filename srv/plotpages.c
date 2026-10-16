@@ -8,6 +8,7 @@
 #include "page.h"
 #include "plots.h"
 #include "posix.h" /* the one boundary beyond ISO C -- see posix.h */
+#include "proto.h" /* ROW_MAX: the longest row */
 #include "util.h"
 #include <sqlite3.h>
 #include <stdio.h>
@@ -189,10 +190,14 @@ void h_data(struct req *r, int64_t owner, int64_t t0, int64_t t1,
       sqlite3_bind_int64(st, 2, (t0 / 86400) - 1);
       sqlite3_bind_int64(st, 3, (t1 / 86400) + 1);
       int prc;
+      /* A ROW STORED TWICE IS ONE READING, as the phone loads it: identical
+       * rows come out next to each other, and the copy is skipped. */
+      char prev[ROW_MAX + 1] = "";
       while ((prc = sqlite3_step(st)) == SQLITE_ROW) {
          const char *ln = (const char *)sqlite3_column_text(st, 0);
-         if (!ln || *ln < '0' || *ln > '9')
+         if (!ln || *ln < '0' || *ln > '9' || strcmp(ln, prev) == 0)
             continue;
+         snprintf(prev, sizeof prev, "%s", ln);
          int64_t t = strtoll(ln, NULL, 10);
          if (t <= t0 || t > t1)
             continue;
@@ -216,6 +221,11 @@ void h_data(struct req *r, int64_t owner, int64_t t0, int64_t t1,
    if (!n)
       sb_add(&s, "(nothing in this window)\n");
    sb_add(&s, "</pre>\n");
+   if (s.err) { /* a listing cut short by memory is not sent as whole */
+      sb_free(&s);
+      oops(r);
+      return;
+   }
    sub_page(r, title, s.p ? s.p : "");
    sb_free(&s);
 }

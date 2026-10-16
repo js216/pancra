@@ -98,7 +98,7 @@ static char g_goal_path[256];
 /* THE GOALS, under food_lk like the rest of this module's state: the frame
  * reads them on the main thread and a restore reloads them on the sync
  * worker. */
-static int g_goals[FOOD_NMACRO] = {275, 50, 78, 2000};
+static int g_goals[FOOD_NMACRO] = {275, 50, 78, FOOD_GOAL_KCAL_DEF};
 
 int food_milli_str(int milli, char *out, int cap)
 {
@@ -353,7 +353,9 @@ int food_type_add(const char *name)
    mutex_unlock(&food_lk);
    if (known >= 0)
       return known;
-   if (full)
+   /* The largest int is never an id: food_type_decode refuses it, so a type
+    * written with it would be gone at the next load. */
+   if (full || id >= 0x7fffffff)
       return -1;
    char b[FOOD_NAME_MAX + 32];
    /* A NEW FOOD IS MADE OF NOTHING YET: its four values are written as zeros,
@@ -385,7 +387,7 @@ static int ft_parse_line(struct food_state *s, const char *p, const char *e)
       return 0; /* the header */
    if (p >= e)
       return 0; /* a trailing newline, or an editor's blank line */
-   int id;
+   int id = 0;
    char nm[FOOD_NAME_MAX + 1];
    int macro[FOOD_NMACRO];
    if (!food_type_decode(p, e, &id, nm, macro))
@@ -582,7 +584,7 @@ static int slurp_lines(struct food_state *s, const char *path,
    if (fd < 0)
       return errno == ENOENT ? 0 : -1;
    char buf[1024];
-   char line[128];
+   char line[FOOD_LINE_MAX + 1];
    int llen    = 0;
    int over    = 0; /* over-long line: skip, never parse a truncation */
    int damaged = 0;
@@ -953,17 +955,8 @@ int food_type_set_macros(int id, const int macro[FOOD_NMACRO])
 
 /* ---- the day's goals ---- */
 
-static const int g_goal_def[FOOD_NMACRO] = {275, 50, 78, 2000};
+static const int g_goal_def[FOOD_NMACRO] = {275, 50, 78, FOOD_GOAL_KCAL_DEF};
 static const char g_goal_hdr[]           = "# carbs_g,protein_g,fat_g,kcal\n";
-
-int food_goal_ok(int which, int v)
-{
-   if (which < 0 || which >= FOOD_NMACRO)
-      return 0;
-   if (which == FOOD_KCAL)
-      return v >= 0 && v <= FOOD_GOAL_KCAL_MAX;
-   return v >= 1 && v <= FOOD_GOAL_G_MAX;
-}
 
 void food_goals_get(int out[FOOD_NMACRO])
 {
@@ -991,21 +984,8 @@ static int goals_load(void)
          while (q < e && *q != '\n')
             q++;
          if (q > p && *p != '#') {
-            struct csv_cur c;
-            csv_open(&c, p, q);
-            ok = 1;
-            for (int k = 0; k < FOOD_NMACRO && ok; k++) {
-               if (k && !csv_sep(&c))
-                  ok = 0;
-               enum csv_field why = CSV_FIELD_OK;
-               long x             = csv_num(&c, &why);
-               if (why != CSV_FIELD_OK || !food_goal_ok(k, (int)x))
-                  ok = 0;
-               else
-                  v[k] = (int)x;
-            }
-            if (c.p != c.e)
-               ok = 0;
+            /* THE ONE DECODER the website reads this file with too. */
+            ok = food_goals_decode(p, q, v);
             break;
          }
          p = q + 1;

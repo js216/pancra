@@ -65,12 +65,14 @@ extern const int db_nmigrations;
 /* The version this build understands. Bump it in the same commit as the
  * migration that needs it, and never renumber: the number is written into
  * every database this server has ever opened. */
-#define DB_SCHEMA_VERSION 4
+#define DB_SCHEMA_VERSION 5
 
 /* CAN THIS SERVER OPEN A FILE AT SCHEMA VERSION `at`? Answered against the
- * shapes and the orphan rules, with the "in between" versions deliberately
- * accepted -- the migration steps are the contract for those. db_verify asks
- * it of a restored copy; db_open asks it of the live file. */
+ * shapes and the orphan rules. An "in between" version is not held to the
+ * shapes -- the migration steps are the contract for those -- but its
+ * `logrow` must hold no orphans, since step 5 copies it under its foreign
+ * key. db_verify asks it of a restored copy; db_open asks it of the live
+ * file. */
 int schema_usable(sqlite3 *h, const char *path, int at);
 
 /* WHAT VERSION IS THIS FILE, AND CAN THIS BUILD READ IT? Fills *at with the

@@ -40,6 +40,16 @@ long tz_off_now(void);
  * caller never gets a wild answer -- only a stale one. */
 long tz_offset_at(JNIEnv *env, long at);
 
+/* The offset in force at instant `at`, for SHOWING it: a drawn date is read
+ * in the offset of its own instant, so an entry from before a DST change
+ * reads the clock time it was made at.
+ *
+ * KEPT PER DAY, AND PER QUARTER HOUR ON A DAY THAT CHANGES OFFSET, because a
+ * frame asks about every record a log screen holds and each answer is a JNI
+ * call (see tzoff.c). tz_refresh forgets them all, since the device's zone
+ * itself can change. */
+long tz_shown_at(JNIEnv *env, long at);
+
 /* Refresh g_tz_off from the device. Call on resume: the offset is not a
  * constant, it moves at a DST boundary and goes stale while the activity is
  * destroyed. */

@@ -7,7 +7,8 @@
  * second implementation can be built from sync.h without reading this code.
  *
  * The one thing that must match the server EXACTLY is the canonical text of a
- * bucket -- rows sorted bytewise ascending, each terminated by '\n'. Bytewise
+ * bucket -- rows sorted bytewise ascending, each terminated by '\n', a row
+ * written twice appearing twice. Bytewise
  * means unsigned byte order, not any locale's idea of order, which is why the
  * comparison below casts to unsigned char rather than using strcmp on chars
  * that may be signed.
@@ -28,7 +29,7 @@
 #include <stdint.h>    /* uint8_t: the key, the hashes, the raw bytes */
 #include <stdio.h>     /* snprintf, SEEK_END */
 #include <stdlib.h>    /* realloc: the log buffer grows to the file */
-#include <string.h>    /* memcpy, memcmp, strcmp: rows are bytes, not strings */
+#include <string.h>    /* memcpy, strcmp, strncmp: copies, log names, hashes */
 
 /* struct sync_log is in app/syncint.h: app/synclocal.c reads the file it
  * names, and the two halves must agree about what one is. */
@@ -309,15 +310,13 @@ int sync_set_logs(const struct sync_log_spec *specs, int n)
  *
  * The hash the phone and the server compare is taken over THIS text, so the
  * two sides agree only while they build it identically: the bucket's rows,
- * SORTED, DE-DUPLICATED, each newline-terminated. A bucket is a SET -- an
- * identical row written twice is one row, which is what the server's primary
- * key enforces on its side.
+ * SORTED, each newline-terminated. Every row is kept: an identical row
+ * written twice is two rows (the same food at the same minute is two meals),
+ * and the server numbers the copies to keep them both.
  *
- * It was written out three times: once here and once inside each of the two
- * sync loops. Three copies of an invariant that must match a REMOTE
- * implementation is the kind of duplication that does not announce itself
- * when it drifts -- the symptom is a bucket both sides hold identically and
- * neither will stop re-sending, forever.
+ * One builder serves here and both sync loops, because the text must match a
+ * REMOTE implementation byte for byte: a copy that drifted would show as a
+ * bucket both sides hold identically and neither stops re-sending.
  *
  * `src` are the rows currently loaded (an index into g_buf). When `filter` is
  * set, only rows falling in `bucket` are taken; otherwise all of them are,
@@ -348,9 +347,6 @@ int64_t bucket_text(const struct row *src, int nsrc, int filter, int64_t bucket,
    row_sort(g_buf, g_sel, nb);
    size_t k = 0;
    for (int i = 0; i < nb; i++) {
-      if (i && g_sel[i].len == g_sel[i - 1].len &&
-          !memcmp(g_buf + g_sel[i].off, g_buf + g_sel[i - 1].off, g_sel[i].len))
-         continue;
       /* +1 for this row's newline, and cap-1 because the terminator is
        * already spoken for. */
       if (cap == 0 || g_sel[i].len + 1 > (cap - 1) - k)

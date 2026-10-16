@@ -656,6 +656,57 @@ enum verify_result db_verify(const char *path)
  * references something absent; the accounts, invitations and readings that do
  * have owners are not what this is about, and a repair that could remove one
  * would be a far worse tool than the problem it fixes. */
+/* THE ORPHANS OF A WITHOUT ROWID TABLE, which foreign_key_check reports
+ * with no rowid to delete by. They are matched instead by the table's own
+ * foreign keys (sqlite's catalogue, not a list kept here): a row whose key
+ * column is set and names no parent row. The one such table with a foreign
+ * key in this schema, logrow, has exactly one; a table with several is
+ * refused rather than half matched. */
+static int fsck_drop_keyed(struct db *d, const char *table, int64_t *gone)
+{
+   sqlite3 *h       = db_handle(d);
+   sqlite3_stmt *st = NULL;
+   char *lq = sqlite3_mprintf("PRAGMA foreign_key_list(\"%w\");", table);
+   if (!lq)
+      return 0;
+   int rc = sqlite3_prepare_v2(h, lq, -1, &st, NULL);
+   sqlite3_free(lq);
+   if (rc != SQLITE_OK)
+      return 0;
+   char from[64] = "", parent[64] = "", to[64] = "";
+   int nkeys = 0;
+   while (sqlite3_step(st) == SQLITE_ROW) {
+      const char *p = (const char *)sqlite3_column_text(st, 2);
+      const char *f = (const char *)sqlite3_column_text(st, 3);
+      const char *t = (const char *)sqlite3_column_text(st, 4);
+      nkeys++;
+      snprintf(parent, sizeof parent, "%s", p ? p : "");
+      snprintf(from, sizeof from, "%s", f ? f : "");
+      snprintf(to, sizeof to, "%s", t ? t : "");
+   }
+   sqlite3_finalize(st);
+   if (nkeys != 1 || !from[0] || !parent[0] || !to[0]) {
+      fprintf(stderr,
+              "sync: cannot match the orphans in `%s` (%d foreign keys)\n",
+              table, nkeys);
+      return 0;
+   }
+   char *q = sqlite3_mprintf("DELETE FROM \"%w\" WHERE \"%w\" IS NOT NULL AND "
+                             "\"%w\" NOT IN (SELECT \"%w\" FROM \"%w\");",
+                             table, from, from, to, parent);
+   if (!q)
+      return 0;
+   int ok = db_exec(d, q);
+   sqlite3_free(q);
+   if (!ok) {
+      fprintf(stderr, "sync: could not remove the orphans in `%s`: %s\n", table,
+              db_errmsg(d));
+      return 0;
+   }
+   *gone = db_changes(d);
+   return 1;
+}
+
 int db_fsck(struct db *d, int fix, int64_t *removed)
 {
    if (removed)
@@ -668,7 +719,9 @@ int db_fsck(struct db *d, int fix, int64_t *removed)
 
    /* PRAGMA foreign_key_check names (child table, rowid, parent, index). The
     * rowid is what makes a targeted delete possible: it identifies the ONE
-    * row, so nothing is matched by content and nothing else can be caught. */
+    * row, so nothing else can be caught. A WITHOUT ROWID table has no rowid
+    * to name, and its orphans are matched by their foreign key instead
+    * (fsck_drop_keyed). */
    sqlite3_stmt *st = NULL;
    if (sqlite3_prepare_v2(h, "PRAGMA foreign_key_check;", -1, &st, NULL) !=
        SQLITE_OK) {
@@ -678,28 +731,67 @@ int db_fsck(struct db *d, int fix, int64_t *removed)
    }
 
    /* Collected FIRST, then deleted: stepping a PRAGMA while deleting the rows
-    * it is walking is not something to rely on. */
+    * it is walking is not something to rely on.
+    *
+    * A WITHOUT ROWID table is ONE entry however many orphans it holds: they
+    * are removed by one statement (fsck_drop_keyed), so only their count is
+    * kept. The cap is on rows named one by one, and a deleted account's
+    * readings -- hundreds a day -- do not count against it. */
    struct orphan {
       char table[64];
       sqlite3_int64 rowid;
+      int keyed;    /* a WITHOUT ROWID table: the check names no rowid */
+      int64_t rows; /* keyed: how many; otherwise 1 */
    };
 
    enum { ORPHAN_MAX = 4096 };
-   static struct orphan found[ORPHAN_MAX];
-   int64_t n = 0;
-   int over  = 0;
+
+   /* ...plus one entry per WITHOUT ROWID table, which the cap does not
+    * count; KEYED_MAX is far above the schema's two. */
+   enum { KEYED_MAX = 16 };
+   static struct orphan found[ORPHAN_MAX + KEYED_MAX];
+   int64_t n     = 0; /* entries in found[] */
+   int64_t named = 0; /* of them, rows named by rowid */
+   int64_t total = 0; /* orphan rows */
+   int over      = 0;
    int rc;
    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-      if (n >= ORPHAN_MAX) {
-         over = 1;
-         break;
-      }
       const char *child = (const char *)sqlite3_column_text(st, 0);
       if (!child)
          continue;
+      const int keyed           = sqlite3_column_type(st, 1) == SQLITE_NULL;
+      const sqlite3_int64 rowid = keyed ? 0 : sqlite3_column_int64(st, 1);
+      int64_t k                 = -1;
+      for (int64_t j = 0; keyed && j < n && k < 0; j++)
+         if (found[j].keyed && !strcmp(found[j].table, child))
+            k = j;
+      if (k >= 0) {
+         found[k].rows++;
+         total++;
+         continue;
+      }
+      /* ONE ROW, ONE ENTRY: the check reports each broken key, and a row
+       * with two (a share whose owner and viewer are both gone) is named
+       * twice. */
+      int seen = 0;
+      for (int64_t j = 0; !keyed && j < n && !seen; j++)
+         seen = !found[j].keyed && found[j].rowid == rowid &&
+                !strcmp(found[j].table, child);
+      if (seen)
+         continue;
+      if ((!keyed && named >= ORPHAN_MAX) ||
+          n >= (int64_t)(sizeof found / sizeof found[0])) {
+         over = 1;
+         break;
+      }
       snprintf(found[n].table, sizeof found[n].table, "%s", child);
-      found[n].rowid = sqlite3_column_int64(st, 1);
+      found[n].keyed = keyed;
+      found[n].rowid = rowid;
+      found[n].rows  = 1;
       n++;
+      total++;
+      if (!keyed)
+         named++;
    }
    sqlite3_finalize(st);
    if (rc != SQLITE_DONE && !over) {
@@ -709,7 +801,8 @@ int db_fsck(struct db *d, int fix, int64_t *removed)
    }
    if (over) {
       fprintf(stderr,
-              "sync: more than %d orphan rows -- refusing to guess at this "
+              "sync: more than %d orphan rows named by rowid -- refusing to "
+              "guess at this "
               "scale.\n  A file this damaged wants a restore from backup, not "
               "a repair.\n",
               ORPHAN_MAX);
@@ -720,14 +813,19 @@ int db_fsck(struct db *d, int fix, int64_t *removed)
       printf("fsck: no orphan rows\n");
       return 1;
    }
-   for (int64_t i = 0; i < n; i++)
-      printf("fsck: orphan in `%s` rowid %lld\n", found[i].table,
-             (long long)found[i].rowid);
+   for (int64_t i = 0; i < n; i++) {
+      if (found[i].keyed)
+         printf("fsck: %lld orphan row%s in `%s`\n", (long long)found[i].rows,
+                found[i].rows == 1 ? "" : "s", found[i].table);
+      else
+         printf("fsck: orphan in `%s` rowid %lld\n", found[i].table,
+                (long long)found[i].rowid);
+   }
    if (!fix) {
       printf("fsck: %" PRIwire
              " orphan row%s found; re-run with `fix` to remove "
              "them\n",
-             n, n == 1 ? "" : "s");
+             total, total == 1 ? "" : "s");
       return 1;
    }
 
@@ -736,6 +834,15 @@ int db_fsck(struct db *d, int fix, int64_t *removed)
       return 0;
    int64_t gone = 0;
    for (int64_t i = 0; i < n; i++) {
+      if (found[i].keyed) {
+         int64_t g = 0; /* the one statement removes all its orphans */
+         if (!fsck_drop_keyed(d, found[i].table, &g)) {
+            db_durable_rollback(d);
+            return 0;
+         }
+         gone += g;
+         continue;
+      }
       char sql[160];
       /* The table name comes from sqlite's own catalogue, not from a user --
        * but it is still spliced into SQL, so it is quoted as an identifier

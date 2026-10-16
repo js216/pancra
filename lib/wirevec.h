@@ -34,12 +34,13 @@
  * /v1/bucket/<log>/<n>      REPLACES that bucket with the body POST /v1/pair/1
  * .. /v1/pair/4  the J-PAKE exchange (see srv/pair.c)
  *
- * A BUCKET IS A SET OF ROWS, and its CANONICAL TEXT is:
+ * A BUCKET IS A MULTISET OF ROWS, and its CANONICAL TEXT is:
  *   - each row is one line, its bytes unmodified (no trimming: a trimmed
  *     trailing space would be a row whose hash the other side cannot
  *     reproduce);
  *   - rows sorted BYTEWISE ascending;
- *   - duplicates removed -- the same row twice is the same fact twice;
+ *   - duplicates kept -- a row written twice is two entries (two identical
+ *     meals are two meals), so it appears twice;
  *   - every line terminated with '\n', including the last.
  *
  * THE HASH of a bucket is the first 16 hex characters (lower case) of the
@@ -126,17 +127,17 @@ static const char *const wv_a_arrival[WV_A_NROWS] = {
     "1728000600,95,2,,0,9,1728000600,-420,1", /* a meter row: no RSSI */
 };
 
-/* ...and the canonical text those rows MUST produce: sorted, deduplicated,
- * every line newline-terminated. Four rows, because two of the five are the
- * same row. */
-#define WV_A_NCANON 4
+/* ...and the canonical text those rows MUST produce: sorted, every line
+ * newline-terminated. Five rows, the repeated one twice, side by side. */
+#define WV_A_NCANON 5
 static const char wv_a_canon[] = "1728000000,120,0,-70,3,7,1728000000,-420,0\n"
                                  "1728000300,131,-1,-70,3,7,1728000300,-420,0\n"
                                  "1728000600,95,2,,0,9,1728000600,-420,1\n"
+                                 "1728000900,118,0,-70,3,7,1728000900,-420,0\n"
                                  "1728000900,118,0,-70,3,7,1728000900,-420,0\n";
 
 /* The protocol's hash of that text: first 16 hex of its SHA-256. */
-static const char wv_a_hash16[] = "f5a2d8ab476d3f3e";
+static const char wv_a_hash16[] = "c1952ad2282e01d4";
 
 /* ---- vector B: a signed request -----------------------------------------
  *
@@ -183,15 +184,15 @@ static const char wv_c_nonce[] = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
 /* The body IS wv_a_canon; spelled as a pointer so the two cannot drift. */
 static const char *const wv_c_body = wv_a_canon;
 static const char wv_c_bodyhash[] =
-    "f5a2d8ab476d3f3efa3f3e357daf745d0c1b97fac34843e7c33f3126b1e04d47";
+    "c1952ad2282e01d4c8fb495ccd2f96febd1a397e31919e3441984937cc8b9ff7";
 static const char wv_c_signing[] = "PUT\n"
                                    "/v1/bucket/glucose/20000\n"
                                    "1728000000\n"
                                    "a1b2c3d4e5f60718293a4b5c6d7e8f90\n"
-                                   "f5a2d8ab476d3f3efa3f3e357daf745d0c1b97fac"
-                                   "34843e7c33f3126b1e04d47";
+                                   "c1952ad2282e01d4c8fb495ccd2f96febd1a397e3"
+                                   "1919e3441984937cc8b9ff7";
 static const char wv_c_mac[] =
-    "edde567e4e8c3c3024883b0e03e44fa82325558f7a89d457e8b470d533078edd";
+    "531350ff5a1bd077b68e317d58e6dcb6212d6d09992ad60fa9a84b76844e11dc";
 /* THE BUCKET HASH IS NOT THE BODY HASH. Both are SHA-256 of the same bytes,
  * but one is truncated to 16 hex characters and the other is not, and a
  * reader who assumes they are unrelated numbers will not notice an

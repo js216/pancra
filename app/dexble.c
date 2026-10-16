@@ -31,35 +31,70 @@
 #include "remote.h" /* pancra_remote_ok: the push worker's acknowledgement */
 #include "shell.h"  /* shell_service_tick: the heartbeat's one entry point */
 #include "status.h"
+#include "store.h" /* store_note_screen: the screen beside each reading */
 #include "syncjni.h"
-#include "thread.h" /* bondmac_lk: the deferred bond address has one */
+#include "thread.h" /* the leaf lock over the in-memory codes */
 #include "util.h"
 #include <jni.h>
 #include <jni_md.h>
 #include <stdint.h>
-#include <string.h> /* strcmp: the deferred bond checks the address */
+#include <string.h> /* strcmp: whose sensor a saved code is for */
 /* NO <stdio.h>: nothing in this file formats a string. An include list is a
  * claim about what a translation unit does, so an entry with no user in the
- * file is a false one.
- *
- * thread.h and <string.h> ARE here, for the deferred bond above: its own leaf
- * mutex, and the strcmp that matches the address on the link. */
+ * file is a false one. */
 
 static jclass g_ble;
 static jobject g_ctx;
 static jmethodID m_connect, m_subscribe, m_write, m_readrssi, m_read,
-    m_startsvc, m_disconnect, m_createbond, m_bondwatch;
+    m_startsvc, m_disconnect, m_createbond, m_bondwatch, m_screenwatch;
 /* The platform adapter's class, borrowed from the bridge that owns it (it is
  * a global ref there, so this one holds nothing of its own). startService is
  * the only method on it this file calls. */
 static jclass g_plat;
 static char g_keypath[256];
 static char g_macpath[256];
+static char g_codepath[256];
 
-/* Per-link key/MAC files. Several CGMs can be bonded at once, and each holds a
- * different shared key -- with a single stelo.key the second sensor silently
- * overwrites the first's and drops its bond. Link 0 uses the unsuffixed names,
- * which is what an install made before the suffix existed has on disk. */
+/* THE CODE FILES, ALSO IN MEMORY, for the device page's CODE row and the
+ * advert path's candidate test: both ask on every frame or advert and must
+ * not read a file to answer. Kept by the functions that write the files, and
+ * filled by dexble_init. A leaf lock: no other lock is taken while it is
+ * held. */
+static struct {
+   char mac[18];
+   char code[9];
+} g_code_mem[LINK_MAX];
+static struct mutex g_code_mem_lk = MUTEX_INIT;
+
+static void code_mem_set(int link, const char *mac, const char *code)
+{
+   mutex_lock(&g_code_mem_lk);
+   str_snapshot(g_code_mem[link].mac, sizeof g_code_mem[link].mac, mac);
+   str_snapshot(g_code_mem[link].code, sizeof g_code_mem[link].code, code);
+   mutex_unlock(&g_code_mem_lk);
+}
+
+/* THE MEMORY COPY IS THE FILE AS IT READS BACK: the address it names, and
+ * the code drv_code_load accepts for that address, or none (a refused code
+ * leaves "<address>,"). No file, or one that does not begin with an address
+ * and a comma, is an empty entry; one that names an address with no usable
+ * code keeps the address and no code. */
+static void code_mem_fill(int link)
+{
+   char mac[24];
+   char code[12];
+   if (!drv_code_owner(link, mac, (int)sizeof mac)) {
+      code_mem_set(link, "", "");
+      return;
+   }
+   if (!drv_code_load(link, mac, code, (int)sizeof code))
+      code[0] = 0;
+   code_mem_set(link, mac, code);
+}
+
+/* Per-link key, MAC and code files. Several CGMs can be bonded at once and
+ * each holds a different shared key, so each link has its own files. Link 0
+ * uses the unsuffixed names, so a single-link install's files are link 0's. */
 static const char *link_path(char *out, int cap, const char *base, int link)
 {
    int i = 0;
@@ -184,13 +219,12 @@ void dexble_chirp(int st10)
 void dexble_morse(const char *elems)
 {
    JNIEnv *e = any_env();
-   jstring s;
    if (!e || !g_alarm_cls || !m_alarm_morse) {
       LOGI("morse: not wired (e=%p cls=%p m=%p)", (void *)e,
            (void *)g_alarm_cls, (void *)m_alarm_morse);
       return;
    }
-   s = (*e)->NewStringUTF(e, elems);
+   jstring s = (*e)->NewStringUTF(e, elems);
    if (!s) {
       if ((*e)->ExceptionCheck(e))
          (*e)->ExceptionClear(e);
@@ -295,24 +329,22 @@ void drv_connect(int link, const char *mac)
  * build can link it and run a reader and a writer at the lock this comment is
  * about. */
 
-/* A BLUETOOTH ADDRESS, AS MUCH OF IT AS A LOG LINE NEEDS.
- *
- * logcat is readable by anyone holding the phone with adb enabled, and it is
- * exactly what a bug report collects and mails off. A Bluetooth address is a
- * stable per-device identifier, so a full one in a log line is a durable
- * record of WHICH sensor this person wears, sitting in a file that leaves the
- * device for reasons that have nothing to do with pairing. The last two
- * octets are enough to tell two sensors apart while a human reads a log,
- * which is all any of these lines is for: "AA:BB:CC:DD:EE:FF" -> "EE:FF".
- *
- * Returns a pointer INTO the caller's string, so there is nothing to free and
- * nothing to size; a MAC too short to trim is returned whole, because a
- * malformed address is a bug worth seeing in full. */
-/* mac_tail IS GONE. It returned the last five characters of the address --
- * "..:B0:B4" -- which reads as anonymised and is not: two bytes single out one
- * device among the handful anybody owns, and they are as stable as the whole
- * address. See devtag.h; every line that used it now carries a per-run tag
- * instead. */
+/* A BLUETOOTH ADDRESS IS LOGGED ONLY AS devtag.h's PER-RUN TAG. logcat is
+ * readable by anyone holding the phone with adb enabled, and it is exactly
+ * what a bug report collects and mails off; even the last two bytes of a MAC
+ * single out one device among the handful anybody owns, and they are as
+ * stable as the whole address. */
+
+/* THE SCREEN, as Java's receiver sees it: 0 off, 1 on and locked, 2
+ * unlocked. Kept for the readings log (store_note_screen) and said in the log,
+ * so a gap in the readings can be lined up with the screen going off. */
+static void jni_screen(JNIEnv *e, jclass cls, jint state)
+{
+   (void)e;
+   (void)cls;
+   store_note_screen((int)state);
+   LOGI("screen: %s", state == 0 ? "off" : state == 1 ? "locked" : "unlocked");
+}
 
 static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
 {
@@ -326,123 +358,6 @@ static void jni_bond_state(JNIEnv *e, jobject cls, jstring mac, jint state)
    char dt[DEVTAG_LEN];
    LOGI("bond: dev %s state=%d", devtag(m, dt), (int)state);
    (*e)->ReleaseStringUTFChars(e, mac, m);
-}
-
-/* THE BOND REQUEST THIS LINK OWES, held until the link is actually up.
- *
- * Asking the OS to bond at the moment the user commits puts the request out
- * while there is no GATT connection to carry it: Android opens one of its
- * own, the sensor will not complete pairing that way, and the attempt dies in
- * under a second -- reported to the user as "couldn't pair, incorrect PIN or
- * passkey", which names the one thing that was never involved. The bond that
- * works is the one raised when the connection is up.
- *
- * So the request is DEFERRED to the connect callback rather than dropped: the
- * point of asking explicitly is that the dialog belongs to the tap the user
- * just made, and a prompt a few seconds later still does. What is lost is
- * only the doomed first attempt and the message it produced.
- *
- * Written by the main thread at commit and read by the binder thread that
- * delivers the connect.
- *
- * THE LINK AND THE ADDRESS ARE ONE REQUEST, under one lock. Published as an
- * atomic link beside a plain buffer, a second commit rewrites the address in
- * place while a binder thread is part-way through comparing it -- so the
- * comparison runs against half of one address and half of another, and while
- * the old terminator is overwritten and the new one not yet written there is
- * briefly no terminator at all. Worse, the link NUMBER cannot tell two
- * requests apart: a reader that matched the first commit's address could
- * claim the second commit's arm for the same link and bond the wrong device.
- * One mutex over both fields removes all three.
- *
- * A LEAF: nothing is called while it is held, and it is taken with no other
- * lock held, so it cannot take part in any ordering. Listed in thread.h's
- * table with the others -- NAMED bondmac_lk and not bond_lk, because
- * bondtable.c already has a leaf by that name, and two leaves sharing one name
- * is how that table comes to disagree with the code. */
-static struct mutex bondmac_lk = MUTEX_INIT;
-static char g_bond_mac[24];
-static int g_bond_link = -1; /* guarded by bondmac_lk, with the address */
-
-void dexble_bond_on_connect(int link, const char *mac)
-{
-   int dropped = -1;
-   mutex_lock(&bondmac_lk);
-   if (link < 0 || link >= LINK_MAX || !mac || !mac[0]) {
-      g_bond_link   = -1;
-      g_bond_mac[0] = 0;
-   } else {
-      /* THE LINK AND THE ADDRESS ARE SET TOGETHER, under one hold: they are
-       * one request, and a reader that could see the new link beside the old
-       * address would ask Android to bond the wrong device. */
-      /* ONE REQUEST AT A TIME, and replacing an unfired one is worth a line:
-       * the first sensor's dialog will not now belong to the tap that asked
-       * for it. Its bond still happens -- the sensor's own security request
-       * raises a prompt when it connects -- but later, and unannounced. */
-      /* A REQUEST IS REPLACED WHENEVER ONE WAS STANDING AND THIS IS NOT IT
-       * -- a different link, or the SAME link for a different address, which
-       * is the case a link-number comparison alone would miss. */
-      dropped = (g_bond_link >= 0 &&
-                 (g_bond_link != link || strcmp(g_bond_mac, mac) != 0))
-                    ? g_bond_link
-                    : -1;
-      str_snapshot(g_bond_mac, sizeof g_bond_mac, mac);
-      g_bond_link = link;
-   }
-   mutex_unlock(&bondmac_lk);
-   /* SAID WITH THE LOCK RELEASED. It is a leaf and nothing is called while it
-    * is held -- including this. Replacing an unfired request is worth a line:
-    * that sensor's dialog will no longer belong to the tap that asked for it.
-    * Its bond still happens, on the prompt its own security request raises
-    * when it connects, but later and unannounced. */
-   if (dropped >= 0)
-      LOGW("bond: request for link %d replaced before it fired; that "
-           "sensor's dialog will arrive on its own connect",
-           dropped);
-}
-
-/* Fire the deferred request if this link is the one that owes it AND the
- * device that answered on it is the one the request was made for.
- *
- * THE ADDRESS IS CHECKED, NOT JUST THE LINK NUMBER. A pairing that is never
- * completed -- the sensor never comes on the air, the user gives up -- leaves
- * the request armed, and link numbers are reused. Firing on the link alone
- * would then raise a pairing dialog for an abandoned sensor at whatever
- * unrelated moment the next device connected there: exactly the "dialog
- * arrives unannounced, long after the moment it belongs to" failure that
- * asking explicitly exists to avoid.
- *
- * Matching the address makes the request self-expiring in the only way that
- * matters -- it can fire ONLY while the intended sensor is on the link, which
- * is when its bond should be asked for however long that takes.
- *
- * TEST, MATCH AND CLAIM ARE ONE CRITICAL SECTION, so a reconnect storm
- * cannot ask twice for one commit and a second commit cannot be consumed by
- * a reader that matched the first. */
-static void bond_if_owed(int link)
-{
-   struct dex_session s;
-   /* The driver is asked FIRST and its lock is released before this one is
-    * taken, so the two are never held together. */
-   if (!driver_session_of(link, &s) || !s.mac[0])
-      return;
-   /* TEST AND CLAIM IN ONE HOLD. Reading the request, matching it against the
-    * device on the link and consuming it are three steps that must not be
-    * separable: a second commit landing between them would be claimed by this
-    * one and bonded to the FIRST commit's address. The claim is what makes a
-    * reconnect storm ask only once. */
-   char want_mac[sizeof g_bond_mac];
-   mutex_lock(&bondmac_lk);
-   int owed =
-       g_bond_link == link && g_bond_mac[0] && strcmp(s.mac, g_bond_mac) == 0;
-   if (owed) {
-      str_snapshot(want_mac, sizeof want_mac, g_bond_mac);
-      g_bond_link = -1;
-   }
-   mutex_unlock(&bondmac_lk);
-   if (!owed)
-      return; /* somebody else is on this link: not this request's moment */
-   (void)dexble_create_bond(want_mac);
 }
 
 int dexble_create_bond(const char *mac)
@@ -570,6 +485,7 @@ static void ble_read_rssi(int link)
    JNIEnv *e = any_env();
    if (!e || !m_readrssi)
       return;
+   linkinfo_rssi_asked(link);
    (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi,
                               (jint)link); /* result -> onRssi */
    if ((*e)->ExceptionCheck(e)) /* never return to Java with one pending */
@@ -841,6 +757,97 @@ int drv_mac_save(int link, const char *mac)
    return 0;
 }
 
+/* THE CODE THIS LINK'S SENSOR WAS PAIRED WITH, beside its key and address,
+ * stored WITH THAT SENSOR'S ADDRESS: "<address>,<code>". The settings hold
+ * only the code typed last, which belongs to whichever sensor was added last;
+ * a sensor that has to run the J-PAKE again -- its key lost, or a pairing cut
+ * short by a restart -- needs its own. Links without an address are handed out
+ * by rank, so the file is only ever answered for the address it names. */
+int drv_code_save(int link, const char *mac, const char *code)
+{
+   char pth[264];
+   char b[32];
+   int k = 0;
+   for (int i = 0; mac[i] && k < 17; i++)
+      b[k++] = mac[i];
+   b[k++] = ',';
+   for (int i = 0; code[i] && k < (int)sizeof b; i++)
+      b[k++] = code[i];
+   link_path(pth, sizeof pth, g_codepath, link);
+   if (atomic_replace(pth, b, k) == REPLACE_FAILED) {
+      LOGW("link %d: pairing code NOT SAVED", link);
+      return -1;
+   }
+   code_mem_fill(link);
+   return 0;
+}
+
+int drv_code_load(int link, const char *mac, char *code, int n)
+{
+   char pth[264];
+   if (n < 2 || !mac)
+      return 0;
+   code[0] = 0;
+   int fd  = open(link_path(pth, sizeof pth, g_codepath, link), O_RDONLY);
+   if (fd < 0)
+      return 0;
+   char buf[27]; /* an address, a comma, eight digits, and one to refuse */
+   long r = read_full(fd, buf, (long)sizeof buf);
+   close(fd);
+   /* AN ADDRESS, A COMMA AND FOUR TO EIGHT DIGITS, or there is no code to
+    * give: a refused code is saved as "<address>," with none, anything else
+    * is not a file this app wrote, and a wrong code costs one of the
+    * sensor's attempts. */
+   long nd = r - 18;
+   if (nd < 4 || nd > 8 || nd >= n || !mac_text_ok(buf, 17) || buf[17] != ',')
+      return 0;
+   for (int i = 0; i < 17; i++)
+      if (buf[i] != mac[i])
+         return 0; /* another sensor's code */
+   for (long i = 0; i < nd; i++)
+      if (buf[18 + i] < '0' || buf[18 + i] > '9')
+         return 0;
+   for (long i = 0; i < nd; i++)
+      code[i] = buf[18 + i];
+   code[nd] = 0;
+   return 1;
+}
+
+int drv_code_owner(int link, char *mac, int n)
+{
+   char pth[264];
+   if (n < 18)
+      return 0;
+   mac[0] = 0;
+   int fd = open(link_path(pth, sizeof pth, g_codepath, link), O_RDONLY);
+   if (fd < 0)
+      return 0;
+   char buf[18];
+   long r = read_full(fd, buf, (long)sizeof buf);
+   close(fd);
+   if (r != 18 || !mac_text_ok(buf, 17) || buf[17] != ',')
+      return 0;
+   for (int i = 0; i < 17; i++)
+      mac[i] = buf[i];
+   mac[17] = 0;
+   return 1;
+}
+
+int drv_code_clear(int link)
+{
+   char pth[264];
+   const int rc =
+       credential_clear(link_path(pth, sizeof pth, g_codepath, link));
+   /* From the file either way: a clear can remove it and still report a
+    * failure (the directory sync), and memory must say what the disk says. */
+   code_mem_fill(link);
+   if (rc != 0) {
+      LOGW("link %d: pairing code NOT CLEARED", link);
+      return -1;
+   }
+   return 0;
+}
+
 int drv_mac_clear(int link)
 {
    char pth[264];
@@ -887,8 +894,6 @@ static void jni_connected(JNIEnv *e, jclass c, jint link)
    } else if (after == DRV_AFTER_RSSI) {
       ble_read_rssi(link);
    }
-   /* The link is up: a bond this commit deferred can go out now. */
-   bond_if_owed(link);
 }
 
 static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
@@ -1030,6 +1035,15 @@ void dexble_init(const char *data_dir)
    for (int j = 0; g[j]; j++)
       g_macpath[k++] = g[j];
    g_macpath[k] = 0;
+   int c        = 0;
+   for (; data_dir[c] && c < 200; c++)
+      g_codepath[c] = data_dir[c];
+   const char *cf = "/stelo.code";
+   for (int j = 0; cf[j]; j++)
+      g_codepath[c++] = cf[j];
+   g_codepath[c] = 0;
+   for (int l = 0; l < LINK_MAX; l++)
+      code_mem_fill(l);
    driver_init();
 }
 
@@ -1040,24 +1054,26 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
    /* JNINativeMethod.name/signature are char* (a JNI API wart); hold the text
     * in mutable arrays so no const is cast away (-Wcast-qual +
     * -Wwrite-strings). */
-   static char n0[] = "onConnected";
-   static char s0[] = "(I)V";
-   static char n1[] = "onDisconnected";
-   static char s1[] = "(II)V";
-   static char n2[] = "onNotify";
-   static char s2[] = "(ILjava/lang/String;[B)V";
-   static char n3[] = "onWritten";
-   static char s3[] = "(ILjava/lang/String;I)V";
-   static char n4[] = "onRssi";
-   static char s4[] = "(II)V";
-   static char n5[] = "onRead";
-   static char s5[] = "(ILjava/lang/String;[B)V";
-   static char n6[] = "onTick";
-   static char s6[] = "()V";
-   static char n7[] = "onRemoteOk";
-   static char s7[] = "()V";
-   static char n8[] = "onBondState";
-   static char s8[] = "(Ljava/lang/String;I)V";
+   static char n0[]  = "onConnected";
+   static char s0[]  = "(I)V";
+   static char n1[]  = "onDisconnected";
+   static char s1[]  = "(II)V";
+   static char n2[]  = "onNotify";
+   static char s2[]  = "(ILjava/lang/String;[B)V";
+   static char n3[]  = "onWritten";
+   static char s3[]  = "(ILjava/lang/String;I)V";
+   static char n4[]  = "onRssi";
+   static char s4[]  = "(II)V";
+   static char n5[]  = "onRead";
+   static char s5[]  = "(ILjava/lang/String;[B)V";
+   static char n6[]  = "onTick";
+   static char s6[]  = "()V";
+   static char n7[]  = "onRemoteOk";
+   static char s7[]  = "()V";
+   static char n8[]  = "onBondState";
+   static char s8[]  = "(Ljava/lang/String;I)V";
+   static char n12[] = "onScreen";
+   static char s12[] = "(I)V";
    /* The sync client's entry points. They BLOCK for several round trips --
     * syncRestore for one per missing bucket, so potentially hundreds -- so
     * Java only ever calls them on its push worker, never here. */
@@ -1077,6 +1093,7 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n6,  s6,  (void *)jni_tick        },
        {n7,  s7,  (void *)jni_remote_ok   },
        {n8,  s8,  (void *)jni_bond_state  },
+       {n12, s12, (void *)jni_screen      },
        {n9,  s9,  (void *)syncjni_run     },
        {n10, s10, (void *)syncjni_pair    },
        {n11, s11, (void *)syncjni_restore },
@@ -1177,12 +1194,22 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
                                          "(Landroid/content/Context;)V");
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
+   m_screenwatch = (*e)->GetStaticMethodID(e, ble, "screenWatch",
+                                           "(Landroid/content/Context;)V");
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
    /* Start watching bond state right away, not at the first createBond: the
     * sensor can begin pairing on its own (a reconnect after the bond was
     * cleared does exactly that), and those are the transitions the user most
     * needs told about. */
    if (m_bondwatch)
       (*e)->CallStaticVoidMethod(e, g_ble, m_bondwatch, g_ctx);
+   if ((*e)->ExceptionCheck(e)) /* no JNI call with one pending */
+      (*e)->ExceptionClear(e);
+   if (m_screenwatch)
+      (*e)->CallStaticVoidMethod(e, g_ble, m_screenwatch, g_ctx);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
    if (m_startsvc && g_plat)
       (*e)->CallStaticVoidMethod(e, g_plat, m_startsvc,
                                  g_ctx); /* keep alive in bg */
@@ -1259,6 +1286,58 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
 void dexble_pair(int link, const char *mac, const char *code)
 {
    driver_start(link, mac, code);
+}
+
+void dexble_pair_if(int link, const char *mac, const char *code, unsigned gen)
+{
+   driver_start_if(link, mac, code, gen);
+}
+
+int dexble_code_save(int link, const char *mac, const char *code)
+{
+   if (link < 0 || link >= LINK_MAX || !mac || !code)
+      return -1;
+   return drv_code_save(link, mac, code);
+}
+
+int dexble_code_load(int link, const char *mac, char *code, int n)
+{
+   if (link < 0 || link >= LINK_MAX || !mac || !code)
+      return 0;
+   return drv_code_load(link, mac, code, n);
+}
+
+int dexble_code_file(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return 0;
+   mutex_lock(&g_code_mem_lk);
+   const int have = g_code_mem[link].mac[0] != 0;
+   mutex_unlock(&g_code_mem_lk);
+   return have;
+}
+
+int dexble_code_for(const char *mac, char *code, int n)
+{
+   if (!mac || !mac[0] || !code || n < 1)
+      return 0;
+   int have = 0;
+   code[0]  = 0;
+   mutex_lock(&g_code_mem_lk);
+   for (int l = 0; l < LINK_MAX && !have; l++)
+      if (strcmp(g_code_mem[l].mac, mac) == 0) {
+         str_snapshot(code, n, g_code_mem[l].code);
+         have = 1;
+      }
+   mutex_unlock(&g_code_mem_lk);
+   return have;
+}
+
+int dexble_code_owner(int link, char *mac, int n)
+{
+   if (link < 0 || link >= LINK_MAX || !mac)
+      return 0;
+   return drv_code_owner(link, mac, n);
 }
 
 /* Open the meter's link. It is a plain connect: the meter driver takes over

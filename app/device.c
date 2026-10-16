@@ -11,12 +11,14 @@
 #include "meter.h"
 #include "nav.h"
 #include "notify.h"
+#include "pairing.h"
 #include "reconcile.h"
 #include "selection.h"
 #include "sensors.h"
 #include "status.h" /* set_status: a change that was not saved must say so */
 #include "store.h"
 #include "ui.h"
+#include <string.h> /* strcmp: whose sensor a code file names */
 
 /* WHICH LINK the chosen sensor is on, for a calibration call, or -1 if this
  * slot may not be calibrated.
@@ -114,14 +116,11 @@ void device_retire(int id)
    {
       /* THE DURABLE CHANGE FIRST, AND THE TEARDOWN ONLY IF IT LANDED.
        *
-       * This ran the other way round: forget the key, close the link, clear
-       * the device-information strings, un-arm the radio -- and THEN call
-       * sensor_retire, which rolls the registry back if slots.csv cannot be
-       * replaced. The rollback restored a slot that says LIVE while its
-       * transport state was already destroyed: no session key, no link, no
-       * DIS, and a status line reading "DISCONNECT NOT SAVED" over a device
-       * that the user can see is still listed. Nothing re-establishes any of
-       * it short of a restart.
+       * sensor_retire rolls the registry back when slots.csv cannot be
+       * replaced, and the slot then stays LIVE. Torn down before that, it
+       * would be a listed device with no session key, no link and no DIS,
+       * under "DISCONNECT NOT SAVED", and nothing re-establishes those short
+       * of a restart.
        *
        * So the registry commits first. If it will not, nothing has been
        * taken apart and the device goes on working exactly as it did.
@@ -132,6 +131,37 @@ void device_retire(int id)
        * slot is retired is what meter_hook_disconnected and the CGM
        * disconnect path already handle. */
       LOGI("forgetting device id %d; history retained", id);
+      /* WHICH LINK IS THIS DEVICE'S, asked while its slot is still live: a
+       * sensor with no address on any link is placed by rank among the live
+       * ones, and asked after the retire it ranks as a different device and
+       * names that device's link -- whose credentials the teardown below
+       * would then erase. Only the lookup comes first; the registry commits
+       * before anything is torn down. */
+      const struct sensor_rec *fr = sensor_rec_of(id, &frv) ? &frv : 0;
+      /* A METER'S LINK IS FOUND IN THE ARM TABLE, NOT BY ADDRESS.
+       * link_for_sensor resolves through the driver session, which a meter
+       * never has (see meter_link_of_mac) -- so asked about one it returns
+       * whatever free CGM link the ranking lands on, and the teardown below
+       * would erase THAT sensor's key file while the meter's own link stayed
+       * armed for the life of the process. */
+      int flink = -1;
+      if (fr && sensor_kind(fr->type) == KIND_BGM)
+         flink = meter_link_of_mac(fr->identity);
+      else if (fr)
+         flink = link_for_sensor(id);
+      /* A LINK WITHOUT AN ADDRESS IS HANDED OUT BY RANK, so for a sensor not
+       * yet on the air it can be the link another sensor is pairing on. Its
+       * code file names the sensor it was saved for; when that is another
+       * sensor, the link is not this device's to tear down. */
+      if (fr && sensor_kind(fr->type) == KIND_CGM && flink >= 0) {
+         struct dex_session fs;
+         char owner[24];
+         if (driver_session_of(flink, &fs) && !fs.mac[0] &&
+             dexble_code_owner(flink, owner, (int)sizeof owner) &&
+             strcmp(owner, fr->identity) != 0)
+            flink = -1;
+      }
+
       /* RETIRE, do not delete: the slot is kept (marker, label, prefs) and
        * flagged old, so it moves to OLD DEVICES with its full per-device menu
        * intact. sensor_retire reassigns the primary to the first live CGM
@@ -148,23 +178,26 @@ void device_retire(int id)
          nav_back();
          return;
       }
-      /* Release the BLE link BEFORE the slot array shifts. Leaving it
-       * connected meant a forgotten sensor kept streaming on a link that
-       * now belonged to a different slot ordinal -- and commit_pair would
-       * later call driver_forget() on that same link, destroying the
+      /* OFF THE CANDIDATE LIST, link or no link: an advert heard just
+       * before the disconnect would otherwise let a pairing already armed
+       * pick it up and revive the slot. DECLINED as well: a sensor that
+       * never streamed is listed again by its next advert, and only the
+       * declined set keeps the tick from committing to it on its own. An
+       * explicit YES still pairs it, and a newly typed code clears the
+       * declined set. */
+      if (fr) {
+         pairing_forget_candidate(fr->identity);
+         pairing_decline(fr->identity);
+      }
+      /* AND THE WAIT ENDS WITH ITS OWN DEVICE: left armed, the next advert
+       * of a sensor that never streamed makes it a candidate again, and the
+       * wait would commit to it and bring the slot back. */
+      if (pairing_pending_device() == id)
+         pairing_arm(0);
+      /* RELEASE THE BLE LINK. Left connected, a forgotten sensor would keep
+       * streaming on a link another slot can be given -- and commit_pair
+       * would later call driver_forget() on that same link, destroying the
        * SURVIVING sensor's bond. */
-      const struct sensor_rec *fr = sensor_rec_of(id, &frv) ? &frv : 0;
-      /* A METER'S LINK IS FOUND IN THE ARM TABLE, NOT BY ADDRESS.
-       * link_for_sensor resolves through the driver session, which a meter
-       * never has (see meter_link_of_mac) -- so asked about one it returns
-       * whatever free CGM link the ranking lands on, and the teardown below
-       * would erase THAT sensor's key file while the meter's own link stayed
-       * armed for the life of the process. */
-      int flink = -1;
-      if (fr && sensor_kind(fr->type) == KIND_BGM)
-         flink = meter_link_of_mac(fr->identity);
-      else if (fr)
-         flink = link_for_sensor(id);
       /* BOTH bounds: flink indexes driver contexts and g_model_l below,
        * and the DIS block a few lines down already checks both. */
       if (fr && flink >= 0 && flink < LINK_MAX) {
@@ -177,19 +210,19 @@ void device_retire(int id)
           * carrying the FORGOTTEN sensor's model and firmware, in a
           * provenance row that is never rewritten and whose fields are
           * part of the id-reuse key. */
-         linkinfo_forget_dis(flink); /* takes the DIS lock itself */
-         /* GIVE THE LINK BACK. Nothing else here did, and for a METER
-          * that leaked the link permanently: the armed table kept the
-          * forgotten meter's MAC and the routing bit stayed set, which
-          * excludes the link from BOTH pools -- meter_alloc_link skips
-          * any link with g_link_armed set, free_cgm_link skips
-          * g_link_armed || g_link_meter. Nothing ever cleared them,
-          * because the only thing that does is meter_release_link on the
-          * disconnect callback, and dexble_link_close on a connect that
-          * is merely PENDING (a meter is switched off between
-          * fingersticks, so that is the normal state) never produces one.
-          * Every meter retired therefore burned one of LINK_MAX links for
-          * the life of the process.
+         linkinfo_forget_dis(flink);  /* takes the DIS lock itself */
+         linkinfo_forget_rssi(flink); /* and its signal sample */
+         /* GIVE THE LINK BACK. For a METER, the armed table holds its
+          * MAC and the routing bit is set, which excludes the link from
+          * BOTH pools -- meter_alloc_link's claim (driver_link_claim)
+          * skips any link with g_link_armed set, driver_free_cgm_link_in
+          * skips any link driver_link_armed or driver_link_is_meter
+          * reports. The disconnect callback's meter_release_link clears them, and
+          * dexble_link_close on a connect that is merely PENDING (a meter
+          * is switched off between fingersticks, so that is the normal
+          * state) never produces that callback. Without this, every meter
+          * retired would hold one of LINK_MAX links for the life of the
+          * process.
           *
           * UN-ARM, DO NOT RELEASE. meter_release_link here clears the
           * routing bit -- and a disconnect callback still in flight (the
@@ -206,19 +239,14 @@ void device_retire(int id)
           * permanent leak, and no misrouting either way.
           *
           * The tick cannot re-arm meanwhile: it skips retired slots, and
-          * this slot is retired two lines down.
+          * this slot was retired before the teardown began.
           *
           * For a CGM all of this is a no-op: the armed entry is empty,
           * the meter bit is 0, and the stamp is gated on that bit. */
          meter_unarm_link(flink);
          int fmeter = meter_link_is(flink);
-         /* MONOTONIC. This is a DEADLINE -- the stranded-link recovery
-          * measures it against mono_s() -- and it was stamped from the wall
-          * clock, which is roughly 1.7e9 seconds ahead. `now - stamped` was
-          * therefore hugely negative on every tick, the 3-minute bound never
-          * expired, and the link the comment above promises to give back
-          * after METER_TEARDOWN_MAX was leaked for the life of the
-          * process. */
+         /* MONOTONIC: this is a DEADLINE, and the stranded-link recovery
+          * measures it against mono_s(). */
          if (fmeter)
             meter_link_idle(flink, mono_s());
       }
@@ -235,11 +263,9 @@ void device_retire(int id)
        * they are about rather than by counting steps.
        *
        * The confirmation sits on top of the retired device's OWN screen, and
-       * both read the selection that was just cleared. Popping once left the
-       * user on that detail screen with nothing selected, where the range
-       * guard in render_sensor returns before drawing anything: a black
-       * screen, with only the escape band at the top responding to a tap, one
-       * confirmed DISCONNECT away from the main screen.
+       * both read the selection that was just cleared. The detail screen with
+       * nothing selected has nothing to show (render_sensor's "NO DEVICE"),
+       * so it goes too.
        *
        * Landing place, once both are off the path: WHERE THE SENSOR SCREEN
        * WAS OPENED FROM, which the path holds and no caller has to name. The

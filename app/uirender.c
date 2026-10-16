@@ -72,6 +72,7 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
    h->n        = 0;
    h->overflow = 0;
    g_clipped   = 0;
+   ui_tz_source(m->tz_at);
    /* TRUE black: zero photons on an OLED, rather than a near-black wash. */
    clear_fb(fb, UI_BLACK);
    switch (m->scr) {

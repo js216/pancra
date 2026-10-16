@@ -71,7 +71,7 @@ static const struct kp_info g_modes[KP_NMODES] = {
     [KP_FOOD_FAT]   = {"FAT",          5, 0, KP_UNIT_NONE, 1, 0, 0},
     [KP_FOOD_KCAL]  = {"KCAL/G",       5, 0, KP_UNIT_NONE, 1, 0, 0},
     /* THE DAY'S GOALS, whole numbers: grams in three slots, kcal in four --
-     * exactly food.h's ceilings. */
+     * exactly foodrow.h's ceilings (FOOD_GOAL_G_MAX, FOOD_GOAL_KCAL_MAX). */
     [KP_GOAL_CARBS] = {"CARBS GOAL",   3, 0, KP_UNIT_G,    0, 0, 0},
     [KP_GOAL_PROT]  = {"PROTEIN GOAL", 3, 0, KP_UNIT_G,    0, 0, 0},
     [KP_GOAL_FAT]   = {"FAT GOAL",     3, 0, KP_UNIT_G,    0, 0, 0},

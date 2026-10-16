@@ -1092,20 +1092,44 @@ static int init_java(struct ANativeActivity *activity, JNIEnv *env)
 }
 
 /* RECOVER THE BONDED SENSOR'S ADDRESS from the OS bond list, when we hold a
- * key but have no saved MAC -- after an app update that added MAC
- * persistence, or if the saved one was lost. Without it the app falls back to
+ * key but have no saved MAC -- an install whose address file was never
+ * written, or one whose file was lost. Without it the app falls back to
  * guessing from adverts, whose local name is usually absent.
  *
  * IT MUST RUN AFTER THE REGISTRY IS READ. It asks for a device whose name
- * matches the PRIMARY sensor's family prefix, and when it ran first the slot
- * table was empty, the primary resolved to -1, and the prefix was always the
- * Stelo's: a G7-only user's bonded device was never found and could never
- * reconnect, and a user with both got LINK_CGM locked onto the Stelo's
- * address while the Stelo already owned its own link -- two links reporting
- * one MAC, collapsing the address-based resolution everything else depends
- * on. */
+ * matches the PRIMARY sensor's family prefix; run against an empty slot
+ * table, the primary resolves to -1 and the prefix is always the Stelo's: a
+ * G7-only user's bonded device is never found and can never reconnect, and a
+ * user with both gets LINK_CGM locked onto the Stelo's address while the
+ * Stelo already owns its own link -- two links reporting one MAC, collapsing
+ * the address-based resolution everything else depends on. */
 static void recover_bonded_mac(struct ANativeActivity *activity, JNIEnv *env)
 {
+   /* A LINK WITH A CODE FILE BUT NO ADDRESS belongs to the sensor the file
+    * names: the commit saved it, and that sensor has not streamed yet, which
+    * is what writes the address. Links without an address are handed out by
+    * rank, and a disconnect between launches reorders the ranks -- so the
+    * address is bound here, before anything ranks, when the sensor the file
+    * names is a live CGM that no other link holds. */
+   for (int l = 0; l < LINK_MAX; l++) {
+      struct dex_session cs;
+      char owner[24];
+      if (!driver_session_of(l, &cs) || cs.mac[0] ||
+          !dexble_code_owner(l, owner, (int)sizeof owner))
+         continue;
+      int taken = 0;
+      for (int o = 0; o < LINK_MAX && !taken; o++) {
+         struct dex_session os;
+         taken =
+             o != l && driver_session_of(o, &os) && strcmp(os.mac, owner) == 0;
+      }
+      const struct sensor_view *cv = sensors_view_ref();
+      const int cidx = sensors_view_find_mac_kind(cv, owner, KIND_CGM);
+      const int live = cidx >= 0 && cidx < cv->n_live;
+      sensors_view_put(cv);
+      if (!taken && live && driver_bind_mac(l, owner) != BIND_PUBLISHED)
+         LOGW("link %d: the address its code names was NOT bound", l);
+   }
    /* Bonded-MAC recovery runs HERE, after sensors_load().
     *
     * It asks the OS bond list for a device whose name matches the
@@ -1138,7 +1162,30 @@ static void recover_bonded_mac(struct ANativeActivity *activity, JNIEnv *env)
          if (sensor_rec_of(sensor_primary_id(), &pr) && pr.type == SENSOR_G7)
             want = "DXCM";
          char bm[24] = {0};
+         /* ONLY A SENSOR THE REGISTRY HOLDS LIVE ON THIS LINK. The bond list
+          * also holds sensors whose sessions ended and that were
+          * disconnected here, in whatever order Android keeps them; the
+          * first with the right prefix is not necessarily this link's. */
+         int ours = 0;
          if (jb_bonded_sensor(env, activity->clazz, want, bm, sizeof bm)) {
+            const struct sensor_view *bv = sensors_view_ref();
+            const int bidx = sensors_view_find_mac_kind(bv, bm, KIND_CGM);
+            const int bid =
+                (bidx >= 0 && bidx < bv->n_live) ? bv->slot[bidx].id : -1;
+            sensors_view_put(bv);
+            ours = bid >= 0 && link_for_sensor(bid) == LINK_CGM;
+            /* NOR WHEN THE LINK'S CODE FILE NAMES ANOTHER SENSOR: its key is
+             * that sensor's (the advert path's rule). */
+            char cown[24];
+            if (ours && dexble_code_owner(LINK_CGM, cown, (int)sizeof cown) &&
+                strcmp(cown, bm) != 0)
+               ours = 0;
+            if (!ours)
+               LOGI("bonded %s device is not this link's live sensor -- "
+                    "not bound",
+                    want);
+         }
+         if (ours) {
             char dt[DEVTAG_LEN];
             LOGI("locked to bonded sensor dev %s (%s)", devtag(bm, dt), want);
             /* dexble_register() has already run, so GATT callbacks can be

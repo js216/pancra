@@ -82,7 +82,7 @@
 /* Rows the DEVICES screen consumes ABOVE (and below) the device entries:
  * title (3 -- the heading, its close X and the air under them), the five-line
  * primary-box explainer plus its trailing air (~3),
- * the blank row under it (1), the armed-pairing "PENDING..." row (1), the
+ * the blank row under it (1), the armed-pairing PENDING row (1), the
  * page-nav row (1), the blank line above OLD DEVICES (1), the "OLD DEVICES (n)"
  * row (1), the blank line below it (1), the SLOTS/LINKS capacity row (1), the
  * separator before the button (1) and the ADD NEW DEVICE button itself

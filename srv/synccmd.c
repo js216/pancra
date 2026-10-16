@@ -944,12 +944,17 @@ int sync_cli_main(int argc, char **argv)
     * live database, on a board that may not have sqlite3 at all, asked of
     * somebody whose service is down.
     *
-    * WITHOUT `fix` IT CHANGES NOTHING, which is the default on purpose: the
+    * WITHOUT `fix` IT DELETES NOTHING, which is the default on purpose: the
     * first thing to do with a damaged file is look at it. `fix` deletes, in
-    * one transaction, reporting every row.
+    * one transaction, naming every row it removes by rowid and giving a count
+    * for each WITHOUT ROWID table.
     *
-    * Opened through db_open_repair -- the one door that skips the orphan
-    * refusal, because this is the tool that removes them. */
+    * `fix` opens through db_open_repair -- the one door that skips the
+    * orphan refusal, because this is the tool that removes them. Without it
+    * the file is opened the ordinary way, exactly as the server would open
+    * it, schema steps included: a file that has never been stamped and holds
+    * orphans is then refused with a count of them and the first few named,
+    * and is left as it was. */
    if (argc > 1 && !strcmp(argv[1], "fsck")) {
       if (!cli_needs(argc, cli_find("fsck")))
          return 1;
@@ -965,7 +970,7 @@ int sync_cli_main(int argc, char **argv)
          return 2;
       }
       sync_resolve_db(dir);
-      d = db_open_repair(sync_db_path());
+      d = fix ? db_open_repair(sync_db_path()) : db_open(sync_db_path());
       if (!d)
          return 1;
       int64_t removed = 0;

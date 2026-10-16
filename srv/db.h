@@ -180,10 +180,11 @@ enum verify_result db_verify(const char *path);
 int db_fsck(struct db *d, int fix, int64_t *removed);
 
 /* Open a database that db_open would REFUSE for holding orphan rows, so they
- * can be removed. The only caller is the fsck verb; every other check --
- * schema shape, version support, the pragmas -- is applied exactly as usual,
- * because a repair against a layout this build does not know would be a
- * repair guessing. */
+ * can be removed. The only caller is the fsck verb. Version support, the
+ * version-0 shape check and the pragmas are applied as usual, because a
+ * repair against a layout this build does not know would be a repair
+ * guessing; no schema step runs, so the file keeps its version and the next
+ * db_open brings the cleaned file forward. */
 struct db *db_open_repair(const char *path);
 
 /* Run a statement with no results; 1 on success. */

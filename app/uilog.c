@@ -1391,14 +1391,11 @@ int ins_points(const struct screen *m, struct log_pt *out, int cap, long *from)
  * `band` takes it instead -- the level in force during each bucket -- and
  * exlog_plot draws that as a strip.
  */
-/* The start of the bucket `t` falls in, read in the offset the rest of the
- * screen renders its dates in. ONE offset for the whole plot, the same one the
- * table above it uses: a point and the rows it totals must land on the same
- * date, and reading each instant in its own historical offset would put a
- * session from the other side of a DST change on a different day from the row
- * that prints it. Five-minute buckets need no such care -- every zone this app
- * meets is a whole number of hours off -- but they go through the same floor
- * so one rule covers both. */
+/* The start of the bucket `t` falls in, read in one offset `tz_off`. The
+ * sub-day buckets use it: an offset is a whole number of quarter hours, so a
+ * five-minute bucket starts at the same instant in any zone, and an hour
+ * bucket in any zone a whole number of hours off. The day tabs use
+ * ex_day_start and ex_day_of, which agree with ex_civil_day. */
 static long ex_floor(long t, long width, long tz_off)
 {
    const long l = t + tz_off;
@@ -1406,6 +1403,67 @@ static long ex_floor(long t, long width, long tz_off)
    if (l < 0 && (l % width) != 0)
       d--; /* floor, not the truncation toward zero C division gives */
    return (d * width) - tz_off;
+}
+
+/* THE CIVIL DAY OF `t`, as a day count, read in the offset in force at `t`
+ * -- the offset the EXERCISE LOG table prints its dates in (fmt_date) -- so a
+ * session lands in the day its own row names, on either side of a DST
+ * change. */
+long ex_civil_day(const struct screen *m, long t)
+{
+   const long l = t + (m->tz_at ? m->tz_at(t) : m->tz_off);
+   long d       = l / 86400;
+   if (l < 0 && (l % 86400) != 0)
+      d--;
+   return d;
+}
+
+/* The first instant of civil day `day`, in that day's own offset: local
+ * midnight, found from the frame's offset and then from the offset at the
+ * instant that gives. Where a zone changes offset at midnight that instant
+ * can still read as the day before, so it is stepped forward a quarter hour
+ * at a time (every offset is whole quarter hours) until it reads as `day`.
+ * Where the clocks fall back from 01:00 to 00:00 midnight comes twice and
+ * the day starts at the first one, so it is then stepped back while the
+ * quarter hour before it still reads as `day`. */
+static long ex_day_start(const struct screen *m, long day)
+{
+   const long guess = (day * 86400) - m->tz_off;
+   long c           = (day * 86400) - (m->tz_at ? m->tz_at(guess) : m->tz_off);
+   for (int k = 0; k < 8 && ex_civil_day(m, c) < day; k++)
+      c += 900;
+   for (int k = 0; k < 8 && ex_civil_day(m, c - 900) >= day; k++)
+      c -= 900;
+   return c;
+}
+
+/* WHICH OF THE `n` DAYS `t` FALLS IN, given their starts out[0..n-1].t and
+ * the span's `end`: -1 outside the span. `*k` is the day found last, tried
+ * first and then the one after it, which is where a time-ordered walk goes;
+ * anything else is a binary search. */
+static long ex_day_of(const struct log_pt *out, long n, long end, long t,
+                      long *k)
+{
+   if (n <= 0 || t < out[0].t || t >= end)
+      return -1;
+   for (long c = *k; c >= 0 && c < n && c <= *k + 1; c++) {
+      const long next = (c + 1 < n) ? out[c + 1].t : end;
+      if (t >= out[c].t && t < next) {
+         *k = c;
+         return c;
+      }
+   }
+   long lo = 0;
+   long hi = n - 1;
+   while (lo < hi) {
+      const long mid = lo + ((hi - lo + 1) / 2);
+      if (out[mid].t <= t)
+         lo = mid;
+      else
+         hi = mid - 1;
+   }
+   *k = lo;
+   return lo;
 }
 
 /* Every minute of a record that falls inside the plot, the running session
@@ -1419,14 +1477,6 @@ static long ex_secs_of(const struct screen *m, int i)
    if (i == m->food.exlog_act)
       return (m->now > e->t) ? m->now - e->t : 0;
    return e->dur;
-}
-
-/* Local midnight at or before `t`. Exported so the EXERCISE LOG's TODAY line
- * and the plot's day buckets floor the day identically -- two copies of this
- * is how a total comes to disagree with the bar beside it. */
-long ex_day_floor(long t, long tz_off)
-{
-   return ex_floor(t, 86400, tz_off);
 }
 
 /* HOW WIDE A BUCKET IS on the sub-day tabs, and the ONE place that decides.
@@ -1532,25 +1582,25 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
    const long f =
        exday_from_of(tab, m->now, (m->food.nexlog > 0) ? m->food.exlog[0].t : 0,
                      (m->food.nsteps > 0) ? m->food.steps[0].t : 0);
-   long d0       = ex_floor(f, 86400, m->tz_off);
-   const long d1 = ex_floor(m->now, 86400, m->tz_off);
-   long n        = ((d1 - d0) / 86400) + 1;
+   long d0       = ex_civil_day(m, f);
+   const long d1 = ex_civil_day(m, m->now);
+   long n        = (d1 - d0) + 1;
    if (n < 1)
       n = 1;
    if (n > half) {
       /* CLAMPED FROM THE OLD END, so the right-hand edge stays today.
        * Dropping the newest days instead would quietly turn a long span into
        * a chart of some earlier window with nothing on screen to say so. */
-      d0 = d1 - ((long)(half - 1) * 86400);
+      d0 = d1 - (long)(half - 1);
       n  = half;
    }
    /* The window starts at the first day drawn, not at the raw span start: a
     * point sits at its day's MIDNIGHT, so a `from` part-way through that day
     * would put the leftmost point outside the window and drop it. */
    if (from)
-      *from = d0;
+      *from = ex_day_start(m, d0);
    for (long i = 0; i < n; i++) {
-      out[i].t          = d0 + (i * 86400);
+      out[i].t          = ex_day_start(m, d0 + i);
       out[i].v          = 0;
       out[i].series     = 0;
       out[i].ix         = -1; /* a day's total, not an entry */
@@ -1559,20 +1609,27 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
       out[n + i].series = 1;
       out[n + i].ix     = -1;
    }
+   /* EACH RECORD'S DAY, BY COMPARISON WITH THE DAY STARTS ABOVE: out[k].t
+    * is when civil day d0+k begins, `end` when the span ends. A record in
+    * [out[k].t, out[k+1].t) belongs to day k, which is what ex_civil_day
+    * answers, without a time-zone lookup per record. Both logs are oldest
+    * first, so the day only moves forward; ex_day_of searches when it does
+    * not. */
+   const long end = ex_day_start(m, d0 + n);
+   long kx        = 0;
    for (int i = 0; i < m->food.nexlog; i++) {
       const long secs = ex_secs_of(m, i);
       if (secs <= 0)
          continue;
-      const long k =
-          (ex_floor(m->food.exlog[i].t, 86400, m->tz_off) - d0) / 86400;
-      if (k < 0 || k >= n)
+      const long k = ex_day_of(out, n, end, m->food.exlog[i].t, &kx);
+      if (k < 0)
          continue; /* outside the span, which also drops a mistyped year */
       out[k].v += secs / 60;
    }
+   long ks = 0;
    for (int i = 0; i < m->food.nsteps; i++) {
-      const long k =
-          (ex_floor(m->food.steps[i].t, 86400, m->tz_off) - d0) / 86400;
-      if (k >= 0 && k < n)
+      const long k = ex_day_of(out, n, end, m->food.steps[i].t, &ks);
+      if (k >= 0)
          out[n + k].v += m->food.steps[i].n;
    }
    return (int)(2 * n);

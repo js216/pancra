@@ -74,13 +74,17 @@ static int g_sys_batt;
 static int g_sys_bucket = -1;
 static int g_sys_bg;
 
-/* Where the PAIRING flow (type tap -> keypad / meter help) was entered
- * from: the ADD menu or the ADD DEVICE picker. Every abort path returns
- * exactly there -- recorded, never inferred (the recurring bug). */
-/* How deep the navigation path was when the ADD-A-DEVICE flow began, so every
- * abort inside it lands where it started (see nav_mark()). Private: no file
- * outside this one has any use for it. */
+/* How deep the navigation path was when the ADD-A-DEVICE flow began (the
+ * ADD menu, the ADD DEVICE picker, or the screen the pairing tick opened the
+ * candidate list over), so every abort inside it lands exactly there --
+ * recorded, never inferred (see nav_mark()). Set from outside this file only
+ * by menu_pair_mark_here. */
 static int g_pair_mark = 1;
+
+void menu_pair_mark_here(void)
+{
+   g_pair_mark = nav_mark();
+}
 
 /* --- settings-menu system ops (main thread; shell_activity()->env valid) ---
  *
@@ -745,9 +749,21 @@ static int device_life_action(int action)
       nav_go(SCR_DEVICES); /* leave it armed, exactly as it was */
    } else if (action == MA_PEND_STOP) {
       if (pairing_pending()) {
+         /* A DEVICE THE WAIT ALREADY REGISTERED goes to OLD DEVICES with it:
+          * it never streamed, and left live it would hold a link and stay a
+          * pairing candidate. */
+         const int pid = pairing_pending_device();
          LOGI("pending pairing cancelled by user");
          pairing_arm(0);
          set_status("PAIRING CANCELLED");
+         /* Never one already moved there, and never a sensor that has
+          * streamed: that is a device in use whose re-pair this wait was,
+          * not one the wait registered. */
+         struct sensor_slot pslot;
+         struct sensor_rec prec;
+         if (pid > 0 && sensor_slot_of(pid, &pslot) && !pslot.old &&
+             sensor_rec_of(pid, &prec) && !sensor_ever_streamed(prec.identity))
+            device_retire(pid);
       }
       nav_go(SCR_DEVICES);
    } else if (action == MA_WEAR) {
@@ -1104,6 +1120,7 @@ static int pair_action(int action, int ix)
       }
    } else if (action == MA_PAIR_NO) {
       if (cur_screen() == SCR_PAIRCONF) {
+         pairing_decline(pairing_pend_mac());
          pairing_propose("", "");
          nav_go(SCR_DEVLIST); /* nothing committed: back to the list */
       }

@@ -221,6 +221,10 @@ int hist_prev_glu(long t, int src, long not_before);
 int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                  long raw, long tz, int kind, int rescale_pm,
                  enum warm_state warm);
+/* The screen as a reading arrives -- 0 off, 1 on and locked, 2 unlocked --
+ * written into the row's trailing `screen` column. Set from Java's screen
+ * receiver on any thread; unset, the column is left empty. */
+void store_note_screen(int state);
 /* Recompute g_cur_* from the newest CGM sample in g_hist. With a primary
  * configured (`prime` >= 0), ONLY the primary's samples qualify: a primary
  * with no data yet clears the current reading (glu -1 = none) rather than

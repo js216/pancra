@@ -191,15 +191,20 @@ static uint32_t session_left(const struct screen *m, const struct ui_sensor *ps,
       (void)snprintf(out, n, "--");
       return plain;
    }
+   /* WARM-UP ENDS WHEN THE SENSOR SAYS SO. The state byte comes with each
+    * response, about five minutes apart, and can still say warm-up after the
+    * session clock has run the hour out; until a response says otherwise the
+    * countdown goes on into the negative ("WARMUP -1:30"). Without a state
+    * byte the clock alone decides, and only inside the hour. */
    if (m->reading.sess_state == SENSOR_STATE_WARMUP ||
        (m->reading.sess_state == 0 && ss > 0 && ss < SENSOR_WARMUP_S)) {
       /* The sensor's OWN state byte, or the clock heuristic before any 4e has
        * answered. The live clock is what makes this match the official
        * reader, to the second. */
-      long r = SENSOR_WARMUP_S - ss;
-      if (r < 0)
-         r = 0;
-      (void)snprintf(out, n, "WARMUP %ld:%02ld", r / 60, r % 60);
+      long r  = SENSOR_WARMUP_S - ss;
+      long ar = (r < 0) ? -r : r;
+      (void)snprintf(out, n, "WARMUP %s%ld:%02ld", (r < 0) ? "-" : "", ar / 60,
+                     ar % 60);
       return UI_WARN;
    }
    if (m->reading.sess_state == SENSOR_STATE_ENDED) {
@@ -747,7 +752,11 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       int wt  = (m->plot.hist[m->plot.scrub].kind == KIND_WT);
       int fd  = (m->plot.hist[m->plot.scrub].kind == KIND_FOOD);
       int exr = (m->plot.hist[m->plot.scrub].kind == KIND_EX);
-      fmt_hms(m->plot.hist[m->plot.scrub].t, m->tz_off, ts, sizeof ts);
+      /* THE OFFSET IN FORCE AT THE READING, like every drawn date
+       * (fmt_date): the time and the weekday below are read in it too. */
+      const long st  = m->plot.hist[m->plot.scrub].t;
+      const long stz = m->tz_at ? m->tz_at(st) : m->tz_off;
+      fmt_hms(st, stz, ts, sizeof ts);
       ts[5] = '\0';
       /* An insulin dose scrubs like glucose, shown as "2 U FAST" /
        * "10 U SLOW" (src carries the dose TYPE for insulin points). A weight
@@ -875,7 +884,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          /* 1970-01-01 was a Thursday. */
          static const char *const wd[7] = {"SUN", "MON", "TUE", "WED",
                                            "THU", "FRI", "SAT"};
-         long z = (m->plot.hist[m->plot.scrub].t + m->tz_off) / 86400;
+         long z                         = (st + stz) / 86400;
          int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0 = Sunday */
          (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
          whenp = whenbuf;

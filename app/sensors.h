@@ -617,6 +617,13 @@ int sensor_id_by_mac(const char *identity);
  * a few times a year (minting), not on the ones that run every second. */
 int sensor_slot_by_mac(const char *identity);
 
+/* 1 when this address once ran a session with this phone: a provenance row
+ * for it carries a session start. A sensor registered at a pairing commit and
+ * never heard from has none. A linear walk of the provenance table under the
+ * registry lock, one row per id ever minted; asked per advert and per commit,
+ * not per frame. */
+int sensor_ever_streamed(const char *identity);
+
 /* Fill `out` (capacity `max`) with the ids of slots whose marker is MARK_HIDE,
  * returning the count. One locked pass, so the plot's scrub path can flag
  * hidden points without a per-point registry lock. */

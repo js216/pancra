@@ -78,6 +78,15 @@ struct dex_ctx {
    char g_mac[24];
    uint8_t g_code[8];
    int g_codelen;
+   /* THE SENSOR REFUSED THIS LINK'S CODE: a J-PAKE run with it ended in a
+    * tokenHash mismatch. Each try spends one of the sensor's attempts, so the
+    * link is not dialled again until a new commit (driver_forget clears
+    * it). */
+   int code_refused;
+   /* HOW MANY TIMES THIS LINK HAS BEEN FORGOTTEN (driver_forget). A caller
+    * that read the link and acts on it later passes the count it read, and
+    * the act is refused if the link was forgotten in between. */
+   unsigned forget_gen;
    int mac_saved;          /* persisted this sensor's MAC this run (once) */
    uint8_t shared_key[16]; /* OUTLIVES the exchange: it is written to a file
                             * and is what a bonded reconnect authenticates
@@ -117,10 +126,11 @@ struct dex_ctx {
     * required a correct one to have arrived at all. The 0x03 and 0x05 handlers
     * are independent arms, so a peer could skip 0x03 entirely, send the three
     * bytes 05 01 01, and land in P_STREAM with its frames accepted as real
-    * glucose. The app does bond (dexble.c requests Ble.createBond for the
-    * pairing flow), but nothing in THIS protocol depends on it -- a sensor's
-    * frames are accepted on the strength of the tokenHash and nothing else,
-    * so that check is the only thing authenticating the peer. */
+    * glucose. The link is bonded (the sensor asks for it after the
+    * certificate exchange), but nothing in THIS protocol depends on it -- a
+    * sensor's frames are accepted on the strength of the tokenHash and
+    * nothing else, so that check is the only thing authenticating the
+    * peer. */
    int chal_ok;
    uint8_t token[8]; /* the challenge we sent: the reply is checked against a
                       * hash of it, so it must outlive the write */

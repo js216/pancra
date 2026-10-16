@@ -35,7 +35,8 @@ struct ex_rec {
     * A row is written when the level SETTLES, which is the start; nothing at
     * that moment knows when the exercise will end. So the row is written open
     * and closed later, by exercise_end, when the user takes the button back
-    * to zero -- the rewrite this log's tier already allows for corrections.
+    * to zero -- the rewrite exercise.h's tier of log already allows for
+    * corrections.
     *
     * 0 therefore means one of two things and the plot treats them
     * differently: the session is still running (the button is still at a
@@ -61,10 +62,16 @@ struct ex_rec {
  * out-of-range level. */
 #define EX_DUR_MAX 604800L
 
+/* The longest line of the exercise log, newline excluded. A longer line is
+ * damage and is skipped whole: a cut-off prefix is never decoded. */
+#define EX_LINE_MAX 95
+
 /* Decode ONE row, from `p` to `e` (the end of the LINE, not of the file).
- * 1 when it is a record this format allows, 0 when it is not: an instant,
- * level or duration out of range. A header or blank line is the caller's to
- * skip before asking. */
+ * 1 when it is a record this format allows, 0 when it is not: an instant or
+ * level that is not a whole number, an offset or duration that is neither a
+ * whole number nor empty (a field of only a '-' reads as empty), or an
+ * instant, level or duration out of range. A
+ * header or blank line is the caller's to skip before asking. */
 int ex_row_decode(const char *p, const char *e, struct ex_rec *r);
 
 #endif

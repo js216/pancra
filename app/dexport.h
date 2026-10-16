@@ -151,5 +151,18 @@ int drv_mac_load(int link, char *mac,
                  int n); /* bonded sensor's MAC; 1 if one was saved */
 int drv_mac_save(int link, const char *mac); /* the sensor we bonded to */
 DRV_MUST_USE int drv_mac_clear(int link);    /* forget it: see drv_key_clear */
+/* The pairing code this link's sensor was paired with, saved with that
+ * sensor's address at the commit, read when that same address must run the
+ * J-PAKE again, cleared when the sensor is forgotten (driver_forget), and
+ * emptied to "<address>," when the sensor refuses it (notify_auth). A key
+ * discarded as stale leaves the code in place: the re-pair needs it. */
+int drv_code_save(int link, const char *mac, const char *code);
+int drv_code_load(int link, const char *mac, char *code,
+                  int n); /* 1 if a usable code is on file for this address
+                           * (0 once the sensor refused it) */
+/* The address `link`'s code file was saved for, into `mac` (18 bytes or
+ * more); 1 when there is such a file. */
+int drv_code_owner(int link, char *mac, int n);
+DRV_MUST_USE int drv_code_clear(int link);
 
 #endif

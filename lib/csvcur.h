@@ -23,9 +23,12 @@
  *
  *   CSV_FIELD_OK        digits were there and the value is all of them
  *   CSV_FIELD_EMPTY     no digits at all -- absent, or not a number
- *   CSV_FIELD_OVERFLOW  more digits than the cap holds; the value returned is
- *                       NOT the number that was written, it is its leading
- *                       digits, which describes a different row entirely
+ *   CSV_FIELD_OVERFLOW  more digits than the cap holds (csv_fixed: 18 or
+ *                       more kept digits, or a scaling that would pass a
+ *                       long); the value returned is
+ *                       NOT the number that was written -- its leading
+ *                       digits, or a part-scaled value -- and describes a
+ *                       different row entirely
  *
  * WHAT IS NOT HERE is every rule about what the fields MEAN: how many columns
  * a row has, which are optional, what ranges are plausible, whether an unknown
@@ -42,6 +45,8 @@
  * bounded field reader over one line of text. */
 #ifndef PANCRA_CSVCUR_H
 #define PANCRA_CSVCUR_H
+
+#include <limits.h> /* LONG_MAX: csv_fixed's scaling stops short of it */
 
 /* The digit cap. Accumulating without one is undefined behaviour on overflow,
  * and it happens during PARSING -- before any range check the caller would
@@ -165,8 +170,16 @@ static inline long csv_fixed(struct csv_cur *c, int dp, enum csv_field *why)
          q++; /* past `dp` places: consumed, not kept */
       }
    }
-   while (scale-- > 0)
+   /* THE SCALING CANNOT OVERFLOW: a value that would pass a long's range is
+    * left where it is and reported as OVERFLOW. */
+   int big = 0;
+   while (scale-- > 0) {
+      if (v > LONG_MAX / 10) {
+         big = 1;
+         break;
+      }
       v *= 10;
+   }
    if (why) {
       /* COUNTED ACROSS BOTH HALVES: ".5" is a number and "5." is a number,
        * and only a field with no digit anywhere in it is empty -- a bare "."
@@ -174,7 +187,7 @@ static inline long csv_fixed(struct csv_cur *c, int dp, enum csv_field *why)
        * where the integer part ended. */
       if (!seen)
          *why = CSV_FIELD_EMPTY;
-      else if (nd >= CSV_MAX_DIGITS)
+      else if (nd >= CSV_MAX_DIGITS || big)
          *why = CSV_FIELD_OVERFLOW;
       else
          *why = CSV_FIELD_OK;

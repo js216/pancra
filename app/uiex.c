@@ -38,7 +38,7 @@
 #include <stdio.h>
 
 /* The word for a level, which is the user's own judgement and not a
- * measurement -- exercise.h is deliberate about that. The number is shown
+ * measurement -- exrow.h is deliberate about that. The number is shown
  * beside it because the number is what the button shows and what the file
  * holds; the word is what makes a table of bare 1s and 3s readable. */
 static const char *ex_level_word(int level)
@@ -115,7 +115,7 @@ void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * HOW LONG IT LASTED, in minutes, and "--" when the log does not know.
     * A row is written when the level SETTLES, which is its start, so nothing
     * knows the length until the session ends -- 0 is the column's own "not
-    * known" (exercise.h) and it has to read as that rather than as a
+    * known" (exrow.h) and it has to read as that rather than as a
     * zero-minute session, with no stop either. These are the fields on this
     * form the button cannot supply, which is why they are here. */
    char durp[12];
@@ -124,13 +124,23 @@ void render_exedit(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * EX_DUR_MAX, so a row this large cannot be written -- but the frame is
     * built from whatever the file held, and a screen must not be the place a
     * corrupted column is discovered. */
-   long durm = m->food.ex_form_dur / 60;
-   if (durm > EX_DUR_MAX / 60)
-      durm = EX_DUR_MAX / 60;
-   if (durm > 0) {
-      (void)snprintf(durp, sizeof durp, "%ld", durm);
+   long dur = m->food.ex_form_dur;
+   if (dur > EX_DUR_MAX)
+      dur = EX_DUR_MAX;
+   /* WHOLE MINUTES BETWEEN THE TWO TIMES SHOWN: START and STOP are drawn to
+    * the minute, and a start the button wrote carries seconds, so the count is
+    * the difference between the two minutes drawn. A session that ends inside
+    * the minute it started in reads "<1", never as zero minutes, which would
+    * read as unknown. */
+   const long end  = m->food.ex_t + dur;
+   const long durm = (dur > 0) ? (end / 60) - (m->food.ex_t / 60) : 0;
+   if (dur > 0) {
+      if (durm > 0)
+         (void)snprintf(durp, sizeof durp, "%ld", durm);
+      else
+         (void)snprintf(durp, sizeof durp, "<1");
       char st[20];
-      fmt_date(m->food.ex_t + (durm * 60), m->tz_off, st, sizeof st);
+      fmt_date(end, m->tz_off, st, sizeof st);
       str_snapshot(stopp, sizeof stopp, (str_len(st) > 11) ? st + 11 : "");
    } else {
       (void)snprintf(durp, sizeof durp, "--");
@@ -231,19 +241,21 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * find is a direction rather than an answer, and the words promise the tap
     * turns counting on, so anything less makes the line a liar.
     *
-    * TODAY IS THE LOCAL CIVIL DAY, floored the way the plot's own day buckets
-    * are, so this figure and the last bar of a day-bucketed tab are the same
-    * arithmetic over the same rows. */
+    * TODAY IS THE LOCAL CIVIL DAY (ex_civil_day), the day the plot's own day
+    * buckets agree with, so this figure and the last point of a
+    * day-bucketed tab count the same rows. */
    if (!m->food.steps_on) {
       draw_str(px, fb, x, y, sc, "STEPS OFF, PRESS HERE TO ENABLE", UI_MUTED);
       add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh + (3 * sc)),
                  MA_STEPS_TOGGLE, 0);
    } else {
-      const long day = ex_day_floor(m->now, m->tz_off);
-      long tot       = 0;
+      const long today = ex_civil_day(m, m->now);
+      long tot         = 0;
+      /* Only the last two days can be today; older records are not asked
+       * their day, which costs a time-zone lookup. */
       for (int i = 0; i < m->food.nsteps; i++) {
-         const long t = m->food.steps[i].t;
-         if (t >= day && t < day + 86400)
+         const long st = m->food.steps[i].t;
+         if (st > m->now - (2L * 86400) && ex_civil_day(m, st) == today)
             tot += m->food.steps[i].n;
       }
       char line[32];
@@ -314,14 +326,19 @@ void render_exlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
        * running one never got an end recorded (struct ex_rec) -- the app was
        * killed, or the log predates the column -- and its length is simply
        * unknown. Showing 0 would claim a session that took no time. */
+      /* Counted as EDIT EXERCISE counts it: whole minutes between the start
+       * and the stop as drawn, "<1" inside one minute. */
       const int running = (ti == m->food.exlog_act);
-      long durm         = e->dur / 60;
-      if (durm > EX_DUR_MAX / 60)
-         durm = EX_DUR_MAX / 60;
+      long ed           = e->dur;
+      if (ed > EX_DUR_MAX)
+         ed = EX_DUR_MAX;
+      const long durm = (ed > 0) ? ((e->t + ed) / 60) - (e->t / 60) : 0;
       if (running)
          (void)snprintf(durp, sizeof durp, "ACTIVE");
       else if (durm > 0)
          (void)snprintf(durp, sizeof durp, "%ld", durm);
+      else if (ed > 0)
+         (void)snprintf(durp, sizeof durp, "<1");
       else
          (void)snprintf(durp, sizeof durp, "--");
       /* THE LEVEL IS CLIPPED TO WHAT THE MIN COLUMN LEAVES. Both are drawn on

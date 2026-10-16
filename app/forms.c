@@ -72,6 +72,22 @@ static long *form_instant_of(enum keypad_mode m)
    return 0;
 }
 
+/* EDIT EXERCISE's START MOVES THE WHOLE SESSION: after `tp` moved from
+ * `old_t`, the stop follows it and MINUTES reads what it read before. The
+ * minutes are the whole minutes between START and STOP as the form draws
+ * them (uiex.c), so they are kept as that count, from the new start's
+ * minute; a session inside one minute keeps its seconds. Any other form's
+ * instant has no duration and is left alone. */
+static void ex_follow_start(const long *tp, long old_t)
+{
+   long *dur = form_ex_duration();
+   if (!tp || tp != form_ex_instant() || !dur || *dur <= 0)
+      return;
+   long mins = ((old_t + *dur) / 60) - (old_t / 60);
+   if (mins > 0)
+      *dur = (((*tp / 60) + mins) * 60) - *tp;
+}
+
 /* ---- OPENING A DRAFT SETS ALL OF IT --------------------------------------
  *
  * EVERY FIELD, INCLUDING THE ONES THE PATH HAS NO USE FOR. Opening the weight
@@ -663,13 +679,18 @@ int kp_commit_number(void)
          long v = 0;
          for (int i = 0; i < g_kp.len; i++)
             v = (v * 10) + (g_kp.entry[i] - '0');
-         /* MINUTES IN, SECONDS STORED: the column is seconds (exercise.h), and
-          * this is the one place the two units meet. Refused rather than
-          * clamped, for the reason the grams branch above gives.
+         /* MINUTES IN, SECONDS STORED: the column is seconds (exrow.h), and
+          * ex_follow_start keeps the minute count when the start moves.
+          * Refused rather than clamped, for the reason the grams branch
+          * above gives.
           *
-          * ZERO IS ACCEPTED, and it is not "no exercise": it is the log's own
-          * "how long is not known", which is what an open session reads as and
-          * what a user who mistyped a duration needs a way back to. */
+          * AT LEAST ONE MINUTE: 0 is the log's own "how long is not known",
+          * and a typed duration is a known one.
+          *
+          * COUNTED FROM THE START'S WHOLE MINUTE, the one the form shows, so
+          * the stop lands on the minute START + MINUTES reads; a start the
+          * button wrote carries seconds, and the duration stored runs from
+          * the start itself. */
          long *dur = form_ex_duration();
          if (!dur) {
             (void)snprintf(g_kp.err, sizeof g_kp.err, "NO ENTRY OPEN");
@@ -677,13 +698,14 @@ int kp_commit_number(void)
             shell_ui_dirty();
             return COMMIT_STAY;
          }
-         if (v < 0 || v > EX_DUR_MAX / 60) {
+         long *tp = form_ex_instant();
+         if (!tp || v < 1 || v > EX_DUR_MAX / 60) {
             (void)snprintf(g_kp.err, sizeof g_kp.err, "MINUTES OUT OF RANGE");
             g_kp.len = 0;
             shell_ui_dirty();
             return COMMIT_STAY;
          }
-         *dur     = v * 60;
+         *dur     = (v * 60) - (*tp % 60);
          g_kp.len = 0;
          keypad_close();
       }
@@ -814,7 +836,9 @@ int kp_commit_number(void)
           * likely to cross a transition -- the same civil date half a year
           * away is a different offset -- so the recombination is the target
           * year's, never today's. */
-         *tp      = civil_reaim(*tp, CIVIL_EDIT_YEAR, v, 0, form_zone, 0).t;
+         const long old = *tp;
+         *tp = civil_reaim(*tp, CIVIL_EDIT_YEAR, v, 0, form_zone, 0).t;
+         ex_follow_start(tp, old);
          g_kp.len = 0;
          keypad_close();
       }
@@ -826,13 +850,14 @@ int kp_commit_number(void)
 
 /* WHAT A TYPED NUMBER MEANT: a date or a time. Two modes and one family,
  * because they are the two halves of a single entry -- MMDD, then HHMM -- and
- * validating the second depends on the first having been accepted. */
+ * validating the second depends on the first having been accepted. EDIT
+ * EXERCISE's STOP is a time of day too, and is answered here first. */
 int kp_commit_datetime(void)
 {
    if (g_kp.mode == KP_EX_STOP) {
       if (g_kp.len == 4) {
-         int a = ((g_kp.entry[0] - '0') * 10) + (g_kp.entry[1] - '0');
-         int b = ((g_kp.entry[2] - '0') * 10) + (g_kp.entry[3] - '0');
+         int a     = ((g_kp.entry[0] - '0') * 10) + (g_kp.entry[1] - '0');
+         int b     = ((g_kp.entry[2] - '0') * 10) + (g_kp.entry[3] - '0');
          long *tp  = form_ex_instant();
          long *dur = form_ex_duration();
          if (!tp || !dur) {
@@ -849,12 +874,51 @@ int kp_commit_datetime(void)
          }
          /* THE STOP IS THE DURATION, said as a time of day: the first instant
           * after the start that shows HHMM -- the start's own day, or the next
-          * one when HHMM is not after the start's time. */
-         long stop = civil_reaim(*tp, CIVIL_EDIT_TIME, a, b, form_zone, 0).t;
-         if (stop <= *tp)
-            stop = civil_reaim(*tp + 86400, CIVIL_EDIT_TIME, a, b, form_zone, 0)
-                       .t;
-         if (stop <= *tp || stop - *tp > EX_DUR_MAX) {
+          * one when HHMM is not after the start's time.
+          *
+          * FOUND FROM THE START'S WHOLE MINUTE, which is what the form shows
+          * (a start the button wrote carries seconds), and STORED EXACT: the
+          * duration runs from the start itself to the typed instant, so the
+          * record ends where the form says it does.
+          *
+          * THE NEXT DAY IS A CIVIL DAY, 23 to 25 hours on: of the anchors a
+          * day and an hour either side of one, the first whose HHMM lands in
+          * that span is the one, whatever DST change lies between. */
+         long t0 = *tp - (*tp % 60);
+         struct civil_res sr =
+             civil_reaim(t0, CIVIL_EDIT_TIME, a, b, form_zone, 0);
+         long stop = sr.t;
+         /* THE REPEATED HOUR OF A FALL-BACK shows HHMM twice on the start's
+          * own day: the later one is the stop when the earlier is not after
+          * the start. */
+         if (sr.fix == CIVIL_AMBIGUOUS) {
+            long lo = sr.t < sr.t_alt ? sr.t : sr.t_alt;
+            long hi = sr.t < sr.t_alt ? sr.t_alt : sr.t;
+            stop    = lo > t0 ? lo : hi;
+         }
+         /* THE SKIPPED HOUR OF A SPRING-FORWARD is moved past the gap, which
+          * can put it after the start even when the HHMM typed is not: then
+          * the stop is the next day's, counted from that HHMM read in the
+          * start's own offset. */
+         if (sr.fix == CIVIL_NONEXISTENT) {
+            long lt = t0 + form_zone(0, t0);
+            long lm = (((lt % 86400) + 86400) % 86400) / 60;
+            long tm = ((long)a * 60) + b;
+            if (tm <= lm)
+               stop = t0 - ((lm - tm) * 60);
+         }
+         if (stop <= t0) {
+            static const long off[3] = {86400, 86400 - 3600, 86400 + 3600};
+            const long same          = stop;
+            for (int k = 0; k < 3 && stop <= t0; k++) {
+               long c = civil_reaim(same + off[k], CIVIL_EDIT_TIME, a, b,
+                                    form_zone, 0)
+                            .t;
+               if (c - same >= 82800 && c - same <= 90000)
+                  stop = c;
+            }
+         }
+         if (stop <= t0 || stop - t0 > EX_DUR_MAX) {
             (void)snprintf(g_kp.err, sizeof g_kp.err, "NOT AFTER THE START");
             g_kp.len = 0;
             shell_ui_dirty();
@@ -871,7 +935,8 @@ int kp_commit_datetime(void)
          /* whichever form's field this MODE is -- see the year entry above */
          long *tp = form_instant_of(g_kp.mode);
          if (!tp)
-            return COMMIT_PASS;       /* not a form field: nothing to move */
+            return COMMIT_PASS; /* not a form field: nothing to move */
+         const long old = *tp;
          if (kp_is_date(g_kp.mode)) { /* MMDD, within the current year */
             /* THE YEAR THE INSTANT IS IN, read in the offset in force at that
              * instant, because February's length depends on it. Reading it in
@@ -907,6 +972,7 @@ int kp_commit_datetime(void)
              * refusal the user cannot act on. */
             *tp = civil_reaim(*tp, CIVIL_EDIT_TIME, a, b, form_zone, 0).t;
          }
+         ex_follow_start(tp, old);
          g_kp.len = 0;
          keypad_close();
       }
@@ -918,6 +984,12 @@ int kp_commit_datetime(void)
 
 void forms_kp_open(enum keypad_mode mode, enum ui_screen ret)
 {
+   /* THE DRAWN OFFSETS ASKED AFRESH as an entry begins: the keypad edits in
+    * the device's zone as it is (form_zone), and the times the form draws
+    * come from a cache the refresh empties, so both read the same zone. */
+   JNIEnv *env = dexble_env();
+   if (env)
+      tz_refresh(env);
    g_kp.mode = mode;
    g_kp.ret  = ret;
    forms_kp_clear();

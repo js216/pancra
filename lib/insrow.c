@@ -32,51 +32,81 @@ int ins_row_decode(const char *p, const char *e, long legacy_id,
    out->del = 0;
    /* THE FIELD THIS FORMAT WILL NOT GUESS AT. Every other column is caught by
     * a range check below -- an empty `t` reads 0 and fails `t <= 0`, an empty
-    * `type` is neither SLOW nor FAST -- but `del` has no such luck: a missing
+    * `type` is refused by the type check -- but `del` has no such luck: a missing
     * retraction flag reads as 0, which is the valid and much more common
     * answer, so a truncated row would silently resurrect a dose the user
     * deleted. It is asked about explicitly instead.
     *
-    * AND IT IS 0 OR 1, NOT "NONZERO". The server's copy took any nonzero
-    * value as a retraction while the phone required exactly 1; a row with
-    * `del` of 2 was therefore a live dose on one screen and a retracted one
-    * on the other. Neither reading is defensible -- the value is not one this
-    * format writes -- so the row is refused. */
+    * AND IT IS 0 OR 1, NOT "NONZERO": any other value is not one this
+    * format writes, and reading it as either answer would make it a live
+    * dose to one reader and a retracted one to another, so the row is
+    * refused. */
+   /* EVERY NUMBER IS READ INTO A long AND RANGE-CHECKED before it is
+    * narrowed to an int: a value past an int's range would otherwise wrap
+    * into a valid one. */
    enum csv_field delok = CSV_FIELD_OK;
+   enum csv_field uok   = CSV_FIELD_OK;
+   enum csv_field idok  = CSV_FIELD_OK; /* 19 digits or more is damage */
+   enum csv_field tok   = CSV_FIELD_OK;
+   enum csv_field tyok  = CSV_FIELD_OK;
+   long del             = 0;
+   long type            = 0;
+   long milli           = 0;
    if (ins_ncommas(p, e) >= 6) {
+      /* EVERY FIELD ENDS AT ITS COMMA: "1.5" as a type would otherwise read
+       * as 1, and its ".5" as the units. */
       (void)csv_num(&c, 0); /* written: ordering is FILE order, not this */
-      csv_sep(&c);
-      out->id = csv_num(&c, 0);
-      csv_sep(&c);
-      out->del = (int)csv_num(&c, &delok);
-      csv_sep(&c);
-      out->t = csv_num(&c, 0);
-      csv_sep(&c);
-      out->type = (int)csv_num(&c, 0);
-      csv_sep(&c);
-      out->milli = (int)csv_fixed(&c, 3, 0);
-      if (out->id == 0 || delok != CSV_FIELD_OK ||
-          (out->del != 0 && out->del != 1))
+      if (!csv_sep(&c))
          return 0;
-      if (out->del)
-         return 1; /* a retraction names a dose; it does not describe one */
+      out->id = csv_num(&c, &idok);
+      if (!csv_sep(&c))
+         return 0;
+      del = csv_num(&c, &delok);
+      if (!csv_sep(&c))
+         return 0;
+      out->t = csv_num(&c, &tok);
+      if (!csv_sep(&c))
+         return 0;
+      type = csv_num(&c, &tyok);
+      if (!csv_sep(&c))
+         return 0;
+      milli = csv_fixed(&c, 3, &uok);
+      if (c.p < c.e && *c.p != ',')
+         return 0; /* "20abc": the units field is not exactly a number */
+      if (out->id == 0 || idok == CSV_FIELD_OVERFLOW ||
+          delok != CSV_FIELD_OK || (del != 0 && del != 1))
+         return 0;
+      out->del = (int)del;
+      if (out->del) {
+         /* a retraction names a dose; it does not describe one */
+         out->type  = 0;
+         out->milli = 0;
+         return 1;
+      }
    } else {
       /* THE ORIGINAL FOUR-FIELD ROW: no id, so the caller's negative one by
        * file order. Positive ids are minted; the two spaces cannot collide
        * however the file was assembled. */
       out->id = legacy_id;
-      out->t  = csv_num(&c, 0);
-      csv_sep(&c);
-      out->type = (int)csv_num(&c, 0);
-      csv_sep(&c);
-      out->milli = (int)csv_fixed(&c, 3, 0);
+      out->t  = csv_num(&c, &tok);
+      if (!csv_sep(&c))
+         return 0;
+      type = csv_num(&c, &tyok);
+      if (!csv_sep(&c))
+         return 0;
+      milli = csv_fixed(&c, 3, &uok);
+      if (c.p < c.e && *c.p != ',')
+         return 0;
    }
-   if (out->t <= 0 || out->t >= INS_T_MAX)
+   if (tok == CSV_FIELD_OVERFLOW || out->t <= 0 || out->t >= INS_T_MAX)
       return 0;
-   if (out->type != INS_SLOW && out->type != INS_FAST)
+   if (tyok != CSV_FIELD_OK || (type != INS_SLOW && type != INS_FAST))
       return 0;
-   if (out->milli < INS_MILLI_MIN || out->milli > INS_MILLI_MAX)
+   if (uok == CSV_FIELD_OVERFLOW || milli < (long)INS_MILLI_MIN ||
+       milli > (long)INS_MILLI_MAX)
       return 0;
+   out->type  = (int)type;
+   out->milli = (int)milli;
    return 1;
 }
 

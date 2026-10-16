@@ -328,13 +328,24 @@ const _Atomic int *hist_count_ptr(void)
 static char g_store_path[256];
 
 /* Column header for readings.csv, so an exported log is self-describing. The
- * trailing `rescale` column is the multiplicative factor applied to this row's
+ * `rescale` column is the multiplicative factor applied to this row's
  * glucose (e.g. 1.040 = +4%); empty means 1.000 (not rescaled). The stored
  * glucose is ALREADY rescaled, so the factor is what makes the raw recoverable
  * (raw = glucose / rescale) -- no data is lost. */
 static const char g_store_hdr[] =
     "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
-    "device_time,tz_offset_s,kind,rescale,warm\n";
+    "device_time,tz_offset_s,kind,rescale,warm,screen\n";
+
+/* THE SCREEN AS THE LAST CHANGE LEFT IT: 0 off, 1 on and locked, 2 unlocked,
+ * -1 not known yet. Written by Java's receiver, read by whichever thread
+ * appends a reading. */
+static _Atomic int g_screen = -1;
+
+void store_note_screen(int state)
+{
+   if (state >= 0 && state <= 2)
+      atomic_store_explicit(&g_screen, state, memory_order_relaxed);
+}
 
 /* ONE DEFINITION OF "THE CURRENT READING IS STALE", used by both forms below.
  *
@@ -548,7 +559,7 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
    char line[160];
    /* Rescale factor column: a decimal (1.040) when this glucose was rescaled,
     * empty when it was not (1.000). Loaders read positionally through `kind`
-    * and ignore this trailing field, so it is pure provenance. */
+    * and ignore the fields after it, so it is pure provenance. */
    char rs[12];
    if (rescale_pm > 0 && rescale_pm != 1000)
       (void)snprintf(rs, sizeof rs, "%d.%03d", rescale_pm / 1000,
@@ -564,16 +575,26 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
       (void)snprintf(ws, sizeof ws, "%d", (int)warm);
    else
       ws[0] = 0;
+   /* Screen column: the screen as this reading arrived (store_note_screen),
+    * empty when it is not known. With recv_lag_s it shows whether late and
+    * backfilled readings follow the screen being off. */
+   char sc[4];
+   const int scr = atomic_load_explicit(&g_screen, memory_order_relaxed);
+   if (scr >= 0)
+      (void)snprintf(sc, sizeof sc, "%d", scr);
+   else
+      sc[0] = 0;
    /* The file is an ARRIVAL log, never re-sorted -- that is what keeps it
     * append-only and crash-safe. Monotonic order is a property of the sorted
     * in-memory view (see hist_insert), not of the bytes on disk. */
-   int n = has_rssi ? snprintf(line, sizeof line,
-                               "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s\n", t, glu,
-                               trend, rssi, lag, src, raw, tz, kind, rs, ws)
-                    : snprintf(line, sizeof line,
-                               "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s\n", t, glu,
-                               trend, lag, src, raw, tz, kind, rs, ws);
-   n     = clampn(n, sizeof line);
+   int n  = has_rssi
+                ? snprintf(line, sizeof line,
+                           "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s,%s\n", t, glu,
+                           trend, rssi, lag, src, raw, tz, kind, rs, ws, sc)
+                : snprintf(line, sizeof line,
+                           "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s,%s\n", t, glu,
+                           trend, lag, src, raw, tz, kind, rs, ws, sc);
+   n      = clampn(n, sizeof line);
    int rc = log_append(g_store_path, g_store_hdr, (int)sizeof g_store_hdr - 1,
                        line, n);
    if (rc == LOG_DAMAGED) {

@@ -41,8 +41,12 @@ void render_calpend(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y        = (fb->height / 20) + (8 * sc);
    /* X / title-bar tap leaves the pending calibration in place. */
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_CAL_BACK, 0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
    draw_str(px, fb, x, y, tsc, "CAL PENDING", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
@@ -82,8 +86,12 @@ void render_rescaleact(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int y        = (fb->height / 20) + (8 * sc);
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_RESCALE_BACK,
               0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
    draw_str(px, fb, x, y, tsc, "RESCALE ON", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
@@ -134,13 +142,17 @@ void render_forget(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int lh  = 16 * sc;
    int x   = 4 * sc;
    int y   = (fb->height / 20) + (8 * sc);
-   /* A way out, recorded BEFORE the range guard. This screen had no close
-    * target of any kind, so with a stale selection it rendered blank and
-    * swallowed every tap -- and even when it rendered, landscape put CANCEL
-    * and FORGET off the buffer, leaving no way back. */
+   /* A way out, recorded BEFORE the range guard: with a stale selection the
+    * screen draws only NO DEVICE and its X, and in landscape CANCEL and
+    * DISCONNECT can fall off the buffer, so without it there would be no
+    * way back. */
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_FORGET_NO, 0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
 
    int rx = fb->width - (4 * sc);
@@ -184,8 +196,12 @@ void render_reconf(struct ANativeWindow_Buffer *fb, const struct screen *m,
    int rx       = fb->width - (4 * sc);
    int y        = (fb->height / 20) + (8 * sc);
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_RECON_NO, 0);
-   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors)
+   if (m->dev.sel < 0 || m->dev.sel >= m->dev.nsensors) {
+      /* Nothing selected: the screen names it, as render_sensor does. */
+      draw_str(px, fb, x, y, tsc, "NO DEVICE", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
    const struct ui_sensor *s = &m->dev.sensors[m->dev.sel];
 
    draw_str(px, fb, x, y, tsc, "RECONNECT?", UI_TEXT);
@@ -276,12 +292,14 @@ void render_pendcancel(struct ANativeWindow_Buffer *fb, const struct screen *m,
    /* A way out, recorded BEFORE anything can bail: a screen with no
     * dispatchable escape is a dead end that swallows every tap. */
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_PEND_KEEP, 0);
-   /* The 1 Hz tick commits an armed pairing the moment its sensor advertises,
-    * which can happen while this screen is open. With nothing left armed the
-    * question is about nothing, so ask none of it -- the escape recorded
-    * above is what carries the tap back to the list. */
-   if (m->dev.pend_type <= 0)
+   /* NOTHING ARMED, NOTHING TO ASK, and the screen says so: the wait ends
+    * when its sensor is committed or the user stops it. The escape recorded
+    * above carries the tap back to the list. */
+   if (m->dev.pend_type <= 0) {
+      draw_str(px, fb, x, y, tsc, "NONE PENDING", UI_MUTED);
+      draw_str(px, fb, fb->width - (4 * sc) - (6 * tsc), y, tsc, "X", UI_TEXT);
       return;
+   }
 
    int rx = fb->width - (4 * sc);
    /* THE SCREEN IS ABOUT THE PENDING PAIRING, and stopping it is one of the

@@ -193,7 +193,7 @@ int sync_restore_inner(const struct sync_ctx *sx)
        * and the only copy that still had them is gone. A restore that
        * "succeeds" while leaving a short bucket has armed the loss.
        *
-       * A hash that differs means the two sides hold different SETS. It does
+       * A hash that differs means the two sides hold different rows. It does
        * not say which way, and does not have to: the merge below only ever
        * adds, so a bucket where this phone holds MORE costs one fetch that
        * contributes nothing. That is the right side to be wrong on.
@@ -331,14 +331,14 @@ int sync_restore_inner(const struct sync_ctx *sx)
           *
           * The staging file already holds this phone's copy of the log,
           * byte for byte, so every local row is in it before this line runs.
-          * Only the rows the server sent that this phone does NOT hold are
-          * appended -- so a row BOTH sides have is written once (a duplicate
-          * line is real bytes on the user's disk, and slots.csv is read by a
-          * loader that does not deduplicate); a row ONLY THE SERVER has is
-          * the repair; and a row ONLY THIS PHONE has is untouched, which is
-          * the direction most likely to go wrong -- a merge that REPLACED the
-          * bucket would delete readings the phone had and the server had not
-          * been told about -- the very loss a restore exists to prevent,
+          * Only the copies the server sent beyond those this phone holds are
+          * appended -- so a row both sides hold k times stays k times (a
+          * duplicate line is real bytes on the user's disk, and slots.csv is
+          * read by a loader that does not deduplicate); a row ONLY THE SERVER
+          * has is the repair; and a row ONLY THIS PHONE has is untouched, which
+          * is the direction most likely to go wrong -- a merge that REPLACED
+          * the bucket would delete readings the phone had and the server had
+          * not been told about -- the very loss a restore exists to prevent,
           * arriving through the repair.
           *
           * The kept lines are compacted to the front of sx->rsp and written in
@@ -350,16 +350,35 @@ int sync_restore_inner(const struct sync_ctx *sx)
             ok = 0; /* cannot tell what we hold: appending blind duplicates */
             continue;
          }
-         int64_t keep  = 0;
-         const char *s = sx->rsp;
-         while (*s) {
+         /* BY COUNT: a row the phone wrote twice is two rows,
+          * and the server sends its copies one after another (the text is
+          * sorted). The k-th copy of a text is appended only when the phone
+          * holds fewer than k of it. */
+         /* The previous text is COPIED into `prev`: the compaction below
+          * moves kept lines toward the front of this same buffer. */
+         static char prev[SYNC_ROW_MAX + 1];
+         int64_t prev_len = -1;
+         int64_t keep     = 0;
+         const char *s    = sx->rsp;
+         int run          = 0;
+         while (s && *s) {
             const char *e = s_chr(s, '\n');
             int64_t ln    = e ? (int64_t)(e - s) : s_len(s);
-            int held      = 0;
-            for (int i = 0; i < nrow && !held; i++)
-               held = g_row[i].len == (size_t)ln &&
-                      memcmp(g_buf + g_row[i].off, s, (size_t)ln) == 0;
-            if (!held) {
+            if (prev_len == ln && memcmp(prev, s, (size_t)ln) == 0)
+               run++;
+            else
+               run = 1;
+            if (ln <= SYNC_ROW_MAX) {
+               memcpy(prev, s, (size_t)ln);
+               prev_len = ln;
+            } else {
+               prev_len = -1; /* longer than any row: never a copy of one */
+            }
+            int held = 0;
+            for (int i = 0; i < nrow; i++)
+               held += g_row[i].len == (size_t)ln &&
+                       memcmp(g_buf + g_row[i].off, s, (size_t)ln) == 0;
+            if (held < run) {
                /* MEMMOVE, NOT MEMCPY: `keep` only ever trails `s`, so the
                 * ranges are disjoint or dst-below-src -- but they DO touch
                 * (with nothing dropped yet the two are the same address), and
@@ -369,7 +388,9 @@ int sync_restore_inner(const struct sync_ctx *sx)
                keep += ln;
                sx->rsp[keep++] = '\n';
             }
-            s = e ? e + 1 : s + ln;
+            /* THE LAST LINE ENDS THE WALK even without its '\n': the newline
+             * written above may sit where the terminator was. */
+            s = e ? e + 1 : NULL;
          }
          if (keep == 0)
             continue; /* the phone already held every row of it */

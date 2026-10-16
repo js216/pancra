@@ -39,12 +39,8 @@
  * The other tier is insulin.h's, and it is the only one: a dose is not a
  * preference, so that log is never rewritten and keeps its own history. */
 
-#include "foodrow.h" /* the domain, the records and their decoders */
-/* How many distinct foods the vocabulary holds: more than a person names in
- * a lifetime of logging, and small enough to keep whole in memory -- the
- * picker pages through it. */
-#define NFOODTYPE 1024
-
+/* The domain, the records and their decoders. */
+#include "foodrow.h" /* IWYU pragma: export */
 /* A thousandths value as a person writes it -- "0.454", "0.5", "0" -- the
  * form both foodtypes.csv and the screens use. Returns the length written. */
 int food_milli_str(int milli, char *out, int cap);
@@ -96,8 +92,9 @@ int food_type_copy(struct food_type *out, int cap);
  * identically would be indistinguishable in the picker and would split the
  * history of one food across two ids, which no later edit could join up.
  *
- * REFUSES rather than repairs: an empty name, one longer than FOOD_NAME_MAX,
- * or one containing a ',' or a newline. Silently stripping the separator would
+ * REFUSES rather than repairs any name food_name_ok refuses (foodrow.h): an
+ * empty one, one longer than FOOD_NAME_MAX, one containing a ',' or a line
+ * end, or one starting with '#'. Silently stripping the separator would
  * store a name the user did not type and cannot retype; silently truncating
  * would make two long names collide. When the vocabulary is full it also
  * refuses -- the caller says so, rather than the newest food quietly replacing
@@ -121,12 +118,8 @@ int food_type_macros(int id, int out[FOOD_NMACRO]);
  * with a restore. Until they are set they are the reference daily values
  * printed on food labels: 2000 kcal, 275 g carbohydrate, 50 g protein, 78 g
  * fat. */
-#define FOOD_GOAL_KCAL_MAX 9999 /* kcal a day */
-#define FOOD_GOAL_G_MAX    999  /* grams a day */
-/* 1 when `v` is a goal `which` can hold: 1..the maximum above, and for kcal
- * also 0, which means no calorie goal is set -- the FOOD LOG buttons then
- * carry no calorie bar. */
-int food_goal_ok(int which, int v);
+/* (The limits, food_goal_ok and the file's decoder are in foodrow.h, which
+ * the server reads the goals with too.) */
 void food_goals_get(int out[FOOD_NMACRO]);
 /* Set one goal, durably. 0 on success, -1 when out of range or not written --
  * and then the goal is what it was. */

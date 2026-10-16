@@ -416,7 +416,7 @@ static int insulin_load_staged(void)
     * live doses are held, never the file's bytes, however many corrections
     * it has grown. */
    char buf[1024];
-   char line[128];
+   char line[INS_LINE_MAX + 1];
    int llen    = 0;
    int over    = 0; /* over-long line: skip, never parse a truncation */
    int damaged = 0; /* anything that means "what you have is short" */

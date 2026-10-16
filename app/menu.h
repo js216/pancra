@@ -33,6 +33,9 @@
 
 /* Perform one action. `ix` is the row or value the control carried. */
 void menu_action(int action, int ix);
+/* Record the screen currently on top as the ADD-A-DEVICE flow's origin: the
+ * pairing tick opens the candidate list over whatever the user is on. */
+void menu_pair_mark_here(void);
 
 /* The action the BACK KEY means on the current screen, or -1 for none.
  * `*ix` receives its index. Derived from the screen, not from a table that

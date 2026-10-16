@@ -128,6 +128,9 @@ void driver_init(void); /* jpake_init + load saved key */
 void driver_start(int link, const char *mac,
                   const char *code); /* set target + code, connect */
 void driver_forget(int link);        /* drop key/bond, pair anew */
+/* driver_start, only while the link has not been forgotten since the
+ * session read that gave `gen` (dex_session.forget_gen). */
+void driver_start_if(int link, const char *mac, const char *code, unsigned gen);
 void driver_lock_mac(
     int link, const char *mac); /* set reconnect target, do not connect */
 void driver_kick(int link);     /* force reconnect if stalled */
@@ -215,6 +218,7 @@ struct dex_session {
    char mac[24];
    int bonded;               /* authenticated on the fast saved-key path */
    int paired;               /* we hold a shared key */
+   unsigned forget_gen;      /* see driver_start_if and driver_bind_mac_if */
    int have_reading;         /* a 4e EGV has been decoded this run */
    uint32_t session_seconds; /* LIVE sensor session time: the clock from the
                                 last 4e projected forward by wall time, so
@@ -401,12 +405,19 @@ enum bind_mac { BIND_PUBLISHED, BIND_NOT_SAVED };
  * degrade, it loses the sensor. Ignore the result and that is what happens,
  * hence PANCRA_MUST_USE. */
 PANCRA_MUST_USE enum bind_mac driver_bind_mac(int link, const char *mac);
+/* driver_bind_mac, only while the link has not been forgotten since the
+ * session read that gave `gen`; BIND_NOT_SAVED when it has. */
+PANCRA_MUST_USE enum bind_mac driver_bind_mac_if(int link, const char *mac,
+                                                 unsigned gen);
 
 /* Try again for every link that owes a save, at most once per 30 s. Cheap
  * and a no-op when nothing is pending, so the link watchdog can just call it.
  * A retry that succeeds publishes the address exactly as an immediate save
  * would. */
 void driver_bind_retry(void);
+/* Drop the save `link` still owes, if any: the link is being forgotten, and
+ * a retry would otherwise bind the forgotten sensor's address to it. */
+void driver_bind_drop(int link);
 
 /* This LINK's session. Same reasoning as driver_cal_of, and the same
  * contract: `*out` is zeroed first, 1 means it was filled from the link. */

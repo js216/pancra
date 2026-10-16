@@ -52,8 +52,10 @@ struct table_shape {
     * load-bearing on them, and each fails SILENTLY without:
     *   - replay protection is `INSERT INTO nonce` relying on the primary key
     *     to collide (auth.c). No key, no replay detection.
-    *   - bucket idempotence is `INSERT OR IGNORE INTO logrow` relying on the
-    *     composite key (logs.c). No key, duplicate rows.
+    *   - a bucket's copies of one text are numbered by counting the copies
+    *     already stored (`n`, logs.c), and the composite key holds each
+    *     (text, n) once. No key, and two copies can share an `n`, so a later
+    *     replace or hash cannot tell them apart.
     *   - `ON CONFLICT(user_id)` / `ON CONFLICT(email)` (pair.c, auth.c) need
     *     a matching unique constraint, or the statement is a runtime error.
     * Comparing only names and types accepted a database with all of them
@@ -73,10 +75,11 @@ struct table_shape {
     *
     * The other direction matters too, which is why every column's collation is
     * compared rather than only the one that must be NOCASE. A stray NOCASE on
-    * `logrow.line` -- part of that table's primary key -- makes two rows whose
-    * text differs only in case COLLIDE, and `INSERT OR IGNORE INTO logrow`
-    * then discards the second one. That is silent data loss on the copy that
-    * is supposed to be the backup. */
+    * `logrow.line` -- part of that table's primary key -- makes `ORDER BY
+    * line` sort case-insensitively, so the bucket text the server hashes is
+    * not in the phone's bytewise order and the bucket never verifies; it
+    * also numbers texts that differ only in case as copies of one another.
+    * That is silent damage to the copy that is supposed to be the backup. */
    const char *cols;
    /* THE FOREIGN KEYS, "from->table.to del=X upd=Y" per key, sorted; "" for a
     * table that must have none.
@@ -121,7 +124,7 @@ struct table_shape {
     *
     * It is checked rather than assumed because it is INVISIBLE to every other
     * check here: a rowid `logrow` reports byte-identical `table_info` and an
-    * automatic index over the same four columns, so a file that has silently
+    * automatic index over the same columns, so a file that has silently
     * doubled the size of its biggest table would otherwise be stamped current
     * and fill the card months later, at a moment unconnected to the change. */
    int rowid;
@@ -150,11 +153,11 @@ static const struct table_shape SHAPES[] = {
     {"user",
      "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
      "INTEGER!,tz_offset INTEGER,display_name TEXT,created_at INTEGER!,pw_kdf "
-     "INTEGER!=1,theme INTEGER!=0",                                                                   "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
-     "INTEGER!,tz_offset INTEGER,display_name TEXT,created_at INTEGER!", "",                                            1},
+     "INTEGER!=1,theme INTEGER!=0",                                                 "id INTEGER#1,email TEXT!~NOCASE,pw_salt BLOB!,pw_hash BLOB!,pw_iters "
+     "INTEGER!,tz_offset INTEGER,display_name TEXT,created_at INTEGER!",                                          "",                                            1},
     {"app",
      "user_id INTEGER#1,key BLOB!,label TEXT,paired_at INTEGER!,last_seen "
-     "INTEGER",                                                                      0,    "user_id->user.id del=CASCADE upd=NO ACTION",  1},
+     "INTEGER",                                                                     0,                                                               "user_id->user.id del=CASCADE upd=NO ACTION",  1},
     /* `tries INTEGER NOT NULL DEFAULT 0` -- the default is checked because it
      * is the difference between "a pairing row inserted without a try count
      * starts at zero" and "that INSERT fails on the NOT NULL". Today every
@@ -163,34 +166,37 @@ static const struct table_shape SHAPES[] = {
      * cannot drift apart unnoticed, and so a later statement that omits the
      * column meets the default the schema promises. */
     {"pairing",
-     "user_id INTEGER#1,code TEXT!,expires_at INTEGER!,tries INTEGER!=0",            0,
-     "user_id->user.id del=CASCADE upd=NO ACTION",                                                                                        1},
+     "user_id INTEGER#1,code TEXT!,expires_at INTEGER!,tries INTEGER!=0",           0,
+     "user_id->user.id del=CASCADE upd=NO ACTION",                                                                                                                                                  1},
     /* `line` is the row's TEXT, not a line number: a file whose logrow says
-     * INTEGER there is the incompatible shape this check exists for. */
-    {"logrow",      "user_id INTEGER!#1,log TEXT!#2,bucket INTEGER!#3,line TEXT!#4",
-     0,                                                                                    "user_id->user.id del=CASCADE upd=NO ACTION",  0},
-    {"share",       "owner_id INTEGER!#1,viewer_id INTEGER!#2,created_at INTEGER!",  0,
+     * INTEGER there is the incompatible shape this check exists for. `n`
+     * numbers the copies of one text in one bucket (step 5). */
+    {"logrow",
+     "user_id INTEGER!#1,log TEXT!#2,bucket INTEGER!#3,line TEXT!#4,n "
+     "INTEGER!#5",                                                                  "user_id INTEGER!#1,log TEXT!#2,bucket INTEGER!#3,line TEXT!#4",
+     "user_id->user.id del=CASCADE upd=NO ACTION",                                                                                                                                                  0},
+    {"share",       "owner_id INTEGER!#1,viewer_id INTEGER!#2,created_at INTEGER!", 0,
      "owner_id->user.id del=CASCADE upd=NO ACTION,"
-     "viewer_id->user.id del=CASCADE upd=NO ACTION",                                                                                      1},
+     "viewer_id->user.id del=CASCADE upd=NO ACTION",                                                                                                                                                1},
     {"share_token",
      "token TEXT#1,owner_id INTEGER,email TEXT,created_at INTEGER!,expires_at "
-     "INTEGER!,used_at INTEGER",                                                     0,    "owner_id->user.id del=CASCADE upd=NO ACTION", 1},
+     "INTEGER!,used_at INTEGER",                                                    0,                                                               "owner_id->user.id del=CASCADE upd=NO ACTION", 1},
     {"session",
      "selector TEXT#1,verifier BLOB!,user_id INTEGER!,expires_at "
-     "INTEGER!,last_seen INTEGER",                                                   0,    "user_id->user.id del=CASCADE upd=NO ACTION",  1},
+     "INTEGER!,last_seen INTEGER",                                                  0,                                                               "user_id->user.id del=CASCADE upd=NO ACTION",  1},
     /* NO FOREIGN KEY, deliberately. A nonce row is spent-token evidence: it
      * exists to make a replayed request collide, and it is swept by age
      * (auth.c), not by ownership. Keeping it out of the cascade also keeps the
      * replay window closed across an account being deleted and recreated with
      * the same id. The empty string SAYS that, so a file that has grown a
      * cascade here -- which would silently reopen that window -- is refused. */
-    {"nonce",       "user_id INTEGER!#1,nonce TEXT!#2,seen_at INTEGER!",             0,    "",                                            0},
+    {"nonce",       "user_id INTEGER!#1,nonce TEXT!#2,seen_at INTEGER!",            0,                                                               "",                                            0},
     /* Also no foreign key: this throttles attempts against an email ADDRESS,
      * which very often is not an account at all -- that is the whole point of
      * throttling it. A REFERENCES here would make every failed login against a
      * non-existent address a constraint error rather than a recorded attempt.
      */
-    {"login_fail",  "email TEXT#1,n INTEGER!,first_at INTEGER!",                     0,    "",                                            1},
+    {"login_fail",  "email TEXT#1,n INTEGER!,first_at INTEGER!",                    0,                                                               "",                                            1},
 };
 
 /* The indexes, which carry the UNIQUE constraints -- sqlite names an implicit
@@ -846,12 +852,11 @@ int no_orphan_rows(sqlite3 *h, const char *path)
            "  reused by the next account, that account inherits them; an "
            "orphan `session` row is a\n"
            "  live cookie for a user who is gone.\n"
-           "  WHAT TO DO: with the server stopped, open the file with the "
-           "sqlite3 shell, run\n"
-           "  `PRAGMA foreign_key_check;` for the full list, and DELETE the "
-           "rows it names -- or\n"
-           "  restore a backup taken before whatever produced them. Do not "
-           "simply re-stamp the\n"
+           "  WHAT TO DO: with the server stopped, run `sync fsck fix`, "
+           "which lists and removes\n"
+           "  them in one transaction -- or restore a backup taken before "
+           "whatever produced them.\n"
+           "  Do not simply re-stamp the\n"
            "  version: the rows do not become owned by anybody when the "
            "schema says they should be.\n",
            path, bad, bad == 1 ? "" : "s");
@@ -869,6 +874,32 @@ static int schema_version(sqlite3 *h, int *out)
       *out = sqlite3_column_int(st, 0);
    sqlite3_finalize(st);
    return ok;
+}
+
+/* No `logrow` row whose owner is gone: what step 5's copy needs. */
+static int logrow_owned(sqlite3 *h, const char *path)
+{
+   sqlite3_stmt *st = NULL;
+   if (sqlite3_prepare_v2(h, "PRAGMA foreign_key_check(logrow);", -1, &st,
+                          NULL) != SQLITE_OK) {
+      fprintf(stderr, "sync: %s: cannot check `logrow` for orphans: %s\n", path,
+              sqlite3_errmsg(h));
+      return 0;
+   }
+   const int rc = sqlite3_step(st);
+   sqlite3_finalize(st);
+   if (rc == SQLITE_DONE)
+      return 1;
+   if (rc == SQLITE_ROW)
+      fprintf(stderr,
+              "sync: %s: `logrow` holds rows whose owner does not exist, "
+              "and the schema step\n  that copies it would refuse them. "
+              "With the server stopped, `sync fsck fix`\n  removes them.\n",
+              path);
+   else
+      fprintf(stderr, "sync: %s: the `logrow` orphan check did not finish\n",
+              path);
+   return 0;
 }
 
 /* WHAT VERSION IS THIS FILE, AND MAY THIS BUILD TOUCH IT? 1 yes, with the
@@ -920,9 +951,11 @@ int version_supported(sqlite3 *h, const char *path, int *at)
  *   in between       -- the migration steps are the contract, and they have
  *                       not run yet; SHAPES describes the far end, so testing
  *                       against it would refuse exactly the files a future
- *                       migration exists to bring forward. Version 1 is now
+ *                       migration exists to bring forward. Version 1 is
  *                       such a file: it has every table but neither of the
- *                       v2 indexes, and INDEXES names both.
+ *                       v2 indexes, and INDEXES names both. What IS checked
+ *                       is `logrow` for orphans: step 5 copies it under its
+ *                       foreign key, so one orphan there refuses the open.
  */
 /* NOT static: db_verify asks exactly this question of a file somebody hands
  * back, and it lives in dbbackup.c (the other half of this module). See
@@ -933,13 +966,5 @@ int schema_usable(sqlite3 *h, const char *path, int at)
       return schema_shapes_ok(h, path, 0) && no_orphan_rows(h, path);
    if (at == DB_SCHEMA_VERSION)
       return schema_shapes_ok(h, path, 1);
-   return 1;
+   return logrow_owned(h, path);
 }
-
-/* PUT THE VERSION STAMP BACK WHERE THE RUN FOUND IT, after a run that is
- * being abandoned. See the call site in migrate().
- *
- * Best-effort on purpose, and it prints if it cannot: the alternative to a
- * failed restore is not a correct database, it is the same refused file with
- * a stamp that is one version too high -- which is what this exists to
- * prevent, so there is nothing better to do than say so. */

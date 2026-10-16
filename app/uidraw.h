@@ -35,10 +35,14 @@ void fmt_glu(int mgdl, int units, char *out, int n);
 void fmt_trend(int tr, char *out, int n);
 /* Format epoch seconds as HH:MM:SS local time (tz = offset seconds). Pure. */
 void fmt_hms(long epoch, long tz, char *out, int n);
-/* Format epoch seconds as a local date (tz = offset seconds). Pure. */
+/* Where fmt_date and fmt_date_md find the offset in force at an instant:
+ * set by ui_render for each frame, from the frame. Without one they read
+ * every instant in the `tz` passed, the current offset. */
+void ui_tz_source(long (*at)(long t));
+/* "YYYY-MM-DD HH:MM", in the offset in force at `epoch` (ui_tz_source). */
 void fmt_date(long epoch, long tz, char *out, int n);
 /* The same instant without the year, "MM-DD HH:MM": for a table that has to
- * give up five columns on a narrow screen. Pure. */
+ * give up five columns on a narrow screen. */
 void fmt_date_md(long epoch, long tz, char *out, int n);
 /* "N S" / "N M" / "N H" / "N D": how long ago `then` was, from `now`. The
  * unit changes as the gap grows, so a row never widens. Pure. */

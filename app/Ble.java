@@ -64,6 +64,11 @@ public final class Ble {
     /* OS bond state changed for `mac`: BOND_NONE 10, BOND_BONDING 11,
      * BOND_BONDED 12 (the framework's own constants, passed through). */
     static native void onBondState(String mac, int state);
+    /* The screen changed, or was first sampled: 0 off, 1 on and locked,
+     * 2 unlocked. Kept by store_note_screen and written into every reading
+     * appended after it (store_append), to tell whether dropped and late
+     * readings follow the screen. */
+    static native void onScreen(int state);
 
     /* THE SYNC CLIENT'S ENTRY POINTS, declared here because RegisterNatives
      * binds natives to a CLASS (app/dexble.c) and this is that class. Nothing
@@ -438,7 +443,9 @@ public final class Ble {
      *
      * Doing it EXPLICITLY at commit time makes the dialog a consequence of the
      * tap: the request goes out while the user is still looking at the screen
-     * they tapped on.
+     * they tapped on. The meter flow calls this. A Dexcom CGM raises its own
+     * bond request once its J-PAKE and certificate exchange have run, and
+     * refuses one asked for earlier.
      *
      * WHAT IS NOT POSSIBLE: auto-accepting. setPairingConfirmation() and
      * setPin() are guarded by BLUETOOTH_PRIVILEGED, which is
@@ -503,6 +510,57 @@ public final class Ble {
         } catch (Throwable t) {
             bondRx = null;
             Log.i(TAG, "bondWatch: " + t);
+        }
+    }
+
+    private static BroadcastReceiver screenRx;
+
+    /* The current screen state: 0 off, 1 on and locked, 2 unlocked. */
+    private static int screenNow(Context app) {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager)
+                app.getSystemService(Context.POWER_SERVICE);
+            if (pm == null || !pm.isInteractive()) return 0;
+            android.app.KeyguardManager km = (android.app.KeyguardManager)
+                app.getSystemService(Context.KEYGUARD_SERVICE);
+            return (km != null && km.isKeyguardLocked()) ? 1 : 2;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /* Follow the screen: off, on, and unlocked (USER_PRESENT), starting from
+     * its state at registration. Registered ONCE, at native init, beside
+     * bondWatch. */
+    public static synchronized void screenWatch(Context ctx) {
+        if (screenRx != null) return;
+        try {
+            final Context app = ctx.getApplicationContext();
+            screenRx = new BroadcastReceiver() {
+                @Override public void onReceive(Context c, Intent i) {
+                    try {
+                        String a = i.getAction();
+                        int st;
+                        if (Intent.ACTION_SCREEN_OFF.equals(a)) st = 0;
+                        else if (Intent.ACTION_USER_PRESENT.equals(a)) st = 2;
+                        else st = screenNow(app);
+                        onScreen(st);
+                    } catch (Throwable t) { Log.i(TAG, "screen rx: " + t); }
+                }
+            };
+            IntentFilter f = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+            f.addAction(Intent.ACTION_SCREEN_ON);
+            f.addAction(Intent.ACTION_USER_PRESENT);
+            /* Flagged where the platform has the overload: see bondWatch. */
+            try {
+                app.registerReceiver(screenRx, f, Context.RECEIVER_NOT_EXPORTED);
+            } catch (Throwable pre33) {
+                app.registerReceiver(screenRx, f);
+            }
+            onScreen(screenNow(app));
+        } catch (Throwable t) {
+            screenRx = null;
+            Log.i(TAG, "screenWatch: " + t);
         }
     }
 

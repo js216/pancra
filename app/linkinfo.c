@@ -76,18 +76,37 @@ static char g_sn_l[LINK_MAX][24];
  *
  * A LEAF LOCK, not an atomic per field. Three atomics would fix the tearing
  * of each number and not the pairing, which is the whole defect: what has to
- * be indivisible is the TUPLE. The lock is taken by these two functions only,
+ * be indivisible is the TUPLE. The lock is taken by the functions below only,
  * holds nothing while taken and calls nothing under it, so it cannot
  * participate in the driver -> registry -> history order at all. */
 static struct mutex rssi_lk = MUTEX_INIT;
 static int g_link_rssi[LINK_MAX], g_link_rssi_ok[LINK_MAX];
 static long g_link_rssi_t[LINK_MAX];
+/* WHICH DEVICE A MEASUREMENT IS FOR. linkinfo_forget_rssi starts a new epoch
+ * on the link, and a reading asked for in an earlier one is dropped: a read
+ * still in flight when its device is retired must not land as the signal of
+ * the next device on that link. Under rssi_lk. */
+static unsigned g_rssi_epoch[LINK_MAX];
+static unsigned g_rssi_asked[LINK_MAX];
 
-void linkinfo_note_rssi(int link, int dbm, long when)
+void linkinfo_rssi_asked(int link)
 {
    if (link < 0 || link >= LINK_MAX)
       return;
    mutex_lock(&rssi_lk);
+   g_rssi_asked[link] = g_rssi_epoch[link];
+   mutex_unlock(&rssi_lk);
+}
+
+int linkinfo_note_rssi(int link, int dbm, long when)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return 0;
+   mutex_lock(&rssi_lk);
+   if (g_rssi_asked[link] != g_rssi_epoch[link]) {
+      mutex_unlock(&rssi_lk);
+      return 0; /* asked for the device the link held before */
+   }
    g_link_rssi[link]   = dbm;
    g_link_rssi_t[link] = when;
    /* THE VALID FLAG LAST, so that a reader can never find `ok` set for a
@@ -96,6 +115,19 @@ void linkinfo_note_rssi(int link, int dbm, long when)
     * next person to reach for a lock-free version of this function needs to
     * find it already stated. */
    g_link_rssi_ok[link] = 1;
+   mutex_unlock(&rssi_lk);
+   return 1;
+}
+
+void linkinfo_forget_rssi(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      return;
+   mutex_lock(&rssi_lk);
+   g_rssi_epoch[link]++;
+   g_link_rssi_ok[link] = 0;
+   g_link_rssi[link]    = 0;
+   g_link_rssi_t[link]  = 0;
    mutex_unlock(&rssi_lk);
 }
 
@@ -224,7 +256,10 @@ void pancra_rssi(int link, int rssi)
        * reading arrives on. A wall-clock correction moves the first (it is a
        * civil instant, and that is what it is for) and cannot move the
        * second. */
-      linkinfo_note_rssi(lk, rssi, realtime_s());
+      /* A sample asked for the device the link held before goes nowhere,
+       * not to the per-link row and not to the readings below. */
+      if (!linkinfo_note_rssi(lk, rssi, realtime_s()))
+         return;
       driver_rssi_note(lk);
    }
    g_conn_rssi = rssi;

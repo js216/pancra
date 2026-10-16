@@ -658,8 +658,25 @@ static void date_parts(long epoch, long tz, long *year, long *mon, long *dday,
    *secs_out = secs;
 }
 
+/* The renderer's one thread sets and reads it. */
+static long (*g_tz_at)(long t);
+
+void ui_tz_source(long (*at)(long t))
+{
+   g_tz_at = at;
+}
+
+/* EACH INSTANT IN ITS OWN OFFSET: an entry made before a DST change shows the
+ * clock time it was made at, which is the time the forms' keypads read and
+ * write it in (forms.c's form_zone). */
+static long tz_for(long epoch, long tz)
+{
+   return g_tz_at ? g_tz_at(epoch) : tz;
+}
+
 void fmt_date(long epoch, long tz, char *out, int n)
 {
+   tz        = tz_for(epoch, tz);
    long year = 0;
    long mon  = 0;
    long dday = 0;
@@ -671,6 +688,7 @@ void fmt_date(long epoch, long tz, char *out, int n)
 
 void fmt_date_md(long epoch, long tz, char *out, int n)
 {
+   tz        = tz_for(epoch, tz);
    long year = 0;
    long mon  = 0;
    long dday = 0;

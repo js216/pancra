@@ -404,6 +404,20 @@ void driver_lock_mac(int link, const char *mac)
    driver_leave();
 }
 
+void driver_start_if(int link, const char *mac, const char *code, unsigned gen)
+{
+   if (!dex_link_ok(link))
+      return;
+   /* THE CHECK AND THE START UNDER ONE HOLD of the driver lock, which is
+    * recursive, so a forget cannot land between them. */
+   struct dex_ctx *dc = driver_enter(link);
+   if (dc->forget_gen == gen)
+      driver_start(link, mac, code);
+   else
+      LOGI("link %d: forgotten since it was read -- not dialling", dc->link);
+   driver_leave();
+}
+
 void driver_start(int link, const char *mac, const char *code)
 {
    /* SELECT AND LOCK AS ONE SCOPE: which context an operation runs on is
@@ -411,7 +425,14 @@ void driver_start(int link, const char *mac, const char *code)
    if (!dex_link_ok(link))
       return;
    struct dex_ctx *dc = driver_enter(link);
-   int i              = 0;
+   /* A REFUSED CODE IS NOT TRIED AGAIN (code_refused): a new commit runs
+    * driver_forget first, which is what lets this link dial once more. */
+   if (dc->code_refused && !dc->have_key) {
+      LOGI("link %d: its code was refused -- not dialling", dc->link);
+      driver_leave();
+      return;
+   }
+   int i = 0;
    for (; mac[i] && i < 23; i++)
       dc->g_mac[i] = mac[i];
    dc->g_mac[i]  = 0;
@@ -611,7 +632,7 @@ void driver_on_disconnected(int link, int status)
            d, dc->fails, dex_phase_name(was));
    } else {
       LOGI("no key/code -- not reconnecting (was=%s)", dex_phase_name(was));
-      drv_status("CONNECTION ERROR");
+      drv_status(dc->code_refused ? "CODE REJECTED" : "CONNECTION ERROR");
    }
    driver_leave();
 }
@@ -650,9 +671,12 @@ void driver_forget(int link)
    ct_wipe(dc->shared_key, sizeof dc->shared_key);
    ct_wipe(dc->g_code, sizeof dc->g_code);
    ct_wipe(dc->token, sizeof dc->token);
-   dc->have_key  = 0;
-   dc->g_bonded  = 0;
-   dc->g_codelen = 0;
+   dc->have_key     = 0;
+   dc->g_bonded     = 0;
+   dc->g_codelen    = 0;
+   dc->code_refused = 0;
+   dc->forget_gen++;
+   driver_bind_drop(dc->link);
    dc->rnd.did   = 0;
    dc->fails     = 0;
    dc->authfails = 0;
@@ -661,14 +685,17 @@ void driver_forget(int link)
    /* THE USER ASKED TO FORGET THIS SENSOR, so a credential that survives is
     * the one failure that matters here: memory says unpaired, the screen says
     * unpaired, and the next launch loads the key back and reconnects to the
-    * sensor they told the app to forget. Both are attempted --
-    * the address surviving without the key is not better -- and either
+    * sensor they told the app to forget. All three are attempted -- the
+    * address or the code surviving without the key is not better -- and any
     * failure is said out loud. */
-   int kept = 0;
+   int kept      = 0; /* the key or the address: enough to reconnect */
+   int kept_code = 0;
    if (drv_key_clear(dc->link) != 0)
       kept = 1;
    if (drv_mac_clear(dc->link) != 0)
       kept = 1;
+   if (drv_code_clear(dc->link) != 0)
+      kept_code = 1;
    dc->g_mac[0] = 0; /* unlock: allow dc->rnd.pairing a different sensor */
    /* Clear the SESSION as well. driver_get_session() otherwise still reported
     * the previous sensor's clock, and sensor_reconcile derives activation from
@@ -685,6 +712,9 @@ void driver_forget(int link)
    if (kept)
       LOGW("driver_forget: a credential could NOT be removed from disk; the "
            "next launch may reconnect to this sensor");
+   else if (kept_code)
+      LOGW("driver_forget: the pairing code could NOT be removed from disk; "
+           "it is used only if this sensor is brought back onto this link");
    else
       LOGI("driver_forget: key/bond dropped, ready to pair a new sensor");
    driver_leave();
@@ -1086,18 +1116,50 @@ static void notify_auth(struct dex_ctx *dc, const uint8_t *buf, int n)
           * A tokenHash mismatch is CRYPTOGRAPHIC PROOF the peer does not
           * hold our key -- a retry with the same key cannot ever succeed,
           * so there is nothing to gain by keeping it for two more
-          * connect->refuse->drop cycles. It means exactly one thing:
-          * something else re-paired this sensor (e.g. the user paired it
-          * to the official Dexcom app), so our stored key is now stale.
-          * Drop it here and the next connection re-pairs via J-PAKE with
-          * the pairing code (have_key == 0 path). The authfails >= 3 gate
+          * connect->refuse->drop cycles. When the key came from a saved
+          * file (no J-PAKE on this connection), something else re-paired
+          * this sensor (e.g. the user paired it to the official Dexcom
+          * app) and the stored key is stale: it is dropped, and the next
+          * connection re-pairs via J-PAKE with the pairing code
+          * (have_key == 0 path). When the key came from this connection's
+          * own J-PAKE, the code was wrong (the branch below). The
+          * authfails >= 3 gate
           * is for AMBIGUOUS failures (a drop mid-cert); a mismatch is not
           * ambiguous.
           *
           * Run it HERE, because setting P_FAIL below takes us out of
           * P_AUTH and driver_on_disconnected's `was == P_AUTH` test would
           * then never fire. */
-         if (dc->have_key) {
+         /* THE KEY CAME FROM THIS CONNECTION'S OWN J-PAKE, so it is the
+          * CODE the sensor refused, not a key gone stale: every retry would
+          * spend another of its attempts on the same wrong code. The code
+          * goes, from memory and from disk, and the link waits for a new
+          * one. */
+         if (dc->rnd.did) {
+            LOGI("!! the sensor refused the pairing code -- not retrying "
+                 "until a new code is committed");
+            drv_status("CODE REJECTED");
+            dc->code_refused = 1;
+            dc->have_key     = 0;
+            /* NOT BONDED EITHER: the sensor is a pairing candidate again, so
+             * the right code can be committed to it. */
+            dc->g_bonded  = 0;
+            dc->authfails = 0;
+            ct_wipe(dc->g_code, sizeof dc->g_code);
+            dc->g_codelen = 0;
+            /* THE FILE STAYS, NAMING THE SENSOR WITH NO CODE: the advert
+             * path guesses a code only for a link with no code file at all,
+             * so after a restart this sensor is not dialled until a new
+             * commit. */
+            if (drv_code_save(dc->link, dc->g_mac, "") != 0 &&
+                drv_code_clear(dc->link) != 0)
+               LOGI("!! the refused code is still on disk");
+            /* AND THE KEY THAT CODE DERIVED, saved before the AuthRequest:
+             * loaded at the next launch, it would send the link dialling
+             * with the same code again. */
+            if (drv_key_clear(dc->link) != 0)
+               LOGI("!! the refused code's key is still on disk");
+         } else if (dc->have_key) {
             LOGI("!! stale key proven by tokenHash mismatch -- discarding "
                  "it now so the sensor re-pairs on the next connect");
             dc->have_key  = 0;
