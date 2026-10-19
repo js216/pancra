@@ -4,5 +4,7 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
         android:width="108dp" android:height="108dp"
         android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#33FF88" android:pathData="M48,12h12v12h-12zM36,24h36v12h-36zM36,36h36v12h-36zM24,48h60v12h-60zM24,60h24v12h-24zM60,60h24v12h-24zM24,72h60v12h-60zM36,84h36v12h-36z"/>
+    <!-- the in-range green of the big number as it appears on screen:
+         UI_GLU_MID (#88FF33) at the 13/16 intensity of resting frames -->
+    <path android:fillColor="#6ECF29" android:pathData="M48,12h12v12h-12zM36,24h36v12h-36zM36,36h36v12h-36zM24,48h60v12h-60zM24,60h24v12h-24zM60,60h24v12h-24zM24,72h60v12h-60zM36,84h36v12h-36z"/>
 </vector>
