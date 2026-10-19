@@ -213,7 +213,7 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
        * which is an interval. It is never persisted and never displayed, so
        * nothing wants the wall clock -- and on the wall clock a backward
        * correction makes every recorded prediction permanently fresh, wedging
-       * the one alarm the user cannot silence. See alarm_pred_low. */
+       * the one alarm that overrides a muted phone. See alarm_pred_low. */
       if (driver_session_of(link, &ps))
          alarm_note_pred(link, ps.predicted, mono_s());
    }

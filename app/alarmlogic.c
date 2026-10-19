@@ -362,8 +362,9 @@ int cal_entry_mgdl(const char *digits, int n, int units)
 }
 
 void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
-                     bool acked, bool pred_low, enum alarm_level prev_want,
-                     bool sounding, bool sound_on, struct alarm_plan *out)
+                     bool acked, bool pred_low, bool pred_new,
+                     enum alarm_level prev_want, bool sounding, bool sound_on,
+                     struct alarm_plan *out)
 {
    out->want      = alarm_want_sustained(zone, stale, stranded, prev_want);
    out->sound_on  = sound_on;
@@ -376,12 +377,20 @@ void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
     * allowed to wake somebody who has switched sound off. */
    out->want     = AL_LOW;
    out->sound_on = true;
-   /* AND IT RE-ARMS ITSELF. Whenever the forced level is not actually being
-    * heard -- dismissed by a tap (`acked`), or never audible in the first
-    * place -- the level alarm_decide compares against is cleared, so it sees
-    * a fresh NONE->LOW edge and announces again. That re-trigger is the whole
-    * of "cannot be silenced while the prediction holds". */
-   if (!sounding || acked)
+   /* AND IT RE-ARMS ITSELF. The level alarm_decide compares against is
+    * cleared, so it sees a fresh NONE->LOW edge and announces again, in two
+    * cases:
+    *
+    *  - the forced level is not being heard and nobody dismissed it -- an
+    *    announcement Java never made audible;
+    *  - the user dismissed it and a NEWER low prediction has arrived since
+    *    (`pred_new`). A tap silences one forecast; the sensor's next one,
+    *    about five minutes on, rings again if it still predicts a hypo.
+    *
+    * A dismissed alarm whose forecast has not been renewed stays quiet: the
+    * evaluation runs every second, and re-arming on `acked` alone restarts
+    * the tone the instant it is silenced, so no tap can ever stop it. */
+   if (acked ? pred_new : !sounding)
       out->prev_want = AL_NONE;
 }
 
@@ -391,7 +400,8 @@ void alarm_actuate_step(const struct alarm_state *st,
 {
    struct alarm_plan pl;
    alarm_plan_next(obs->zone, obs->stale, obs->stranded, st->acked,
-                   obs->pred_low, st->want, st->sounding, obs->sound_on, &pl);
+                   obs->pred_low, obs->pred_new, st->want, st->sounding,
+                   obs->sound_on, &pl);
    struct alarm_out out;
    alarm_decide(pl.want, pl.prev_want, pl.sound_on, obs->vib_on, &out);
 

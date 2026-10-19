@@ -466,17 +466,20 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
       return;
    }
 
-   /* Rows that fit between the NEW FOOD button and a reserved bottom nav
-    * line, capped by the HIT BUDGET as well as by height -- add_hit drops
-    * everything past UI_MAX_HITS, and a dropped target draws perfectly while
-    * being dead to touch. render_olddev carries the full argument; the
-    * failure was reproduced there at 480x1920 and 540x2340. */
+   /* TWO COLUMNS, so a page holds twice the foods and a long vocabulary is
+    * half the pages to step through. Rows fit between the NEW FOOD button
+    * and a reserved bottom nav line, and the cells are capped by the HIT
+    * BUDGET as well as by height -- add_hit drops everything past
+    * UI_MAX_HITS, and a dropped target draws perfectly while being dead to
+    * touch. render_olddev carries the full argument; the failure was
+    * reproduced there at 480x1920 and 540x2340. */
    int avail = fb->height - y - (2 * lh);
-   int per   = avail / (2 * lh);
+   int rows  = avail / (2 * lh);
+   if (rows < 1)
+      rows = 1;
+   int per = 2 * rows;
    if (per > UI_MAX_HITS - UI_LOG_FIXED)
       per = UI_MAX_HITS - UI_LOG_FIXED;
-   if (per < 1)
-      per = 1;
    int npages = (n + per - 1) / per;
    int page   = m->food.type_page;
    if (page < 0)
@@ -485,22 +488,43 @@ void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
       page = npages - 1;
    int start = page * per;
 
+   /* THE COLUMN WIDTH IN CELLS: half of what the margins leave, less one
+    * cell of gutter between the two. ui_fit_scale guarantees UI_COLS (33)
+    * cells, so each column has at least 16: one for the mark, the rest for
+    * the name, cut with an explicit precision so a long name loses its tail
+    * inside its own column rather than running into its neighbour. */
+   const int cw    = 6 * sc;
+   const int colc  = (((rx - x) / cw) - 1) / 2;
+   const int namew = (colc - 1 > FOOD_NAME_MAX) ? FOOD_NAME_MAX : colc - 1;
+   const int x2    = x + ((colc + 1) * cw);
+   /* The tap targets split the screen at the middle of the gutter, so the
+    * two cells of a row cover the full width between them. */
+   const int mid = x + (colc * cw) + (cw / 2);
+
+   /* ACROSS, THEN DOWN: the vocabulary is sorted by how often each food is
+    * used, so the most-used foods take the top rows of both columns. */
    for (int r = start; r < start + per && r < n; r++) {
-      /* THE ROW CARRIES ITS INDEX INTO THE VOCABULARY, and the dispatcher
+      /* THE CELL CARRIES ITS INDEX INTO THE VOCABULARY, and the dispatcher
        * turns that into an ID before anything stores it. The index is a fact
        * about this frame's snapshot -- the table can grow between frames --
        * so it must not outlive the tap that used it. */
       const struct food_type *ft = &m->food.types[r];
-      /* The one already chosen reads back in white, the rest in the row
-       * colour: coming here from the form's TYPE row, "which is currently
-       * selected" is the question the screen has to answer at a glance. */
-      int chosen      = (ft->id == m->food.food_type);
-      uint32_t col    = chosen ? UI_TEXT : UI_FAINT;
-      const char *val = chosen ? "*" : "";
-      char name[3 + FOOD_NAME_MAX + 1];
-      (void)snprintf(name, sizeof name, "  %s", ft->name);
-      menu_row(fb, h, y, sc, lh, name, val, col, MA_FOODTYPE_PICK, r);
-      y += 2 * lh;
+      /* The one already chosen carries a white mark ahead of its name:
+       * coming here from the form's TYPE row, "which is currently selected"
+       * is the question the screen has to answer at a glance. */
+      const int right = (r - start) % 2;
+      const int cx    = right ? x2 : x;
+      const int ry    = y + (((r - start) / 2) * 2 * lh);
+      if (ft->id == m->food.food_type)
+         draw_str(px, fb, cx, ry, sc, "*", UI_TEXT);
+      char name[FOOD_NAME_MAX + 1];
+      (void)snprintf(name, sizeof name, "%.*s", namew < 0 ? 0 : namew,
+                     ft->name);
+      draw_str(px, fb, cx + cw, ry, sc, name, UI_TEXT_DIM);
+      add_hit_ix(h,
+                 right ? ui_rect(mid, ry - (3 * sc), fb->width - mid, lh)
+                       : ui_rect(0, ry - (3 * sc), mid, lh),
+                 MA_FOODTYPE_PICK, r);
    }
 
    pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,

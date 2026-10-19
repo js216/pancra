@@ -93,7 +93,7 @@ enum alarm_level { AL_NONE = 0, AL_LOW = 1, AL_HIGH = 2, AL_STALE = 3 };
  *     the one rule that keeps a ringing hypo alive through a dropout is
  *     switched off at exactly the moment the data cannot be trusted;
  *   - an imminent-hypo prediction is preserved indefinitely, and that alarm
- *     is the one the user cannot silence.
+ *     is the one that overrides a muted phone.
  *
  * So the rule is: an age must be NONNEGATIVE as well as within the limit. A
  * stamp from the future is a stamp whose age we do not know, and "I do not
@@ -214,7 +214,7 @@ enum nudge_band nudge_next(enum nudge_band nzone, enum nudge_band prev);
  * show: the imminent-hypo override (a prediction below PRED_LOW_MGDL forces
  * AL_LOW at any current reading), the DISCONNECT alarm, and the stranded
  * sustain. Passing the zone alone let a nudge blip through underneath the
- * unsilenceable predicted-hypo alarm -- the loudest possible moment to add a
+ * overriding predicted-hypo alarm -- the loudest possible moment to add a
  * sound that means "no action needed".
  *
  * The two zone-shaped arguments are named apart deliberately: they are the
@@ -331,7 +331,7 @@ bool alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
  * threshold at which guidance stops calling it a low and calls it urgent, and
  * the same number Dexcom's own readouts use for their Urgent Low alert. That
  * is why THIS alarm is the one that overrides the user's sound setting and
- * cannot be silenced away: it is the only value in the app chosen because
+ * rings again on every new forecast after a tap: it is the only value in the app chosen because
  * somebody else's evidence says a person may stop being able to act. */
 #define PRED_LOW_MGDL 55
 
@@ -341,7 +341,7 @@ bool alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
  * `now_mono` is read from the same one. A prediction is not a record: it is
  * never written to a file and never shown, so the wall clock has no claim on
  * it, and stamping it with realtime meant a backward correction preserved a
- * prediction forever -- on the one alarm the user cannot silence.
+ * prediction forever -- on the one alarm that overrides a muted phone.
  *
  * It lives here rather than in alarm.c because it is a pure decision on the
  * app's loudest path, and alarm.c is reachable by no test: the override was
@@ -367,7 +367,7 @@ bool alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
  *      and the age belong to each other in the first place. Neither is any
  *      use without the other -- a 48 mg/dL prediction carrying a stamp from
  *      five minutes ago is refused as expired when it is current, and a
- *      recovered value carrying a fresh stamp forces the unsilenceable LOW
+ *      recovered value carrying a fresh stamp forces the overriding LOW
  *      over a prediction that has nothing to say.
  *
  * WHY NOT SIMPLY TAKE alarm_lk IN THE WRITER. Because the writer holds the
@@ -383,7 +383,7 @@ bool alarm_pred_low(int pred_mgdl, long pred_mono, long now_mono);
  * magnitude to spare (the sensor scale stops at 400), and 48 bits of seconds
  * is 8.9 million years of uptime. Both halves are clamped rather than
  * truncated, because a wrapped stamp would read as an arrival time that never
- * happened -- on the one alarm the user cannot silence.
+ * happened -- on the one alarm that overrides a muted phone.
  *
  * These two are PURE, which is what makes them checkable at all: a round
  * trip that loses a field, or shifts by one bit, is the whole failure and is
@@ -585,8 +585,9 @@ int cal_entry_mgdl(const char *digits, int n, int units);
  *
  * alarm_want_sustained answers "what level does the data justify". This adds
  * the one rule that outranks it: a CGM predicting below PRED_LOW_MGDL forces
- * a LOW that sounds even when the user has switched sound off, and that
- * cannot be silenced while the prediction holds.
+ * a LOW that sounds even when the user has switched sound off. A tap
+ * silences it until the sensor sends a NEWER prediction (`pred_new`); one
+ * that still forecasts a hypo rings again.
  *
  * It lives here, and not in the actuator, because it is the only code path in
  * the app that can wake a sleeping person -- and because a review deleted it
@@ -595,9 +596,10 @@ int cal_entry_mgdl(const char *digits, int n, int units);
  *
  * `prev_want` in is the level currently committed. `prev_want` out is what
  * alarm_decide should compare against: normally unchanged, but cleared to
- * AL_NONE when the override holds and nothing is sounding, so the next
- * evaluation sees a fresh NONE->LOW edge and re-triggers. THAT re-trigger is
- * what makes the alarm unsilenceable. */
+ * AL_NONE when the override holds and either nothing is sounding with no
+ * dismissal, or the user dismissed it and a newer low prediction has
+ * arrived since -- so the evaluation sees a fresh NONE->LOW edge and
+ * re-triggers. */
 struct alarm_plan {
    enum alarm_level want;      /* the level to aim for */
    bool sound_on;              /* possibly forced on by the override */
@@ -605,8 +607,9 @@ struct alarm_plan {
 };
 
 void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
-                     bool acked, bool pred_low, enum alarm_level prev_want,
-                     bool sounding, bool sound_on, struct alarm_plan *out);
+                     bool acked, bool pred_low, bool pred_new,
+                     enum alarm_level prev_want, bool sounding, bool sound_on,
+                     struct alarm_plan *out);
 
 /* ================= THE ALARM ACTUATION WORKFLOW =====================
  *
@@ -642,6 +645,7 @@ struct alarm_obs {
    bool stale;            /* the current reading has aged out */
    bool stranded;         /* the sensor is gone, not merely quiet */
    bool pred_low;         /* a CGM predicts an imminent hypo */
+   bool pred_new;         /* ...in one that arrived after the last tap */
    bool sound_on, vib_on; /* the user's alarm output settings */
 };
 

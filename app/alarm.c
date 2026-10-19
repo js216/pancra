@@ -18,7 +18,7 @@
 
 /* Imminent hypo: ANY CGM whose latest reading predicts below PRED_LOW_MGDL, and
  * which reported within the alarm freshness window. The freshness gate is what
- * keeps an unsilenceable alarm from wedging on stale data after a sensor drops
+ * keeps the alarm that overrides a muted phone from wedging on stale data after a sensor drops
  * out -- the prediction must be current, not a value frozen at disconnect.
  *
  * The threshold and the predicate both live in alarmlogic.h, which has no
@@ -149,6 +149,11 @@ static enum alarm_level g_alarm_want;
  * re-actuation and is cleared by a genuine level change, which is a new alarm
  * they have not seen. Call with alarm_lock held. */
 static bool g_alarm_acked;
+/* WHEN the user last dismissed an alarm, on the monotonic clock, to compare
+ * with the arrival stamps in g_link_pred: a low prediction stamped after it
+ * is a forecast the user has not seen, and re-raises the imminent-hypo
+ * override (see alarm_plan_next). Call with alarm_lock held. */
+static long g_alarm_acked_mono;
 
 /* Most recent PREDICTED value and WHEN IT ARRIVED, per CGM link, AS ONE WORD.
  *
@@ -164,7 +169,7 @@ static bool g_alarm_acked;
  * the previous sample's arrival time, or the reverse. Both halves of that are
  * wrong in a way that matters: a current 48 mg/dL prediction stamped five
  * minutes ago is discarded as expired, and a recovered value stamped now
- * forces the unsilenceable LOW over a prediction that no longer says anything.
+ * forces the overriding LOW over a prediction that no longer says anything.
  *
  * ONE ATOMIC WORD, not a lock, and not alarm_lk in particular. The writer
  * holds the driver lock; alarm_lk is held across blocking MediaPlayer JNI, so
@@ -216,9 +221,10 @@ int alarm_silence_tap(void)
    alarm_lock();
    if (g_alarm_sounding) {
       if (dexble_alarm_silence()) {
-         g_alarm_sounding = false;
-         g_alarm_acked    = true;
-         consumed         = 1;
+         g_alarm_sounding   = false;
+         g_alarm_acked      = true;
+         g_alarm_acked_mono = mono_s();
+         consumed           = 1;
       } else {
          LOGI("alarm: silence failed; leaving the gesture armed");
       }
@@ -243,7 +249,8 @@ void alarm_note_pred(int link, int pred_mgdl, long mono_now)
                          memory_order_relaxed);
 }
 
-/* Is any CGM link forecasting a hypo?
+/* Is any CGM link forecasting a hypo? The arrival stamp of the NEWEST such
+ * forecast, or 0 when none is.
  *
  * `is_meter` is passed IN, sampled before alarm_lock, and that is the whole
  * point of the parameter. Asking the driver from in here takes the DRIVER's
@@ -258,12 +265,13 @@ void alarm_note_pred(int link, int pred_mgdl, long mono_now)
  * alarm_gather already samples the registry and the history before the lock
  * for exactly this reason; the routing bits are the third thing that has to
  * be read first. */
-static bool any_pred_low(const int *is_meter)
+static long any_pred_low(const int *is_meter)
 {
    /* MONOTONIC, matching the stamps alarm_note_pred records. The rule itself
     * is alarm_pred_low (alarmlogic.h) -- it was open-coded here, in a file no
     * test can reach, on the one alarm path that overrides a muted phone. */
-   long now = mono_s();
+   long now    = mono_s();
+   long newest = 0;
    for (int l = 0; l < LINK_MAX; l++) {
       if (is_meter[l])
          continue; /* CGMs only */
@@ -271,10 +279,10 @@ static bool any_pred_low(const int *is_meter)
        * for the stamp would put the mixed-pair hole straight back. */
       struct link_pred p = pred_unpack(
           atomic_load_explicit(&g_link_pred[l], memory_order_relaxed));
-      if (alarm_pred_low(p.mgdl, p.mono, now))
-         return true;
+      if (alarm_pred_low(p.mgdl, p.mono, now) && p.mono > newest)
+         newest = p.mono;
    }
-   return false;
+   return newest;
 }
 
 /* WHICH LINKS ARE METERS, as one read, BEFORE the alarm lock is taken. */
@@ -296,9 +304,12 @@ static void meter_links_snapshot(int *out)
  * would change nothing on the phone, which is the exact shape of gap
  * alarmlogic.h exists to close.
  *
+ * `pred_t` is any_pred_low's answer: when the newest low forecast arrived,
+ * or 0 for none.
+ *
  * Call with alarm_lock held. */
 static void alarm_apply_ex(enum alarm_level zone, bool stale, bool stranded,
-                           bool pred_low)
+                           long pred_t)
 {
    struct prefs sp;
    settings_get(&sp);
@@ -308,7 +319,8 @@ static void alarm_apply_ex(enum alarm_level zone, bool stale, bool stranded,
    struct alarm_obs obs  = {.zone     = zone,
                             .stale    = stale,
                             .stranded = stranded,
-                            .pred_low = pred_low,
+                            .pred_low = pred_t != 0,
+                            .pred_new = pred_t > g_alarm_acked_mono,
                             .sound_on = sp.sound_on != 0,
                             .vib_on   = sp.vib_on != 0};
    struct alarm_state next;
@@ -500,8 +512,9 @@ void alarm_reeval(void)
    meter_links_snapshot(is_meter); /* the driver's lock, also BEFORE */
    alarm_lock();
    g_alarm_state      = zone;
-   bool pred          = any_pred_low(is_meter);
-   enum nudge_band ng = nudge_fire(nzone, alarming(zone, pred), g_nudge_state);
+   long pred          = any_pred_low(is_meter);
+   enum nudge_band ng =
+       nudge_fire(nzone, alarming(zone, pred != 0), g_nudge_state);
    g_nudge_state      = nudge_next(nzone, g_nudge_state);
    alarm_apply_ex(g_alarm_state,
                   atomic_load_explicit(&g_disc_alarmed, memory_order_relaxed) !=
@@ -641,8 +654,9 @@ void pancra_alarm_check(void)
     * the main looper takes. Nothing depends on when it lands, unlike the
     * glucose alarm whose actuation must stay inside the lock (see
     * alarm_apply_ex). */
-   bool pred          = any_pred_low(is_meter);
-   enum nudge_band ng = nudge_fire(nzone, alarming(zone, pred), g_nudge_state);
+   long pred          = any_pred_low(is_meter);
+   enum nudge_band ng =
+       nudge_fire(nzone, alarming(zone, pred != 0), g_nudge_state);
    g_nudge_state      = nudge_next(nzone, g_nudge_state);
    /* Either the user's configured DISCONNECT threshold, or -- regardless of
     * that setting -- data going stale while the last reading was out of
