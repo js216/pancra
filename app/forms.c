@@ -282,16 +282,18 @@ int label_commit(void)
          set_status("SERVER SAVED, STILL PAIRED: RE-PAIR");
       g_kp.len = 0;
       nav_go(SCR_REMOTE);
-   } else if (cur_screen() == SCR_LABEL && g_kp.label_field == LABEL_FOOD) {
-      /* A NEW FOOD: added to the vocabulary and CHOSEN in one step.
+   } else if (cur_screen() == SCR_FOODTYPE) {
+      /* THE PICKER'S OK: the name typed is added to the vocabulary and
+       * CHOSEN in one step.
        *
        * Naming a food is already the act of picking it -- nobody types
        * PORRIDGE in order to then go and find PORRIDGE in a list -- so the
-       * commit sets the form's type and returns to the form rather than to
-       * the picker it was opened from. nav_go RETURNS to SCR_FOOD because it
-       * is already on the path (form_food_action pushed it under the picker),
-       * so the keypad and the picker are both discarded in one step and the
-       * form's own exit still goes wherever the flow began.
+       * commit sets the form's type and returns to the form. nav_go RETURNS
+       * to SCR_FOOD because it is already on the path (form_food_action
+       * pushed it under the picker), so the picker is discarded and the
+       * form's own exit still goes wherever the flow began. A name the
+       * vocabulary already has is that food (food_type_add is idempotent on
+       * the name), so typing it in full picks it as a tap on it would.
        *
        * food_type_add OWNS the rules -- what a name may contain, what happens
        * to one that is already there, what happens when the vocabulary is
@@ -300,11 +302,15 @@ int label_commit(void)
        * has no business knowing them. A refusal keeps the keypad open with
        * the text still in it, because the alternative is silently discarding
        * something the user typed. */
+      if (g_kp.len <= 0) {
+         set_status_refused("TYPE A NAME OR PICK A FOOD");
+         return COMMIT_DONE;
+      }
       g_kp.entry[g_kp.len < (int)sizeof g_kp.entry ? g_kp.len : 0] = 0;
       int id = food_type_add(g_kp.entry);
       if (id <= FOOD_TYPE_NONE) {
          set_status_refused("FOOD NAME NOT SAVED");
-         return COMMIT_DONE; /* stay put: the text is still on the keypad */
+         return COMMIT_DONE; /* stay put: the text is still in the entry */
       }
       forms_food_type_set(id);
       g_kp.len = 0;

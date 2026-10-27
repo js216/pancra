@@ -514,8 +514,11 @@ static int style_action(int action, int ix)
          cap = (int)sizeof(((struct sync_creds *)0)->email) - 1;
       else if (fv.label_field == LABEL_FOOD)
          cap = FOOD_NAME_MAX;
-      if (forms_kp_len() < cap)
+      if (forms_kp_len() < cap) {
          forms_kp_type(ui_label_chars[ix]);
+         if (cur_screen() == SCR_FOODTYPE)
+            forms_food_query_edited();
+      }
    } else if (action == MA_COLOR_PICK) {
       int ci = ix;
       if (forms_markpick() >= 0) {
@@ -1054,6 +1057,8 @@ static int keypad_action(int action, int ix)
       }
    } else if (action == MA_BACKSPACE) {
       forms_kp_del();
+      if (cur_screen() == SCR_FOODTYPE)
+         forms_food_query_edited();
    } else if (action == MA_KP_CLOSE) {
       /* ONLY the pairing keypad backs out to the ADD DEVICE type picker. The
        * label editor and the plot-max / calibration keypads share this close

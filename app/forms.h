@@ -264,6 +264,9 @@ void forms_ex_edit(int i);
 
 /* Set the type the form holds; the picker's only side effect on the form. */
 void forms_food_type_set(int type_id);
+/* The picker's typed text changed: its list is filtered by that text, so it
+ * goes back to page one. */
+void forms_food_query_edited(void);
 
 /* One consistent copy of all of it. */
 /* The bar or point the finger is on in whichever log plot is open; -1 clears

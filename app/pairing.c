@@ -1543,13 +1543,14 @@ void pairing_tick(void)
     * inside commit_pair, so aim it at the CURRENT menu first -- a background
     * commit must never yank the user out of whatever screen they are on.
     * Nor is it made while the user is answering KEEP WAITING or STOP (the
-    * answer comes first), typing into the text editor, or reading the meter
-    * help: the last two flows hold the keypad's return target and the add
-    * type, which a commit would overwrite. */
+    * answer comes first), typing into the text editor or the food picker,
+    * or reading the meter help: those flows hold the keypad's entry, its
+    * return target and the add type, which a commit would overwrite. */
    if (g_pend_pairing && sensor_kind(g_pend_pairing) == KIND_CGM &&
        cur_screen() != SCR_KEYPAD && cur_screen() != SCR_DEVLIST &&
        cur_screen() != SCR_PAIRCONF && cur_screen() != SCR_PENDCANCEL &&
-       cur_screen() != SCR_LABEL && cur_screen() != SCR_METERHELP) {
+       cur_screen() != SCR_LABEL && cur_screen() != SCR_FOODTYPE &&
+       cur_screen() != SCR_METERHELP) {
       /* THE CANDIDATE LIST IS FOR THE ADD TYPE IT WAS BUILT FOR: a flow
        * left behind for another type (a meter, or the other CGM) fills it
        * with that type's devices. The wait's own type is restored and the

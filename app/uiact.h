@@ -148,7 +148,6 @@ enum ui_menu {
     * recorded on the way in rather than inferred here. */
    MA_FOOD_OPEN,     /* ADD menu: start logging food (opens the PICKER) */
    MA_FOODTYPE_PICK, /* picker: ix = the vocabulary index chosen */
-   MA_FOODTYPE_NEW,  /* picker: type a food this list does not have yet */
    MA_FOODTYPE_BACK, /* picker: leave without choosing */
    MA_FOODPAGE,      /* food picker: go to page ix */
    MA_FOODGOAL,      /* FOOD LOG: set goal ix (food.h's FOOD_CARBS...) */
@@ -309,15 +308,16 @@ enum ui_menu {
  * a code is appending a name. Nothing persists them (see settings.h). */
 /* Up to this many touch targets per frame.
  *
- * Headroom is thinner than it looks: SCR_LABEL (the letter keypad) records
- * one target per character in ui_label_chars plus the close band, DEL and OK
- * -- 45 of these at every geometry, since the count does not depend on the
- * scale. Three spare. add_hit DROPS the excess, and a dropped box is a control
- * the user simply cannot tap: drawn normally, dead to touch. add_hit says so in
- * the log the first time it happens in a process, and `overflow` below records
- * it on the frame. uikeypad.c asserts its own share of this number at build
- * time, so growing that alphabet cannot quietly spend the headroom. */
-#define UI_MAX_HITS 48
+ * The FOOD picker is the screen that spends the most: the letter keys,
+ * DEL and OK (UI_LABEL_KEY_HITS, 44), the close band, a page of foods and
+ * the four pager buttons -- 59 at every geometry, since none of it depends
+ * on the scale. uifood.c asserts that total at build time, and uikeypad.c
+ * asserts the keys' own share, so neither can quietly spend the headroom.
+ * add_hit DROPS the excess, and a dropped box is a control the user simply
+ * cannot tap: drawn normally, dead to touch. add_hit says so in the log the
+ * first time it happens in a process, and `overflow` below records it on
+ * the frame. */
+#define UI_MAX_HITS 64
 
 /* Touch targets a paginated log screen spends on its OWN controls before any
  * row. Rows are capped at UI_MAX_HITS - UI_LOG_FIXED so a tall window cannot

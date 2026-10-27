@@ -22,6 +22,23 @@
 static int g_foodtype_page;
 static int g_foodlog_page;
 
+/* THE PICKER IS ALSO WHERE A NEW FOOD IS NAMED: its letter keys type into the
+ * shared text entry, which filters the list and, on OK, adds the name typed
+ * (label_commit). So it opens on page one with that entry empty and marked as
+ * a food name, whose capacity MA_CHAR enforces. */
+static void foodtype_open(void)
+{
+   g_foodtype_page = 0;
+   forms_kp_clear();
+   nav_go(SCR_FOODTYPE);
+   forms_set_label_field(LABEL_FOOD);
+}
+
+void forms_food_query_edited(void)
+{
+   g_foodtype_page = 0; /* the list just changed under the page */
+}
+
 struct food_draft {
    long t;
    int type; /* a food_type id; FOOD_TYPE_NONE = nothing chosen yet */
@@ -74,7 +91,6 @@ int form_food_action(int action, int ix)
 {
    if (action == MA_FOOD_OPEN) {
       forms_food_open(realtime_s());
-      g_foodtype_page = 0; /* always page one: see the food log's note */
       /* STRAIGHT TO THE FORM, CARRYING THE LAST MEAL.
        *
        * People eat the same things in the same amounts, so the entry that was
@@ -99,26 +115,19 @@ int form_food_action(int action, int ix)
       if (lst.t > 0 && lst.type != FOOD_TYPE_NONE)
          forms_food_type_set(lst.type);
       else
-         nav_go(SCR_FOODTYPE);
+         foodtype_open();
    } else if (action == MA_FOODTYPE_PICK) {
       /* THE ROW GAVE AN INDEX; WHAT IS STORED IS AN ID. The vocabulary can
        * grow between the frame that drew the row and the tap that lands on it
-       * -- NEW FOOD does exactly that -- so an index kept past this moment
-       * would name a different food. Resolve it here, immediately, and store
-       * the id. An index that no longer exists resolves to nothing and the
-       * form is left alone rather than being pointed at a neighbour. */
+       * -- OK on a typed name does exactly that -- so an index kept past this
+       * moment would name a different food. Resolve it here, immediately, and
+       * store the id. An index that no longer exists resolves to nothing and
+       * the form is left alone rather than being pointed at a neighbour. */
       struct food_type ft = food_type_at(ix);
       if (ft.id != FOOD_TYPE_NONE) {
          forms_food_type_set(ft.id);
          nav_back(); /* to the form: whatever opened the picker */
       }
-   } else if (action == MA_FOODTYPE_NEW) {
-      /* The letter keypad, seeded empty. A new food is a word nobody has
-       * typed here before, so there is nothing useful to pre-fill. */
-      forms_kp_clear();
-      nav_go(SCR_LABEL);
-      forms_set_label_field(LABEL_FOOD);
-      forms_kp_return_set(SCR_FOODTYPE);
    } else if (action == MA_FOODLOG_EDIT) {
       /* A row opens that entry in the form. The picker and the keypad reach
        * it exactly as they do for a new entry; what differs is that CONFIRM
@@ -182,8 +191,7 @@ int form_food_action(int action, int ix)
        * arithmetic version of that (`KP_FOOD_G + ix`) is what keypad.h
        * records going wrong for the insulin form. */
       if (ix == 0) {
-         g_foodtype_page = 0;
-         nav_go(SCR_FOODTYPE);
+         foodtype_open();
       } else {
          enum keypad_mode mode = kp_food_field(ix - 1);
          /* A TOTAL NEEDS A PORTION to be divided by: with no grams there is

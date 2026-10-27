@@ -97,7 +97,7 @@ enum ui_screen {
    SCR_ALARM,    /* alarm submenu: LOW/HIGH thresholds + outputs */
    SCR_EXPORT,   /* EXPORT DATA: range + section checkboxes + the button */
    SCR_FOOD,     /* LOG FOOD entry form: type, grams, time, date, year */
-   SCR_FOODTYPE, /* pick a food from the vocabulary, or add a new one */
+   SCR_FOODTYPE, /* search the vocabulary and pick a food, or name one */
    SCR_FOODLOG,  /* the food entries, paginated, newest first */
    SCR_FOODDEL,  /* confirm deleting a food entry */
    SCR_EXLOG,    /* the exercise entries, paginated, newest first */

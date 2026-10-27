@@ -56,7 +56,7 @@ static struct wt_draft g_wt = {
  * the values being typed, plus the entry as it was on disk for an edit.
  *
  * WHICH FOOD IS AN ID, not a position in the vocabulary. The picker can ADD a
- * food -- that is the point of its NEW FOOD row -- which grows the table on
+ * food -- OK on a name typed there -- which grows the table on
  * the very tap that returns here, so an index would name a different food
  * afterwards and nothing on the screen would say so. */
 

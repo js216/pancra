@@ -19,4 +19,13 @@
 
 int ui_label_nchars(void);
 
+struct ANativeWindow_Buffer;
+struct hits;
+/* The letter keys and DEL / OK, from `y` to the bottom of the screen, at
+ * label scale `sc`. Records UI_LABEL_KEY_HITS targets: one per character of
+ * ui_label_chars, then DEL and OK. */
+#define UI_LABEL_KEY_HITS 44
+void ui_letter_grid(struct ANativeWindow_Buffer *fb, struct hits *h, int y,
+                    int sc);
+
 #endif

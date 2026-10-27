@@ -25,6 +25,7 @@
 #include "uiact.h"
 #include "uidraw.h"
 #include "uifmt.h" /* fmt_date: the instant, split into YEAR / MM-DD / HH:MM */
+#include "uikeypad.h" /* the letter keys the picker types with */
 #include "uimodel.h"
 #include "uipriv.h"
 #include "util.h" /* str_snapshot */
@@ -461,112 +462,171 @@ void render_foodlog(struct ANativeWindow_Buffer *fb, const struct screen *m,
    pager_row(fb, h, x, rx, nav_y, sc, lh, page, npages, MA_FOODLOG_PAGE);
 }
 
+/* ---- THE FOOD PICKER: a search over the vocabulary, and where a new food
+ * is named ----
+ *
+ * WHERE `t` OCCURS IN `name`, ignoring case: at the start of the name if it
+ * does there, else at the start of a later word, else anywhere -- the place
+ * that reads as the match. The offset, or -1 when it does not occur. An empty
+ * `t` occurs at the start of every name. */
+static int food_match(const char *name, const char *t, int tl)
+{
+   int best  = -1;
+   int brank = 3;
+   for (int p = 0; name[p] && brank > 0; p++) {
+      int i = 0;
+      while (i < tl && name[p + i]) {
+         char a = name[p + i];
+         char b = t[i];
+         if (a >= 'a' && a <= 'z')
+            a = (char)(a - 'a' + 'A');
+         if (b >= 'a' && b <= 'z')
+            b = (char)(b - 'a' + 'A');
+         if (a != b)
+            break;
+         i++;
+      }
+      if (i < tl)
+         continue;
+      int r = 2;
+      if (p == 0)
+         r = 0;
+      else if (name[p - 1] == ' ' || name[p - 1] == '-')
+         r = 1;
+      if (r < brank) {
+         brank = r;
+         best  = p;
+      }
+   }
+   return best;
+}
+
+/* A name in at most `cells` characters, the `ml` from `mo` in the entry's
+ * green and the rest dim: the part that matches what is typed is the part
+ * the eye compares. */
+static void food_hl(uint32_t *px, const struct ANativeWindow_Buffer *fb, int x,
+                    int y, int sc, const char *name, int cells, int mo, int ml)
+{
+   for (int i = 0; name[i] && i < cells; i++) {
+      const char c[2] = {name[i], 0};
+      draw_str(px, fb, x + (i * 6 * sc), y, sc, c,
+               (i >= mo && i < mo + ml) ? UI_OK : UI_TEXT_DIM);
+   }
+}
+
+/* A PAGE IS FIVE ROWS OF TWO. The screen's targets are the close band, a
+ * page of foods, the four pager buttons and the keys -- fixed at every
+ * geometry, so the total is checked here rather than measured. */
+#define UI_FOODTYPE_ROWS 5
+#define UI_FOODTYPE_PER  (2 * UI_FOODTYPE_ROWS)
+_Static_assert(1 + UI_FOODTYPE_PER + 4 + UI_LABEL_KEY_HITS <= UI_MAX_HITS,
+               "the food picker's close band, foods, pager and keys have "
+               "outgrown UI_MAX_HITS");
+
+/* THE PICKER: what is typed in the title bar, the foods containing it below,
+ * most eaten first, and the letter keys under them.
+ *
+ * ONE SCREEN FOR CHOOSING AND FOR NAMING. Typing narrows the list until the
+ * food is on it, and a tap picks it; a food the vocabulary does not have is
+ * typed in full and OK adds it and picks it (label_commit). Nothing typed
+ * lists every food. The order is the vocabulary's own, the one the FOOD LOG
+ * makes by use, so filtering never reshuffles what remains. */
 void render_foodtype(struct ANativeWindow_Buffer *fb, const struct screen *m,
                      struct hits *h)
 {
    uint32_t *px = fb->bits;
-   int sc       = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc      = FONT_TITLE(sc);
-   int lh       = 16 * sc;
-   int x        = 4 * sc;
-   int rx       = fb->width - (4 * sc);
-   int y        = (fb->height / 20) + (8 * sc);
+   /* The rename editor's scale, so the keys are the same size on both. */
+   int sc  = ui_fit_scale(fb->width, fb->height, 30);
+   int tsc = FONT_TITLE(sc);
+   int lh  = 16 * sc;
+   int x   = 4 * sc;
+   int rx  = fb->width - (4 * sc);
+   int y   = (fb->height / 20) + (8 * sc);
 
-   draw_str(px, fb, x, y, tsc, "FOOD", UI_TEXT);
+   /* THE ENTRY RIDES IN THE TITLE BAR, after NAME and two cells of gap, in
+    * the entry's green with a caret. A name longer than the room before the
+    * X shows its end, which is where the typing is. */
+   draw_str(px, fb, x, y, tsc, "NAME", UI_TEXT);
    draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
+   const char *t = m->entry.entry ? m->entry.entry : "";
+   const int tl  = str_len(t);
+   {
+      char shown[FOOD_NAME_MAX + 2];
+      (void)snprintf(shown, sizeof shown, "%.*s_", FOOD_NAME_MAX, t);
+      const int ex    = x + (6 * 6 * tsc);
+      const int cells = (rx - (7 * tsc) - ex) / (6 * tsc);
+      const int sl    = str_len(shown);
+      const int from  = (cells > 0 && sl > cells) ? sl - cells : 0;
+      draw_str(px, fb, ex, y, tsc, shown + from, UI_OK);
+   }
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, 2 * lh), MA_FOODTYPE_BACK,
               0);
-   y += 3 * lh;
+   y += 2 * lh;
 
-   /* NEW FOOD IS FIRST, ALWAYS, and it is the one row that is always here.
-    *
-    * On a fresh install the vocabulary is empty, and a screen whose only
-    * content is "None yet" is a dead end: the user came here to log a meal
-    * and the app has nothing to say but no. Putting the way OUT of that state
-    * at the top means the empty screen is still a working screen.
-    *
-    * It stays at the top rather than after the list, so its position does not
-    * move as the vocabulary grows -- the row you reach for to add a food is in
-    * the same place on the tenth use as on the first. */
-   menu_button(fb, h, x, y, rx - x, sc, "+ NEW FOOD", UI_TEXT_DIM,
-               MA_FOODTYPE_NEW, 0);
-   /* A BLANK LINE BELOW IT, because this row is not one of the list. It ADDS
-    * to the vocabulary; everything under it PICKS from it. At the same pitch
-    * as the entries it read as the first item, which is the one row it must
-    * not be mistaken for -- tapping it opens a keypad rather than choosing a
-    * food. The gap is what says "different kind of thing", the same way every
-    * other menu here separates its sections. */
-   y += 3 * lh;
-
-   int n = m->food.ntypes;
-   if (n <= 0) {
-      draw_str(px, fb, x, y, sc, "NO FOODS YET. ADD ONE", UI_MUTED);
-      y += lh;
-      draw_str(px, fb, x, y, sc, "AND IT STAYS ON THIS LIST.", UI_MUTED);
-      return;
-   }
-
-   /* TWO COLUMNS, so a page holds twice the foods and a long vocabulary is
-    * half the pages to step through. Rows fit between the NEW FOOD button
-    * and a reserved bottom nav line, and the cells are capped by the HIT
-    * BUDGET as well as by height -- add_hit drops everything past
-    * UI_MAX_HITS, and a dropped target draws perfectly while being dead to
-    * touch. render_olddev carries the full argument; the failure was
-    * reproduced there at 480x1920 and 540x2340. */
-   int avail = fb->height - y - (2 * lh);
-   int rows  = avail / (2 * lh);
-   if (rows < 1)
-      rows = 1;
-   int per = 2 * rows;
-   if (per > UI_MAX_HITS - UI_LOG_FIXED)
-      per = UI_MAX_HITS - UI_LOG_FIXED;
-   int npages = (n + per - 1) / per;
-   int page   = m->food.type_page;
-   if (page < 0)
-      page = 0;
-   if (page >= npages)
-      page = npages - 1;
-   int start = page * per;
-
-   /* THE COLUMN WIDTH IN CELLS: half of what the margins leave, less one
-    * cell of gutter between the two. ui_fit_scale guarantees UI_COLS (33)
-    * cells, so each column has at least 16: one for the mark, the rest for
-    * the name, cut with an explicit precision so a long name loses its tail
-    * inside its own column rather than running into its neighbour. */
+   /* TWO COLUMNS: half of what the margins leave, less one cell of gutter,
+    * in cells of the label scale. ui_fit_scale guarantees UI_COLS (33), so
+    * each column has at least 16: one for the mark, the rest for the name,
+    * cut inside its own column rather than running into its neighbour. The
+    * targets meet at the middle of the gutter and span the row's pitch. */
    const int cw    = 6 * sc;
    const int colc  = (((rx - x) / cw) - 1) / 2;
    const int namew = (colc - 1 > FOOD_NAME_MAX) ? FOOD_NAME_MAX : colc - 1;
    const int x2    = x + ((colc + 1) * cw);
-   /* The tap targets split the screen at the middle of the gutter, so the
-    * two cells of a row cover the full width between them. */
-   const int mid = x + (colc * cw) + (cw / 2);
+   const int mid   = x + (colc * cw) + (cw / 2);
+   const int pitch = (3 * lh) / 2;
 
-   /* ACROSS, THEN DOWN: the vocabulary is sorted by how often each food is
-    * used, so the most-used foods take the top rows of both columns. */
-   for (int r = start; r < start + per && r < n; r++) {
-      /* THE CELL CARRIES ITS INDEX INTO THE VOCABULARY, and the dispatcher
-       * turns that into an ID before anything stores it. The index is a fact
-       * about this frame's snapshot -- the table can grow between frames --
-       * so it must not outlive the tap that used it. */
+   int nmatch = 0;
+   for (int r = 0; r < m->food.ntypes; r++)
+      if (food_match(m->food.types[r].name, t, tl) >= 0)
+         nmatch++;
+   int npages = (nmatch + UI_FOODTYPE_PER - 1) / UI_FOODTYPE_PER;
+   if (npages < 1)
+      npages = 1;
+   int page = m->food.type_page;
+   if (page < 0)
+      page = 0;
+   if (page >= npages)
+      page = npages - 1;
+
+   if (m->food.ntypes <= 0) {
+      draw_str(px, fb, x, y, sc, "NO FOODS YET. TYPE ONE,", UI_MUTED);
+      draw_str(px, fb, x, y + lh, sc, "THEN OK.", UI_MUTED);
+   } else if (nmatch == 0) {
+      draw_str(px, fb, x, y, sc, "NO SUCH FOOD YET.", UI_MUTED);
+      draw_str(px, fb, x, y + lh, sc, "OK ADDS IT.", UI_MUTED);
+   }
+   /* ACROSS, THEN DOWN, as the vocabulary's order puts the most eaten in
+    * the top rows of both columns. THE CELL CARRIES THE VOCABULARY INDEX,
+    * which the dispatcher turns into an id before anything stores it. */
+   int k = 0;
+   for (int r = 0; r < m->food.ntypes && k < (page + 1) * UI_FOODTYPE_PER;
+        r++) {
       const struct food_type *ft = &m->food.types[r];
-      /* The one already chosen carries a white mark ahead of its name:
-       * coming here from the form's TYPE row, "which is currently selected"
-       * is the question the screen has to answer at a glance. */
-      const int right = (r - start) % 2;
+      const int mo               = food_match(ft->name, t, tl);
+      if (mo < 0)
+         continue;
+      if (k++ < page * UI_FOODTYPE_PER)
+         continue;
+      const int c     = (k - 1) - (page * UI_FOODTYPE_PER);
+      const int right = c % 2;
       const int cx    = right ? x2 : x;
-      const int ry    = y + (((r - start) / 2) * 2 * lh);
+      const int ry    = y + ((c / 2) * pitch);
+      /* The food the form holds carries a white mark ahead of its name:
+       * coming here from the form's TYPE row, "which is chosen now" is the
+       * question the screen answers at a glance. */
       if (ft->id == m->food.food_type)
          draw_str(px, fb, cx, ry, sc, "*", UI_TEXT);
-      char name[FOOD_NAME_MAX + 1];
-      (void)snprintf(name, sizeof name, "%.*s", namew < 0 ? 0 : namew,
-                     ft->name);
-      draw_str(px, fb, cx + cw, ry, sc, name, UI_TEXT_DIM);
+      food_hl(px, fb, cx + cw, ry, sc, ft->name, namew < 0 ? 0 : namew, mo, tl);
+      const int ty = ry - ((pitch - (7 * sc)) / 2);
       add_hit_ix(h,
-                 right ? ui_rect(mid, ry - (3 * sc), fb->width - mid, lh)
-                       : ui_rect(0, ry - (3 * sc), mid, lh),
+                 right ? ui_rect(mid, ty, fb->width - mid, pitch)
+                       : ui_rect(0, ty, mid, pitch),
                  MA_FOODTYPE_PICK, r);
    }
+   y += UI_FOODTYPE_ROWS * pitch;
 
-   pager_row(fb, h, x, rx, fb->height - lh - (4 * sc), sc, lh, page, npages,
-             MA_FOODPAGE);
+   pager_row(fb, h, x, rx, y, sc, lh, page, npages, MA_FOODPAGE);
+   y += 2 * lh;
+
+   ui_letter_grid(fb, h, y, sc);
 }
