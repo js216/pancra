@@ -25,57 +25,64 @@
  *      merely awkward
  */
 static const struct kp_info g_modes[KP_NMODES] = {
-    [KP_PAIR_CODE]  = {0,              4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_PLOT_MAX]   = {"PLOT MAX",     3, 0, KP_UNIT_GLU,  0, 0, 0},
-    [KP_CALIB]      = {"CALIBRATION",  3, 0, KP_UNIT_GLU,  0, 0, 0},
-    [KP_RESCALE]    = {"RESCALE",      3, 0, KP_UNIT_GLU,  0, 0, 0},
-    [KP_PORT]       = {"REMOTE PORT",  5, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_INS_UNITS]  = {"UNITS",        5, 0, KP_UNIT_NONE, 1, 0, 0},
-    [KP_DATE]       = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_TIME]       = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_YEAR]       = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_ALARM_LOW]  = {"ALARM LOW",    4, 1, KP_UNIT_GLU,  0, 1, 0},
-    [KP_ALARM_HIGH] = {"ALARM HIGH",   4, 1, KP_UNIT_GLU,  0, 0, 0},
-    [KP_NUDGE_LOW]  = {"NUDGE LOW",    4, 1, KP_UNIT_GLU,  0, 1, 1},
-    [KP_NUDGE_HIGH] = {"NUDGE HIGH",   4, 1, KP_UNIT_GLU,  0, 0, 1},
-    [KP_WEIGHT]     = {"WEIGHT",       5, 0, KP_UNIT_WT,   1, 0, 0},
-    [KP_SYNC_CODE]  = {"PAIRING CODE", 6, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_PAIR_CODE]  = {0,               4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_PLOT_MAX]   = {"PLOT MAX",      3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_CALIB]      = {"CALIBRATION",   3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_RESCALE]    = {"RESCALE",       3, 0, KP_UNIT_GLU,  0, 0, 0},
+    [KP_PORT]       = {"REMOTE PORT",   5, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_INS_UNITS]  = {"UNITS",         5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_DATE]       = {"DATE (MMDD)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_TIME]       = {"TIME (HHMM)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_YEAR]       = {"YEAR",          4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_ALARM_LOW]  = {"ALARM LOW",     4, 1, KP_UNIT_GLU,  0, 1, 0},
+    [KP_ALARM_HIGH] = {"ALARM HIGH",    4, 1, KP_UNIT_GLU,  0, 0, 0},
+    [KP_NUDGE_LOW]  = {"NUDGE LOW",     4, 1, KP_UNIT_GLU,  0, 1, 1},
+    [KP_NUDGE_HIGH] = {"NUDGE HIGH",    4, 1, KP_UNIT_GLU,  0, 0, 1},
+    [KP_WEIGHT]     = {"WEIGHT",        5, 0, KP_UNIT_WT,   1, 0, 0},
+    [KP_SYNC_CODE]  = {"PAIRING CODE",  6, 0, KP_UNIT_NONE, 0, 0, 0},
     /* The weight form's calendar fields: the same entry as the insulin
      * form's, and their own modes so the commit knows whose instant it is
      * editing. */
-    [KP_WT_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_WT_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_WT_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_WT_DATE] = {"DATE (MMDD)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_WT_TIME] = {"TIME (HHMM)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_WT_YEAR] = {"YEAR",          4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* The LOG FOOD form. GRAMS is a whole number with a unit suffix and no
      * decimal point: portions are recorded to the gram, and a '.' key would
      * invite tenths the format does not store. THREE digits, which is exactly
      * FOOD_MAX_G -- so the field cannot accept a number the commit would then
      * have to refuse. */
-    [KP_FOOD_G]    = {"GRAMS",        3, 0, KP_UNIT_G,    0, 0, 0},
-    [KP_FOOD_DATE] = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_FOOD_TIME] = {"TIME (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_EX_DATE]   = {"DATE (MMDD)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_EX_TIME]   = {"START (HHMM)", 4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_EX_STOP]   = {"STOP (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_EX_YEAR]   = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_FOOD_G]    = {"GRAMS",         3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_FOOD_DATE] = {"DATE (MMDD)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_FOOD_TIME] = {"TIME (HHMM)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_DATE]   = {"DATE (MMDD)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_TIME]   = {"START (HHMM)",  4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_STOP]   = {"STOP (HHMM)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_YEAR]   = {"YEAR",          4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* MINUTES, five slots: EX_DUR_MAX is seven days, which is 10080 of them.
      * Whole minutes and no decimal point -- the column is seconds, but a
      * session nobody timed to the second is not one anybody types that way. */
-    [KP_EX_DUR]    = {"MINUTES",      5, 0, KP_UNIT_NONE, 0, 0, 0},
-    [KP_FOOD_YEAR] = {"YEAR",         4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_EX_DUR]    = {"MINUTES",       5, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_FOOD_YEAR] = {"YEAR",          4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* WHAT A FOOD IS MADE OF: a fraction of its weight, "0.454", or kcal per
      * gram, "3.89". Five slots hold a digit, the point and three decimals,
      * which is every value food.h stores. */
-    [KP_FOOD_CARBS] = {"CARBS",        5, 0, KP_UNIT_NONE, 1, 0, 0},
-    [KP_FOOD_PROT]  = {"PROTEIN",      5, 0, KP_UNIT_NONE, 1, 0, 0},
-    [KP_FOOD_FAT]   = {"FAT",          5, 0, KP_UNIT_NONE, 1, 0, 0},
-    [KP_FOOD_KCAL]  = {"KCAL/G",       5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_CARBS] = {"CARBS PER G",   5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_PROT]  = {"PROTEIN PER G", 5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_FAT]   = {"FAT PER G",     5, 0, KP_UNIT_NONE, 1, 0, 0},
+    [KP_FOOD_KCAL]  = {"KCAL PER G",    5, 0, KP_UNIT_NONE, 1, 0, 0},
+    /* THE SAME FACTS FOR THE WHOLE PORTION: grams to one decimal, "999.9",
+     * which is all of a FOOD_MAX_G portion; kcal whole, four slots, which is
+     * FOOD_KCAL_MAX per gram of a FOOD_MAX_G portion (9989). */
+    [KP_FOOD_CARBS_T] = {"CARBS TOTAL",   5, 0, KP_UNIT_G,    1, 0, 0},
+    [KP_FOOD_PROT_T]  = {"PROTEIN TOTAL", 5, 0, KP_UNIT_G,    1, 0, 0},
+    [KP_FOOD_FAT_T]   = {"FAT TOTAL",     5, 0, KP_UNIT_G,    1, 0, 0},
+    [KP_FOOD_KCAL_T]  = {"KCAL TOTAL",    4, 0, KP_UNIT_NONE, 0, 0, 0},
     /* THE DAY'S GOALS, whole numbers: grams in three slots, kcal in four --
      * exactly foodrow.h's ceilings (FOOD_GOAL_G_MAX, FOOD_GOAL_KCAL_MAX). */
-    [KP_GOAL_CARBS] = {"CARBS GOAL",   3, 0, KP_UNIT_G,    0, 0, 0},
-    [KP_GOAL_PROT]  = {"PROTEIN GOAL", 3, 0, KP_UNIT_G,    0, 0, 0},
-    [KP_GOAL_FAT]   = {"FAT GOAL",     3, 0, KP_UNIT_G,    0, 0, 0},
-    [KP_GOAL_KCAL]  = {"KCAL GOAL",    4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_GOAL_CARBS] = {"CARBS GOAL",    3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_PROT]  = {"PROTEIN GOAL",  3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_FAT]   = {"FAT GOAL",      3, 0, KP_UNIT_G,    0, 0, 0},
+    [KP_GOAL_KCAL]  = {"KCAL GOAL",     4, 0, KP_UNIT_NONE, 0, 0, 0},
 };
 
 /* A mode this build does not define draws nothing and takes nothing. NOT the
@@ -146,7 +153,11 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_FOOD_CARBS:
       case KP_FOOD_PROT:
       case KP_FOOD_FAT:
-      case KP_FOOD_KCAL: return KP_FORM_FOOD;
+      case KP_FOOD_KCAL:
+      case KP_FOOD_CARBS_T:
+      case KP_FOOD_PROT_T:
+      case KP_FOOD_FAT_T:
+      case KP_FOOD_KCAL_T: return KP_FORM_FOOD;
       case KP_EX_DATE:
       case KP_EX_TIME:
       case KP_EX_YEAR:
@@ -197,10 +208,12 @@ int kp_is_year(enum keypad_mode mode)
 enum keypad_mode kp_food_field(int ix)
 {
    /* ITS OWN calendar fields, like the weight form's: see keypad.h. Then what
-    * the food is made of, in the order the form lists them. */
+    * the food is made of, per gram and then for the portion, each indexed
+    * like food.h's macros. */
    static const enum keypad_mode f[] = {
-       KP_FOOD_G,     KP_FOOD_TIME, KP_FOOD_DATE, KP_FOOD_YEAR,
-       KP_FOOD_CARBS, KP_FOOD_PROT, KP_FOOD_FAT,  KP_FOOD_KCAL};
+       KP_FOOD_G,       KP_FOOD_TIME,   KP_FOOD_DATE,  KP_FOOD_YEAR,
+       KP_FOOD_CARBS,   KP_FOOD_PROT,   KP_FOOD_FAT,   KP_FOOD_KCAL,
+       KP_FOOD_CARBS_T, KP_FOOD_PROT_T, KP_FOOD_FAT_T, KP_FOOD_KCAL_T};
 
    if (ix < 0 || ix >= (int)(sizeof f / sizeof f[0]))
       return KP_NONE;
@@ -256,6 +269,14 @@ int kp_food_macro(enum keypad_mode mode)
 {
    for (int k = 0; k < 4; k++)
       if (kp_food_field(4 + k) == mode)
+         return k;
+   return -1;
+}
+
+int kp_food_total(enum keypad_mode mode)
+{
+   for (int k = 0; k < 4; k++)
+      if (kp_food_field(8 + k) == mode)
          return k;
    return -1;
 }

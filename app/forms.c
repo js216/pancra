@@ -650,6 +650,56 @@ int kp_commit_number(void)
          g_kp.len = 0;
          keypad_close();
       }
+   } else if (kp_food_total(g_kp.mode) >= 0) { /* "45.4" g, or "389" kcal */
+      if (g_kp.len > 0) {
+         /* THE PORTION'S TOTAL, STORED PER GRAM: what a food is made of is a
+          * property of the food (food.h), so the typed total is divided by
+          * the portion and rounded to the thousandths the food stores. Grams
+          * to one decimal place, kcal whole (kp_info offers no '.'); `v` is
+          * tenths of a gram or whole kcal. Refused, not clamped, when the
+          * quotient is outside what food.h stores -- the bound said in the
+          * typed unit, which for grams is the portion itself. */
+         const int k  = kp_food_total(g_kp.mode);
+         const long g = form_food_grams();
+         long v       = 0;
+         int scale    = 0;
+         int dot      = 0;
+         int bad      = 0;
+         for (int i = 0; i < g_kp.len; i++) {
+            char ch = g_kp.entry[i];
+            if (ch == '.') {
+               if (dot)
+                  bad = 1;
+               dot = 1;
+            } else if (!dot || scale < 1) {
+               v = (v * 10) + (ch - '0');
+               if (dot)
+                  scale++;
+            } else {
+               bad = 1; /* a second decimal place */
+            }
+         }
+         if (k != FOOD_KCAL && scale < 1)
+            v *= 10;
+         const long per =
+             (g > 0) ? ((v * (k == FOOD_KCAL ? 1000 : 100)) + (g / 2)) / g : -1;
+         if (bad || g <= 0 || per > 0x7fffffffL ||
+             !food_macro_ok(k, (int)per)) {
+            if (g <= 0)
+               (void)snprintf(g_kp.err, sizeof g_kp.err, "ENTER GRAMS FIRST");
+            else if (k == FOOD_KCAL)
+               (void)snprintf(g_kp.err, sizeof g_kp.err, "MUST BE 0..%ld KCAL",
+                              (FOOD_KCAL_MAX * g) / 1000);
+            else
+               (void)snprintf(g_kp.err, sizeof g_kp.err, "MUST BE 0..%ld G", g);
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
+         form_food_set_macro(k, (int)per);
+         g_kp.len = 0;
+         keypad_close();
+      }
    } else if (kp_food_goal(g_kp.mode) >= 0) { /* whole grams, or kcal */
       if (g_kp.len > 0) {
          const int k = kp_food_goal(g_kp.mode);

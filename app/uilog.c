@@ -1624,7 +1624,11 @@ int ex_points(const struct screen *m, struct log_pt *out, int cap, long *from,
       const long k = ex_day_of(out, n, end, m->food.exlog[i].t, &kx);
       if (k < 0)
          continue; /* outside the span, which also drops a mistyped year */
-      out[k].v += secs / 60;
+      /* COUNTED AS THE LOG AND EDIT EXERCISE COUNT IT: whole minutes between
+       * the start and the stop as drawn to the minute (uiex.c), so a day's
+       * total is the sum of the MIN column for its sessions. */
+      const long t0 = m->food.exlog[i].t;
+      out[k].v += ((t0 + secs) / 60) - (t0 / 60);
    }
    long ks = 0;
    for (int i = 0; i < m->food.nsteps; i++) {

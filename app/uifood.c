@@ -83,24 +83,29 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
                            ? food_type_name(m->food.food_type)
                            : "CHOOSE...";
    uint32_t tcol     = m->food.food_type != FOOD_TYPE_NONE ? UI_TEXT : UI_MUTED;
-   /* NINE VALUE ROWS: the entry's five, then what the food is made of --
-    * per gram of it, and the food's, not this entry's; CONFIRM writes them
-    * to the food (food.h). Calories lead them, in the FOOD LOG's order.
+   /* NINE VALUE ROWS: the entry's five, then what the food is made of in
+    * two columns -- PER G, the food's own numbers, and TOTAL, what this
+    * portion holds of them. Both are the food's, not this entry's; CONFIRM
+    * writes them to the food (food.h). Calories lead them, in the FOOD
+    * LOG's order, under a line naming the columns.
     *
     * THE GAP BETWEEN ROWS SPENDS THE HEIGHT THE SCREEN HAS. It is what is
-    * left above the system gesture bar once the rows and EDIT FOOD's three
-    * buttons are placed, shared out over the nine gaps: never more than a
-    * line, the other forms' spacing, and never less than half a line, which
-    * is what the 27 rows asked of ui_fit_scale pay for. Sized for EDIT FOOD
-    * in both modes, so LOG FOOD and EDIT FOOD lay their rows out alike. */
+    * left above the system gesture bar once the rows, the column names and
+    * EDIT FOOD's three buttons are placed, shared out over ten gaps: one
+    * after each row, and a second one above the column names, which sets
+    * what the food is made of apart from when it was eaten. Never more than
+    * a line, the other forms' spacing, and never less than a quarter of one,
+    * which is what the 27 rows asked of ui_fit_scale pay for. Sized for EDIT
+    * FOOD in both modes, so LOG FOOD and EDIT FOOD lay their rows out
+    * alike. */
    const int vrow  = (7 * tsc) + (8 * sc);
    const int btn   = 25 * sc;
-   const int fixed = (9 * vrow) + (3 * btn) + (2 * ((3 * lh) / 2));
-   int gap         = (fb->height - (fb->height / 24) - y - fixed) / 9;
+   const int fixed = (9 * vrow) + lh + (3 * btn) + (2 * ((3 * lh) / 2));
+   int gap         = (fb->height - (fb->height / 24) - y - fixed) / 10;
    if (gap > lh)
       gap = lh;
-   if (gap < lh / 2)
-      gap = lh / 2;
+   if (gap < lh / 4)
+      gap = lh / 4;
    y = value_row_wide(fb, h, y, sc, "TYPE", tname, tcol, MA_FOOD_EDIT, 0);
    y += gap;
    char gval[16];
@@ -112,19 +117,54 @@ void render_food(struct ANativeWindow_Buffer *fb, const struct screen *m,
    y = value_row_wide(fb, h, y, sc, "DATE", datep, UI_TEXT, MA_FOOD_EDIT, 3);
    y += gap;
    y = value_row_wide(fb, h, y, sc, "YEAR", yearp, UI_TEXT, MA_FOOD_EDIT, 4);
-   y += gap;
+   y += 2 * gap;
    {
+      /* TWO COLUMNS OF FIVE CHARACTERS at the value scale, one between
+       * them: "9.999" per gram, "999.9" or "9989" for the portion. The
+       * labels' seven characters at the label scale sit left of both within
+       * the UI_COLS cells ui_fit_scale guarantees, with more than two label
+       * cells to spare. */
+      const int cell = 5 * 6 * tsc;
+      const int pr   = rx - cell - (6 * tsc); /* PER G's right edge */
+      const int mid  = pr + (3 * tsc);        /* where the two targets meet */
+      draw_str(px, fb, pr - (((str_len("PER G") * 6) - 1) * sc), y, sc, "PER G",
+               UI_MUTED);
+      draw_str(px, fb, rx - (((str_len("TOTAL") * 6) - 1) * sc), y, sc, "TOTAL",
+               UI_MUTED);
+      y += lh;
       static const int order[FOOD_NMACRO]        = {FOOD_KCAL, FOOD_CARBS,
                                                     FOOD_PROTEIN, FOOD_FAT};
-      static const char *const mlbl[FOOD_NMACRO] = {"CARBS G/G", "PROTEIN G/G",
-                                                    "FAT G/G", "KCAL/G"};
+      static const char *const mlbl[FOOD_NMACRO] = {"CARBS", "PROTEIN", "FAT",
+                                                    "KCAL"};
+      const long g                               = m->food.food_g;
       for (int r = 0; r < FOOD_NMACRO; r++) {
-         const int k = order[r];
-         char v[16];
-         (void)food_milli_str(m->food.food_macro[k], v, (int)sizeof v);
-         y = value_row_wide(fb, h, y, sc, mlbl[k], v, UI_TEXT, MA_FOOD_EDIT,
-                            5 + k);
-         y += gap;
+         const int k    = order[r];
+         const long per = m->food.food_macro[k];
+         char pv[16];
+         char tv[16];
+         /* PER G TO THE THOUSANDTH, which is what the food stores. THE
+          * TOTAL is per gram times the portion, rounded: grams to a tenth,
+          * kcal whole, the resolution a label prints them at. With no
+          * portion there is no total, and "--" says so. */
+         (void)snprintf(pv, sizeof pv, "%ld.%03ld", per / 1000, per % 1000);
+         if (g <= 0) {
+            (void)snprintf(tv, sizeof tv, "--");
+         } else if (k == FOOD_KCAL) {
+            (void)snprintf(tv, sizeof tv, "%ld", ((per * g) + 500) / 1000);
+         } else {
+            const long t = ((per * g) + 50) / 100;
+            (void)snprintf(tv, sizeof tv, "%ld.%ld", t / 10, t % 10);
+         }
+         draw_str(px, fb, x, y + (((7 * tsc) - (7 * sc)) / 2), sc, mlbl[k],
+                  UI_TEXT_DIM);
+         draw_str(px, fb, pr - (str_len(pv) * 6 * tsc), y, tsc, pv, UI_TEXT);
+         draw_str(px, fb, rx - (str_len(tv) * 6 * tsc), y, tsc, tv,
+                  g > 0 ? UI_TEXT : UI_MUTED);
+         add_hit_ix(h, ui_rect(0, y - (4 * sc), mid, vrow), MA_FOOD_EDIT,
+                    5 + k);
+         add_hit_ix(h, ui_rect(mid, y - (4 * sc), fb->width - mid, vrow),
+                    MA_FOOD_EDIT, 9 + k);
+         y += vrow + gap;
       }
    }
 

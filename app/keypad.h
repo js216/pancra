@@ -111,7 +111,14 @@ enum keypad_mode {
    /* The EDIT EXERCISE form's STOP: a time of day, typed like the start's,
     * that sets the duration rather than the instant. */
    KP_EX_STOP = 34,
-   KP_NMODES  = 35
+   /* What the portion on the LOG/EDIT FOOD form holds of each, in grams and
+    * kcal: the same four facts as KP_FOOD_CARBS..KP_FOOD_KCAL, typed as the
+    * portion's total and stored per gram (food.h). */
+   KP_FOOD_CARBS_T = 35,
+   KP_FOOD_PROT_T  = 36,
+   KP_FOOD_FAT_T   = 37,
+   KP_FOOD_KCAL_T  = 38,
+   KP_NMODES       = 39
 };
 
 /* WHICH UNIT THE ENTRY CARRIES -- a name, not a yes/no.
@@ -223,14 +230,17 @@ int kp_is_date(enum keypad_mode mode);
 int kp_is_time(enum keypad_mode mode);
 int kp_is_year(enum keypad_mode mode);
 
-/* The LOG FOOD form's fields by row index: 0 grams, 1 time, 2 date, 3 year.
- * (Row 0 of the form is TYPE, which opens the picker rather than a keypad, so
- * the dispatcher maps it before reaching here.) */
+/* The LOG FOOD form's fields by row index: 0 grams, 1 time, 2 date, 3 year,
+ * 4-7 per gram and 8-11 for the portion, each run indexed like food.h's
+ * macros. (Row 0 of the form is TYPE, which opens the picker rather than a
+ * keypad, so the dispatcher maps it before reaching here.) */
 enum keypad_mode kp_food_field(int ix);
 /* The FOOD LOG's goal rows, indexed like food.h's macros (FOOD_CARBS...). */
 enum keypad_mode kp_goal_field(int ix);
-/* Which food.h macro index a macro or goal mode edits, or -1. */
+/* Which food.h macro index a per-gram, portion-total or goal mode edits, or
+ * -1. */
 int kp_food_macro(enum keypad_mode mode);
+int kp_food_total(enum keypad_mode mode);
 int kp_food_goal(enum keypad_mode mode);
 /* The EDIT EXERCISE form's rows, minus the LEVEL row the caller handles
  * itself: 0 year, 1 date, 2 start, 3 stop, 4 minutes. KP_NONE for anything

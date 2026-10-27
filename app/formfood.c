@@ -186,6 +186,12 @@ int form_food_action(int action, int ix)
          nav_go(SCR_FOODTYPE);
       } else {
          enum keypad_mode mode = kp_food_field(ix - 1);
+         /* A TOTAL NEEDS A PORTION to be divided by: with no grams there is
+          * no per-gram value a typed total could mean. */
+         if (kp_food_total(mode) >= 0 && g_food.g <= 0) {
+            set_status_refused("ENTER GRAMS FIRST");
+            mode = KP_NONE;
+         }
          if (mode != KP_NONE) {
             nav_go(SCR_KEYPAD);
             forms_kp_open(mode, SCR_FOOD);
@@ -339,6 +345,11 @@ void form_food_set_macro(int which, int milli)
 {
    if (which >= 0 && which < FOOD_NMACRO)
       g_food.macro[which] = milli;
+}
+
+int form_food_grams(void)
+{
+   return g_food.g;
 }
 
 void form_food_set_grams(int grams)

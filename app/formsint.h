@@ -95,6 +95,8 @@ void form_food_set_grams(int grams);
 /* What the chosen food is made of, as the form shows it: food.h's macro
  * index and thousandths. Written to the food on CONFIRM. */
 void form_food_set_macro(int which, int milli);
+/* The portion the form holds, in grams: what a typed total is divided by. */
+int form_food_grams(void);
 
 /* This workflow's part of the frame's snapshot. Each fills only its own
  * fields, so a field can be traced to exactly one writer. */
