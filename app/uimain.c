@@ -52,13 +52,20 @@
 
 /* A RUN OF TIME IN THE COARSEST UNIT THAT STILL SAYS SOMETHING.
  *
- * Days from two days up, hours from one hour up, minutes below that. One
- * function because the streak and the record it is measured against are
+ * Days and hours from one day up ("12D 5H"), hours from one hour up, minutes
+ * below that. From 100 days up the hours are dropped ("365D"): a run that long
+ * is told by its days, and the hours would push the widest line past the plot.
+ * One function because the streak and the record it is measured against are
  * rendered side by side, and two copies of this arithmetic would eventually
  * disagree about where an hour becomes a day -- which would read as the two
  * numbers being on different scales.
  *
- * `cap` is at least 7: the widest answers are "59 MIN" and "365 D" plus their
+ * WIDTH BUDGET. The widest line is "STREAK 99D 23H (BEST 99D 23H)", 29
+ * characters. The landscape plot column is at least 188 sc wide, and after the
+ * corner inset it holds 30 characters, so the line always fits. Inner spaces
+ * would make it 33 and push the start of the line off the plot.
+ *
+ * `cap` is at least 8: the widest answers are "99D 23H" and "59 MIN" plus their
  * terminator, and a truncated one would silently change the number rather than
  * the unit. The callers pass 8, which is what lets the compiler prove the line
  * they build out of two of these fits its own buffer. */
@@ -66,8 +73,10 @@ static void streak_len(long s, char *out, size_t cap)
 {
    if (s < 0)
       s = 0;
-   if (s >= 2L * 86400)
-      (void)snprintf(out, cap, "%ld D", s / 86400);
+   if (s >= 100L * 86400)
+      (void)snprintf(out, cap, "%ldD", s / 86400);
+   else if (s >= 86400)
+      (void)snprintf(out, cap, "%ldD %ldH", s / 86400, (s % 86400) / 3600);
    else if (s >= 3600)
       (void)snprintf(out, cap, "%ld H", s / 3600);
    else
@@ -1462,7 +1471,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
        * value back here one reading later. */
       const int is_best = (bb <= 0) || (ss >= bb);
       /* 8 IS THE PROVABLE BOUND, and the compiler is the reason it is not 16:
-       * streak_len's widest answer is "59 MIN" or "365 D", but with a 16-byte
+       * streak_len's widest answer is "99D 23H", but with a 16-byte
        * destination gcc must assume 15 characters twice and cannot show the
        * combined line fits -- which this build treats as an error rather than
        * letting a number be cut in half. */
