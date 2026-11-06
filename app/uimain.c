@@ -694,475 +694,23 @@ static struct bignum_geo render_bignum(struct ANativeWindow_Buffer *fb,
    }
 }
 
-/* The plot block: the span tabs, the plot itself and the two threshold rows.
- * `g` carries what the number block above it decided (see bignum_geo); in
- * landscape the caller synthesises one for the right column, where there is no
- * number above and the rows align to the column's own edges instead. */
-static int render_glucose(struct ANativeWindow_Buffer *fb,
-                          const struct screen *m, struct hits *h, int cx,
-                          int cw, int sc, int bottom, struct bignum_geo g)
+/* THE GLUCOSE PLOT ITSELF, inside `r`: every reading, dose, weighing, meal and
+ * exercise session in m->plot, the change points under it when they are
+ * switched on, and the 70 and 180 edges named. The window is the one m->plot
+ * describes -- `plot_hours` ending at `end` -- so the main screen and GLUCOSE
+ * HISTORY draw the same picture from the same code. `hi` is the point to
+ * highlight, or -1. Returns the configuration it drew with, which the touch
+ * path needs to resolve a press against the same mapping. */
+struct plot_cfg ui_glu_plot(struct ANativeWindow_Buffer *fb,
+                            const struct screen *m, int sc, struct plot_rect r,
+                            int hi)
 {
-   uint32_t *px  = fb->bits;
-   int landscape = bottom > 0;
-   int scrub     = (m->plot.scrub >= 0 && m->plot.scrub < m->plot.nhist);
-   int y         = g.y;
-   int pad       = g.pad;
-   int gh        = g.gh;
-   int bigsc3    = g.bigsc3;
-   int agev_y    = g.agev_y;
-   int pl_y      = g.pl_y;
-
-   /* plot-window tabs (or the scrub readout while dragging) */
-   int colw = cw / UI_TABS;
-   int rowh = 14 * sc;
-   /* Tap target reaches up to the big number's lowest pixel and no higher, then
-    * down through the tab row. The big-number (settings) band ends exactly
-    * there, so the two never fight over the same pixels. */
-   int tab_y = y - bigsc3 - pad;
-   /* ...BUT NEVER OVER THE AGE ROW. The comment above is the original
-    * intent, and it was true when the age sat beside the number; the bar and
-    * its value were later moved DOWN to bar_y (= this same line plus bgap),
-    * which put them inside this band. A tap on the age -- the natural "how
-    * fresh is this?" gesture -- therefore dispatched ACT_PLOT_TAB and
-    * silently switched the plot span to 30D. Keep the band's BOTTOM where it
-    * was and start it below the age glyphs instead. */
-   int age_bot = agev_y + gh + sc;
-   /* ...and never over the PRIMARY line under the bar either, for exactly the
-    * same reason: it is a tap target of its own now. */
-   if (pl_y + gh + (4 * sc) > age_bot)
-      age_bot = pl_y + gh + (4 * sc);
-   int tab_bot = y + rowh;
-   if (tab_y < age_bot)
-      tab_y = age_bot;
-   int tab_h = tab_bot - tab_y;
-   if (tab_h < rowh)
-      tab_h = rowh; /* never shrink below the tab glyphs themselves */
-   /* SETTINGS OPENS FROM THE HAMBURGER ONLY (added above), never from the
-    * whole top band: a band-wide target means a tap on the number or the
-    * trend navigates away by accident. */
-   if (scrub) {
-      char ts[16];
-      /* THE VALUE ALONE, in whatever form its kind is measured: the unit and
-       * the instant are separate fields with separate zones on the row, so
-       * this holds only the number. */
-      char gv[12];
-      /* HOW WIDE THE VALUE FIELD IS, and it is per KIND rather than one width
-       * for all of them.
-       *
-       * The field is centred and the number right-aligned inside it, so every
-       * column of padding beyond what the value can actually need pushes the
-       * digits that far right of centre. A glucose reading in mg/dL is three
-       * digits at most; padding it out to hold a weight's five would sit it a
-       * full glyph off centre for the whole of its life on screen. So each
-       * kind declares the widest IT can be -- mmol/L needs a tenth, mg/dL
-       * does not -- and the digits straddle the middle in every case. */
-      int gvw = m->prefs.units ? 4 : 3;
-      int ins = (m->plot.hist[m->plot.scrub].kind == KIND_INS);
-      int wt  = (m->plot.hist[m->plot.scrub].kind == KIND_WT);
-      int fd  = (m->plot.hist[m->plot.scrub].kind == KIND_FOOD);
-      int exr = (m->plot.hist[m->plot.scrub].kind == KIND_EX);
-      /* THE OFFSET IN FORCE AT THE READING, like every drawn date
-       * (fmt_date): the time and the weekday below are read in it too. */
-      const long st  = m->plot.hist[m->plot.scrub].t;
-      const long stz = m->tz_at ? m->tz_at(st) : m->tz_off;
-      fmt_hms(st, stz, ts, sizeof ts);
-      ts[5] = '\0';
-      /* An insulin dose scrubs like glucose, shown as "2 U FAST" /
-       * "10 U SLOW" (src carries the dose TYPE for insulin points). A weight
-       * scrubs the same way -- identical code path, identical readout shape --
-       * converted from the stored GRAMS into whichever display unit is set,
-       * so switching KG/LB re-renders history rather than relabelling it. */
-      if (ins) {
-         /* `glu` carries THOUSANDTHS for an insulin point (model.c), so the
-          * dose is rendered rather than printed: "0.5 U", not "500 U". */
-         char iu[16];
-         (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
-         (void)snprintf(gv, sizeof gv, "%s", iu);
-         gvw = 5; /* "12.5", and thousandths can render "1.125" */
-      } else if (wt) {
-         /* Clamped so the format is provably bounded: the store's own range
-          * (WT_MIN_G..WT_MAX_G) tops out at 400 kg / 882 lb, i.e. four digits
-          * of tenths, but the compiler cannot see that through wt_to_tenths
-          * and treats the snprintf as possibly truncating. */
-         int t10 =
-             wt_to_tenths(m->plot.hist[m->plot.scrub].glu, m->prefs.wunits);
-         if (t10 < 0)
-            t10 = 0;
-         if (t10 > 99999)
-            t10 = 99999;
-         (void)snprintf(gv, sizeof gv, "%d.%d", t10 / 10, t10 % 10);
-         gvw = 5; /* "150.5" */
-      } else if (fd) {
-         /* Grams, as stored. FOOD_MAX_G is 999, so three digits and the unit
-          * fit `gv` with room to spare -- and fit the value column below
-          * without widening it. */
-         (void)snprintf(gv, sizeof gv, "%d", m->plot.hist[m->plot.scrub].glu);
-         gvw = 3; /* FOOD_MAX_G is 999 */
-      } else if (exr) {
-         /* HOW LONG IT LASTED, which is the thing about a session that a
-          * glance at the plot cannot give you: the rule shows roughly, this
-          * says exactly. Minutes, because seconds are noise at this scale and
-          * hours would round a 40-minute walk to nothing. A session with no
-          * recorded end -- the app was killed, or it is still running -- has
-          * no length to show, so the intensity carries the line alone. */
-         /* NO "EX " PREFIX: the unit column beside this one already carries
-          * LIGHT / MOD / HARD, so the letters would be saying a second time
-          * what the next field says once -- and they are two of the six
-          * columns the value field gets, which every other reading on the
-          * plot then has to be padded out to. */
-         long mins = m->plot.hist[m->plot.scrub].src / 60;
-         if (mins <= 0)
-            (void)snprintf(gv, sizeof gv, "--");
-         else if (mins > 9999)
-            (void)snprintf(gv, sizeof gv, "9999");
-         else
-            (void)snprintf(gv, sizeof gv, "%ld", mins);
-         gvw = 4; /* minutes, clamped at 9999 above */
-      } else {
-         fmt_glu(m->plot.hist[m->plot.scrub].glu, m->prefs.units, gv,
-                 sizeof gv);
-      }
-      /* On the multi-day spans a bare HH:MM is ambiguous across days, so
-       * prefix the DATE as M/DD ("7/21"). A weekday name told you it was a
-       * Thursday but not WHICH one, which is useless once the span passes a
-       * week -- and at 30D it is useless immediately. */
-      const char *unit = UI_LBL(m->prefs.units);
-      if (ins) {
-         unit = (m->plot.hist[m->plot.scrub].src == INS_FAST) ? "U FAST"
-                                                              : "U SLOW";
-      } else if (wt) {
-         unit = wt_unit_name(m->prefs.wunits);
-      } else if (exr) {
-         /* The user's own words for the three levels, the same ones the
-          * button shows -- a scrub that said "2" would be asking the reader
-          * to remember a scale nothing on screen defines. */
-         static const char *const exl[EX_MAX_LEVEL + 1] = {
-             "MIN", "MIN LIGHT", "MIN MOD", "MIN HARD"};
-         int lv = m->plot.hist[m->plot.scrub].glu;
-         unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv] : exl[0];
-      } else if (fd) {
-         /* THE FOOD'S NAME, TRUNCATED TO WHAT THE LINE HOLDS.
-          *
-          * A name is up to FOOD_NAME_MAX (20) characters and this readout
-          * also carries a value, a date and a time inside a 48-byte line --
-          * so a long name would push the time off the end, and the time is
-          * the part that says WHICH entry is being scrubbed. Cut to SIX, the
-          * width of the unit column this readout keeps -- see the layout
-          * below -- so a name can never widen the line and shift the fields
-          * after it.
-          *
-          * A copy, not a borrowed pointer: `unit` is used further down and
-          * food_type_name's answer is only valid while the vocabulary is
-          * unchanged. An id the vocabulary does not hold answers "", which
-          * renders as a blank name rather than a number -- the honest look of
-          * an entry nothing can name. */
-         static char fname[9];
-         const char *nm = food_type_name(m->plot.hist[m->plot.scrub].src);
-         int fi         = 0;
-         for (; nm[fi] && fi < (int)sizeof fname - 1; fi++)
-            fname[fi] = nm[fi];
-         fname[fi] = 0;
-         /* "G" AND THE NAME TOGETHER: the number is a quantity of grams OF
-          * something, and both halves of that belong on the unit's side of
-          * the reading. */
-         static char fu[16];
-         (void)snprintf(fu, sizeof fu, "G %s", fname);
-         unit = fu;
-      }
-      /* WHEN IT HAPPENED, on the left. A bare HH:MM is ambiguous across days,
-       * so the multi-day spans put the date in front of it: M/DD ("7/21") at
-       * a month or more, where a weekday name tells you it was a Thursday but
-       * not WHICH one, and the weekday itself within a week, because "TUE
-       * 08:15" places a reading the way you actually remember it and there is
-       * only one Tuesday to confuse it with. */
-      char whenbuf[24];
-      const char *whenp = ts;
-      if (m->plot.plot_hours >= 720) {
-         char dt[20];
-         /* 12, not 8: gcc cannot prove the month is two digits, and this
-          * build treats a possibly-truncating snprintf as an error. */
-         char md[12];
-         fmt_date(m->plot.hist[m->plot.scrub].t, m->tz_off, dt, sizeof dt);
-         /* fmt_date gives "YYYY-MM-DD HH:MM"; take the month without its
-          * leading zero, and the day as written. */
-         int mon = ((dt[5] - '0') * 10) + (dt[6] - '0');
-         (void)snprintf(md, sizeof md, "%d/%c%c", mon, dt[8], dt[9]);
-         (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", md, ts);
-         whenp = whenbuf;
-      } else if (m->plot.plot_hours >= 72) {
-         /* 1970-01-01 was a Thursday. */
-         static const char *const wd[7] = {"SUN", "MON", "TUE", "WED",
-                                           "THU", "FRI", "SAT"};
-         long z                         = (st + stz) / 86400;
-         int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0 = Sunday */
-         (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
-         whenp = whenbuf;
-      }
-      /* ---- EVERY FIELD A FIXED WIDTH, SO NOTHING MOVES UNDER THE FINGER --
-       *
-       * log_scrub_row pins the time to the left edge and the unit field to
-       * the right, and centres the value between them -- so a field that
-       * changes width from one point to the next slides the unit field, and
-       * the value with it, while the reader is sweeping the trace to read
-       * them. Within each kind of row below, every field is therefore the
-       * same width at every point, numbers right-aligned inside it, and a
-       * value that is absent is blanks of the same width.
-       *
-       * EIGHTEEN CHARACTERS, the row's budget. log_scrub_row keeps its full
-       * size while the three fields and a cell of air either side of the
-       * middle fit the plot's width: on a 720-wide portrait screen that is
-       * 18 characters. Each layout below is 5 + value + 10 or 9 to the
-       * character. */
-
-      /* INSULIN ON THE 3H AND 12H PLOTS: "22:30  1.5U  FAST 1H30".
-       *
-       * Both types share the layout, so stepping from a FAST dose to a SLOW
-       * one moves nothing either. The dose with its U is four wide, which
-       * holds every dose of up to three characters ("2", "12", "1.5"); the
-       * type is four; and the age is four, right-aligned: "  5M", " 45M",
-       * "1H30". The age carries no sign because the sign is the one
-       * character the row does not have -- next to the clock, "1H30" can
-       * only be an interval.
-       *
-       * THE AGE IS FOR A FAST DOSE UNDER TEN HOURS OLD, which keeps it to its
-       * four characters. A SLOW dose, an older FAST dose and a dose stamped
-       * in the future, which has no age, have blanks in its place. A dose of
-       * four characters ("16.5") is wider than its field, and makes the row
-       * one character too long for the full size. */
-      static char insu[16];
-      if (ins && (m->plot.plot_hours == 3 || m->plot.plot_hours == 12)) {
-         const struct ui_point *d = &m->plot.hist[m->plot.scrub];
-         const int fast           = d->src == INS_FAST;
-         const long dage          = m->now - d->t;
-         char iu[16];
-         char ago[8] = "";
-         (void)ins_units_str(d->glu, iu, sizeof iu);
-         (void)snprintf(gv, sizeof gv, "%.10sU", iu);
-         gvw = 4;
-         if (fast && dage >= 0 && dage < 10L * 3600)
-            fmt_ago_hm(dage, ago, sizeof ago);
-         (void)snprintf(insu, sizeof insu, "%s %4s", fast ? "FAST" : "SLOW",
-                        ago);
-         unit = insu;
-      }
-
-      /* GLUCOSE IN mg/dL ON THE 3H, 12H AND 24H PLOTS: "22:30  148  MG/DL
-       * +12" -- how far a CGM reading moved since the same sensor's reading
-       * before it.
-       *
-       * AFTER THE UNIT, where it reads as a change and not as arithmetic on
-       * the value beside it. Signed always, "+0" included, and right-aligned
-       * in four: the history holds readings of 20..600 (INGEST_GLU_MIN..MAX),
-       * so a change is at most 580 and "+580" is the widest. With the clock's
-       * 5 and the value's 3, "MG/DL +580" is 10 and the row is 18.
-       *
-       * ONLY ACROSS ONE READING'S GAP. The previous point is the latest
-       * earlier CGM reading from the same source, and only if it is less than
-       * six minutes older -- the sensor's five-minute cadence and a little
-       * slack. Across a dropout, at a session's first reading, and for a
-       * meter reading, the change is blanks.
-       *
-       * THESE SPANS ONLY, because theirs is the bare clock. From 3D the time
-       * field carries a weekday or a date as well, and ten more characters
-       * would not fit at the full size. mg/dL only, for the same reason: the
-       * mmol/L value and unit are one character wider each. */
-      static char gluu[16];
-      if (!ins && !wt && !fd && !exr && !m->prefs.units &&
-          m->plot.plot_hours < 72) {
-         const struct ui_point *cur = &m->plot.hist[m->plot.scrub];
-         char dv[8]                 = "";
-         int prev                   = -1;
-         if (cur->kind == KIND_CGM)
-            for (int i = 0; i < m->plot.nhist; i++) {
-               const struct ui_point *p = &m->plot.hist[i];
-               if (p->kind != KIND_CGM || p->src != cur->src ||
-                   p->t >= cur->t || cur->t - p->t >= PLOT_CHG_GAP_S)
-                  continue;
-               if (prev < 0 || p->t > m->plot.hist[prev].t)
-                  prev = i;
-            }
-         if (prev >= 0) {
-            int d = cur->glu - m->plot.hist[prev].glu;
-            if (d > 999)
-               d = 999;
-            if (d < -999)
-               d = -999;
-            (void)snprintf(dv, sizeof dv, "%+d", d);
-         }
-         (void)snprintf(gluu, sizeof gluu, "%s %4s", unit, dv);
-         unit = gluu;
-      }
-      /* THE APP'S ONE READOUT LAYOUT -- when, value, unit, each anchored so
-       * that sweeping the trace moves the number and nothing else. See
-       * log_scrub_row, which every plot in the app draws through.
-       *
-       * FULL DOUBLE SCALE, unconditionally. The old single centred string had
-       * to be stepped down a size on the dated spans to fit the date it had
-       * gained; with the fields anchored to the plot's two edges instead of
-       * packed end to end, the width they need is the width they occupy and
-       * nothing has to give. */
-      /* THE NUMBER IS RIGHT-ALIGNED IN A FIXED FIELD, and it is the field
-       * that is centred.
-       *
-       * Centring the digits themselves would move them every time the reading
-       * changed width: sweeping past 100 down to 90 slides the number half a
-       * glyph left, which under a finger reads as the row twitching rather
-       * than as the value falling. Padded to a constant width, the field's
-       * centre never moves and the units digit stays in its column, so what
-       * changes on screen is the digits and nothing else.
-       *
-       * The width is `gvw`, which each kind sets to what it can actually
-       * need; see where it is declared. */
-      char vpad[16];
-      (void)snprintf(vpad, sizeof vpad, "%*s", gvw, gv);
-      log_scrub_row(px, fb, cx + (2 * sc), y, cw - (4 * sc), sc, 2 * sc, whenp,
-                    vpad, unit);
-   } else {
-      int laby = y + ((rowh - (7 * sc)) / 2);
-      for (int i = 0; i < UI_TABS; i++) {
-         char lab[12];
-         int th = ui_tab_hours[i];
-         ui_span_label(th, lab, sizeof lab);
-         int lw   = str_len(lab) * 6 * sc;
-         int tabx = cx + (i * colw);
-         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, lab,
-                  ui_tab_hours[i] == m->plot.plot_hours ? UI_TEXT : UI_MUTED);
-         /* arg carries the plot span in hours, so the shell needn't know the
-          * tab list -- it just assigns it. */
-         add_hit(h, ui_rect(tabx, tab_y, colw, tab_h), ACT_PLOT_TAB,
-                 ui_tab_hours[i]);
-      }
-   }
-   y += rowh;
-
-   /* Plot height: in landscape it fills the column; in PORTRAIT it grows to
-    * consume the screen down to a RESERVED band that exactly holds the info
-    * block plus the alarm banner with a blank line above and below the alarm's
-    * large letters -- so the bottom is never a large dead gap, and the layout
-    * does not jump when an alarm appears (the space is always held).
-    *
-    * The reserve is the info block's own vertical budget (render_info's needv:
-    * 4 info rows + gap + 4 stat rows + the banner's advance and 7*5 glyph) plus
-    * one blank line (16) for the gap BELOW the alarm. render_info fits itself
-    * into whatever is left, so reserving at least this much can only leave it
-    * room to spare -- never clip. */
-   /* Reserve, in sc units, everything drawn between the plot bottom and the
-    * screen bottom AT FULL FONT:
-    *   34 = what render_glucose itself adds after the plot: a 9 gap, then the
-    *        threshold row at 7 row + 18 portrait pad. A row the reserve
-    *        leaves out is a row the plot grows over, and the overlap would
-    *        land on the thresholds -- the numbers whose whole purpose is to
-    *        be readable at a glance.
-    *  211 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
-    *        the banner's advance and glyph) plus the THIRD shortcut row.
-    *
-    *   16 = one blank line BELOW the alarm's large letters.
-    *
-    * 34 + 211 IS THE 59 + 186 IT REPLACES, and deliberately so: collapsing
-    * the ALARM and NUDGE rows into one freed 25 of height, and that height
-    * belongs to the shortcut grid rather than to the plot. Leaving the total
-    * alone is what hands it over -- the plot ends where it always did and the
-    * block below it is 25 taller.
-    *
-    * Reserving render_info's full budget keeps its font at sc (it only
-    * downscales when squeezed), which is the point -- the plot grows into the
-    * dead space, the text below it does NOT shrink. */
-   int reserve = (34 + 211 + 16) * sc;
-   int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
-   int ph   = 0;
-   if (landscape)
-   /* 26, BECAUSE ONE THRESHOLD ROW COMES AFTER THE PLOT. In landscape the
-    * plot is sized by subtracting what follows it: a 9 gap, then 7 glyph +
-    * 6 landscape pad, i.e. 22, plus 4 sc of slack.
-    *
-    * A NUMBER TOO SMALL HERE DOES NOT CROP THE PLOT -- it puts the threshold
-    * row and all five of its tap targets below the buffer, on every
-    * wide-short geometry. This app does not scroll, so that is drawn nowhere
-    * and tappable nowhere.
-    *
-    * The shortcut grid is in the OTHER column in landscape, so the row freed
-    * by collapsing ALARM and NUDGE has nothing to be handed to here and goes
-    * to the plot. */
-   /* THREE QUARTERS of what is left, not all of it. The rest is the
-    * threshold row (26*sc).
-    *
-    * The banner needs no reservation here: it is above the big number, in the
-    * other column. The three-quarter cap stays anyway, because what it
-    * protects is the threshold rows' own room on a short window, not
-    * the banner's. */
-   {
-      ph      = bottom - y - (26 * sc);
-      int cap = ((bottom - y) * 3) / 4;
-      if (ph > cap)
-         ph = cap;
-   } else {
-      /* A FLOOR OF 12*bigsc, and growth only into genuine excess above it. A
-       * plot that shrinks on a short screen takes the space from itself
-       * rather than from the rows below, which is the wrong way round: those
-       * rows have tap targets and this does not. */
-      ph = (grow > 12 * g.bigsc) ? grow : 12 * g.bigsc;
-   }
-   if (ph < 20 * sc)
-      ph = 20 * sc;
-   /* ---- THE CHANGE BAND, AT THE SCALE THE GLUCOSE ALREADY HAS ----------
-    *
-    * The plot's scale runs down to PLOT_CHG_FLOOR rather than 50, so each CGM
-    * reading's change since the same sensor's previous one can be drawn on
-    * it (see the change points below). The band that adds is paid for in
-    * HEIGHT, not in scale: the plot grows by exactly the pixels 50 -
-    * PLOT_CHG_FLOOR mg/dL take at the scale computed above, so every glucose
-    * value sits the same distance below the top as it did.
-    *
-    * THE ROOM COMES FROM SPACING ONLY. In portrait, what follows the plot is
-    * the threshold row (34 sc, see the reserve above), then render_info:
-    * its table (73 sc to the button row), the air it puts above the buttons
-    * -- which it gives up when short, down to none -- and the button rows.
-    * So the plot may grow by as much as keeps the buttons, with no air above
-    * them, clear of the system gesture bar -- the bottom 1/24 of the screen,
-    * as the log screens reserve it.
-    *
-    * THAT ALSO KEEPS render_info AT ITS OWN TEXT SIZE. It sizes its text
-    * down when it has less than its whole budget below its first row --
-    * 98 sc and the extra button rows -- and the buttons end 97 sc and those
-    * rows below it. The gesture bar is h/24 and a portrait sc is at most
-    * h/466, so buttons that clear the bar leave the text its budget.
-    *
-    * In landscape the column below the plot holds only the threshold row.
-    * Where that room is short of the band's pixels the band gets what there
-    * is, and the whole scale is that much tighter.
-    *
-    * DELTA MARKER OFF (settings, DISPLAY) is no band at all: the plot keeps
-    * the height and the 50 floor it has without one. */
+   uint32_t *px     = fb->bits;
    const int chg_on = m->prefs.chg_marker != MARK_HIDE;
-   if (chg_on) {
-      const int top = plot_cfg_max((struct plot_cfg){m->plot.plot_max, 1, 0});
-      const int want =
-          ((ph - 3) * (PLOT_GLU_MIN - PLOT_CHG_FLOOR)) / (top - PLOT_GLU_MIN);
-      int room = 0;
-      if (landscape) {
-         room = (bottom - y - (26 * sc)) - ph;
-      } else {
-         int npin = 0;
-         for (int i = 0; i < SC_MAX; i++)
-            if (m->prefs.shortcut[i] > 0)
-               npin++;
-         int nsc = 0;
-         for (int slot = 0; slot < ui_shortcut_count(); slot++)
-            if (pin_has(&m->prefs, ui_shortcut_id(slot)))
-               nsc++;
-         const int nrows  = pin_rows(npin > nsc ? npin : nsc);
-         const int info_y = y + ph + (34 * sc);
-         const int limit  = fb->height - (fb->height / 24);
-         const int foot   = (((nrows - 1) * 28) + 24) * sc;
-         room             = limit - (info_y + (73 * sc) + foot);
-      }
-      if (room < 0)
-         room = 0;
-      ph += want < room ? want : room;
-   }
-   int plot_x = cx + (2 * sc);
-   int plot_y = y;
-   int plot_w = cw - (4 * sc);
+   const int plot_x = r.x;
+   const int plot_y = r.y;
+   const int plot_w = r.w;
+   const int ph     = r.h;
    /* WHAT THE PLOT WILL DRAW is UI_PLOT_MAX below: UI_PTS_MAX, the glucose
     * points a long span can return plus the four logs' entries the model
     * appends after them in the SAME m->plot.hist array. Capping at the
@@ -1380,8 +928,8 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    struct plot_cfg pcfg = {m->plot.plot_max, prad, chg_on ? PLOT_CHG_FLOOR : 0};
    plot_render((struct plot_fb){px, fb->stride, fb->width, fb->height},
                (struct plot_rect){plot_x, plot_y, plot_w, ph}, pts, npts,
-               m->now, m->plot.plot_hours, pcfg, white_color,
-               scrub ? m->plot.scrub : -1, UI_HILITE, m->tz_off);
+               m->plot.end, m->plot.plot_hours, pcfg, white_color, hi,
+               UI_HILITE, m->tz_off);
 
    /* THE RANGE'S OWN EDGES, NAMED.
     *
@@ -1414,9 +962,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          char lab[12];
          int ex = 0;
          int ey = 0;
-         if (!plot_point_xy((struct plot_rect){plot_x, plot_y, plot_w, ph},
-                            (struct plot_pt){m->now, edge[i], 0, 0, 0, 0, 0},
-                            m->now, m->plot.plot_hours, pcfg, &ex, &ey))
+         if (!plot_point_xy(
+                 (struct plot_rect){plot_x, plot_y, plot_w, ph},
+                 (struct plot_pt){m->plot.end, edge[i], 0, 0, 0, 0, 0},
+                 m->plot.end, m->plot.plot_hours, pcfg, &ex, &ey))
             continue;
          fmt_glu(edge[i], m->prefs.units, lab, sizeof lab);
          draw_str(px, fb, plot_x + (2 * lsc), ey - (8 * lsc), lsc, lab,
@@ -1428,14 +977,511 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
          int ex = 0;
          int ey = 0;
          if (plot_point_xy((struct plot_rect){plot_x, plot_y, plot_w, ph},
-                           (struct plot_pt){m->now, 0, 0, 0, 0, 0, 0}, m->now,
-                           m->plot.plot_hours, pcfg, &ex, &ey)) {
+                           (struct plot_pt){m->plot.end, 0, 0, 0, 0, 0, 0},
+                           m->plot.end, m->plot.plot_hours, pcfg, &ex, &ey)) {
             fmt_glu(0, m->prefs.units, lab, sizeof lab);
             draw_str(px, fb, plot_x + (2 * lsc), ey - (8 * lsc), lsc, lab,
                      UI_DISCLAIM);
          }
       }
    }
+   return pcfg;
+}
+
+/* THE SCRUB READOUT of the glucose plot's highlighted point, m->plot.scrub,
+ * as one row at x, y, w wide: when it happened on the left, its value in the
+ * middle and its unit on the right. The main screen draws it over its span
+ * tabs and GLUCOSE HISTORY over its step row above the plot. */
+void ui_glu_scrub_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                      int x, int y, int w, int sc)
+{
+   uint32_t *px = fb->bits;
+   char ts[16];
+   /* THE VALUE ALONE, in whatever form its kind is measured: the unit and
+    * the instant are separate fields with separate zones on the row, so
+    * this holds only the number. */
+   char gv[12];
+   /* HOW WIDE THE VALUE FIELD IS, and it is per KIND rather than one width
+    * for all of them.
+    *
+    * The field is centred and the number right-aligned inside it, so every
+    * column of padding beyond what the value can actually need pushes the
+    * digits that far right of centre. A glucose reading in mg/dL is three
+    * digits at most; padding it out to hold a weight's five would sit it a
+    * full glyph off centre for the whole of its life on screen. So each
+    * kind declares the widest IT can be -- mmol/L needs a tenth, mg/dL
+    * does not -- and the digits straddle the middle in every case. */
+   int gvw = m->prefs.units ? 4 : 3;
+   int ins = (m->plot.hist[m->plot.scrub].kind == KIND_INS);
+   int wt  = (m->plot.hist[m->plot.scrub].kind == KIND_WT);
+   int fd  = (m->plot.hist[m->plot.scrub].kind == KIND_FOOD);
+   int exr = (m->plot.hist[m->plot.scrub].kind == KIND_EX);
+   /* THE OFFSET IN FORCE AT THE READING, like every drawn date
+    * (fmt_date): the time and the weekday below are read in it too. */
+   const long st  = m->plot.hist[m->plot.scrub].t;
+   const long stz = m->tz_at ? m->tz_at(st) : m->tz_off;
+   fmt_hms(st, stz, ts, sizeof ts);
+   ts[5] = '\0';
+   /* An insulin dose scrubs like glucose, shown as "2 U FAST" /
+    * "10 U SLOW" (src carries the dose TYPE for insulin points). A weight
+    * scrubs the same way -- identical code path, identical readout shape --
+    * converted from the stored GRAMS into whichever display unit is set,
+    * so switching KG/LB re-renders history rather than relabelling it. */
+   if (ins) {
+      /* `glu` carries THOUSANDTHS for an insulin point (model.c), so the
+       * dose is rendered rather than printed: "0.5 U", not "500 U". */
+      char iu[16];
+      (void)ins_units_str(m->plot.hist[m->plot.scrub].glu, iu, sizeof iu);
+      (void)snprintf(gv, sizeof gv, "%s", iu);
+      gvw = 5; /* "12.5", and thousandths can render "1.125" */
+   } else if (wt) {
+      /* Clamped so the format is provably bounded: the store's own range
+       * (WT_MIN_G..WT_MAX_G) tops out at 400 kg / 882 lb, i.e. four digits
+       * of tenths, but the compiler cannot see that through wt_to_tenths
+       * and treats the snprintf as possibly truncating. */
+      int t10 = wt_to_tenths(m->plot.hist[m->plot.scrub].glu, m->prefs.wunits);
+      if (t10 < 0)
+         t10 = 0;
+      if (t10 > 99999)
+         t10 = 99999;
+      (void)snprintf(gv, sizeof gv, "%d.%d", t10 / 10, t10 % 10);
+      gvw = 5; /* "150.5" */
+   } else if (fd) {
+      /* Grams, as stored. FOOD_MAX_G is 999, so three digits and the unit
+       * fit `gv` with room to spare -- and fit the value column below
+       * without widening it. */
+      (void)snprintf(gv, sizeof gv, "%d", m->plot.hist[m->plot.scrub].glu);
+      gvw = 3; /* FOOD_MAX_G is 999 */
+   } else if (exr) {
+      /* HOW LONG IT LASTED, which is the thing about a session that a
+       * glance at the plot cannot give you: the rule shows roughly, this
+       * says exactly. Minutes, because seconds are noise at this scale and
+       * hours would round a 40-minute walk to nothing. A session with no
+       * recorded end -- the app was killed, or it is still running -- has
+       * no length to show, so the intensity carries the line alone. */
+      /* NO "EX " PREFIX: the unit column beside this one already carries
+       * LIGHT / MOD / HARD, so the letters would be saying a second time
+       * what the next field says once -- and they are two of the six
+       * columns the value field gets, which every other reading on the
+       * plot then has to be padded out to. */
+      long mins = m->plot.hist[m->plot.scrub].src / 60;
+      if (mins <= 0)
+         (void)snprintf(gv, sizeof gv, "--");
+      else if (mins > 9999)
+         (void)snprintf(gv, sizeof gv, "9999");
+      else
+         (void)snprintf(gv, sizeof gv, "%ld", mins);
+      gvw = 4; /* minutes, clamped at 9999 above */
+   } else {
+      fmt_glu(m->plot.hist[m->plot.scrub].glu, m->prefs.units, gv, sizeof gv);
+   }
+   /* On the multi-day spans a bare HH:MM is ambiguous across days, so
+    * prefix the DATE as M/DD ("7/21"). A weekday name told you it was a
+    * Thursday but not WHICH one, which is useless once the span passes a
+    * week -- and at 30D it is useless immediately. */
+   const char *unit = UI_LBL(m->prefs.units);
+   if (ins) {
+      unit =
+          (m->plot.hist[m->plot.scrub].src == INS_FAST) ? "U FAST" : "U SLOW";
+   } else if (wt) {
+      unit = wt_unit_name(m->prefs.wunits);
+   } else if (exr) {
+      /* The user's own words for the three levels, the same ones the
+       * button shows -- a scrub that said "2" would be asking the reader
+       * to remember a scale nothing on screen defines. */
+      static const char *const exl[EX_MAX_LEVEL + 1] = {"MIN", "MIN LIGHT",
+                                                        "MIN MOD", "MIN HARD"};
+      int lv = m->plot.hist[m->plot.scrub].glu;
+      unit   = (lv >= EX_MIN_LEVEL && lv <= EX_MAX_LEVEL) ? exl[lv] : exl[0];
+   } else if (fd) {
+      /* THE FOOD'S NAME, TRUNCATED TO WHAT THE LINE HOLDS.
+       *
+       * A name is up to FOOD_NAME_MAX (20) characters and this readout
+       * also carries a value, a date and a time inside a 48-byte line --
+       * so a long name would push the time off the end, and the time is
+       * the part that says WHICH entry is being scrubbed. Cut to SIX, the
+       * width of the unit column this readout keeps -- see the layout
+       * below -- so a name can never widen the line and shift the fields
+       * after it.
+       *
+       * A copy, not a borrowed pointer: `unit` is used further down and
+       * food_type_name's answer is only valid while the vocabulary is
+       * unchanged. An id the vocabulary does not hold answers "", which
+       * renders as a blank name rather than a number -- the honest look of
+       * an entry nothing can name. */
+      static char fname[9];
+      const char *nm = food_type_name(m->plot.hist[m->plot.scrub].src);
+      int fi         = 0;
+      for (; nm[fi] && fi < (int)sizeof fname - 1; fi++)
+         fname[fi] = nm[fi];
+      fname[fi] = 0;
+      /* "G" AND THE NAME TOGETHER: the number is a quantity of grams OF
+       * something, and both halves of that belong on the unit's side of
+       * the reading. */
+      static char fu[16];
+      (void)snprintf(fu, sizeof fu, "G %s", fname);
+      unit = fu;
+   }
+   /* WHEN IT HAPPENED, on the left. A bare HH:MM is ambiguous across days,
+    * so the multi-day spans put the date in front of it: M/DD ("7/21") at
+    * a month or more, where a weekday name tells you it was a Thursday but
+    * not WHICH one, and the weekday itself within a week, because "TUE
+    * 08:15" places a reading the way you actually remember it and there is
+    * only one Tuesday to confuse it with. */
+   char whenbuf[24];
+   const char *whenp = ts;
+   if (m->plot.plot_hours >= 720) {
+      char dt[20];
+      /* 12, not 8: gcc cannot prove the month is two digits, and this
+       * build treats a possibly-truncating snprintf as an error. */
+      char md[12];
+      fmt_date(m->plot.hist[m->plot.scrub].t, m->tz_off, dt, sizeof dt);
+      /* fmt_date gives "YYYY-MM-DD HH:MM"; take the month without its
+       * leading zero, and the day as written. */
+      int mon = ((dt[5] - '0') * 10) + (dt[6] - '0');
+      (void)snprintf(md, sizeof md, "%d/%c%c", mon, dt[8], dt[9]);
+      (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", md, ts);
+      whenp = whenbuf;
+   } else if (m->plot.plot_hours >= 72) {
+      /* 1970-01-01 was a Thursday. */
+      static const char *const wd[7] = {"SUN", "MON", "TUE", "WED",
+                                        "THU", "FRI", "SAT"};
+      long z                         = (st + stz) / 86400;
+      int wi = (int)(((z % 7) + 4 + 7) % 7); /* 0 = Sunday */
+      (void)snprintf(whenbuf, sizeof whenbuf, "%s %s", wd[wi], ts);
+      whenp = whenbuf;
+   }
+   /* ---- EVERY FIELD A FIXED WIDTH, SO NOTHING MOVES UNDER THE FINGER --
+    *
+    * log_scrub_row pins the time to the left edge and the unit field to
+    * the right, and centres the value between them -- so a field that
+    * changes width from one point to the next slides the unit field, and
+    * the value with it, while the reader is sweeping the trace to read
+    * them. Within each kind of row below, every field is therefore the
+    * same width at every point, numbers right-aligned inside it, and a
+    * value that is absent is blanks of the same width.
+    *
+    * EIGHTEEN CHARACTERS, the row's budget. log_scrub_row keeps its full
+    * size while the three fields and a cell of air either side of the
+    * middle fit the plot's width: on a 720-wide portrait screen that is
+    * 18 characters. Each layout below is 5 + value + 10 or 9 to the
+    * character. */
+
+   /* INSULIN ON THE 3H AND 12H PLOTS: "22:30  1.5U  FAST 1H30".
+    *
+    * Both types share the layout, so stepping from a FAST dose to a SLOW
+    * one moves nothing either. The dose with its U is four wide, which
+    * holds every dose of up to three characters ("2", "12", "1.5"); the
+    * type is four; and the age is four, right-aligned: "  5M", " 45M",
+    * "1H30". The age carries no sign because the sign is the one
+    * character the row does not have -- next to the clock, "1H30" can
+    * only be an interval.
+    *
+    * THE AGE IS FOR A FAST DOSE UNDER TEN HOURS OLD, which keeps it to its
+    * four characters. A SLOW dose, an older FAST dose and a dose stamped
+    * in the future, which has no age, have blanks in its place. A dose of
+    * four characters ("16.5") is wider than its field, and makes the row
+    * one character too long for the full size. */
+   static char insu[16];
+   if (ins && (m->plot.plot_hours == 3 || m->plot.plot_hours == 12)) {
+      const struct ui_point *d = &m->plot.hist[m->plot.scrub];
+      const int fast           = d->src == INS_FAST;
+      const long dage          = m->now - d->t;
+      char iu[16];
+      char ago[8] = "";
+      (void)ins_units_str(d->glu, iu, sizeof iu);
+      (void)snprintf(gv, sizeof gv, "%.10sU", iu);
+      gvw = 4;
+      if (fast && dage >= 0 && dage < 10L * 3600)
+         fmt_ago_hm(dage, ago, sizeof ago);
+      (void)snprintf(insu, sizeof insu, "%s %4s", fast ? "FAST" : "SLOW", ago);
+      unit = insu;
+   }
+
+   /* GLUCOSE IN mg/dL ON THE 3H, 12H AND 24H PLOTS: "22:30  148  MG/DL
+    * +12" -- how far a CGM reading moved since the same sensor's reading
+    * before it.
+    *
+    * AFTER THE UNIT, where it reads as a change and not as arithmetic on
+    * the value beside it. Signed always, "+0" included, and right-aligned
+    * in four: the history holds readings of 20..600 (INGEST_GLU_MIN..MAX),
+    * so a change is at most 580 and "+580" is the widest. With the clock's
+    * 5 and the value's 3, "MG/DL +580" is 10 and the row is 18.
+    *
+    * ONLY ACROSS ONE READING'S GAP. The previous point is the latest
+    * earlier CGM reading from the same source, and only if it is less than
+    * six minutes older -- the sensor's five-minute cadence and a little
+    * slack. Across a dropout, at a session's first reading, and for a
+    * meter reading, the change is blanks.
+    *
+    * THESE SPANS ONLY, because theirs is the bare clock. From 3D the time
+    * field carries a weekday or a date as well, and ten more characters
+    * would not fit at the full size. mg/dL only, for the same reason: the
+    * mmol/L value and unit are one character wider each. */
+   static char gluu[16];
+   if (!ins && !wt && !fd && !exr && !m->prefs.units &&
+       m->plot.plot_hours < 72) {
+      const struct ui_point *cur = &m->plot.hist[m->plot.scrub];
+      char dv[8]                 = "";
+      int prev                   = -1;
+      if (cur->kind == KIND_CGM)
+         for (int i = 0; i < m->plot.nhist; i++) {
+            const struct ui_point *p = &m->plot.hist[i];
+            if (p->kind != KIND_CGM || p->src != cur->src || p->t >= cur->t ||
+                cur->t - p->t >= PLOT_CHG_GAP_S)
+               continue;
+            if (prev < 0 || p->t > m->plot.hist[prev].t)
+               prev = i;
+         }
+      if (prev >= 0) {
+         int d = cur->glu - m->plot.hist[prev].glu;
+         if (d > 999)
+            d = 999;
+         if (d < -999)
+            d = -999;
+         (void)snprintf(dv, sizeof dv, "%+d", d);
+      }
+      (void)snprintf(gluu, sizeof gluu, "%s %4s", unit, dv);
+      unit = gluu;
+   }
+   /* THE APP'S ONE READOUT LAYOUT -- when, value, unit, each anchored so
+    * that sweeping the trace moves the number and nothing else. See
+    * log_scrub_row, which every plot in the app draws through.
+    *
+    * FULL DOUBLE SCALE, unconditionally. The old single centred string had
+    * to be stepped down a size on the dated spans to fit the date it had
+    * gained; with the fields anchored to the plot's two edges instead of
+    * packed end to end, the width they need is the width they occupy and
+    * nothing has to give. */
+   /* THE NUMBER IS RIGHT-ALIGNED IN A FIXED FIELD, and it is the field
+    * that is centred.
+    *
+    * Centring the digits themselves would move them every time the reading
+    * changed width: sweeping past 100 down to 90 slides the number half a
+    * glyph left, which under a finger reads as the row twitching rather
+    * than as the value falling. Padded to a constant width, the field's
+    * centre never moves and the units digit stays in its column, so what
+    * changes on screen is the digits and nothing else.
+    *
+    * The width is `gvw`, which each kind sets to what it can actually
+    * need; see where it is declared. */
+   char vpad[16];
+   (void)snprintf(vpad, sizeof vpad, "%*s", gvw, gv);
+   log_scrub_row(px, fb, x, y, w, sc, 2 * sc, whenp, vpad, unit);
+}
+
+/* The plot block: the span tabs, the plot itself and the two threshold rows.
+ * `g` carries what the number block above it decided (see bignum_geo); in
+ * landscape the caller synthesises one for the right column, where there is no
+ * number above and the rows align to the column's own edges instead. */
+static int render_glucose(struct ANativeWindow_Buffer *fb,
+                          const struct screen *m, struct hits *h, int cx,
+                          int cw, int sc, int bottom, struct bignum_geo g)
+{
+   uint32_t *px  = fb->bits;
+   int landscape = bottom > 0;
+   int scrub     = (m->plot.scrub >= 0 && m->plot.scrub < m->plot.nhist);
+   int y         = g.y;
+   int pad       = g.pad;
+   int gh        = g.gh;
+   int bigsc3    = g.bigsc3;
+   int agev_y    = g.agev_y;
+   int pl_y      = g.pl_y;
+
+   /* plot-window tabs (or the scrub readout while dragging) */
+   int colw = cw / UI_TABS;
+   int rowh = 14 * sc;
+   /* Tap target reaches up to the big number's lowest pixel and no higher, then
+    * down through the tab row. The big-number (settings) band ends exactly
+    * there, so the two never fight over the same pixels. */
+   int tab_y = y - bigsc3 - pad;
+   /* ...BUT NEVER OVER THE AGE ROW. The comment above is the original
+    * intent, and it was true when the age sat beside the number; the bar and
+    * its value were later moved DOWN to bar_y (= this same line plus bgap),
+    * which put them inside this band. A tap on the age -- the natural "how
+    * fresh is this?" gesture -- therefore dispatched ACT_PLOT_TAB and
+    * silently switched the plot span to 30D. Keep the band's BOTTOM where it
+    * was and start it below the age glyphs instead. */
+   int age_bot = agev_y + gh + sc;
+   /* ...and never over the PRIMARY line under the bar either, for exactly the
+    * same reason: it is a tap target of its own now. */
+   if (pl_y + gh + (4 * sc) > age_bot)
+      age_bot = pl_y + gh + (4 * sc);
+   int tab_bot = y + rowh;
+   if (tab_y < age_bot)
+      tab_y = age_bot;
+   int tab_h = tab_bot - tab_y;
+   if (tab_h < rowh)
+      tab_h = rowh; /* never shrink below the tab glyphs themselves */
+   /* SETTINGS OPENS FROM THE HAMBURGER ONLY (added above), never from the
+    * whole top band: a band-wide target means a tap on the number or the
+    * trend navigates away by accident. */
+   if (scrub) {
+      ui_glu_scrub_row(fb, m, cx + (2 * sc), y, cw - (4 * sc), sc);
+   } else {
+      int laby = y + ((rowh - (7 * sc)) / 2);
+      for (int i = 0; i < UI_SPAN_TABS; i++) {
+         char lab[12];
+         int th = ui_tab_hours[i];
+         ui_span_label(th, lab, sizeof lab);
+         int lw   = str_len(lab) * 6 * sc;
+         int tabx = cx + (i * colw);
+         draw_str(px, fb, tabx + ((colw - lw) / 2), laby, sc, lab,
+                  ui_tab_hours[i] == m->plot.plot_hours ? UI_TEXT : UI_MUTED);
+         /* arg carries the plot span in hours, so the shell needn't know the
+          * tab list -- it just assigns it. */
+         add_hit(h, ui_rect(tabx, tab_y, colw, tab_h), ACT_PLOT_TAB,
+                 ui_tab_hours[i]);
+      }
+      /* THE LAST COLUMN OPENS GLUCOSE HISTORY, where any day, week, month
+       * or year can be looked at. It is not a span of its own, so it is
+       * never drawn as the chosen one. Its three dots sit at the middle of
+       * the other labels' letters, where the font's '.' sits on their
+       * baseline: each is the font's 2x2 dot, centred in the 7-row cell. */
+      {
+         const int tabx = cx + (UI_SPAN_TABS * colw);
+         const int lw   = 3 * 6 * sc;
+         const int dx   = tabx + ((colw - lw) / 2);
+         const int dy   = laby + ((5 * sc) / 2);
+         for (int d = 0; d < 3; d++)
+            fill_rect(px, fb, dx + (((d * 6) + 1) * sc), dy, 2 * sc, 2 * sc,
+                      UI_MUTED);
+         add_hit_ix(h, ui_rect(tabx, tab_y, colw, tab_h), MA_GLUHIST_OPEN, 0);
+      }
+   }
+   y += rowh;
+
+   /* Plot height: in landscape it fills the column; in PORTRAIT it grows to
+    * consume the screen down to a RESERVED band that exactly holds the info
+    * block plus the alarm banner with a blank line above and below the alarm's
+    * large letters -- so the bottom is never a large dead gap, and the layout
+    * does not jump when an alarm appears (the space is always held).
+    *
+    * The reserve is the info block's own vertical budget (render_info's needv:
+    * 4 info rows + gap + 4 stat rows + the banner's advance and 7*5 glyph) plus
+    * one blank line (16) for the gap BELOW the alarm. render_info fits itself
+    * into whatever is left, so reserving at least this much can only leave it
+    * room to spare -- never clip. */
+   /* Reserve, in sc units, everything drawn between the plot bottom and the
+    * screen bottom AT FULL FONT:
+    *   34 = what render_glucose itself adds after the plot: a 9 gap, then the
+    *        threshold row at 7 row + 18 portrait pad. A row the reserve
+    *        leaves out is a row the plot grows over, and the overlap would
+    *        land on the thresholds -- the numbers whose whole purpose is to
+    *        be readable at a glance.
+    *  211 = render_info's own budget (needv: 4 info rows + gap + 4 stat rows +
+    *        the banner's advance and glyph) plus the THIRD shortcut row.
+    *
+    *   16 = one blank line BELOW the alarm's large letters.
+    *
+    * 34 + 211 IS THE 59 + 186 IT REPLACES, and deliberately so: collapsing
+    * the ALARM and NUDGE rows into one freed 25 of height, and that height
+    * belongs to the shortcut grid rather than to the plot. Leaving the total
+    * alone is what hands it over -- the plot ends where it always did and the
+    * block below it is 25 taller.
+    *
+    * Reserving render_info's full budget keeps its font at sc (it only
+    * downscales when squeezed), which is the point -- the plot grows into the
+    * dead space, the text below it does NOT shrink. */
+   int reserve = (34 + 211 + 16) * sc;
+   int grow = fb->height - y - reserve; /* plot bottom = reserve from screen */
+   int ph   = 0;
+   if (landscape)
+   /* 26, BECAUSE ONE THRESHOLD ROW COMES AFTER THE PLOT. In landscape the
+    * plot is sized by subtracting what follows it: a 9 gap, then 7 glyph +
+    * 6 landscape pad, i.e. 22, plus 4 sc of slack.
+    *
+    * A NUMBER TOO SMALL HERE DOES NOT CROP THE PLOT -- it puts the threshold
+    * row and all five of its tap targets below the buffer, on every
+    * wide-short geometry. This app does not scroll, so that is drawn nowhere
+    * and tappable nowhere.
+    *
+    * The shortcut grid is in the OTHER column in landscape, so the row freed
+    * by collapsing ALARM and NUDGE has nothing to be handed to here and goes
+    * to the plot. */
+   /* THREE QUARTERS of what is left, not all of it. The rest is the
+    * threshold row (26*sc).
+    *
+    * The banner needs no reservation here: it is above the big number, in the
+    * other column. The three-quarter cap stays anyway, because what it
+    * protects is the threshold rows' own room on a short window, not
+    * the banner's. */
+   {
+      ph      = bottom - y - (26 * sc);
+      int cap = ((bottom - y) * 3) / 4;
+      if (ph > cap)
+         ph = cap;
+   } else {
+      /* A FLOOR OF 12*bigsc, and growth only into genuine excess above it. A
+       * plot that shrinks on a short screen takes the space from itself
+       * rather than from the rows below, which is the wrong way round: those
+       * rows have tap targets and this does not. */
+      ph = (grow > 12 * g.bigsc) ? grow : 12 * g.bigsc;
+   }
+   if (ph < 20 * sc)
+      ph = 20 * sc;
+   /* ---- THE CHANGE BAND, AT THE SCALE THE GLUCOSE ALREADY HAS ----------
+    *
+    * The plot's scale runs down to PLOT_CHG_FLOOR rather than 50, so each CGM
+    * reading's change since the same sensor's previous one can be drawn on
+    * it (see the change points below). The band that adds is paid for in
+    * HEIGHT, not in scale: the plot grows by exactly the pixels 50 -
+    * PLOT_CHG_FLOOR mg/dL take at the scale computed above, so every glucose
+    * value sits the same distance below the top as it did.
+    *
+    * THE ROOM COMES FROM SPACING ONLY. In portrait, what follows the plot is
+    * the threshold row (34 sc, see the reserve above), then render_info:
+    * its table (73 sc to the button row), the air it puts above the buttons
+    * -- which it gives up when short, down to none -- and the button rows.
+    * So the plot may grow by as much as keeps the buttons, with no air above
+    * them, clear of the system gesture bar -- the bottom 1/24 of the screen,
+    * as the log screens reserve it.
+    *
+    * THAT ALSO KEEPS render_info AT ITS OWN TEXT SIZE. It sizes its text
+    * down when it has less than its whole budget below its first row --
+    * 98 sc and the extra button rows -- and the buttons end 97 sc and those
+    * rows below it. The gesture bar is h/24 and a portrait sc is at most
+    * h/466, so buttons that clear the bar leave the text its budget.
+    *
+    * In landscape the column below the plot holds only the threshold row.
+    * Where that room is short of the band's pixels the band gets what there
+    * is, and the whole scale is that much tighter.
+    *
+    * DELTA MARKER OFF (settings, DISPLAY) is no band at all: the plot keeps
+    * the height and the 50 floor it has without one. */
+   const int chg_on = m->prefs.chg_marker != MARK_HIDE;
+   if (chg_on) {
+      const int top = plot_cfg_max((struct plot_cfg){m->plot.plot_max, 1, 0});
+      const int want =
+          ((ph - 3) * (PLOT_GLU_MIN - PLOT_CHG_FLOOR)) / (top - PLOT_GLU_MIN);
+      int room = 0;
+      if (landscape) {
+         room = (bottom - y - (26 * sc)) - ph;
+      } else {
+         int npin = 0;
+         for (int i = 0; i < SC_MAX; i++)
+            if (m->prefs.shortcut[i] > 0)
+               npin++;
+         int nsc = 0;
+         for (int slot = 0; slot < ui_shortcut_count(); slot++)
+            if (pin_has(&m->prefs, ui_shortcut_id(slot)))
+               nsc++;
+         const int nrows  = pin_rows(npin > nsc ? npin : nsc);
+         const int info_y = y + ph + (34 * sc);
+         const int limit  = fb->height - (fb->height / 24);
+         const int foot   = (((nrows - 1) * 28) + 24) * sc;
+         room             = limit - (info_y + (73 * sc) + foot);
+      }
+      if (room < 0)
+         room = 0;
+      ph += want < room ? want : room;
+   }
+   int plot_x = cx + (2 * sc);
+   int plot_y = y;
+   int plot_w = cw - (4 * sc);
+   struct plot_cfg pcfg =
+       ui_glu_plot(fb, m, sc, (struct plot_rect){plot_x, plot_y, plot_w, ph},
+                   scrub ? m->plot.scrub : -1);
    /* THE IN-RANGE STREAK, upper right, inside the plot.
     *
     * Drawn only while the streak is running -- 0 means the newest reading is

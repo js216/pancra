@@ -334,7 +334,7 @@ static char g_store_path[256];
  * (raw = glucose / rescale) -- no data is lost. */
 static const char g_store_hdr[] =
     "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
-    "device_time,tz_offset_s,kind,rescale,warm,screen\n";
+    "device_time,tz_offset_s,kind,rescale,warm,screen,shown\n";
 
 /* THE SCREEN AS THE LAST CHANGE LEFT IT: 0 off, 1 on and locked, 2 unlocked,
  * -1 not known yet. Written by Java's receiver, read by whichever thread
@@ -345,6 +345,16 @@ void store_note_screen(int state)
 {
    if (state >= 0 && state <= 2)
       atomic_store_explicit(&g_screen, state, memory_order_relaxed);
+}
+
+/* WHETHER PANCRA IS IN FRONT: 1 resumed, 0 not. A process started by the
+ * service alone has no activity to show, so 0 is true from the start. Written
+ * by the main looper, read by whichever thread appends a reading. */
+static _Atomic int g_shown = 0;
+
+void store_note_shown(int shown)
+{
+   atomic_store_explicit(&g_shown, shown ? 1 : 0, memory_order_relaxed);
 }
 
 /* ONE DEFINITION OF "THE CURRENT READING IS STALE", used by both forms below.
@@ -584,16 +594,20 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
       (void)snprintf(sc, sizeof sc, "%d", scr);
    else
       sc[0] = 0;
+   /* Shown column: 1 when Pancra's screen was in front as this reading
+    * arrived (store_note_shown). */
+   const int shown = atomic_load_explicit(&g_shown, memory_order_relaxed);
    /* The file is an ARRIVAL log, never re-sorted -- that is what keeps it
     * append-only and crash-safe. Monotonic order is a property of the sorted
     * in-memory view (see hist_insert), not of the bytes on disk. */
-   int n  = has_rssi
-                ? snprintf(line, sizeof line,
-                           "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s,%s\n", t, glu,
-                           trend, rssi, lag, src, raw, tz, kind, rs, ws, sc)
-                : snprintf(line, sizeof line,
-                           "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s,%s\n", t, glu,
-                           trend, lag, src, raw, tz, kind, rs, ws, sc);
+   int n =
+       has_rssi
+           ? snprintf(line, sizeof line,
+                      "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d\n", t, glu,
+                      trend, rssi, lag, src, raw, tz, kind, rs, ws, sc, shown)
+           : snprintf(line, sizeof line,
+                      "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d\n", t, glu,
+                      trend, lag, src, raw, tz, kind, rs, ws, sc, shown);
    n      = clampn(n, sizeof line);
    int rc = log_append(g_store_path, g_store_hdr, (int)sizeof g_store_hdr - 1,
                        line, n);

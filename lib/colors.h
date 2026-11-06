@@ -76,6 +76,14 @@
 #define UI_FOOD_TRACK 0xFF303030U /* a day's total's bar, unfilled */
 #define UI_FOOD_FILL  0xFF55AA55U /* how much of the goal has been eaten */
 #define UI_FOOD_OVER  0xFF3399E6U /* ...and past it: amber */
+#define UI_RANGE_LOW  0xFF0000FFU /* GLUCOSE HISTORY's bar: below 70, red    */
+#define UI_RANGE_IN   0xFF33FF88U /* 70 to 180, the plot's in-range green    */
+#define UI_RANGE_HIGH 0xFF0080FFU /* above 180: orange */
+
+/* ---- the ambulatory glucose profile ------------------------------------ */
+#define UI_AGP_OUTER  0xFF1F4A30U /* 5th to 95th percentile: dark green */
+#define UI_AGP_INNER  0xFF2F7A4CU /* 25th to 75th: a lighter green */
+#define UI_AGP_MEDIAN 0xFF33FF88U /* the median line, the in-range green */
 
 /* ---- sync and status --------------------------------------------------- */
 #define UI_SYNC_STALE 0xFFAA8844U /* pushed, but not lately */

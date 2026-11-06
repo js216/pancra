@@ -83,6 +83,8 @@ static const struct kp_info g_modes[KP_NMODES] = {
     [KP_GOAL_PROT]  = {"PROTEIN GOAL",  3, 0, KP_UNIT_G,    0, 0, 0},
     [KP_GOAL_FAT]   = {"FAT GOAL",      3, 0, KP_UNIT_G,    0, 0, 0},
     [KP_GOAL_KCAL]  = {"KCAL GOAL",     4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_GH_YEAR]    = {"YEAR",          4, 0, KP_UNIT_NONE, 0, 0, 0},
+    [KP_GH_MMDD]    = {"DATE (MMDD)",   4, 0, KP_UNIT_NONE, 0, 0, 0},
 };
 
 /* A mode this build does not define draws nothing and takes nothing. NOT the
@@ -180,6 +182,8 @@ enum kp_form kp_form_of(enum keypad_mode mode)
       case KP_GOAL_PROT:
       case KP_GOAL_FAT:
       case KP_GOAL_KCAL:
+      case KP_GH_YEAR:
+      case KP_GH_MMDD:
       case KP_NMODES: return KP_FORM_NONE;
    }
    return KP_FORM_NONE;

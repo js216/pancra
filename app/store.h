@@ -225,6 +225,12 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
  * written into the row's trailing `screen` column. Set from Java's screen
  * receiver on any thread; unset, the column is left empty. */
 void store_note_screen(int state);
+/* Whether Pancra's own screen is in front as a reading arrives -- 1 between
+ * the activity's resume and its pause, 0 otherwise, including while only the
+ * service is running -- written into the row's trailing `shown` column. With
+ * `screen` it tells Pancra on the screen apart from another app on an
+ * unlocked phone; the BLE scan runs only while the activity is resumed. */
+void store_note_shown(int shown);
 /* Recompute g_cur_* from the newest CGM sample in g_hist. With a primary
  * configured (`prime` >= 0), ONLY the primary's samples qualify: a primary
  * with no data yet clears the current reading (glu -1 = none) rather than

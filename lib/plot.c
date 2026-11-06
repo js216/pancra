@@ -462,6 +462,10 @@ void plot_render(struct plot_fb b, struct plot_rect rc,
     * (3 lines for 3H ... 24 for 24H), daily once the span exceeds a day
     * (3 lines for 3D, 7 for 7D) so multi-day plots aren't a picket fence */
    long gstep = (span <= 24L * 3600) ? 3600 : 24L * 3600;
+   /* Past two months a daily line is a pixel or two from the next one and
+    * the grid reads as a grey wash; a weekly one still marks out the span. */
+   if (span > 62L * 24 * 3600)
+      gstep = 7L * 24 * 3600;
    /* Anchor lines to exact clock boundaries -- the last full hour (or day)
     * before now -- so every vertical line lands on a round time rather than an
     * arbitrary offset back from now. (Whole-hour time zones; sub-hour zones

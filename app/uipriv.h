@@ -84,6 +84,18 @@ void render_label(struct ANativeWindow_Buffer *fb, const struct screen *m,
                   struct hits *h);
 void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  struct hits *h);
+/* The glucose plot in `r`, drawn from m->plot; `hi` is the point to
+ * highlight or -1. Returns the configuration it drew with (uimain.c). */
+struct plot_cfg ui_glu_plot(struct ANativeWindow_Buffer *fb,
+                            const struct screen *m, int sc, struct plot_rect r,
+                            int hi);
+/* The glucose plot's scrub readout, one row at x, y, w wide (uimain.c). */
+void ui_glu_scrub_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                      int x, int y, int w, int sc);
+/* GLUCOSE HISTORY: one span of the plot, its time in range and its
+ * ambulatory glucose profile (uigluhist.c). */
+void render_gluhist(struct ANativeWindow_Buffer *fb, const struct screen *m,
+                    struct hits *h);
 void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
                      struct hits *h);
 void render_meterhelp(struct ANativeWindow_Buffer *fb, const struct screen *m,

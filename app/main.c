@@ -934,6 +934,7 @@ static void on_queue_destroyed(struct ANativeActivity *a, struct AInputQueue *q)
 static void on_resume(struct ANativeActivity *a)
 {
    g_paused = 0;
+   store_note_shown(1);
    /* scan_restart, NOT start_scan.
     *
     * on_pause's stop_scan leaves scan_running() SET when Java cannot confirm
@@ -967,6 +968,7 @@ static void on_resume(struct ANativeActivity *a)
 static void on_pause(struct ANativeActivity *a)
 {
    g_paused = 1; /* set BEFORE the stop, or on_timer could race it back up */
+   store_note_shown(0);
    timer_set(1000, 1000); /* back to the 1 Hz cadence */
    stop_scan(a);
 }

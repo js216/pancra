@@ -103,6 +103,7 @@ enum ui_screen {
    SCR_EXLOG,    /* the exercise entries, paginated, newest first */
    SCR_EXEDIT,   /* EDIT EXERCISE: level, time, date, year */
    SCR_EXDEL,    /* confirm deleting an exercise entry */
+   SCR_GLUHIST,  /* GLUCOSE HISTORY: one day, week, month or year at a time */
    SCR_N
 };
 
@@ -297,6 +298,48 @@ struct ui_plotview {
     * wrote a file. */
    long best_streak_s;
    struct ui_stat stat[5]; /* rolling stats: 1d / 3d / 7d / 30d / 90d */
+   /* THE RIGHT EDGE OF THE WINDOW, an instant: `now` on the main screen, the
+    * end of the chosen day, week, month or year on GLUCOSE HISTORY. The plot
+    * covers the plot_hours before it. */
+   long end;
+};
+
+/* GLUCOSE HISTORY's spans, in the order the SPAN row shows them. */
+enum ui_hspan {
+   HSPAN_DAY,
+   HSPAN_WEEK,
+   HSPAN_MONTH,
+   HSPAN_QUARTER, /* three calendar months */
+   HSPAN_YEAR,
+   HSPAN_N
+};
+
+/* THE AMBULATORY GLUCOSE PROFILE's resolution: half-hour bins of local time
+ * of day, and the five percentiles each bin carries, low to high. */
+#define UI_AGP_BINS 48
+#define UI_AGP_PCT  5
+extern const int ui_agp_pct[UI_AGP_PCT]; /* 5, 25, 50, 75, 95 */
+
+/* WHAT ONE WINDOW OF CGM READINGS ADDS UP TO: how many fell below, inside and
+ * above the 70-180 band, and for each half hour of the day the percentiles
+ * of every reading taken in it, in mg/dL. `have` is 0 for a bin no reading
+ * fell in, whose percentiles are then meaningless. Every CGM's readings
+ * count, the way the main screen's TIR counts them. */
+struct ui_glusum {
+   int n_low, n_in, n_high;
+
+   struct {
+      int have;
+      short p[UI_AGP_PCT];
+   } agp[UI_AGP_BINS];
+};
+
+/* GLUCOSE HISTORY: which span, and where it starts. */
+struct ui_gluhist {
+   int span;      /* enum ui_hspan */
+   long y, mo, d; /* the chosen date: the window's first local day */
+   /* The window's summary (borrowed), or NULL when there is none. */
+   const struct ui_glusum *sum;
 };
 
 /* Stored preferences, as VALUES -- never the settings module's globals, so a
@@ -587,6 +630,7 @@ struct screen {
 
    struct ui_reading reading;
    struct ui_plotview plot;
+   struct ui_gluhist gh;
    struct ui_prefs prefs;
    struct ui_entry entry;
    struct ui_devview dev;

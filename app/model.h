@@ -83,6 +83,26 @@ enum { PLOG_INS, PLOG_WT, PLOG_FOOD, PLOG_EX, PLOG_N };
 
 void model_plot_logs(long now, int hours, int first[PLOG_N], int end[PLOG_N]);
 
+/* THE WINDOW THE GLUCOSE PLOT SHOWS, and what it is drawn from: on the main
+ * screen the chosen span ending `now`, on GLUCOSE HISTORY (`hist`) the day,
+ * week, month or year chosen there, [start, end). `fixed` says it is the
+ * latter. The frame and the scrub's hit test both ask these, so a press
+ * picks from the very points that were drawn. `gh`, when given, receives the
+ * history window's date and span. */
+struct plot_win {
+   long start, end;
+   int hours, fixed;
+};
+
+struct plot_win model_plot_win(int hist, long now, struct ui_gluhist *gh);
+
+/* The window's glucose points from the log, or NULL when the span is short
+ * enough to be drawn from the readings in RAM. */
+const struct ui_point *model_plot_win_source(struct plot_win w, int *n);
+
+/* The window's log entries, as model_plot_logs gives them. */
+void model_plot_win_logs(struct plot_win w, int first[PLOG_N], int end[PLOG_N]);
+
 /* Fill `m` with everything one frame needs. Main thread. */
 void build_model(struct screen *m);
 

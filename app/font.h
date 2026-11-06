@@ -48,6 +48,8 @@ extern const uint8_t icon_pencil[7];   /* "edit this row" mark */
 extern const uint8_t icon_dot[7];      /* NEW DATAPOINT beep indicator */
 extern const uint8_t icon_arrow_up[7]; /* alarm row: above this threshold */
 extern const uint8_t icon_arrow_dn[7]; /* alarm row: below this threshold */
+extern const uint8_t icon_less[7];     /* "less than", where '<' is an arrow */
+extern const uint8_t icon_more[7];     /* "greater than", where '>' is one  */
 extern const uint8_t icon_pg_prev[7];  /* pager: one page back            */
 extern const uint8_t icon_pg_next[7];  /* pager: one page on              */
 extern const uint8_t icon_pg_first[7]; /* pager: jump to the first page   */

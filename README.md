@@ -68,6 +68,24 @@ Then, from the top of the tree:
     make deploy     # stop, replace and start the server on the board
     make clean      # rm -rf build
 
+## Renewing certificate
+
+1. Forward external TCP port 80 to the board, port 8081.
+
+2. On the board serve the challenge directory on 8081:
+
+       mkdir -p ~/acme-www
+       python3 -m http.server 8081 --directory ~/acme-www &
+
+3. Renew:
+
+       ~/.acme.sh/acme.sh --renew --force --ecc -d pancra.org
+
+4. Stop the challenge server, then remove the port 80 forward from the
+   router:
+
+       kill %1
+
 ## Legal
 
 Pancra is a personal project published as source code. It is not a product, it

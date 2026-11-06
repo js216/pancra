@@ -64,7 +64,7 @@ void ui_clip_bump(long n)
 }
 
 /* Plot ranges, 3H on the left to 720h = 30D on the right. */
-const int ui_tab_hours[UI_TABS] = {3, 12, 24, 72, 168, 720};
+const int ui_tab_hours[UI_SPAN_TABS] = {3, 12, 24, 168, 720};
 
 void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
                struct hits *h)
@@ -116,6 +116,7 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_EXLOG: render_exlog(fb, m, h); break;
       case SCR_EXEDIT: render_exedit(fb, m, h); break;
       case SCR_EXDEL: render_exdel(fb, m, h); break;
+      case SCR_GLUHIST: render_gluhist(fb, m, h); break;
       case SCR_FOODLOG: render_foodlog(fb, m, h); break;
       case SCR_FOODDEL: render_fooddel(fb, m, h); break;
       case SCR_FOOD: render_food(fb, m, h); break;

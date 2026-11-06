@@ -154,12 +154,13 @@ int ui_sensor_capacity(int w, int h);
 
 /* Spans the WEIGHT LOG plot offers, in DAYS; 0 is "everything". Exported so
  * the shell can map a tab tap back to a span without duplicating the list. */
-/* THE PLOT SPANS, shared by the glucose plot and the STEP COUNT one -- the
- * same six a reader already knows, so a second chart does not teach a second
- * vocabulary. In uifmt.h rather than uipriv.h because the tap handler picks
- * the span and it is not a renderer. */
-#define UI_TABS 6
-extern const int ui_tab_hours[UI_TABS];
+/* THE MAIN PLOT'S SPANS. The tab row has UI_TABS columns: one per span, and
+ * a last one, "...", that opens GLUCOSE HISTORY for anything longer. In
+ * uifmt.h rather than uipriv.h because the tap handler picks the span and it
+ * is not a renderer. */
+#define UI_TABS      6
+#define UI_SPAN_TABS (UI_TABS - 1)
+extern const int ui_tab_hours[UI_SPAN_TABS];
 /* A SPAN TAB'S NAME, into `out`: hours below two days, whole days above.
  *
  * ONE DEFINITION, because two charts offer these same six spans and the rule

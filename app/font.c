@@ -304,6 +304,11 @@ const uint8_t icon_dot[7] = {0x00, 0x0E, 0x1F, 0x1F, 0x1F, 0x0E, 0x00};
  * text, and an arrow is not a character anybody types. */
 const uint8_t icon_arrow_up[7] = {0x04, 0x0E, 0x1F, 0x04, 0x04, 0x04, 0x00};
 const uint8_t icon_arrow_dn[7] = {0x00, 0x04, 0x04, 0x04, 0x1F, 0x0E, 0x04};
+/* LESS THAN AND GREATER THAN, the comparison signs. The font's '<' and '>'
+ * are arrows -- the keypad's backspace and the primary sensor's mark -- so a
+ * threshold written "< 70" takes these instead. */
+const uint8_t icon_less[7] = {0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02};
+const uint8_t icon_more[7] = {0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08};
 
 /* THE PAGER'S FOUR BUTTONS, as SOLID TRIANGLES rather than the font's '<'
  * and '>'.

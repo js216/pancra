@@ -14,6 +14,7 @@
 #include "exercise.h"
 #include "food.h"
 #include "forms.h"
+#include "gluhist.h" /* the window GLUCOSE HISTORY has chosen */
 #include "insulin.h"
 #include "linkinfo.h" /* the per-link RSSI the frame shows */
 #include "log.h"      /* LOGW: when a frame cannot carry every live device */
@@ -48,6 +49,7 @@
 #include <string.h>
 
 struct frame_ctx; /* defined below: everything one frame is made of */
+static long frame_tz_at(long t);
 static void snap_registry(struct frame_ctx *f);
 static void snap_drivers(struct frame_ctx *f);
 
@@ -229,6 +231,54 @@ void model_plot_logs(long now, int hours, int first[PLOG_N], int end[PLOG_N])
    for (int k = 0; k < PLOG_N; k++)
       if (end[k] - first[k] > PLOT_LOG_MAX)
          first[k] = end[k] - PLOT_LOG_MAX;
+}
+
+/* THE SAME, FOR A FIXED WINDOW [from, to): entries from `from` up to but not
+ * including the first at or after `to`. Exercise starts a day early, so a
+ * session already running when the window opens still shows the part of it
+ * inside. */
+static void plot_logs_window(long from, long to, int first[PLOG_N],
+                             int end[PLOG_N])
+{
+   first[PLOG_INS]  = ins_first_since(from);
+   end[PLOG_INS]    = ins_first_since(to);
+   first[PLOG_WT]   = wt_first_since(from);
+   end[PLOG_WT]     = wt_first_since(to);
+   first[PLOG_FOOD] = food_first_since(from);
+   end[PLOG_FOOD]   = food_first_since(to);
+   first[PLOG_EX]   = ex_first_since(from - 86400);
+   end[PLOG_EX]     = ex_first_since(to);
+   for (int k = 0; k < PLOG_N; k++)
+      if (end[k] - first[k] > PLOT_LOG_MAX)
+         first[k] = end[k] - PLOT_LOG_MAX;
+}
+
+struct plot_win model_plot_win(int hist, long now, struct ui_gluhist *gh)
+{
+   struct plot_win w = {0, now, model_plot_hours(), 0};
+   if (hist) {
+      struct ui_gluhist local;
+      gluhist_window(&w.start, &w.end, gh ? gh : &local);
+      w.hours = (int)((w.end - w.start) / 3600);
+      w.fixed = 1;
+   }
+   return w;
+}
+
+const struct ui_point *model_plot_win_source(struct plot_win w, int *n)
+{
+   if (w.fixed)
+      return plot_source_window(store_path(), w.end, w.end - w.start,
+                                frame_tz_at, n);
+   return plot_source_from(store_path(), w.end, w.hours, n);
+}
+
+void model_plot_win_logs(struct plot_win w, int first[PLOG_N], int end[PLOG_N])
+{
+   if (w.fixed)
+      plot_logs_window(w.start, w.end, first, end);
+   else
+      model_plot_logs(w.end, w.hours, first, end);
 }
 
 static char g_lines[MAX_LINES][MAX_COLS + 1];
@@ -932,10 +982,15 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * reg_lock, this one is not recursive (struct mutex, not struct rmutex).
     * An adversarial review flagged the missing lock; acting on it would have
     * wedged the app on the first repaint. */
-   int nlong = 0;
-   const struct ui_point *plong =
-       plot_source_from(store_path(), now, model_plot_hours(), &nlong);
-   int nh = 0;
+   /* WHICH WINDOW: the chosen span ending now, or on GLUCOSE HISTORY the
+    * day, week, month or year it has chosen, always read from the log. */
+   const struct plot_win w = model_plot_win(m->scr == SCR_GLUHIST, now, &m->gh);
+   const long wend         = w.end;
+   const int hours         = w.hours;
+   int nlong               = 0;
+   const struct ui_point *plong = model_plot_win_source(w, &nlong);
+   m->gh.sum                    = w.fixed ? plot_window_summary() : 0;
+   int nh                       = 0;
    if (plong) {
       /* A long span: one column per pixel, straight from the log, so its
        * depth does not depend on how many points happen to fit in RAM. */
@@ -959,7 +1014,7 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
     * picks from: see model_plot_logs. */
    int lfirst[PLOG_N];
    int lend[PLOG_N];
-   model_plot_logs(now, model_plot_hours(), lfirst, lend);
+   model_plot_win_logs(w, lfirst, lend);
    for (int i = lfirst[PLOG_INS]; i < lend[PLOG_INS] && nh < UI_PTS_MAX; i++) {
       struct ins_rec ir = ins_at(i);
       f->pts[nh].t      = ir.t;
@@ -1051,7 +1106,8 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
       m->plot.nchg = nc;
    }
    m->plot.scrub      = f->fv.scrub;
-   m->plot.plot_hours = model_plot_hours();
+   m->plot.plot_hours = hours;
+   m->plot.end        = wend;
    m->plot.plot_max   = f->prefs.plot_max;
    /* THE IN-RANGE STREAK. Computed from the reading history, not from the
     * point list above -- that one carries doses, weights and food mixed in,

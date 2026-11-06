@@ -28,6 +28,28 @@
 const struct ui_point *plot_source_from(const char *path, long now, int hours,
                                         int *n);
 
+/* THE SAME, FOR A FIXED WINDOW: the `span` seconds ending at `end`, always
+ * read from the log, whatever the span. Also gathers that window's summary
+ * (plot_window_summary), reading time of day in `tz`, the offset east of UTC
+ * in force at an instant. Rebuilt only when the window changes, or after
+ * plot_window_forget: a year of log is a long read, and readings arriving
+ * while the window is on screen do not repeat it. */
+const struct ui_point *plot_source_window(const char *path, long end, long span,
+                                          long (*tz)(long), int *n);
+
+/* Drop the cached window, so the next plot_source_window reads the log
+ * again. GLUCOSE HISTORY calls it on opening. */
+void plot_window_forget(void);
+
+/* The summary of the last window plot_source_window built, or NULL when the
+ * buffer last answered plot_source_from. */
+const struct ui_glusum *plot_window_summary(void);
+
+/* The instant of the oldest CGM reading the last read of the log met, or 0
+ * when none has been read. Every read of the log passes every row, so this
+ * is the whole log's first reading as of that read. */
+long plot_first_cgm(void);
+
 /* Parse one readings.csv row into (t, glu, src, kind); 0 if it is not a
  * datapoint. Exposed so it can be asserted from outside. */
 int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind);

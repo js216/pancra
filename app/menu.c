@@ -10,6 +10,7 @@
 #include "devtag.h" /* a log may not carry an address; see there */
 #include "food.h"
 #include "forms.h"
+#include "gluhist.h" /* gluhist_action: the GLUCOSE HISTORY screen's family */
 #include "jbridge.h"
 #include "keypad.h" /* the dot key and the slot count, once */
 #include "log.h"
@@ -1207,6 +1208,7 @@ int menu_back_code(int *ix)
       case SCR_EXLOG: return MA_EXLOG_BACK;
       case SCR_EXEDIT: return MA_EX_DISCARD;
       case SCR_EXDEL: return MA_EXDEL_NO;
+      case SCR_GLUHIST: return MA_GLUHIST_BACK;
       case SCR_MARKPICK:
          /* the combined picker's X: DISPLAY for an insulin type's styling,
           * the owning sensor's screen otherwise (same as render_markpick) */
@@ -1266,7 +1268,8 @@ void menu_action(int action, int ix)
        calib_action(action, ix) || system_action(action, ix) ||
        keypad_action(action, ix) || pair_action(action, ix) ||
        shortcut_action(action, ix) || forms_action(action, ix) ||
-       style_action(action, ix) || submenu_action(action, ix)) {
+       style_action(action, ix) || submenu_action(action, ix) ||
+       gluhist_action(action, ix)) {
       /* HANDLED BY A NAMED FAMILY, and EXACTLY ONE of them.
        *
        * Every family is defined immediately above this function or in

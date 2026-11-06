@@ -3,9 +3,10 @@
 // Copyright 2026 Jakob Kastelic
 #include "plotdata.h"
 #include "csvcur.h"  /* the shared CSV cursor; the grammar stays here */
-#include "plot.h"    /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "ingest.h"  /* STORE_GLU_MAX: the plot must be able to show it */
+#include "plot.h"    /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "sensors.h" /* KIND_CGM */
+#include "stats.h" /* STAT_TIR_LO / STAT_TIR_HI: the band the summary counts */
 #include "uimodel.h"
 #include <stddef.h>
 /* The app is freestanding and declares its own syscalls (dexlibc.h); the
@@ -54,6 +55,68 @@ static struct ui_point g_plong[PLOT_LONG_MAX];
 static unsigned short g_pcoln[PCOL_MAX]; /* cells kept in each column */
 static int g_nplong;
 static long g_plong_end, g_plong_span, g_plong_size;
+/* The oldest CGM reading the last read of the log met (plot_first_cgm). */
+static long g_first_cgm;
+/* WHICH QUESTION THE BUFFER ABOVE ANSWERS: 0 a span ending at `now`
+ * (plot_source_from), 1 a fixed window (plot_source_window). The two share
+ * one buffer, so a cached answer to one is never handed out for the other. */
+static int g_plong_fixed;
+
+/* THE SUMMARY OF A FIXED WINDOW, gathered while its rows stream past: the
+ * band counts, and per half hour of local time a histogram of the readings in
+ * 2 mg/dL cells, from which the percentiles are read once the scan ends. A
+ * 16-bit count holds a year of readings from several CGMs per cell. */
+#define AGP_CELL_MG 2
+#define AGP_CELLS   (PCELL_GLU / AGP_CELL_MG)
+static unsigned short g_agp_cnt[UI_AGP_BINS][AGP_CELLS];
+static struct ui_glusum g_sum;
+
+const int ui_agp_pct[UI_AGP_PCT] = {5, 25, 50, 75, 95};
+
+static void sum_seen(long t, int glu, long (*tz)(long))
+{
+   if (glu < STAT_TIR_LO)
+      g_sum.n_low++;
+   else if (glu > STAT_TIR_HI)
+      g_sum.n_high++;
+   else
+      g_sum.n_in++;
+   long tod = (t + tz(t)) % 86400;
+   if (tod < 0)
+      tod += 86400;
+   const int bin  = (int)((tod * UI_AGP_BINS) / 86400);
+   const int cell = glu / AGP_CELL_MG;
+   if (cell < AGP_CELLS && g_agp_cnt[bin][cell] < 0xFFFF)
+      g_agp_cnt[bin][cell]++;
+}
+
+/* Each bin's percentiles: the smallest cell whose running count reaches the
+ * rank, read back as the middle of that cell. */
+static void sum_finish(void)
+{
+   for (int b = 0; b < UI_AGP_BINS; b++) {
+      long n = 0;
+      for (int c = 0; c < AGP_CELLS; c++)
+         n += g_agp_cnt[b][c];
+      g_sum.agp[b].have = n > 0;
+      if (n == 0)
+         continue;
+      for (int k = 0; k < UI_AGP_PCT; k++) {
+         long rank = ((n * ui_agp_pct[k]) + 99) / 100;
+         if (rank < 1)
+            rank = 1;
+         long run = 0;
+         int c    = 0;
+         while (c < AGP_CELLS - 1) {
+            run += g_agp_cnt[b][c];
+            if (run >= rank)
+               break;
+            c++;
+         }
+         g_sum.agp[b].p[k] = (short)((c * AGP_CELL_MG) + (AGP_CELL_MG / 2));
+      }
+   }
+}
 
 /* ---- THE CHANGES OF A LONG SPAN -----------------------------------------
  *
@@ -298,8 +361,16 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
    return 1;
 }
 
-static void plong_build(const char *path, long end, long span)
+/* `tz`, when given, is the zone the summary's time of day is read in, and
+ * asks for the summary at all; NULL skips it. */
+static void plong_build(const char *path, long end, long span, long (*tz)(long))
 {
+   for (int b = 0; tz && b < UI_AGP_BINS; b++)
+      for (int c = 0; c < AGP_CELLS; c++)
+         g_agp_cnt[b][c] = 0;
+   g_sum.n_low  = 0;
+   g_sum.n_in   = 0;
+   g_sum.n_high = 0;
    for (size_t i = 0; i < sizeof g_pcell; i++)
       g_pcell[i] = 0;
    for (int i = 0; i < PCOL_MAX; i++)
@@ -314,6 +385,7 @@ static void plong_build(const char *path, long end, long span)
 
    int fd = open(path, O_RDONLY, 0);
    if (fd >= 0) {
+      g_first_cgm = 0;
       char rd[2048];
       char line[256];
       int llen = 0;
@@ -342,10 +414,15 @@ static void plong_build(const char *path, long end, long span)
                continue;
             /* Before the window test: the reading a change is taken from
              * may be just before the window. */
+            if (kind == KIND_CGM && t > 0 &&
+                (g_first_cgm == 0 || t < g_first_cgm))
+               g_first_cgm = t;
             if (kind == KIND_CGM)
                chg_seen(t, glu, src, from, end, span);
             if (t <= from || t > end || glu >= PCELL_GLU)
                continue;
+            if (tz && kind == KIND_CGM)
+               sum_seen(t, glu, tz);
             int col = (int)(((t - from) * (PCOL_MAX - 1)) / span);
             if (col < 0 || col >= PCOL_MAX)
                continue;
@@ -369,6 +446,8 @@ static void plong_build(const char *path, long end, long span)
    for (int c = 0; c < PCOL_MAX; c++)
       for (int j = 0; j < g_nchg_col[c] && g_npchg < UI_CHG_MAX; j++)
          g_pchg[g_npchg++] = g_chg_col[c][j];
+   if (tz)
+      sum_finish();
    g_plong_end  = end;
    g_plong_span = span;
    g_plong_size = plot_log_size(path);
@@ -385,8 +464,42 @@ const struct ui_point *plot_source_from(const char *path, long now, int hours,
       return NULL; /* caller uses g_hist */
    }
    long sz = plot_log_size(path);
-   if (g_plong_span != span || g_plong_size != sz || now - g_plong_end >= 60)
-      plong_build(path, now, span);
+   if (g_plong_fixed || g_plong_span != span || g_plong_size != sz ||
+       now - g_plong_end >= 60) {
+      plong_build(path, now, span, 0);
+      g_plong_fixed = 0;
+   }
    *n = g_nplong;
    return g_plong;
+}
+
+const struct ui_point *plot_source_window(const char *path, long end, long span,
+                                          long (*tz)(long), int *n)
+{
+   if (span <= 0) {
+      *n = 0;
+      return g_plong;
+   }
+   if (!g_plong_fixed || g_plong_span != span || g_plong_end != end) {
+      plong_build(path, end, span, tz);
+      g_plong_fixed = 1;
+   }
+   *n = g_nplong;
+   return g_plong;
+}
+
+void plot_window_forget(void)
+{
+   g_plong_fixed = 0;
+   g_plong_span  = 0;
+}
+
+long plot_first_cgm(void)
+{
+   return g_first_cgm;
+}
+
+const struct ui_glusum *plot_window_summary(void)
+{
+   return g_plong_fixed ? &g_sum : 0;
 }

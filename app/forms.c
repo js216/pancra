@@ -10,6 +10,7 @@
 #include "exercise.h" /* EX_DUR_MAX: the ceiling a typed duration meets */
 #include "food.h"
 #include "formsint.h" /* what the four workflow controllers owe this file */
+#include "gluhist.h"  /* gluhist_set_part: a typed date part */
 #include "insrow.h"   /* INS_*: what a dose row can say */
 #include "insulin.h"
 #include "keypad.h" /* enum keypad_mode: these numbers have names */
@@ -562,6 +563,22 @@ int kp_commit_number(void)
          struct remote_config rc;
          remote_config_get(&rc);
          syncjni_pair_request(rc.email, code);
+         g_kp.len = 0;
+         keypad_close();
+      }
+   } else if (g_kp.mode == KP_GH_YEAR || g_kp.mode == KP_GH_MMDD) {
+      /* GLUCOSE HISTORY's date, one part: the window moves to it, or the
+       * keypad stays with the range said. */
+      if (g_kp.len > 0) {
+         long v = 0;
+         for (int i = 0; i < g_kp.len; i++)
+            v = (v * 10) + (g_kp.entry[i] - '0'); /* max 4 digits: no wrap */
+         const int part = g_kp.mode == KP_GH_YEAR ? GH_PART_YEAR : GH_PART_MMDD;
+         if (gluhist_set_part(part, v, g_kp.err, (int)sizeof g_kp.err) != 0) {
+            g_kp.len = 0;
+            shell_ui_dirty();
+            return COMMIT_STAY;
+         }
          g_kp.len = 0;
          keypad_close();
       }

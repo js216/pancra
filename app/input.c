@@ -17,7 +17,6 @@
 #include "nav.h"
 #include "ndk.h"
 #include "plot.h"
-#include "plotdata.h"
 #include "readingrec.h" /* struct reading: one stored sample */
 #include "scan.h"
 #include "sensors.h"
@@ -234,6 +233,269 @@ static int plot_rect(int *x, int *y, int *w, int *h)
    return 0;
 }
 
+/* THE GLUCOSE PLOT'S SCRUB, one press or move of it: the finger at tx, ty
+ * (averaged with the event's batched samples) picks the nearest drawn point
+ * in the plot rectangle rx, ry, rw, rh, and the pick becomes the highlighted
+ * point. The main screen and GLUCOSE HISTORY both call it; the window and
+ * the points it picks from are the ones the frame drew, from model_plot_win.
+ * `begin` is the press that starts a drag. */
+static void glu_scrub(const struct AInputEvent *ev, int tx, int ty, int begin,
+                      const struct prefs *sp, int rx, int ry, int rw, int rh)
+{
+   const struct plot_win w =
+       model_plot_win(cur_screen() == SCR_GLUHIST, realtime_s(), 0);
+   /* Average the current sample with the batched historical ones so
+    * the pick tracks the centre of the contact, not a jittery edge.
+    */
+   unsigned long hs = AMotionEvent_getHistorySize(ev);
+   long ax          = tx;
+   long ay          = ty;
+   long n           = 1;
+   for (unsigned long h = 0; h < hs; h++) {
+      ax += (long)AMotionEvent_getHistoricalX(ev, 0, h);
+      ay += (long)AMotionEvent_getHistoricalY(ev, 0, h);
+      n++;
+   }
+   int fx = (int)(ax / n);
+   int fy = (int)(ay / n);
+   static struct plot_pt pts[UI_PTS_MAX];
+   /* SIZED FOR THE SAME LOOP AS pts, not for the live window.
+    * Left at NHIST while pts holds a long span, scrubbing 7D or
+    * 30D writes up to PLOT_LONG_MAX ints into a
+    * 5040-int array -- 176 kB straight through the statics that
+    * follow it, which is what silently emptied the stats ring
+    * minutes after every restart. */
+   static int psrc[UI_PTS_MAX];
+   /* Under hist_lock: hist_insert memmoves g_hist from a BLE binder
+    * thread, so an unlocked copy here reads a half-shifted array
+    * and the scrub lands on a datapoint that was never there. Every
+    * other reader takes the lock; this one was missed. */
+   int nlong2                    = 0;
+   const struct ui_point *plong2 = model_plot_win_source(w, &nlong2);
+   int np                        = 0;
+   if (plong2) {
+      /* Hit-test what was DRAWN: on a long span that is the
+       * bucketed set, not the RAM window, or the scrub would
+       * select points the plot never showed. */
+      for (int i = 0; i < nlong2 && np < PLOT_LONG_MAX; i++) {
+         pts[np].t      = plong2[i].t;
+         pts[np].glu    = plong2[i].glu;
+         pts[np].marker = 0;
+         pts[np].col    = 0;
+         pts[np].hidden = 0;
+         psrc[np]       = plong2[i].src;
+         np++;
+      }
+   } else {
+      /* ONE SNAPSHOT, rather than a count and NHIST indexed reads
+       * with the store lock taken by hand around them. */
+      static struct reading snap[NHIST];
+      np = hist_copy(snap, NHIST);
+      for (int i = 0; i < np; i++) {
+         pts[i].t      = snap[i].t;
+         pts[i].glu    = snap[i].glu;
+         pts[i].marker = 0;
+         pts[i].col    = 0;
+         pts[i].hidden = 0;
+         psrc[i]       = snap[i].src;
+      }
+   }
+   /* A HIDDEN device (marker OFF) is off the plot, so its points
+    * must not be scrub-selectable either. plot_hit skips
+    * pts[].hidden. Pull the (few) hidden-marker device ids in ONE
+    * locked call, then flag matching points -- no per-point
+    * registry lock. */
+   /* ONE ARRAY, not one per call: this runs as a looper callback
+    * on the main thread, which cannot re-enter itself, and the
+    * registry's capacity is a lifetime of sensors -- a local would
+    * put that whole capacity in the frame of every touch. */
+   static int hid[MAX_SLOTS];
+   int nhid = sensor_hidden_ids(hid, MAX_SLOTS);
+   /* ONE BIT PER HIDDEN ID, not a scan per point. Testing each
+    * point against the hidden list multiplies two bounds that both
+    * grow with the registry -- a long scrub carries tens of thousands
+    * of points, and the hidden list is bounded by the whole table --
+    * inside a touch handler on the main thread. A bitmap makes it one
+    * test per point.
+    *
+    * An id is 1..MAX_SLOTS, bounded where it is minted, so the bitmap
+    * covers every id that can exist; anything outside it is not
+    * hidden. */
+   static unsigned char hbits[(MAX_SLOTS / 8) + 1];
+   if (nhid > 0) {
+      memset(hbits, 0, sizeof hbits);
+      for (int j = 0; j < nhid; j++) {
+         unsigned u = (unsigned)hid[j];
+         if (u <= (unsigned)MAX_SLOTS)
+            hbits[u >> 3U] = (unsigned char)(hbits[u >> 3U] | (1U << (u & 7U)));
+      }
+      for (int i = 0; i < np; i++) {
+         unsigned u = (unsigned)psrc[i];
+         if (u <= (unsigned)MAX_SLOTS &&
+             (hbits[u >> 3U] & (1U << (u & 7U))) != 0U)
+            pts[i].hidden = 1;
+      }
+   }
+   /* Insulin doses ride along, in the SAME order the model
+    * appends them, so the returned index maps onto m->plot.hist. */
+   int np_glu = np;
+   /* The span's entries of each log, the ones build_model took:
+    * see model_plot_logs. */
+   int lfirst[PLOG_N];
+   int lend[PLOG_N];
+   model_plot_win_logs(w, lfirst, lend);
+   for (int i = lfirst[PLOG_INS]; i < lend[PLOG_INS] && np < UI_PTS_MAX; i++) {
+      struct ins_rec ir = ins_at(i);
+      pts[np].t         = ir.t;
+      pts[np].glu       = 60; /* the renderer's fixed insulin y */
+      pts[np].marker    = 0;
+      pts[np].col       = 0;
+      pts[np].size      = 0;
+      pts[np].hidden =
+          (sp->ins_marker[ir.type == INS_FAST ? INS_FAST : INS_SLOW] ==
+           MARK_HIDE);
+      np++;
+   }
+   /* WEIGHTS, in the SAME order build_model appends them (glucose,
+    * doses, weights) so the index plot_hit returns maps onto
+    * m->plot.hist. THIS array, not the model's, is what the hit test
+    * walks, so a series missing here is drawn on the plot and cannot
+    * be scrubbed. They share the doses' y, so they fall inside
+    * the same bottom band and the aiming rule below picks them up
+    * without any extra case. */
+   for (int i = lfirst[PLOG_WT]; i < lend[PLOG_WT] && np < UI_PTS_MAX; i++) {
+      struct wt_rec wr = wt_at(i);
+      pts[np].t        = wr.t;
+      pts[np].glu      = 60; /* the renderer's fixed bottom-line y */
+      pts[np].marker   = 0;
+      pts[np].col      = 0;
+      pts[np].size     = 0;
+      pts[np].hidden   = 0; /* weights have no hide toggle */
+      np++;
+   }
+   /* FOOD, last, because build_model appends it last -- glucose,
+    * doses, weights, food. THE ORDER IS THE CONTRACT: plot_hit
+    * returns an INDEX into this array and the scrub reads that index
+    * out of m->plot.hist, so the two lists must be built in the same
+    * order or a tap on a food entry reads out somebody else's
+    * record. Nothing checks that at compile time; it is why both
+    * loops name the order they follow.
+    *
+    * Food shares the doses' fixed y, so it lands in the same bottom
+    * band and the aiming rule below picks it up with no extra case
+    * -- exactly as the weights above do. Without this the F markers
+    * drew perfectly and could not be selected, which is the bug the
+    * weights had and the comment above records. */
+   for (int i = lfirst[PLOG_FOOD]; i < lend[PLOG_FOOD] && np < UI_PTS_MAX;
+        i++) {
+      struct food_rec fr = food_at(i);
+      pts[np].t          = fr.t;
+      pts[np].glu        = 60; /* the renderer's fixed bottom line */
+      pts[np].marker     = 0;
+      pts[np].col        = 0;
+      pts[np].size       = 0;
+      pts[np].hidden     = 0; /* food has no hide toggle */
+      np++;
+   }
+   /* EXERCISE, after food, because build_model appends it last --
+    * glucose, doses, weights, food, exercise. The order IS the
+    * contract, for the reason spelled out above: plot_hit returns an
+    * index into THIS array and the scrub reads that index out of
+    * m->plot.hist, so a kind appended here in a different place
+    * would read out somebody else's record.
+    *
+    * `span` is left at zero deliberately. It changes how a point is
+    * DRAWN and not where it is, and the hit test picks by position;
+    * a span here would be a second copy of a number this array has
+    * no other use for. */
+   for (int i = lfirst[PLOG_EX]; i < lend[PLOG_EX] && np < UI_PTS_MAX; i++) {
+      struct ex_rec er = ex_at(i);
+      pts[np].t        = er.t;
+      pts[np].glu      = 60; /* the renderer's fixed bottom line */
+      pts[np].marker   = 0;
+      pts[np].col      = 0;
+      pts[np].size     = 0;
+      pts[np].hidden   = 0; /* exercise has no hide toggle */
+      pts[np].span     = 0;
+      np++;
+   }
+   /* plot_hit picks by TIME alone, which would leave a dose
+    * between two 5-minute CGM points a sliver of reachability.
+    * Aim by finger HEIGHT instead: in the insulin band (twice the
+    * below-70 strip, so the row is reachable without covering it
+    * with the fingertip) only insulin is selectable, above it
+    * only glucose -- sliding along the plot bottom walks the
+    * doses. Decided ONCE, at the DOWN: the rest of the gesture
+    * keeps scrubbing whichever series it began on, wherever the
+    * finger wanders. With no dose in the visible window the whole
+    * plot aims at glucose -- no dead band over nothing. */
+   if (begin) {
+      int oy70 = ry + rh;
+      /* THE STRIP'S FLOOR is the 50 line, which is where the frame
+       * ends on a plain plot and where the change band starts on one
+       * that has it: 2 below it is the rectangle's bottom edge in the
+       * first case, so the band is the same one either way. */
+      int oy50 = ry + rh - 2;
+      {
+         int oxx            = 0;
+         struct plot_pt ref = {0};
+         ref.t              = w.end;
+         ref.glu            = 70;
+         if (!plot_point_xy((struct plot_rect){rx, ry, rw, rh}, ref, w.end,
+                            w.hours, input_plot_cfg(), &oxx, &oy70))
+            oy70 = ry + rh; /* degenerate window: all glucose */
+         ref.glu = PLOT_GLU_MIN;
+         if (!plot_point_xy((struct plot_rect){rx, ry, rw, rh}, ref, w.end,
+                            w.hours, input_plot_cfg(), &oxx, &oy50))
+            oy50 = ry + rh - 2;
+      }
+      /* A dose only claims the touch if one is actually NEAR the
+       * finger. Asking merely "is there a dose in this window"
+       * meant that on a 30-day span a single marker at one edge
+       * captured a press at the far edge, and the scrub then
+       * jumped to a dose an inch away rather than reading the
+       * glucose under the fingertip. About half an inch of x
+       * either side -- an eighth of the plot -- is roughly a
+       * fingertip's own width. */
+      int near_x   = rw / 8;
+      int have_ins = 0;
+      for (int i = np_glu; i < np && !have_ins; i++) {
+         int oxx = 0;
+         int oyy = 0;
+         if (pts[i].hidden ||
+             !plot_point_xy((struct plot_rect){rx, ry, rw, rh}, pts[i], w.end,
+                            w.hours, input_plot_cfg(), &oxx, &oyy))
+            continue;
+         int dx = oxx - fx;
+         if (dx < 0)
+            dx = -dx;
+         if (dx <= near_x)
+            have_ins = 1;
+      }
+      g_scrub_ins = have_ins && (fy >= (2 * oy70) - (oy50 + 2));
+   }
+   int aim_ins = g_scrub_ins;
+   for (int i = 0; i < np_glu; i++)
+      if (aim_ins)
+         pts[i].hidden = 1;
+   for (int i = np_glu; i < np; i++)
+      if (!aim_ins)
+         pts[i].hidden = 1;
+   /* SPLIT the doses line's shared columns, never the glucose
+    * trace's: a dose and a weight logged in the same sitting sit on
+    * one pixel, and without this only one of the two could ever be
+    * scrubbed. On the glucose series a shared column is the normal
+    * state of a multi-day span, and the plain nearest-in-time pick is
+    * what keeps a drag to the left edge landing on the oldest sample.
+    */
+   int idx = plot_hit((struct plot_rect){rx, ry, rw, rh}, pts, np, w.end,
+                      w.hours, input_plot_cfg(), fx, fy, aim_ins);
+   if (idx != forms_scrub()) {
+      forms_set_scrub(idx);
+      shell_repaint();
+   }
+}
+
 /* THE CHOSEN ORIENTATION AS IT IS *NOW*, applied to the main screen.
  *
  * on_input drains EVERY queued event in one pass, and a menu action can
@@ -379,6 +641,36 @@ int on_input(int fd, int events, void *data)
           * -- back on the same target -- dispatches its menu_action code.
           * Sliding off first cancels without firing anything. */
          if (cur_screen()) {
+            /* GLUCOSE HISTORY'S PLOT SCRUBS AS THE MAIN SCREEN'S DOES: a
+             * press inside it starts a drag, every move keeps picking
+             * wherever the finger goes, and the release clears it. */
+            if (cur_screen() == SCR_GLUHIST) {
+               struct action ga = ui_hit(&g_hits, tx, ty);
+               int gbegin =
+                   action == AMOTION_EVENT_ACTION_DOWN && ga.kind == ACT_SCRUB;
+               int gx = 0;
+               int gy = 0;
+               int gw = 0;
+               int gh = 0;
+               if ((gbegin ||
+                    (action == AMOTION_EVENT_ACTION_MOVE && g_scrubbing)) &&
+                   plot_rect(&gx, &gy, &gw, &gh)) {
+                  g_scrubbing = 1;
+                  press_cancel();
+                  glu_scrub(ev, tx, ty, gbegin, &sp, gx, gy, gw, gh);
+                  AInputQueue_finishEvent(q, ev, 1);
+                  continue;
+               }
+               if ((action == AMOTION_EVENT_ACTION_UP ||
+                    action == AMOTION_EVENT_ACTION_CANCEL) &&
+                   g_scrubbing) {
+                  g_scrubbing = 0;
+                  forms_set_scrub(-1);
+                  shell_repaint();
+                  AInputQueue_finishEvent(q, ev, 1);
+                  continue;
+               }
+            }
             /* THE LOG PLOTS SCRUB -- the weight trend, and the exercise and
              * insulin logs' daily totals. They live on MENU screens, where
              * every other target is press-arm/release, so they are handled
@@ -496,265 +788,7 @@ int on_input(int fd, int events, void *data)
          if ((begin || cont) && plot_rect(&rx, &ry, &rw, &rh)) {
             g_scrubbing = 1;
             press_cancel(); /* scrubbing is exempt; no arm may linger */
-            /* Average the current sample with the batched historical ones so
-             * the pick tracks the centre of the contact, not a jittery edge.
-             */
-            unsigned long hs = AMotionEvent_getHistorySize(ev);
-            long ax          = tx;
-            long ay          = ty;
-            long n           = 1;
-            for (unsigned long h = 0; h < hs; h++) {
-               ax += (long)AMotionEvent_getHistoricalX(ev, 0, h);
-               ay += (long)AMotionEvent_getHistoricalY(ev, 0, h);
-               n++;
-            }
-            int fx = (int)(ax / n);
-            int fy = (int)(ay / n);
-            static struct plot_pt pts[UI_PTS_MAX];
-            /* SIZED FOR THE SAME LOOP AS pts, not for the live window.
-             * Left at NHIST while pts holds a long span, scrubbing 7D or
-             * 30D writes up to PLOT_LONG_MAX ints into a
-             * 5040-int array -- 176 kB straight through the statics that
-             * follow it, which is what silently emptied the stats ring
-             * minutes after every restart. */
-            static int psrc[UI_PTS_MAX];
-            /* Under hist_lock: hist_insert memmoves g_hist from a BLE binder
-             * thread, so an unlocked copy here reads a half-shifted array
-             * and the scrub lands on a datapoint that was never there. Every
-             * other reader takes the lock; this one was missed. */
-            int nlong2                    = 0;
-            const struct ui_point *plong2 = plot_source_from(
-                store_path(), realtime_s(), model_plot_hours(), &nlong2);
-            int np = 0;
-            if (plong2) {
-               /* Hit-test what was DRAWN: on a long span that is the
-                * bucketed set, not the RAM window, or the scrub would
-                * select points the plot never showed. */
-               for (int i = 0; i < nlong2 && np < PLOT_LONG_MAX; i++) {
-                  pts[np].t      = plong2[i].t;
-                  pts[np].glu    = plong2[i].glu;
-                  pts[np].marker = 0;
-                  pts[np].col    = 0;
-                  pts[np].hidden = 0;
-                  psrc[np]       = plong2[i].src;
-                  np++;
-               }
-            } else {
-               /* ONE SNAPSHOT, rather than a count and NHIST indexed reads
-                * with the store lock taken by hand around them. */
-               static struct reading snap[NHIST];
-               np = hist_copy(snap, NHIST);
-               for (int i = 0; i < np; i++) {
-                  pts[i].t      = snap[i].t;
-                  pts[i].glu    = snap[i].glu;
-                  pts[i].marker = 0;
-                  pts[i].col    = 0;
-                  pts[i].hidden = 0;
-                  psrc[i]       = snap[i].src;
-               }
-            }
-            /* A HIDDEN device (marker OFF) is off the plot, so its points
-             * must not be scrub-selectable either. plot_hit skips
-             * pts[].hidden. Pull the (few) hidden-marker device ids in ONE
-             * locked call, then flag matching points -- no per-point
-             * registry lock. */
-            /* ONE ARRAY, not one per call: this runs as a looper callback
-             * on the main thread, which cannot re-enter itself, and the
-             * registry's capacity is a lifetime of sensors -- a local would
-             * put that whole capacity in the frame of every touch. */
-            static int hid[MAX_SLOTS];
-            int nhid = sensor_hidden_ids(hid, MAX_SLOTS);
-            /* ONE BIT PER HIDDEN ID, not a scan per point. Testing each
-             * point against the hidden list multiplies two bounds that both
-             * grow with the registry -- a long scrub carries tens of thousands
-             * of points, and the hidden list is bounded by the whole table --
-             * inside a touch handler on the main thread. A bitmap makes it one
-             * test per point.
-             *
-             * An id is 1..MAX_SLOTS, bounded where it is minted, so the bitmap
-             * covers every id that can exist; anything outside it is not
-             * hidden. */
-            static unsigned char hbits[(MAX_SLOTS / 8) + 1];
-            if (nhid > 0) {
-               memset(hbits, 0, sizeof hbits);
-               for (int j = 0; j < nhid; j++) {
-                  unsigned u = (unsigned)hid[j];
-                  if (u <= (unsigned)MAX_SLOTS)
-                     hbits[u >> 3U] =
-                         (unsigned char)(hbits[u >> 3U] | (1U << (u & 7U)));
-               }
-               for (int i = 0; i < np; i++) {
-                  unsigned u = (unsigned)psrc[i];
-                  if (u <= (unsigned)MAX_SLOTS &&
-                      (hbits[u >> 3U] & (1U << (u & 7U))) != 0U)
-                     pts[i].hidden = 1;
-               }
-            }
-            /* Insulin doses ride along, in the SAME order the model
-             * appends them, so the returned index maps onto m->plot.hist. */
-            int np_glu = np;
-            /* The span's entries of each log, the ones build_model took:
-             * see model_plot_logs. */
-            int lfirst[PLOG_N];
-            int lend[PLOG_N];
-            model_plot_logs(realtime_s(), model_plot_hours(), lfirst, lend);
-            for (int i = lfirst[PLOG_INS];
-                 i < lend[PLOG_INS] && np < UI_PTS_MAX; i++) {
-               struct ins_rec ir = ins_at(i);
-               pts[np].t         = ir.t;
-               pts[np].glu       = 60; /* the renderer's fixed insulin y */
-               pts[np].marker    = 0;
-               pts[np].col       = 0;
-               pts[np].size      = 0;
-               pts[np].hidden =
-                   (sp.ins_marker[ir.type == INS_FAST ? INS_FAST : INS_SLOW] ==
-                    MARK_HIDE);
-               np++;
-            }
-            /* WEIGHTS, in the SAME order build_model appends them (glucose,
-             * doses, weights) so the index plot_hit returns maps onto
-             * m->plot.hist. THIS array, not the model's, is what the hit test
-             * walks, so a series missing here is drawn on the plot and cannot
-             * be scrubbed. They share the doses' y, so they fall inside
-             * the same bottom band and the aiming rule below picks them up
-             * without any extra case. */
-            for (int i = lfirst[PLOG_WT]; i < lend[PLOG_WT] && np < UI_PTS_MAX;
-                 i++) {
-               struct wt_rec wr = wt_at(i);
-               pts[np].t        = wr.t;
-               pts[np].glu      = 60; /* the renderer's fixed bottom-line y */
-               pts[np].marker   = 0;
-               pts[np].col      = 0;
-               pts[np].size     = 0;
-               pts[np].hidden   = 0; /* weights have no hide toggle */
-               np++;
-            }
-            /* FOOD, last, because build_model appends it last -- glucose,
-             * doses, weights, food. THE ORDER IS THE CONTRACT: plot_hit
-             * returns an INDEX into this array and the scrub reads that index
-             * out of m->plot.hist, so the two lists must be built in the same
-             * order or a tap on a food entry reads out somebody else's
-             * record. Nothing checks that at compile time; it is why both
-             * loops name the order they follow.
-             *
-             * Food shares the doses' fixed y, so it lands in the same bottom
-             * band and the aiming rule below picks it up with no extra case
-             * -- exactly as the weights above do. Without this the F markers
-             * drew perfectly and could not be selected, which is the bug the
-             * weights had and the comment above records. */
-            for (int i = lfirst[PLOG_FOOD];
-                 i < lend[PLOG_FOOD] && np < UI_PTS_MAX; i++) {
-               struct food_rec fr = food_at(i);
-               pts[np].t          = fr.t;
-               pts[np].glu        = 60; /* the renderer's fixed bottom line */
-               pts[np].marker     = 0;
-               pts[np].col        = 0;
-               pts[np].size       = 0;
-               pts[np].hidden     = 0; /* food has no hide toggle */
-               np++;
-            }
-            /* EXERCISE, after food, because build_model appends it last --
-             * glucose, doses, weights, food, exercise. The order IS the
-             * contract, for the reason spelled out above: plot_hit returns an
-             * index into THIS array and the scrub reads that index out of
-             * m->plot.hist, so a kind appended here in a different place
-             * would read out somebody else's record.
-             *
-             * `span` is left at zero deliberately. It changes how a point is
-             * DRAWN and not where it is, and the hit test picks by position;
-             * a span here would be a second copy of a number this array has
-             * no other use for. */
-            for (int i = lfirst[PLOG_EX]; i < lend[PLOG_EX] && np < UI_PTS_MAX;
-                 i++) {
-               struct ex_rec er = ex_at(i);
-               pts[np].t        = er.t;
-               pts[np].glu      = 60; /* the renderer's fixed bottom line */
-               pts[np].marker   = 0;
-               pts[np].col      = 0;
-               pts[np].size     = 0;
-               pts[np].hidden   = 0; /* exercise has no hide toggle */
-               pts[np].span     = 0;
-               np++;
-            }
-            /* plot_hit picks by TIME alone, which would leave a dose
-             * between two 5-minute CGM points a sliver of reachability.
-             * Aim by finger HEIGHT instead: in the insulin band (twice the
-             * below-70 strip, so the row is reachable without covering it
-             * with the fingertip) only insulin is selectable, above it
-             * only glucose -- sliding along the plot bottom walks the
-             * doses. Decided ONCE, at the DOWN: the rest of the gesture
-             * keeps scrubbing whichever series it began on, wherever the
-             * finger wanders. With no dose in the visible window the whole
-             * plot aims at glucose -- no dead band over nothing. */
-            if (begin) {
-               int oy70 = ry + rh;
-               /* THE STRIP'S FLOOR is the 50 line, which is where the frame
-                * ends on a plain plot and where the change band starts on one
-                * that has it: 2 below it is the rectangle's bottom edge in the
-                * first case, so the band is the same one either way. */
-               int oy50 = ry + rh - 2;
-               {
-                  int oxx            = 0;
-                  struct plot_pt ref = {0};
-                  ref.t              = realtime_s();
-                  ref.glu            = 70;
-                  if (!plot_point_xy((struct plot_rect){rx, ry, rw, rh}, ref,
-                                     realtime_s(), model_plot_hours(),
-                                     input_plot_cfg(), &oxx, &oy70))
-                     oy70 = ry + rh; /* degenerate window: all glucose */
-                  ref.glu = PLOT_GLU_MIN;
-                  if (!plot_point_xy((struct plot_rect){rx, ry, rw, rh}, ref,
-                                     realtime_s(), model_plot_hours(),
-                                     input_plot_cfg(), &oxx, &oy50))
-                     oy50 = ry + rh - 2;
-               }
-               /* A dose only claims the touch if one is actually NEAR the
-                * finger. Asking merely "is there a dose in this window"
-                * meant that on a 30-day span a single marker at one edge
-                * captured a press at the far edge, and the scrub then
-                * jumped to a dose an inch away rather than reading the
-                * glucose under the fingertip. About half an inch of x
-                * either side -- an eighth of the plot -- is roughly a
-                * fingertip's own width. */
-               int near_x   = rw / 8;
-               int have_ins = 0;
-               for (int i = np_glu; i < np && !have_ins; i++) {
-                  int oxx = 0;
-                  int oyy = 0;
-                  if (pts[i].hidden ||
-                      !plot_point_xy((struct plot_rect){rx, ry, rw, rh}, pts[i],
-                                     realtime_s(), model_plot_hours(),
-                                     input_plot_cfg(), &oxx, &oyy))
-                     continue;
-                  int dx = oxx - fx;
-                  if (dx < 0)
-                     dx = -dx;
-                  if (dx <= near_x)
-                     have_ins = 1;
-               }
-               g_scrub_ins = have_ins && (fy >= (2 * oy70) - (oy50 + 2));
-            }
-            int aim_ins = g_scrub_ins;
-            for (int i = 0; i < np_glu; i++)
-               if (aim_ins)
-                  pts[i].hidden = 1;
-            for (int i = np_glu; i < np; i++)
-               if (!aim_ins)
-                  pts[i].hidden = 1;
-            /* SPLIT the doses line's shared columns, never the glucose
-             * trace's: a dose and a weight logged in the same sitting sit on
-             * one pixel, and without this only one of the two could ever be
-             * scrubbed. On the glucose series a shared column is the normal
-             * state of a multi-day span, and the plain nearest-in-time pick is
-             * what keeps a drag to the left edge landing on the oldest sample.
-             */
-            int idx = plot_hit((struct plot_rect){rx, ry, rw, rh}, pts, np,
-                               realtime_s(), model_plot_hours(),
-                               input_plot_cfg(), fx, fy, aim_ins);
-            if (idx != forms_scrub()) {
-               forms_set_scrub(idx);
-               shell_repaint();
-            }
+            glu_scrub(ev, tx, ty, begin, &sp, rx, ry, rw, rh);
             handled = 1;
          } else if (action == AMOTION_EVENT_ACTION_DOWN) {
             if (act.kind == ACT_OPEN_SETTINGS || act.kind == ACT_MENU ||

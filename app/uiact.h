@@ -185,6 +185,13 @@ enum ui_menu {
    MA_EX_DELETE, /* EDIT EXERCISE: delete this entry (red) */
    MA_EXDEL_YES,
    MA_EXDEL_NO,
+   /* GLUCOSE HISTORY (gluhist.h): opened from the main screen's last span
+    * tab. SPAN's ix is an enum ui_hspan, STEP's an enum gluhist_step. */
+   MA_GLUHIST_OPEN,
+   MA_GLUHIST_BACK,
+   MA_GLUHIST_SPAN,
+   MA_GLUHIST_STEP,
+   MA_GLUHIST_DATE, /* ix: which part of the date (enum gluhist_part) */
    /* THE MODEL'S OWN SCREEN. Two ways in, deliberately: the stats table on the
     * main screen is where a number about the near future belongs, and
     * SETTINGS is where somebody goes looking for it by name. */

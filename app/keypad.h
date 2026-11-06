@@ -118,7 +118,11 @@ enum keypad_mode {
    KP_FOOD_PROT_T  = 36,
    KP_FOOD_FAT_T   = 37,
    KP_FOOD_KCAL_T  = 38,
-   KP_NMODES       = 39
+   /* GLUCOSE HISTORY's date, one part at a time: typed straight into the
+    * window shown rather than into any form. */
+   KP_GH_YEAR = 39,
+   KP_GH_MMDD = 40, /* month and day at once: 1106 is the 6th of November */
+   KP_NMODES  = 41
 };
 
 /* WHICH UNIT THE ENTRY CARRIES -- a name, not a yes/no.
