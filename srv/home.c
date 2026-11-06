@@ -1119,7 +1119,8 @@ void h_home(struct req *r, int64_t me, const char *cookie)
    sb_raw(&s, pre, k);
    sb_add(&s,
           "</pre>\n"
-          "<a href=\"/plots%s\">Plots ...</a>\n",
+          "<a href=\"/plots%s\">Plots ...</a><br>\n"
+          "<a href=\"/plan\">Plan ...</a>\n",
           r->who);
    if (foot_attr) {
       char esc[300] = {0};

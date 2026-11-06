@@ -97,6 +97,8 @@ static const struct web_rule WEB_RULES[] = {
     {WEB_EXACT,  "/units",     HTTP_M_GET              },
     {WEB_EXACT,  "/exercise",  HTTP_M_GET              },
     {WEB_EXACT,  "/food",      HTTP_M_GET              },
+    /* World readable: see h_plan. */
+    {WEB_EXACT,  "/plan",      HTTP_M_GET              },
     {WEB_EXACT,  "/settings",  HTTP_M_GET              },
     /* Every state change the settings page offers: pair, unpair, tz, password,
      * delete, signout-all, share, revoke-link, revoke. One rule, because they
@@ -213,6 +215,31 @@ void web_route(struct req *r)
    }
 }
 
+/* The weekly meal plan: a finished HTML page that food/push.sh copies into the
+ * data directory, which is this process's working directory. Read per request
+ * so a new plan needs no restart, and under a fixed name so nothing from the
+ * request reaches the filesystem. The buffer goes to web_route like any other
+ * page: see struct req. */
+static void h_plan(struct req *r)
+{
+   enum { PLAN_MAX = 256 * 1024 };
+   FILE *f   = fopen("plan.html", "rb");
+   char *buf = f ? malloc(PLAN_MAX) : NULL;
+   size_t n  = buf ? fread(buf, 1, PLAN_MAX, f) : 0;
+   if (f)
+      fclose(f);
+   if (!n) {
+      free(buf);
+      page(r, 404, "Not Found", "not found", "<p>No plan yet.</p>");
+      return;
+   }
+   r->resp        = buf;
+   r->resp_n      = n;
+   r->resp_code   = 200;
+   r->resp_reason = "OK";
+   r->resp_ctype  = "text/html";
+}
+
 static void web_route_locked(struct req *r)
 {
    /* THE METHOD GATE, BEFORE ANYTHING ELSE TOUCHES THE REQUEST -- before the
@@ -323,6 +350,12 @@ static void web_route_locked(struct req *r)
          h_login_post(r);
       else
          h_login_form(r, NULL);
+      return;
+   }
+   /* BEFORE THE SIGN-IN GATE ON PURPOSE: the meal plan is public, and holds
+    * nothing from any account. */
+   if (!strcmp(r->path, "/plan") && get) {
+      h_plan(r);
       return;
    }
    if (!me) {
