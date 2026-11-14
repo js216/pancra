@@ -8,11 +8,13 @@
 #include "http.h"
 #include "insrow.h" /* the insulin decoder, ins_units_str, line limit */
 #include "oops.h"
+#include "ownstreak.h" /* owner_streak: the run under the number */
 #include "page.h"
 #include "pair.h"
 #include "plot.h"  /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "proto.h" /* ROW_MAX: the longest row */
 #include "rowdec.h"
+#include "streak.h" /* streak_line, the band: the phone's own words */
 #include "util.h"
 #include <sqlite3.h>
 #include <stdarg.h> /* apnd: a bounded snprintf append */
@@ -899,6 +901,21 @@ void h_home(struct req *r, int64_t me, const char *cookie)
          snprintf(title, sizeof title, "%s %s", stamp + 11, big);
    }
    sb_add(&s, "<div>%s</div>\n", stamp);
+   /* THE IN-RANGE STREAK, one line between the stamp and the number, in the
+    * words the phone draws over its plot (streak_line). Only while the number
+    * on the page is a current reading inside the band: a run worth stretching
+    * is the news then, and out of range there are more urgent things on the
+    * page. A log that cannot be read leaves the line out. */
+   long st_cur  = 0;
+   long st_best = 0;
+   if (big[0] != '-' && newest_glu >= TIR_LOW_MGDL &&
+       newest_glu <= TIR_HIGH_MGDL &&
+       owner_streak(r->db, owner, &st_cur, &st_best) && st_cur > 0) {
+      char sl[40];
+      streak_line(st_cur, st_best, sl, sizeof sl);
+      sb_add(&s, "<div>%s</div>\n", sl);
+   }
+
    /* THE CHANGE SITS TO THE RIGHT OF THE NUMBER, a third of its size, on
     * one baseline: "148 (+14)". Where the two do not fit side by side -- a
     * phone held upright is narrower than both at these sizes -- the change

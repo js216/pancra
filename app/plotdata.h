@@ -45,14 +45,15 @@ void plot_window_forget(void);
  * buffer last answered plot_source_from. */
 const struct ui_glusum *plot_window_summary(void);
 
-/* The instant of the oldest CGM reading the last read of the log met, or 0
- * when none has been read. Every read of the log passes every row, so this
- * is the whole log's first reading as of that read. */
-long plot_first_cgm(void);
+/* The instant of the oldest glucose reading, CGM or fingerstick, the last
+ * read of the log met, or 0 when none has been read. Every read passes every
+ * row, so this is the whole log's first reading as of that read. */
+long plot_first_reading(void);
 
-/* Parse one readings.csv row into (t, glu, src, kind); 0 if it is not a
+/* Parse one readings.csv row into (t, glu, src, kind, lead); 0 if it is not a
  * datapoint. Exposed so it can be asserted from outside. */
-int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind);
+int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind,
+                   int *lead);
 
 /* THE CHANGES OF THE LAST LONG SPAN plot_source_from built: one per sensor
  * per column, each the newest reading of that sensor in the column minus the

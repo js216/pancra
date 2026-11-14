@@ -7,6 +7,8 @@
 #include "plot.h"    /* PLOT_CHG_GAP_S: what counts as one reading's gap */
 #include "sensors.h" /* KIND_CGM */
 #include "stats.h" /* STAT_TIR_LO / STAT_TIR_HI: the band the summary counts */
+#include "store.h" /* store_spans_locked: who was primary before the record */
+#include "streak.h" /* read_lead, READ_LEAD_*: whose reading the summary counts */
 #include "uimodel.h"
 #include <stddef.h>
 /* The app is freestanding and declares its own syscalls (dexlibc.h); the
@@ -55,8 +57,9 @@ static struct ui_point g_plong[PLOT_LONG_MAX];
 static unsigned short g_pcoln[PCOL_MAX]; /* cells kept in each column */
 static int g_nplong;
 static long g_plong_end, g_plong_span, g_plong_size;
-/* The oldest CGM reading the last read of the log met (plot_first_cgm). */
-static long g_first_cgm;
+/* The oldest glucose reading, CGM or fingerstick, the last read of the log
+ * met (plot_first_reading). */
+static long g_first;
 /* WHICH QUESTION THE BUFFER ABOVE ANSWERS: 0 a span ending at `now`
  * (plot_source_from), 1 a fixed window (plot_source_window). The two share
  * one buffer, so a cached answer to one is never handed out for the other. */
@@ -264,7 +267,8 @@ static long plot_log_size(const char *path)
  * after it has already published three others is the same defect one step
  * later: the caller sees 0, ignores the row, and the next caller to forget
  * that gets whatever the corrupt line left behind. */
-int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
+int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind,
+                   int *lead)
 {
    /* The cursor reads inside ONE line and can never run past it, so it needs
     * that line's end. Callers hand this function either a NUL-terminated
@@ -298,8 +302,10 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
     * the whole row has been read and passed. */
    long srcv  = 0;
    long kindv = KIND_CGM;
+   int leadv  = READ_LEAD_UNKNOWN;
 
-   /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale */
+   /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale,warm,
+    * screen,shown,lead */
    int f = 1;
    while (!csv_at_end(&c)) {
       if (!csv_sep(&c)) {
@@ -345,6 +351,8 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
           * comparison is the bound, and narrowed first it would sit
           * downstream of the wrap that produced the value it checks. */
          kindv = (n == KIND_BGM) ? KIND_BGM : KIND_CGM;
+      } else if (f == 13 && (n == 0 || n == 1)) {
+         leadv = n == 1 ? READ_LEAD_YES : READ_LEAD_NO;
       }
    }
 
@@ -358,6 +366,7 @@ int plot_store_row(const char *ln, long *t, int *glu, int *src, int *kind)
    *glu  = (int)gv;
    *src  = (int)srcv;
    *kind = (int)kindv;
+   *lead = leadv;
    return 1;
 }
 
@@ -383,9 +392,13 @@ static void plong_build(const char *path, long end, long span, long (*tz)(long))
    g_nplong  = 0;
    int cap   = (int)(sizeof g_plong / sizeof g_plong[0]);
 
-   int fd = open(path, O_RDONLY, 0);
+   /* Each CGM's first and last reading: every caller holds the history lock
+    * (model.c, input.c). */
+   static struct src_span sp[STREAK_SPANS];
+   const int nsp = tz ? store_spans_locked(sp, STREAK_SPANS) : 0;
+   int fd        = open(path, O_RDONLY, 0);
    if (fd >= 0) {
-      g_first_cgm = 0;
+      g_first = 0;
       char rd[2048];
       char line[256];
       int llen = 0;
@@ -410,18 +423,21 @@ static void plong_build(const char *path, long end, long span, long (*tz)(long))
             int glu  = 0;
             int src  = 0;
             int kind = 0;
-            if (!plot_store_row(line, &t, &glu, &src, &kind))
+            int lead = READ_LEAD_UNKNOWN;
+            if (!plot_store_row(line, &t, &glu, &src, &kind, &lead))
                continue;
             /* Before the window test: the reading a change is taken from
              * may be just before the window. */
-            if (kind == KIND_CGM && t > 0 &&
-                (g_first_cgm == 0 || t < g_first_cgm))
-               g_first_cgm = t;
+            if ((kind == KIND_CGM || kind == KIND_BGM) && t > 0 &&
+                (g_first == 0 || t < g_first))
+               g_first = t;
             if (kind == KIND_CGM)
                chg_seen(t, glu, src, from, end, span);
             if (t <= from || t > end || glu >= PCELL_GLU)
                continue;
-            if (tz && kind == KIND_CGM)
+            /* THE SUMMARY IS THE PRIMARY'S, as the statistics are: every
+             * sensor is drawn, only the one leading at `t` is counted. */
+            if (tz && kind == KIND_CGM && read_lead(lead, src, t, sp, nsp))
                sum_seen(t, glu, tz);
             int col = (int)(((t - from) * (PCOL_MAX - 1)) / span);
             if (col < 0 || col >= PCOL_MAX)
@@ -494,9 +510,9 @@ void plot_window_forget(void)
    g_plong_span  = 0;
 }
 
-long plot_first_cgm(void)
+long plot_first_reading(void)
 {
-   return g_first_cgm;
+   return g_first;
 }
 
 const struct ui_glusum *plot_window_summary(void)

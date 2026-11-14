@@ -387,7 +387,6 @@ struct frame_ctx {
    struct ui_chg chg[UI_CHG_MAX]; /* the span's changes: see build_plot */
    struct ui_dev devs[UI_DEVS_MAX];
    struct ui_sensor sens[UI_MAX_SLOTS];
-   struct reading hist[NHIST];
    /* THE FOUR LOGS, whole, in heap buffers that grow with them and are
     * refreshed only when the log's generation moves (wt_snapshot): a frame
     * every second must not copy years of rows that have not changed. */
@@ -1109,33 +1108,16 @@ static void build_plot(struct frame_ctx *f, struct screen *m)
    m->plot.plot_hours = hours;
    m->plot.end        = wend;
    m->plot.plot_max   = f->prefs.plot_max;
-   /* THE IN-RANGE STREAK. Computed from the reading history, not from the
-    * point list above -- that one carries doses, weights and food mixed in,
-    * and a 90-gram meal is not a glucose value. The band is the CLINICAL one
-    * (70-180, TIR's own), not the configured alarm band, so the streak and
-    * the TIR figure below it are measured against the same range and cannot
-    * disagree about a sample; a gap longer than four missed samples ends it
-    * rather than counting through time nobody measured. */
+   /* THE IN-RANGE STREAK, as the store keeps it over the whole log (this
+    * frame holds the history lock), and the record: the longer of the
+    * store's and the one the settings remember. */
    {
-      /* hist_at, NOT hist_copy -- and this is the self-deadlock the comment
-       * above spells out. hist_copy takes g_hist_lk itself, draw() already
-       * holds it across build_model, and the lock is not recursive: the first
-       * repaint wedged the app on the splash screen with the process alive
-       * and nothing drawn. Reading through hist_at is what every other walk
-       * in this function does, for exactly this reason. */
-      int hn = hist_count();
-      if (hn > NHIST)
-         hn = NHIST;
-      for (int i = 0; i < hn; i++)
-         f->hist[i] = hist_at(i);
-      m->plot.streak_s =
-          alarm_streak_s(f->hist, hn, TIR_LOW_MGDL, TIR_HIGH_MGDL, 20L * 60);
-      /* THE RECORD, as stored. Read here and raised nowhere near here: see
-       * the note on the field, and reading.c for where it grows. A streak
-       * that has just passed the record shows a record BEHIND it for one
-       * frame until the next reading lands, which is the honest lag of a
-       * number that is only allowed to be written from one place. */
-      m->plot.best_streak_s = f->prefs.best_streak_s;
+      long cur  = 0;
+      long best = 0;
+      store_streak_locked(&cur, &best);
+      m->plot.streak_s = cur;
+      m->plot.best_streak_s =
+          best > f->prefs.best_streak_s ? best : (long)f->prefs.best_streak_s;
    }
 }
 

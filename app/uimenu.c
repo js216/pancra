@@ -507,8 +507,9 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
                  k);
       y += 2 * lh;
    }
-   /* The main plot's change points, styled the same way; OFF turns the
-    * change band off and gives the plot back its plain scale. */
+   /* The plot's change points: a shape and a size, each sensor's in its own
+    * colour; OFF turns the change band off and gives the plot back its plain
+    * scale. */
    draw_str(px, fb, x, y, sc, "DELTA MARKER", UI_TEXT_DIM);
    if (m->prefs.chg_marker == MARK_HIDE) {
       int lw = str_len("OFF") * 6 * sc;
@@ -521,7 +522,7 @@ void render_display(struct ANativeWindow_Buffer *fb, const struct screen *m,
          gr = 5 * sc;
       plot_marker_glyph((struct plot_fb){px, fb->stride, fb->width, fb->height},
                         rx - (6 * sc), y + (3 * sc), gr, m->prefs.chg_marker,
-                        ui_sensor_color(m->prefs.chg_color));
+                        UI_TEXT);
    }
    add_hit_ix(h, ui_rect(0, y - (3 * sc), fb->width, lh), MA_INSMARK_OPEN,
               MARKPICK_CHG);
@@ -1086,7 +1087,9 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
       curc = m->prefs.chg_color;
       curs = m->prefs.chg_size;
    }
-   uint32_t curcol = ui_sensor_color(curc);
+   /* The change points take each sensor's colour, so their picker offers a
+    * shape and a size only. */
+   uint32_t curcol = chg ? UI_TEXT : ui_sensor_color(curc);
 
    /* short titles: at title scale the full "SLOW INSULIN MARKER" would
     * run under the X */
@@ -1114,11 +1117,12 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
     *
     * `rows` counts the grid rows only (shape rows + colour + size); the
     * labels and gaps between them are subtracted separately. */
-   int gridrows = ((UI_NMARKERS + 3) / 4) + 2;
-   int gridav   = fb->height - y   /* what is left below the title */
-                  - (3 * lh)       /* the SHAPE / COLOR / SIZE labels */
-                  - ((3 * lh) / 2) /* the half-line gap after each grid */
-                  - (lh / 2);      /* keep the last row off the very edge */
+   const int ngrid = chg ? 2 : 3; /* SHAPE, COLOR unless chg, SIZE */
+   int gridrows    = ((UI_NMARKERS + 3) / 4) + ngrid - 1;
+   int gridav      = fb->height - y       /* what is left below the title */
+                     - (ngrid * lh)       /* the grid labels */
+                     - ((ngrid * lh) / 2) /* the half-line gap after each */
+                     - (lh / 2); /* keep the last row off the very edge */
    int cellmax  = (gridav > gridrows) ? gridav / gridrows : 1;
 
    /* SHAPE grid: each shape as a glyph in the sensor's own colour. */
@@ -1153,9 +1157,9 @@ void render_markpick(struct ANativeWindow_Buffer *fb, const struct screen *m,
    }
 
    /* COLOR grid: full-colour buttons. */
-   draw_str(px, fb, x, y, sc, "COLOR", UI_MUTED);
-   y += lh;
-   {
+   if (!chg) {
+      draw_str(px, fb, x, y, sc, "COLOR", UI_MUTED);
+      y += lh;
       int cols = UI_NCOLORS;
       int cell = gw / cols;
       if (cell > cellmax)

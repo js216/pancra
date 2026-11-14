@@ -11,6 +11,7 @@
 #include "csvcur.h"  /* the shared CSV cursor; the grammar stays here */
 #include "dexlibc.h" /* errno / ENOENT: a missing file is not a failure */
 #include "log.h"     /* a refused registry says WHY, where it can be seen */
+#include "streak.h"  /* struct sensor_start: what sensors_starts hands out */
 #include "style.h"
 #include "thread.h" /* rmutex: the ONLY cross-thread primitives */
 #include "util.h"
@@ -745,6 +746,17 @@ int sensor_slot_of(int id, struct sensor_slot *out)
       *out = *s;
    reg_unlock();
    return have;
+}
+
+int sensors_starts(struct sensor_start *out, int cap)
+{
+   int n = 0;
+   reg_lock();
+   for (int i = 0; i < g_nsrec && n < cap; i++)
+      if (g_srec[i].activation > 0)
+         out[n++] = (struct sensor_start){g_srec[i].id, g_srec[i].activation};
+   reg_unlock();
+   return n;
 }
 
 int sensor_rec_of(int id, struct sensor_rec *out)

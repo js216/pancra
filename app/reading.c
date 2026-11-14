@@ -17,7 +17,6 @@
 #include "sensors.h"
 #include "settings.h"
 #include "shell.h"
-#include "stats.h"  /* TIR_LOW_MGDL/TIR_HIGH_MGDL: the clinical band */
 #include "status.h" /* set_status: a reading that did NOT persist says so */
 #include "store.h"
 #include "tzoff.h"
@@ -159,7 +158,8 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
                                .warm        = warm,
                                .wstate      = measured,
                                .warm_unsure = wv == WARM_COUNT_UNSURE,
-                               .prime       = prime};
+                               .prime       = prime,
+                               .start       = sensor_session_start(src)};
    struct reading_result rr = store_record(&ev, CHIRP_MAX_GAP_S);
    int prev_glu             = rr.prev_glu;
    /* WHAT HAPPENED TO IT, kept as its own type. Spelled `int isnew =
@@ -174,24 +174,20 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
     * than the display window reaches the record but is not what the screen is
     * showing, so it must not be treated as a sample that just arrived. */
    if (hist_is_tail(got)) {
-      /* THE RECORD IN-RANGE RUN, raised here and nowhere else.
+      /* THE RECORD IN-RANGE RUN, persisted here and nowhere else.
        *
-       * HERE because this is the only moment a streak can grow, and because
-       * it is outside the history lock (see the paragraph above) -- the
-       * renderer recomputes the same streak every frame, but it does so while
-       * draw() holds that lock, and persisting from there would put a file
-       * write underneath it. settings_set_best_streak compares before it
-       * writes, so an ordinary streak costs a comparison and no I/O.
-       *
-       * The band is the CLINICAL one and the gap rule is alarm_streak_s's,
-       * which is what makes this number the same measurement the plot shows
-       * rather than a second opinion about it. */
-      static struct reading snap[NHIST];
-      int hn = hist_copy(snap, NHIST);
-      long run =
-          alarm_streak_s(snap, hn, TIR_LOW_MGDL, TIR_HIGH_MGDL, 20L * 60L);
-      if (run > 0 && run <= BEST_STREAK_MAX)
-         (void)settings_set_best_streak((int)run);
+       * The store keeps the streak over the whole log (store_streak); the
+       * settings keep the longest one ever, so a record outlives a log that
+       * is restored without it. HERE because a run grows when a reading
+       * arrives, and because this is outside the history lock: a settings
+       * write under it would put a file write beneath every frame.
+       * settings_set_best_streak compares before it writes, so an ordinary
+       * reading costs a comparison and no I/O. */
+      long cur  = 0;
+      long best = 0;
+      store_streak(&cur, &best);
+      if (best > 0 && best <= BEST_STREAK_MAX)
+         (void)settings_set_best_streak((int)best);
    }
    if (hist_kept(got) && has) {
       store_note_rssi(linkinfo_conn_rssi()); /* kept like glu/trend */
@@ -213,8 +209,10 @@ int pancra_glucose(int link, int mg_dl, int trend, int age_s)
        * which is an interval. It is never persisted and never displayed, so
        * nothing wants the wall clock -- and on the wall clock a backward
        * correction makes every recorded prediction permanently fresh, wedging
-       * the one alarm that overrides a muted phone. See alarm_pred_low. */
-      if (driver_session_of(link, &ps))
+       * the one alarm that overrides a muted phone. See alarm_pred_low. A
+       * forecast off a new sensor's first readings is no better than they
+       * are, so none is noted for them: see STREAK_N_SKIP. */
+      if (driver_session_of(link, &ps) && !alarm_settling(src))
          alarm_note_pred(link, ps.predicted, mono_s());
    }
    /* A reading just PROVED this sensor is streaming -- the ideal moment to
@@ -401,7 +399,8 @@ int pancra_backfill(int link, int mg_dl, int trend, int age_s)
                                   .warm        = warm,
                                   .wstate      = WARM_UNKNOWN,
                                   .warm_unsure = wv == WARM_COUNT_UNSURE,
-                                  .prime       = prime};
+                                  .prime       = prime,
+                                  .start       = sensor_session_start(src)};
    struct reading_result brr   = store_record(&bev, CHIRP_MAX_GAP_S);
    enum hist_insert_result got = brr.inserted;
    if (hist_kept(got) && !brr.persisted)

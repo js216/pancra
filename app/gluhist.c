@@ -193,7 +193,7 @@ int gluhist_action(int action, int ix)
       if (ix >= 0 && ix < HSPAN_N)
          g_span = ix;
    } else if (action == MA_GLUHIST_STEP) {
-      const long first = plot_first_cgm();
+      const long first = plot_first_reading();
       if (ix == GH_TODAY)
          g_day = ending_today(g_span);
       else if (ix == GH_FIRST && first > 0)

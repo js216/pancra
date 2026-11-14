@@ -5,9 +5,6 @@
 /* See alarmlogic.h. Pure by design: no globals, no clock, no locks, no JNI. */
 #include "alarmlogic.h"
 
-#include "readingrec.h" /* struct reading: the LAYOUT, not the store */
-#include "sensors.h" /* KIND_CGM: a fingerstick neither ends nor extends a streak */
-
 enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi)
 {
    /* data_fresh, not `now - glu_t <= AL_FRESH_S`: a clock rollback makes that
@@ -84,8 +81,7 @@ static const struct morse_row {
 
 static const char *morse_of(char ch)
 {
-   int k;
-   for (k = 0; k < MORSE_TBL_N; k++)
+   for (int k = 0; k < MORSE_TBL_N; k++)
       if (morse_tbl[k].ch == ch)
          return morse_tbl[k].el;
    return 0;
@@ -94,13 +90,13 @@ static const char *morse_of(char ch)
 int morse_encode(const char *text, char *out, int n)
 {
    int w = 0;
-   int i;
+   int i = 0;
 
    if (n < 1)
       return 0;
    for (i = 0; text[i]; i++) {
       const char *el = morse_of(text[i]);
-      int j;
+      int j          = 0;
 
       if (!el)
          goto refuse;
@@ -247,8 +243,8 @@ struct link_pred pred_unpack(unsigned long long word)
 
 enum alarm_level alarm_zone_merge(enum alarm_level a, enum alarm_level b)
 {
-   /* Combine verdicts from DIFFERENT sensors: the alarm watches every CGM
-    * the user wears, and the worst excursion anywhere wins. A LOW outranks a
+   /* Combine verdicts from DIFFERENT sensors, each judged at its own limits
+    * (AL_OTHER_LO), and the worst excursion anywhere wins. A LOW outranks a
     * HIGH -- hypoglycemia is the one that kills quickly -- so two sensors
     * disagreeing in opposite directions ring LOW. */
    if (a == AL_LOW || b == AL_LOW)
@@ -390,7 +386,7 @@ void alarm_plan_next(enum alarm_level zone, bool stale, bool stranded,
     * A dismissed alarm whose forecast has not been renewed stays quiet: the
     * evaluation runs every second, and re-arming on `acked` alone restarts
     * the tone the instant it is silenced, so no tap can ever stop it. */
-   if (acked ? pred_new : !sounding)
+   if ((acked && pred_new) || (!acked && !sounding))
       out->prev_want = AL_NONE;
 }
 
@@ -417,56 +413,4 @@ void alarm_actuate_step(const struct alarm_state *st,
    next->sounding = out.sounding != 0;
    if (out.act == AL_ACT_TRIGGER)
       eff->kind = alarm_java_kind(out.want);
-}
-
-/* See alarmlogic.h. Newest first, so the walk starts at the present and stops
- * at the first thing that breaks the run. */
-long alarm_streak_s(const struct reading *r, int n, int lo, int hi,
-                    long gap_max)
-{
-   if (!r || n <= 0)
-      return 0;
-   /* THE BAND IS INCLUSIVE: [lo, hi] is IN range, and only a reading strictly
-    * outside it breaks the run.
-    *
-    * That is the opposite convention from alarm_zone, and deliberately so.
-    * This measures against the clinical time-in-range band, and stats.c
-    * counts a reading with `glu >= TIR_LOW_MGDL && glu <= TIR_HIGH_MGDL` --
-    * so 70 and 180 are in range there. A streak that broke at exactly 70
-    * while TIR counted the same reading as good would be two numbers on one
-    * screen disagreeing about one sample. The alarm band is exclusive at its
-    * limits because an alarm FIRES at the limit; a range is inclusive at its
-    * limits because the limit is inside it. */
-   int i = 0;
-   /* CGM ONLY. A fingerstick is a spot check from a different device with its
-    * own calibration, and people test precisely when they suspect a low --
-    * letting one end a streak would punish the user for checking, and letting
-    * one EXTEND a streak would credit a reading the CGM never made. Skipped
-    * entirely, exactly as the statistics skip them. */
-   while (i < n && r[i].kind != KIND_CGM)
-      i++;
-   if (i >= n)
-      return 0;
-   /* NO EARLY RETURN for "out of range now". The loop below breaks on its
-    * first iteration in that case, leaving oldest == newest, which is already
-    * 0 -- measured: a mutant deleting the guard passed every case here. A
-    * branch no input can distinguish is one more thing to keep true. */
-   long newest = r[i].t;
-   long oldest = newest;
-   long prev   = newest;
-   for (; i < n; i++) {
-      if (r[i].kind != KIND_CGM)
-         continue;
-      if (r[i].glu < lo || r[i].glu > hi)
-         break; /* the run ends here */
-      /* A HOLE ENDS IT AT THE NEAR SIDE. Readings come every five minutes;
-       * a longer gap means the sensor was off, the phone was away or the
-       * session ended, and nothing measured what happened inside it.
-       * Counting through would claim credit for time nobody observed. */
-      if (prev - r[i].t > gap_max)
-         break;
-      oldest = r[i].t;
-      prev   = r[i].t;
-   }
-   return newest - oldest;
 }

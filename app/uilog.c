@@ -564,6 +564,216 @@ int ui_wt_hit(const struct screen *m, int plot_x, int plot_w, int sc, int x)
    return best;
 }
 
+/* THE TREND: an ordinary least-squares line through the weighings in the
+ * window, w(t) = a + b t, with t in days from `now` (so the past is negative
+ * and `a` is the fitted weight today) and w in grams. `ok` is 0 when there is
+ * no line to fit: fewer than two weighings, or all of them at one instant. */
+struct wt_fit {
+   int ok;
+   double a, b; /* grams; grams per day */
+   long t0, t1; /* the oldest and newest weighing fitted */
+};
+
+static void wt_fit_of(const struct ui_wtview *wt, long from, long to, long now,
+                      struct wt_fit *f)
+{
+   *f         = (struct wt_fit){0};
+   int n      = 0;
+   double st  = 0;
+   double sw  = 0;
+   double stt = 0;
+   double stw = 0;
+   for (int i = 0; i < wt->nwt; i++) {
+      const long t = wt->wt[i].t;
+      if (t < from || t > to)
+         continue;
+      const double d = (double)(t - now) / 86400.0;
+      const double g = (double)wt->wt[i].g;
+      st += d;
+      sw += g;
+      stt += d * d;
+      stw += d * g;
+      if (!n || t < f->t0)
+         f->t0 = t;
+      if (!n || t > f->t1)
+         f->t1 = t;
+      n++;
+   }
+   if (n < 2 || f->t1 <= f->t0)
+      return;
+   const double dn  = (double)n;
+   const double sxx = stt - ((st * st) / dn);
+   if (sxx <= 0)
+      return;
+   f->b  = (stw - ((st * sw) / dn)) / sxx;
+   f->a  = (sw - (f->b * st)) / dn;
+   f->ok = 1;
+}
+
+/* Nearest whole number, held to a range a legend can print. */
+static long wt_round(double v)
+{
+   if (v > 1e7)
+      v = 1e7;
+   if (v < -1e7)
+      v = -1e7;
+   return (long)(v < 0 ? v - 0.5 : v + 0.5);
+}
+
+/* THE FIT AS THE LEGEND STATES IT, in the display unit: "W = 154.2 - 0.35
+ * T/WK", the fitted weight today and the change a week, with T the time from
+ * now, so the past reads as T < 0. A week because a weight moves by tenths
+ * over one, where a day's change would print as noise in the second
+ * decimal. */
+static void wt_fit_line(const struct wt_fit *f, int units, char *l1, int n1)
+{
+   const double per_g = units == WT_LB ? 1.0 / 453.59237 : 0.001;
+   const long a10     = wt_round(f->a * per_g * 10.0);
+   const long b100    = wt_round(f->b * 7.0 * per_g * 100.0);
+   const long aa      = a10 < 0 ? -a10 : a10;
+   const long bb      = b100 < 0 ? -b100 : b100;
+   (void)snprintf(l1, (size_t)n1, "W = %s%ld.%ld %c %ld.%02ld T/WK",
+                  a10 < 0 ? "-" : "", aa / 10, aa % 10, b100 < 0 ? '-' : '+',
+                  bb / 100, bb % 100);
+}
+
+/* A candidate place for the legend, and what it would sit on. */
+struct wt_box {
+   int x, y, w, h;
+   long pts;   /* weighings whose marker it would cover */
+   long tr;    /* steps of the trace it would cover */
+   long clear; /* the squared distance to the nearest thing drawn */
+};
+
+/* The squared distance from (x,y) to the box; 0 inside it. */
+static long wt_dist2(const struct wt_box *b, int x, int y)
+{
+   long dx = 0;
+   long dy = 0;
+   if (x < b->x)
+      dx = b->x - x;
+   else if (x >= b->x + b->w)
+      dx = x - (b->x + b->w - 1);
+   if (y < b->y)
+      dy = b->y - y;
+   else if (y >= b->y + b->h)
+      dy = y - (b->y + b->h - 1);
+   return (dx * dx) + (dy * dy);
+}
+
+/* Walk a segment from (x0,y0) to (x1,y1) in steps of `step` pixels, at most
+ * `stmax` of them, counting the steps that land inside the box into `tr`
+ * when `tr` is given, and bringing the box's clearance down to the nearest
+ * step. */
+static void wt_seg_scan(struct wt_box *b, int x0, int y0, int x1, int y1,
+                        int step, int stmax, long *tr)
+{
+   const int dx = x1 - x0;
+   const int dy = y1 - y0;
+   const int ax = dx < 0 ? -dx : dx;
+   const int ay = dy < 0 ? -dy : dy;
+   int st       = (ax > ay ? ax : ay) / (step > 0 ? step : 1);
+   if (st > stmax)
+      st = stmax;
+   if (st < 1)
+      st = 1;
+   for (int k = 0; k <= st; k++) {
+      const long d = wt_dist2(b, x0 + ((dx * k) / st), y0 + ((dy * k) / st));
+      if (d < b->clear)
+         b->clear = d;
+      if (tr && d == 0)
+         (*tr)++;
+   }
+}
+
+/* Is box `a` a better place for the legend than box `b`? `a_tl` and `b_tl`
+ * say which of them is the top-left corner. */
+static int wt_box_better(const struct wt_box *a, int a_tl,
+                         const struct wt_box *b, int b_tl)
+{
+   if (a->pts != b->pts)
+      return a->pts < b->pts;
+   if (a->tr != b->tr)
+      return a->tr < b->tr;
+   if (a_tl != b_tl)
+      return b_tl;
+   return a->clear > b->clear;
+}
+
+/* THE LEGEND: the fitted line's expression in the line's colour, on a black
+ * ground that hides the grid behind it, in the corner of the data band that
+ * hides the fewest weighings. Between corners that hide as many, in turn:
+ *   - the one with less trace under it;
+ *   - not the top left, where the legend sits directly under the upper
+ *     bound's label and the two crowd into one block of text;
+ *   - the one with more room around it: the farthest from the nearest
+ *     weighing, stretch of trace or stretch of the fitted line, so the
+ *     legend sits in the widest empty space;
+ *   - top right, top left, bottom right, bottom left, in that order.
+ * The corners sit inside the strips that hold the y bounds, so the legend
+ * never covers the numbers that scale the plot. A plot too small to hold it
+ * beside the data goes without. `fl` is the fitted line as drawn: x0, y0, x1,
+ * y1. */
+static void wt_legend(uint32_t *px, const struct ANativeWindow_Buffer *fb,
+                      const struct ui_wtview *wt, const struct wt_win *w,
+                      const struct wt_fit *fit, const int fl[4], int units,
+                      long from, int px0, int py0, int pw, int ph, int sc,
+                      int pad, int pad_t, int pad_b)
+{
+   char l1[40];
+   wt_fit_line(fit, units, l1, sizeof l1);
+   const int in    = 3 * sc; /* the box's inner margin */
+   const int tw    = str_len(l1) * 6 * sc;
+   const int lw    = in + tw + in;
+   const int lh    = in + (7 * sc) + in;
+   const int m     = 3 * sc;
+   const int top   = py0 + (13 * sc);
+   const int bot   = py0 + ph - (21 * sc) - lh;
+   const int left  = px0 + m;
+   const int right = px0 + pw - m - lw;
+   if (right < left || bot < top + lh)
+      return;
+
+   const int cx[4] = {right, left, right, left};
+   const int cy[4] = {top, top, bot, bot};
+   const int r     = 2 * sc; /* a weighing's marker reaches this far */
+   const int stmax = fb->width + fb->height;
+   const long far  = (long)(fb->width + fb->height) * (fb->width + fb->height);
+   struct wt_box box[4];
+   int pick = 0;
+   for (int c = 0; c < 4; c++) {
+      struct wt_box *b = &box[c];
+      *b               = (struct wt_box){cx[c], cy[c], lw, lh, 0, 0, far};
+      int prevx        = 0;
+      int prevy        = 0;
+      int have         = 0;
+      for (int i = 0; i < wt->nwt; i++) {
+         if (wt->wt[i].t < from || wt->wt[i].t > w->tmax)
+            continue;
+         const int x = wt_px(w, wt->wt[i].t, px0, pw, pad);
+         const int y = wt_py(w, wt->wt[i].g, py0, ph, pad_t, pad_b);
+         if (x + r >= b->x && x - r < b->x + lw && y + r >= b->y &&
+             y - r < b->y + lh)
+            b->pts++;
+         if (have)
+            wt_seg_scan(b, prevx, prevy, x, y, sc, stmax, &b->tr);
+         else
+            wt_seg_scan(b, x, y, x, y, sc, stmax, NULL);
+         prevx = x;
+         prevy = y;
+         have  = 1;
+      }
+      wt_seg_scan(b, fl[0], fl[1], fl[2], fl[3], sc, stmax, NULL);
+      if (c && wt_box_better(b, c == 1, &box[pick], pick == 1))
+         pick = c;
+   }
+
+   const int bx = cx[pick];
+   const int by = cy[pick];
+   fill_rect(px, fb, bx, by, lw, lh, UI_BLACK);
+   draw_str(px, fb, bx + in, by + in, sc, l1, UI_WT_TREND);
+}
+
 /* The weight trend, drawn into [px0,px0+pw) x [py0,py0+ph).
  *
  * Its own plot, not plot.c's: that one is a glucose instrument -- fixed
@@ -657,6 +867,48 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       draw_str(px, fb, gx - (lw / 2), py0 + ph - (9 * sc), sc, md, UI_DISCLAIM);
    }
 
+   /* THE FITTED LINE, under the trace: the weighings are the data and sit on
+    * top of the line drawn through them. Dashed, so it is never taken for a
+    * stretch of the trace, and drawn only across the weighings it was fitted
+    * to -- past them it would be a forecast. */
+   struct wt_fit fit;
+   wt_fit_of(wt, from, w.tmax, now, &fit);
+   const int stmax = fb->width + fb->height;
+   int fl[4]       = {0, 0, 0, 0}; /* the line as drawn: x0, y0, x1, y1 */
+   if (fit.ok) {
+      const int x0    = wt_px(&w, fit.t0, px0, pw, pad);
+      const int x1    = wt_px(&w, fit.t1, px0, pw, pad);
+      const double d0 = (double)(fit.t0 - now) / 86400.0;
+      const double d1 = (double)(fit.t1 - now) / 86400.0;
+      const int y0 =
+          wt_py(&w, wt_round(fit.a + (fit.b * d0)), py0, ph, pad_t, pad_b);
+      const int y1 =
+          wt_py(&w, wt_round(fit.a + (fit.b * d1)), py0, ph, pad_t, pad_b);
+      fl[0]        = x0;
+      fl[1]        = y0;
+      fl[2]        = x1;
+      fl[3]        = y1;
+      const int dx = x1 - x0;
+      const int dy = y1 - y0;
+      const int ax = dx < 0 ? -dx : dx;
+      const int ay = dy < 0 ? -dy : dy;
+      int st       = ax > ay ? ax : ay;
+      if (st > stmax)
+         st = stmax;
+      const int dash = 4 * sc;
+      for (int k = 0; k <= st && st > 0; k++) {
+         if ((k / dash) % 2)
+            continue;
+         const int x = x0 + ((dx * k) / st);
+         const int y = y0 + ((dy * k) / st);
+         /* Inside the frame: the line is fitted, not bounded by the data, so
+          * at its ends it can stand a little past the highest weighing. */
+         if (y <= py0 || y + sc >= py0 + ph)
+            continue;
+         fill_rect(px, fb, x, y, sc, sc, UI_WT_TREND);
+      }
+   }
+
    int prevx = 0;
    int prevy = 0;
    int have  = 0;
@@ -684,7 +936,6 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
           * over. Every step is a fill_rect on the UI thread, so an unbounded
           * count is a frame that never finishes. The diagonal of the surface is
           * the most a visible segment can need. */
-         int stmax = fb->width + fb->height;
          if (st > stmax)
             st = stmax;
          for (int k = 1; k <= st && st > 0; k++)
@@ -699,6 +950,10 @@ static void wt_plot(uint32_t *px, const struct ANativeWindow_Buffer *fb,
       prevy = cy;
       have  = 1;
    }
+
+   if (fit.ok)
+      wt_legend(px, fb, wt, &w, &fit, fl, prefs->wunits, from, px0, py0, pw, ph,
+                sc, pad, pad_t, pad_b);
 
    /* SCRUB CURSOR: a full-height rule through the picked point and its value
     * spelled out, so the number under the finger is readable rather than
@@ -819,7 +1074,15 @@ void render_wtlog(struct ANativeWindow_Buffer *fb, const struct ui_wtview *wt,
       char wv[16];
       char when[24];
       char line[48];
-      fmt_weight(p->g, prefs->wunits, wv, sizeof wv);
+      /* THE NUMBER ALONE: log_scrub_row draws the unit in its own column.
+       * Clamped as the main plot's readout clamps it, so the format is
+       * provably bounded. */
+      int t10 = wt_to_tenths(p->g, prefs->wunits);
+      if (t10 < 0)
+         t10 = 0;
+      if (t10 > 99999)
+         t10 = 99999;
+      (void)snprintf(wv, sizeof wv, "%d.%d", t10 / 10, t10 % 10);
       fmt_date(p->t, tz_off, when, sizeof when);
       /* THE INSTANT, THE WEIGHT, THE UNIT -- the app's one readout layout;
        * see log_scrub_row. White for the value and the point marked in

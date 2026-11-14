@@ -7,6 +7,7 @@
 #include <stdbool.h>
 
 #include "loadresult.h" /* what a load actually found */
+#include "streak.h"     /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band */
 
 /* O(1) per reading via hourly buckets; O(days*24) to read a rolling window. */
 /* Record one reading in the statistics. `unsure` marks a reading counted on
@@ -68,11 +69,6 @@ struct stat_cov {
 
 /* The same question without the metadata. */
 int stat_window(int days, int *tir, int *avg);
-/* The time-in-range band, in mg/dL: the ADA/ATTD international consensus
- * range. Named so the figure and its provenance travel together, and so a
- * test can sit on the boundary without repeating the literals. */
-#define TIR_LOW_MGDL  70
-#define TIR_HIGH_MGDL 180
 
 /* SEED THE BUCKETS FROM THE READINGS LOG, and say what happened.
  *

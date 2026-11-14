@@ -17,20 +17,8 @@
  * reach, decidable only on a phone. */
 #ifndef ALARMLOGIC_H
 #define ALARMLOGIC_H
+#include <limits.h>  /* INT_MAX: a high limit no reading reaches */
 #include <stdbool.h> /* the yes/no observations are bool, not int */
-
-/* FORWARD-DECLARED, NOT INCLUDED, and the difference is a build failure.
- *
- * store.h includes ingest.h which includes THIS header, so a translation unit
- * that reaches store.h first finds PANCRA_STORE_H already defined by the time
- * the cycle comes back round -- and `struct reading` is then still undefined
- * where the prototype below needs it. Including store.h here made exactly that
- * happen.
- *
- * A pointer to an incomplete type is all a prototype needs. alarmlogic.c
- * includes store.h itself for the definition, and this header keeps the
- * no-dependencies property its own comment claims. */
-struct reading;
 
 /* ---- ONE TYPE PER DOMAIN, AND THE CONVERSIONS NAMED ----------
  *
@@ -267,33 +255,6 @@ int morse_encode(const char *text, char *out, int n);
  * forever. */
 enum alarm_level alarm_zone(int glu, long glu_t, long now, int lo, int hi);
 
-/* HOW LONG THE USER HAS BEEN CONTINUOUSLY IN RANGE, in seconds, ending at the
- * newest reading. 0 when the newest reading is itself out of range -- the
- * streak is lost the moment it breaks, which is the whole point of it.
- *
- * `r` is the history NEWEST FIRST, which is the order store.h hands out.
- *
- * THE BAND IS [lo, hi] INCLUSIVE, and the caller passes the CLINICAL
- * time-in-range range (TIR_LOW_MGDL..TIR_HIGH_MGDL, 70-180) rather than the
- * configured alarm band. A streak is a claim about glucose control, so it is
- * measured against the published consensus range that TIR itself uses -- and
- * because stats.c counts 70 and 180 as in range, so does this. Breaking at a
- * reading TIR calls good would be two numbers on one screen disagreeing about
- * one sample.
- *
- * Note this is the OPPOSITE convention from alarm_zone, which is exclusive at
- * its limits: an alarm FIRES at the limit, while a range CONTAINS it.
- *
- * A GAP BREAKS IT. Readings arrive every five minutes; a hole means the
- * sensor was off, the phone was away, or the session ended, and nobody knows
- * what happened in between. Counting straight through would claim credit for
- * time nobody measured, so a gap longer than `gap_max` seconds ends the
- * streak at the near side of the hole rather than spanning it.
- *
- * Pure, like everything else in this header: the caller passes the history
- * and the bounds. */
-long alarm_streak_s(const struct reading *r, int n, int lo, int hi,
-                    long gap_max);
 /* Combine two sensors' zone verdicts: LOW (1) anywhere outranks HIGH (2)
  * anywhere outranks in-range (0). Commutative and associative, so a caller
  * can fold it over any number of sensors. */
@@ -334,6 +295,15 @@ bool alarm_stale(int glu, long glu_t, long now, long mono_now, long launch_mono,
  * rings again on every new forecast after a tap: it is the only value in the app chosen because
  * somebody else's evidence says a person may stop being able to act. */
 #define PRED_LOW_MGDL 55
+
+/* THE ALARM FOLLOWS THE PRIMARY CGM, the number on the screen, at the user's
+ * limits. Every other CGM rings only below PRED_LOW_MGDL: two worn sensors
+ * routinely disagree by more than the distance to a limit, so the second one
+ * at its user limits rings about a number nobody is looking at, while a value
+ * this low is worth hearing from any sensor. These are that sensor's limits,
+ * inclusive as alarm_zone's are. */
+#define AL_OTHER_LO (PRED_LOW_MGDL - 1)
+#define AL_OTHER_HI INT_MAX
 
 /* Does one CGM link's newest PREDICTION justify forcing a LOW right now?
  *

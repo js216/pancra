@@ -12,7 +12,7 @@
 #include "plot.h"
 #include "sensors.h" /* sensor types, kinds, marker enum */
 #include "settings.h"
-#include "stats.h" /* TIR_LOW_MGDL / TIR_HIGH_MGDL: the band plot.c shades */
+#include "streak.h" /* streak_line: the words the server prints too */
 #include "style.h"
 #include "uiact.h"
 #include "uidraw.h"
@@ -50,38 +50,10 @@
  * nudge simply leaves it empty -- so identical arithmetic here puts every
  * column in the same place on both rows. */
 
-/* A RUN OF TIME IN THE COARSEST UNIT THAT STILL SAYS SOMETHING.
- *
- * Days and hours from one day up ("12D 5H"), hours from one hour up, minutes
- * below that. From 100 days up the hours are dropped ("365D"): a run that long
- * is told by its days, and the hours would push the widest line past the plot.
- * One function because the streak and the record it is measured against are
- * rendered side by side, and two copies of this arithmetic would eventually
- * disagree about where an hour becomes a day -- which would read as the two
- * numbers being on different scales.
- *
- * WIDTH BUDGET. The widest line is "STREAK 99D 23H (BEST 99D 23H)", 29
- * characters. The landscape plot column is at least 188 sc wide, and after the
- * corner inset it holds 30 characters, so the line always fits. Inner spaces
- * would make it 33 and push the start of the line off the plot.
- *
- * `cap` is at least 8: the widest answers are "99D 23H" and "59 MIN" plus their
- * terminator, and a truncated one would silently change the number rather than
- * the unit. The callers pass 8, which is what lets the compiler prove the line
- * they build out of two of these fits its own buffer. */
-static void streak_len(long s, char *out, size_t cap)
-{
-   if (s < 0)
-      s = 0;
-   if (s >= 100L * 86400)
-      (void)snprintf(out, cap, "%ldD", s / 86400);
-   else if (s >= 86400)
-      (void)snprintf(out, cap, "%ldD %ldH", s / 86400, (s % 86400) / 3600);
-   else if (s >= 3600)
-      (void)snprintf(out, cap, "%ld H", s / 3600);
-   else
-      (void)snprintf(out, cap, "%ld MIN", s / 60);
-}
+/* THE STREAK LINE'S WIDTH BUDGET. The widest line streak_line writes is
+ * "STREAK 99D 23H (BEST 99D 23H)", 29 characters. The landscape plot column is
+ * at least 188 sc wide, and after the corner inset it holds 30 characters, so
+ * the line always fits. */
 
 /* HOW THE PINNED SHORTCUTS PACK: how many go on a row, and how many rows that
  * comes to.
@@ -837,72 +809,33 @@ struct plot_cfg ui_glu_plot(struct ANativeWindow_Buffer *fb,
       }
    }
    /* ---- THE CHANGE POINTS: how far a CGM reading moved since the same
-    * sensor's reading before it (m->plot.chg), on every span, as the marker
-    * chosen under DELTA MARKER.
+    * sensor's reading before it (m->plot.chg), on every span, in the shape and
+    * size chosen under DELTA MARKER.
     *
-    * ONE SENSOR'S AT EACH MOMENT. Every sensor's changes are in the frame,
-    * but drawn in one style two sensors' interleave into one noisy series.
-    * So each moment has one sensor: the primary CGM once it has started --
-    * it is the sensor the big number is -- and before that, the CGM that had
-    * most recently started by then, which is the sensor that was being worn.
-    * A sensor's start is its first reading in the points this span plots.
+    * EVERY SENSOR'S, IN THAT SENSOR'S COLOUR, by the rule its glucose points
+    * follow above: a hidden sensor's are dropped, a source with no slot is
+    * muted, and pre-registry legacy data takes the plain text colour.
     *
     * NOT SCRUBBABLE: they are appended after the history's own points, and
     * the touch path picks among those alone (input.c). */
    int npts = np;
-   if (chg_on && m->plot.nchg > 0) {
-      struct {
-         int src;
-         long start;
-      } st[16];
-
-      int nst = 0;
-      for (int i = 0; i < np; i++) {
-         const struct ui_point *p = &m->plot.hist[i];
-         if (p->kind != KIND_CGM)
-            continue;
-         int k = 0;
-         while (k < nst && st[k].src != p->src)
-            k++;
-         if (k == nst) {
-            if (nst == (int)(sizeof st / sizeof st[0]))
-               continue;
-            st[nst].src   = p->src;
-            st[nst].start = p->t;
-            nst++;
-         } else if (p->t < st[k].start) {
-            st[k].start = p->t;
-         }
-      }
-      const struct ui_sensor *pcg = primary_cgm(m);
-      int have_pstart             = 0;
-      long pstart                 = 0;
-      for (int k = 0; pcg && k < nst; k++)
-         if (st[k].src == pcg->id) {
-            pstart      = st[k].start;
-            have_pstart = 1;
-         }
-      const uint32_t ccol = ui_sensor_color(m->prefs.chg_color);
+   if (chg_on) {
       for (int c = 0; c < m->plot.nchg && npts < UI_PLOT_MAX + UI_CHG_MAX;
            c++) {
          const struct ui_chg *d = &m->plot.chg[c];
-         int ref                = -1;
-         if (have_pstart && d->t >= pstart) {
-            ref = pcg->id;
-         } else {
-            long best = 0;
-            for (int k = 0; k < nst; k++)
-               if (st[k].start <= d->t && (ref < 0 || st[k].start > best)) {
-                  best = st[k].start;
-                  ref  = st[k].src;
-               }
+         uint32_t col           = UI_TEXT;
+         struct sensor_style st;
+         if (d->src != 0 && sensor_style_of(d->src, &st)) {
+            if (st.marker == MARK_HIDE)
+               continue;
+            col = ui_sensor_color(st.color);
+         } else if (d->src != 0 && m->dev.nsensors > 0) {
+            col = UI_ORPHAN;
          }
-         if (d->src != ref)
-            continue;
          pts[npts].t      = d->t;
          pts[npts].glu    = d->delta;
          pts[npts].marker = m->prefs.chg_marker;
-         pts[npts].col    = ccol;
+         pts[npts].col    = col;
          pts[npts].size   = m->prefs.chg_size;
          pts[npts].hidden = 0;
          pts[npts].span   = 0;
@@ -1496,39 +1429,18 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * and inside the plot rect rather than above it, where the tab row lives
     * and the scrub readout replaces it. */
    if (m->plot.streak_s > 0) {
-      /* 40, and clamped below. A long is up to 19 digits and the compiler
-       * cannot see that a streak is bounded by the history's own span, so at
-       * 24 it treats the format as possibly truncating -- which this build
-       * makes an error rather than letting the label be cut in half. The
-       * clamp is the honest half of it: a streak of more than a year is not
-       * a number this screen should be trying to render. */
       char st[40];
+      streak_line(m->plot.streak_s, m->plot.best_streak_s, st, sizeof st);
+      /* The bar measures the run against the record, both clamped to a year
+       * as the line clamps them. A record reached or passed has no bar:
+       * streak_line then says BEST STREAK and nothing else. */
       long ss = m->plot.streak_s;
       if (ss > 365L * 86400)
          ss = 365L * 86400;
       long bb = m->plot.best_streak_s;
       if (bb > 365L * 86400)
          bb = 365L * 86400;
-      /* IS THIS THE BEST ONE YET? Then it says so and nothing else: a record
-       * being broken is the whole news, and a bar showing 100% of a target
-       * already passed would be reporting the smaller fact. `>=` because
-       * equalling the record is reaching it, and because the record is raised
-       * on the reading path -- a streak that has just passed it reads its own
-       * value back here one reading later. */
       const int is_best = (bb <= 0) || (ss >= bb);
-      /* 8 IS THE PROVABLE BOUND, and the compiler is the reason it is not 16:
-       * streak_len's widest answer is "99D 23H", but with a 16-byte
-       * destination gcc must assume 15 characters twice and cannot show the
-       * combined line fits -- which this build treats as an error rather than
-       * letting a number be cut in half. */
-      char cur[8];
-      char bst[8];
-      streak_len(ss, cur, sizeof cur);
-      streak_len(bb, bst, sizeof bst);
-      if (is_best)
-         (void)snprintf(st, sizeof st, "BEST STREAK %s", cur);
-      else
-         (void)snprintf(st, sizeof st, "STREAK %s (BEST %s)", cur, bst);
       /* INSET BY HALF A CHARACTER HEIGHT, down and left.
        *
        * A glyph is 7*sc tall at this scale, so the inset is (7*sc)/2 on both

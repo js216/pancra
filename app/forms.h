@@ -57,21 +57,12 @@ enum { LABEL_SENSOR = 0, LABEL_SERVER = 1, LABEL_EMAIL = 2, LABEL_FOOD = 3 };
 /* Which insulin type the MARKER PICKER is styling (INS_SLOW / INS_FAST), or
  * -1 when it is editing a sensor's styling instead. */
 
-/* WHAT AN OK-COMMIT FAMILY DECIDED.
- *
- * Three answers, not two: a single chain has three exits and one of them is
- * a bare `return` out of menu_action -- which also skips the repaint at the
- * bottom of it. That is load-bearing behaviour for
- * a refused entry: the family has already cleared the entry and put a message
- * on the keypad, and the screen it wants is the one already on it.
- *
- * (Whether skipping the repaint is RIGHT is a separate question: the cleared
- * entry and the refusal message then wait for the 1 Hz tick to appear. It is
- * preserved here exactly as it was rather than quietly changed under a
- * refactor.) */
+/* WHAT AN OK-COMMIT FAMILY DECIDED. menu_action repaints after either a commit
+ * or a refusal, so the cleared entry and the refusal message appear with the
+ * press. */
 #define COMMIT_PASS 0 /* not this family's field */
-#define COMMIT_DONE 1 /* committed; menu_action repaints as usual */
-#define COMMIT_STAY 2 /* refused; the keypad stays up and is NOT repainted */
+#define COMMIT_DONE 1 /* committed */
+#define COMMIT_STAY 2 /* refused; the keypad stays up with its message */
 
 /* WHAT A CONFIRMED WRITE LEFT ON THE DISK, and therefore whether the form
  * that asked for it may be torn down.

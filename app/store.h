@@ -79,6 +79,16 @@ long hist_newest_t(int src);
  * last-seen table, which store_load rewrites. Its one caller is inside
  * build_model, which holds the lock across the whole frame. */
 long store_src_last_seen(int src);
+/* EVERY CGM'S FIRST AND LAST READING across the whole log, into `out`; how
+ * many were written. The _locked form is for a caller holding hist_lock. */
+int store_spans_locked(struct src_span *out, int cap);
+int store_spans(struct src_span *out, int cap);
+/* THE IN-RANGE STREAK over the whole log: the run ending at the newest
+ * counted reading and the longest run, in seconds (streak.h). Kept current by
+ * store_load and store_record, so asking costs nothing. The _locked form is
+ * for a caller holding hist_lock. */
+void store_streak_locked(long *cur, long *best);
+void store_streak(long *cur, long *best);
 
 /* Forget every last-seen date. Called by store_load before it re-reads the
  * file: these are maxima, so a restore that REPLACES readings.csv would
@@ -194,8 +204,9 @@ static inline int hist_is_tail(enum hist_insert_result r)
  * and a global time window would let one silently overwrite the other. A BGM
  * fingerstick never dedups against a CGM sample either -- a meter reading in
  * the same minute is precisely the divergence worth seeing. */
+/* `lead` is a READ_LEAD_* (readingrec.h). */
 enum hist_insert_result hist_insert(long t, int glu, int trend, int src,
-                                    int kind);
+                                    int kind, int lead);
 /* Glucose of the newest CGM sample from `src` in [not_before, t) -- strictly
  * older than `t`, and no older than `not_before` -- or -1 if that source has
  * none in the window.
@@ -218,9 +229,10 @@ int hist_prev_glu(long t, int src, long not_before);
  * was not written is still shown, alarmed on and counted until the next
  * restart, and then gone -- which is the one failure the log exists to
  * prevent. app/insulin.c's ins_write_row has always been checked this way. */
+/* `lead` is a READ_LEAD_*, written to the `lead` column. */
 int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                  long raw, long tz, int kind, int rescale_pm,
-                 enum warm_state warm);
+                 enum warm_state warm, int lead);
 /* The screen as a reading arrives -- 0 off, 1 on and locked, 2 unlocked --
  * written into the row's trailing `screen` column. Set from Java's screen
  * receiver on any thread; unset, the column is left empty. */
@@ -345,6 +357,10 @@ struct reading_event {
     * before calling. -1 when no CGM is registered. It is a parameter and not
     * a lookup for the lock-order reason in hist_refresh_current's comment. */
    int prime;
+   /* WHEN THE READING'S SENSOR STARTED ITS SESSION, epoch seconds, 0 when not
+    * known (sensor_session_start): a new sensor's first readings do not
+    * count toward the streak. */
+   long start;
 };
 
 /* What recording it did. */
@@ -399,8 +415,12 @@ int store_drain(int ms);
  * history lock held would be registry inside history -- the inverse of the
  * documented registry -> history order, and one binder thread away from a
  * freeze. The lock order is a property of the CALL SITE, so the id is
- * an argument. -1 means "no primary". */
-int store_load(int prime);
+ * an argument. -1 means "no primary".
+ *
+ * `starts` are every sensor's session start (sensors_starts), gathered by the
+ * caller before the lock for the same reason: the streak is built from the
+ * whole log here, and a new sensor's first readings do not count. */
+int store_load(int prime, const struct sensor_start *starts, int ns);
 /* Count the rows currently in the log (one pass). */
 int store_count(void);
 

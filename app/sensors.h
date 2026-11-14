@@ -421,6 +421,10 @@ int sensors_load(void); /* both files; safe on a fresh install */
  * of field copies. Returns 1 when the id is known; `out` may
  * be NULL to ask only whether it is. */
 int sensor_rec_of(int id, struct sensor_rec *out);
+/* EVERY SENSOR'S SESSION START the registry knows, into `out`; how many were
+ * written. Takes the registry lock. struct sensor_start is streak.h's. */
+struct sensor_start;
+int sensors_starts(struct sensor_start *out, int cap);
 /* The slot for an id, or 0 if the sensor has been forgotten. */
 /* THE SLOT FOR AN ID, AS A COPY -- and its index, for the operations that
  * take one. A writable pointer here would let any caller change a device's

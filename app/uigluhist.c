@@ -88,7 +88,7 @@ static int range_rows(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (tot == 0) {
       fill_rect(px, fb, x, y, w, bh, UI_RULE);
       y += bh + (4 * sc);
-      const char *msg = "NO READINGS";
+      const char *msg = "NO CGM READINGS";
       const int mw    = ((str_len(msg) * 6) - 1) * sc;
       draw_str(px, fb, x + ((w - mw) / 2), y, sc, msg, UI_MUTED);
       return y + (7 * sc);
@@ -307,14 +307,7 @@ void render_gluhist(struct ANativeWindow_Buffer *fb, const struct screen *m,
    const int gap = 2 * sc;
    int y         = (fb->height / 20) + (8 * sc);
 
-   /* THE X CLOSES THE SCREEN, and only the X: the rest of the title line is
-    * the date, whose parts are targets of their own. */
-   const int xx = rx - (6 * tsc);
-   draw_str(px, fb, xx, y, tsc, "X", UI_TEXT);
-   add_hit_ix(h,
-              ui_rect(xx - (3 * sc), y - (3 * sc), fb->width - xx + (3 * sc),
-                      (2 * lh) - (2 * sc)),
-              MA_GLUHIST_BACK, 0);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", UI_TEXT);
 
    /* THE TITLE IS THE DATE, YYYY-MM-DD: the window's first day, whatever the
     * span. A tap on the year opens a keypad for the year, one on MM-DD a
@@ -355,6 +348,10 @@ void render_gluhist(struct ANativeWindow_Buffer *fb, const struct screen *m,
       }
       dx += w;
    }
+   /* THE REST OF THE TITLE LINE CLOSES THE SCREEN, as on every menu: from
+    * where the date ends to the X and the screen's edge. */
+   add_hit_ix(h, ui_rect(dx, y - (3 * sc), fb->width - dx, (2 * lh) - (2 * sc)),
+              MA_GLUHIST_BACK, 0);
    y += 2 * lh;
 
    /* The step columns leave room either side for the buttons that go to

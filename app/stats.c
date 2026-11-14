@@ -13,6 +13,8 @@
 #include "ingest.h"     /* STORE_GLU_MIN/MAX: what a stored reading may be */
 #include "loadresult.h" /* what a load actually found; see stat_load */
 #include "sensors.h"    /* KIND_BGM / KIND_CGM: fingersticks are excluded */
+#include "store.h"      /* store_spans: who was primary before the record */
+#include "streak.h" /* read_lead, READ_LEAD_*: which sensor a row counts for */
 #include <stdio.h>      /* SEEK_SET / SEEK_END */
 #include <stdlib.h>
 #include <string.h> /* memcpy: the chunked replay carries partial lines */
@@ -261,10 +263,18 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now);
  * failed partway or the buffer could not be allocated -- what the rest of the
  * file said is then unknown, so the buckets are a PREFIX and not a summary,
  * and the caller must not present them as one. */
+/* EACH CGM'S FIRST AND LAST READING, taken from the store when a replay
+ * starts: what read_lead needs for rows that do not record the primary. The
+ * store has read the same log by then (main.c, logsload.c). */
+#define STAT_SPANS 1024
+static struct src_span g_lspan[STAT_SPANS];
+static int g_nlspan;
+
 static enum load_result load_into(struct stat_fill *d,
                                   const char *readings_path)
 {
-   int fd = open(readings_path, O_RDONLY, 0);
+   g_nlspan = store_spans(g_lspan, STAT_SPANS);
+   int fd   = open(readings_path, O_RDONLY, 0);
    if (fd < 0) {
       /* ENOENT IS AN ANSWER; ANYTHING ELSE IS A REFUSAL.
        *
@@ -500,7 +510,7 @@ void stat_reload_publish(void)
  * `if (!why)` reads as failure and means success -- every test here names the
  * enumerator. */
 static int stat_row(const char *ln, const char *e, long *t, long *glu, int *src,
-                    long *kind, enum warm_state *warm)
+                    long *kind, enum warm_state *warm, int *lead)
 {
    struct csv_cur c;
    csv_open(&c, ln, e);
@@ -529,6 +539,7 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu, int *src,
     * added to a log that is never rewritten: every row written before it
     * existed says nothing, which is exactly true. */
    long warmv = WARM_UNKNOWN;
+   long leadv = -1;
 
    /* fields: t,glu,trend,rssi,lag,src,device_time,tz,kind,rescale,warm
     *
@@ -572,6 +583,8 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu, int *src,
          kindv = n;
       else if (f == 11)
          warmv = n;
+      else if (f == 14)
+         leadv = n;
    }
 
    /* Both bounds are applied on the WIDE side, before anything narrows: an
@@ -590,6 +603,9 @@ static int stat_row(const char *ln, const char *e, long *t, long *glu, int *src,
     * measured state would be inventing one. */
    *warm = (warmv == WARM_NO || warmv == WARM_YES) ? (enum warm_state)warmv
                                                    : WARM_UNKNOWN;
+   *lead = READ_LEAD_UNKNOWN;
+   if (leadv == 0 || leadv == 1)
+      *lead = leadv == 1 ? READ_LEAD_YES : READ_LEAD_NO;
    return 1;
 }
 
@@ -612,8 +628,9 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now)
       long kind            = 0;
       int src              = 0;
       enum warm_state warm = WARM_UNKNOWN;
+      int lead             = READ_LEAD_UNKNOWN;
       /* '#' is the header / a comment, and it is not damage. */
-      if (*p != '#' && stat_row(p, e, &t, &glu, &src, &kind, &warm)) {
+      if (*p != '#' && stat_row(p, e, &t, &glu, &src, &kind, &warm, &lead)) {
          /* This predicate MUST match the live path's exactly (see
           * glucose_plausible in reading.c). When replay used `glu > 0` while
           * the live path had no bound at all, an implausible sample was
@@ -640,9 +657,12 @@ static void stat_load_chunk(struct stat_fill *d, char *buf, long now)
           * so the activation that inference resolves against is already on
           * hand. A row counted on the inference alone is marked, and the
           * coverage figures carry the total. */
+         /* AND ONLY THE PRIMARY'S, as the live path counts: see read_lead,
+          * against the spans load_into took from the store. */
          enum warm_verdict v = warm_decide(warm, src, t);
          if (t > 0 && glu >= STORE_GLU_MIN && glu <= STORE_GLU_MAX &&
-             kind != KIND_BGM && v != WARM_SKIP)
+             kind != KIND_BGM && v != WARM_SKIP &&
+             read_lead(lead, src, t, g_lspan, g_nlspan))
             bucket_add(d, t, (int)glu, v == WARM_COUNT_UNSURE, now);
       }
       p = e + 1;

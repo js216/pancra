@@ -22,6 +22,7 @@
 #include "readingrec.h" /* STORE_SRC_MAX / STORE_TREND_*: the field widths */
 #include "sensors.h"    /* KIND_CGM / KIND_BGM */
 #include "stats.h"      /* stat_add: recording a reading feeds the statistics */
+#include "streak.h"     /* struct streak_pt, struct src_span */
 #include "thread.h"     /* the history lock lives with the history */
 #include "util.h"
 #include <stdatomic.h> /* the crash mirrors below: see store.h */
@@ -70,6 +71,18 @@ static long rdfield(char **p, const char *e, int *present)
    if (present)
       *present = got;
    return neg ? -v : v;
+}
+
+/* Step past one field, whatever it holds: a decimal like 0.875 stops rdfield
+ * at the point, so a column after one is reached through this. */
+static void skipfield(char **p, const char *e)
+{
+   char *q = *p;
+   while (q < e && *q != ',')
+      q++;
+   if (q < e)
+      q++;
+   *p = q;
 }
 
 /* ---- WHAT THE CRASH HANDLER READS, PUBLISHED AS ATOMICS ---------------
@@ -199,6 +212,7 @@ struct reading hist_at(int i)
  * shows (see meterstore.h). */
 #define SRC_LAST_MAX (MAX_SLOTS + 1)
 static long g_src_last[SRC_LAST_MAX];
+static long g_src_first[SRC_LAST_MAX]; /* the oldest, for store_spans */
 
 /* FORGOTTEN WHEN THE LOG IS RE-READ. These are maxima, so nothing lowers one:
  * after a restore replaces readings.csv the table would keep a last-seen date
@@ -206,8 +220,10 @@ static long g_src_last[SRC_LAST_MAX];
  * store_load calls this before it re-reads. */
 void store_src_last_reset(void)
 {
-   for (int i = 0; i < SRC_LAST_MAX; i++)
-      g_src_last[i] = 0;
+   for (int i = 0; i < SRC_LAST_MAX; i++) {
+      g_src_last[i]  = 0;
+      g_src_first[i] = 0;
+   }
 }
 
 static void src_last_note(int src, long t, int kind)
@@ -216,6 +232,25 @@ static void src_last_note(int src, long t, int kind)
       return;
    if (t > g_src_last[src])
       g_src_last[src] = t;
+   if (t > 0 && (g_src_first[src] == 0 || t < g_src_first[src]))
+      g_src_first[src] = t;
+}
+
+int store_spans_locked(struct src_span *out, int cap)
+{
+   int n = 0;
+   for (int i = 1; i < SRC_LAST_MAX && n < cap; i++)
+      if (g_src_first[i] > 0)
+         out[n++] = (struct src_span){i, g_src_first[i], g_src_last[i]};
+   return n;
+}
+
+int store_spans(struct src_span *out, int cap)
+{
+   store_lock();
+   const int n = store_spans_locked(out, cap);
+   store_unlock();
+   return n;
 }
 
 long store_src_last_seen(int src)
@@ -280,6 +315,86 @@ int hist_copy(struct reading *out, int cap)
    return n;
 }
 
+/* ---- THE STREAK ----------------------------------------------
+ *
+ * EVERY CGM ROW OF THE LOG, newest first, 16 bytes each, and the streak's
+ * running state over them (streak.h). A reading newer than every other is
+ * applied in a few comparisons; one that lands further back -- a backfill, a
+ * catch-up after a dropout -- is put in its place and the state is rebuilt
+ * from the rows in memory, which is one pass and no file read. All of it under
+ * the history lock, like the history. */
+static struct streak_pt *g_spts;
+static int g_nspts, g_cspts;
+static struct streak_acc g_sacc;
+static struct sensor_start g_sst[MAX_SENSOR_RECS];
+static int g_nsst;
+
+static void streak_rebuild_locked(void)
+{
+   static struct src_span sp[STREAK_SPANS];
+   const int nsp = store_spans_locked(sp, STREAK_SPANS);
+   streak_acc_build(&g_sacc, g_spts, g_nspts, sp, nsp, g_sst, g_nsst);
+}
+
+/* Remember sensor `src`'s start, so a rebuild skips its first readings too. */
+static void streak_note_start(int src, long start)
+{
+   if (start <= 0)
+      return;
+   for (int i = 0; i < g_nsst; i++)
+      if (g_sst[i].id == src) {
+         g_sst[i].start = start;
+         return;
+      }
+   if (g_nsst < MAX_SENSOR_RECS)
+      g_sst[g_nsst++] = (struct sensor_start){src, start};
+}
+
+static long streak_start_of(int src)
+{
+   for (int i = 0; i < g_nsst; i++)
+      if (g_sst[i].id == src)
+         return g_sst[i].start;
+   return 0;
+}
+
+/* One reading that reached the log. */
+static void streak_record_locked(const struct streak_pt *x, long start)
+{
+   streak_note_start(x->src, start);
+   if (g_nspts == g_cspts) {
+      const int ncap      = g_cspts ? g_cspts * 2 : 4096;
+      struct streak_pt *q = realloc(g_spts, (size_t)ncap * sizeof *q);
+      if (!q)
+         return; /* the streak goes on without it until the next load */
+      g_spts  = q;
+      g_cspts = ncap;
+   }
+   int k = 0;
+   while (k < g_nspts && streak_cmp(&g_spts[k], x) < 0)
+      k++;
+   if (k < g_nspts && streak_cmp(&g_spts[k], x) == 0)
+      return; /* already held */
+   memmove(&g_spts[k + 1], &g_spts[k], (size_t)(g_nspts - k) * sizeof *x);
+   g_spts[k] = *x;
+   g_nspts++;
+   if (k != 0 || !streak_acc_add(&g_sacc, x, streak_start_of(x->src), NULL, 0))
+      streak_rebuild_locked();
+}
+
+void store_streak_locked(long *cur, long *best)
+{
+   *cur  = g_sacc.cur;
+   *best = g_sacc.best > g_sacc.cur ? g_sacc.best : g_sacc.cur;
+}
+
+void store_streak(long *cur, long *best)
+{
+   store_lock();
+   store_streak_locked(cur, best);
+   store_unlock();
+}
+
 static int g_cur_glu = -1, g_cur_trend;
 static long g_cur_time;
 static int g_cur_rssi, g_cur_rssi_ok;
@@ -334,7 +449,7 @@ static char g_store_path[256];
  * (raw = glucose / rescale) -- no data is lost. */
 static const char g_store_hdr[] =
     "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
-    "device_time,tz_offset_s,kind,rescale,warm,screen,shown\n";
+    "device_time,tz_offset_s,kind,rescale,warm,screen,shown,lead\n";
 
 /* THE SCREEN AS THE LAST CHANGE LEFT IT: 0 off, 1 on and locked, 2 unlocked,
  * -1 not known yet. Written by Java's receiver, read by whichever thread
@@ -443,7 +558,7 @@ void hist_refresh_current(int prime)
 }
 
 static int tab_insert(struct hist_tab *h, long t, int glu, int trend, int src,
-                      int kind)
+                      int kind, int lead)
 {
    /* NORMALISE THE KIND FIRST. Two callers pass a value PARSED FROM A FILE
     * -- the readings.csv loader and the import path -- and neither bounds
@@ -523,6 +638,7 @@ static int tab_insert(struct hist_tab *h, long t, int glu, int trend, int src,
    h->v[i].trend = (short)trend;
    h->v[i].src   = (unsigned short)src;
    h->v[i].kind  = (unsigned char)kind;
+   h->v[i].lead  = (unsigned char)lead;
    return HIST_NEW;
 }
 
@@ -557,7 +673,7 @@ int hist_prev_glu(long t, int src, long not_before)
  * too. */
 int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
                  long raw, long tz, int kind, int rescale_pm,
-                 enum warm_state warm)
+                 enum warm_state warm, int lead)
 {
    /* THE HEADER AND THE FIRST ROW TOGETHER, and the whole append in one
     * operation (see log_append). Spelled out here as open / lseek / write the
@@ -597,17 +713,25 @@ int store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
    /* Shown column: 1 when Pancra's screen was in front as this reading
     * arrived (store_note_shown). */
    const int shown = atomic_load_explicit(&g_shown, memory_order_relaxed);
+   /* Lead column: 1 when this sensor was the primary as the reading arrived,
+    * 0 when another was, empty when that is not known. */
+   char ld[4];
+   if (lead == READ_LEAD_YES || lead == READ_LEAD_NO)
+      (void)snprintf(ld, sizeof ld, "%d", lead == READ_LEAD_YES ? 1 : 0);
+   else
+      ld[0] = 0;
    /* The file is an ARRIVAL log, never re-sorted -- that is what keeps it
     * append-only and crash-safe. Monotonic order is a property of the sorted
     * in-memory view (see hist_insert), not of the bytes on disk. */
    int n =
        has_rssi
            ? snprintf(line, sizeof line,
-                      "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d\n", t, glu,
-                      trend, rssi, lag, src, raw, tz, kind, rs, ws, sc, shown)
+                      "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d,%s\n", t, glu,
+                      trend, rssi, lag, src, raw, tz, kind, rs, ws, sc, shown,
+                      ld)
            : snprintf(line, sizeof line,
-                      "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d\n", t, glu,
-                      trend, lag, src, raw, tz, kind, rs, ws, sc, shown);
+                      "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s,%s,%s,%d,%s\n", t, glu,
+                      trend, lag, src, raw, tz, kind, rs, ws, sc, shown, ld);
    n      = clampn(n, sizeof line);
    int rc = log_append(g_store_path, g_store_hdr, (int)sizeof g_store_hdr - 1,
                        line, n);
@@ -655,10 +779,10 @@ int store_count(void)
 }
 
 enum hist_insert_result hist_insert(long t, int glu, int trend, int src,
-                                    int kind)
+                                    int kind, int lead)
 {
    struct hist_tab h = live_hist();
-   int r             = tab_insert(&h, t, glu, trend, src, kind);
+   int r             = tab_insert(&h, t, glu, trend, src, kind, lead);
    /* `n` is a copy, so it is written back here; the rows themselves went
     * straight into g_hist through the pointer. */
    g_nhist = h.n;
@@ -669,6 +793,8 @@ enum hist_insert_result hist_insert(long t, int glu, int trend, int src,
 /* What a load is building, carried across chunks. */
 struct load_ctx {
    struct hist_tab tab;
+   struct streak_pt *pts; /* every CGM row, for the streak */
+   int npts, cpts;
    long best_t;   /* timestamp of the newest row seen anywhere in the file */
    int best_rssi; /* ...and the link RSSI recorded with it */
    int best_ok;
@@ -676,7 +802,23 @@ struct load_ctx {
 
 static int store_load_chunk(struct load_ctx *c, char *buf);
 
-int store_load(int prime)
+/* One CGM row into the load's streak rows. A row that cannot be held leaves
+ * the streak short of it, which is the cost of an allocation the phone could
+ * not make. */
+static void load_pt(struct load_ctx *c, struct streak_pt x)
+{
+   if (c->npts == c->cpts) {
+      const int ncap      = c->cpts ? c->cpts * 2 : 65536;
+      struct streak_pt *q = realloc(c->pts, (size_t)ncap * sizeof *q);
+      if (!q)
+         return;
+      c->pts  = q;
+      c->cpts = ncap;
+   }
+   c->pts[c->npts++] = x;
+}
+
+int store_load(int prime, const struct sensor_start *starts, int ns)
 {
    /* The last-seen table is a set of maxima and this is a whole re-read:
     * clear it, or a restore leaves dates from rows the file no longer has. */
@@ -713,7 +855,7 @@ int store_load(int prime)
    }
    struct load_ctx ctx = {
        {stage, 0},
-       0, 0, 0
+       NULL, 0, 0, 0, 0, 0
    };
    /* THE WHOLE FILE, not a tail.
     *
@@ -798,6 +940,7 @@ int store_load(int prime)
     * worse answer than the understatement the -1 already reports. */
    if (n < 0) {
       free(stage);
+      free(ctx.pts);
       return -1;
    }
 
@@ -824,6 +967,16 @@ int store_load(int prime)
     * them. Counted here rather than by the caller, which had to know to do it
     * and which counter it was setting. */
    g_stored = store_count();
+   /* THE STREAK, from every CGM row the file holds and the starts the caller
+    * gathered. */
+   free(g_spts);
+   g_spts  = ctx.pts;
+   g_cspts = ctx.cpts;
+   g_nspts = streak_sort(g_spts, ctx.npts);
+   g_nsst  = 0;
+   for (int i = 0; i < ns && starts; i++)
+      streak_note_start(starts[i].id, starts[i].start);
+   streak_rebuild_locked();
    /* What is lost when this returns -1 is not a file -- it is history: g_hist
     * drives the plot, the time-in-range figures and (through
     * g_cur_glu/g_cur_time) the alarm's idea of the current reading. Coming up
@@ -900,6 +1053,14 @@ static int store_load_chunk(struct load_ctx *c, char *buf)
       int have_kind = 0;
       long kind     = rdfield(&q, e, &have_kind);
       int kind_ok   = !have_kind || kind == KIND_CGM || kind == KIND_BGM;
+      /* rescale, warm, screen and shown are provenance; then the lead. */
+      for (int k = 0; k < 4; k++)
+         skipfield(&q, e);
+      int have_lead = 0;
+      long lead_v   = rdfield(&q, e, &have_lead);
+      int lead      = READ_LEAD_UNKNOWN;
+      if (have_lead)
+         lead = lead_v == 1 ? READ_LEAD_YES : READ_LEAD_NO;
       /* Same plausibility bound the live path applies (glucose_plausible in
        * main.c) and stat_load applies on replay. Without it, rows written
        * before that gate existed -- a 0 mg/dL warm-up sentinel, or a spliced
@@ -922,8 +1083,14 @@ static int store_load_chunk(struct load_ctx *c, char *buf)
           glu <= STORE_GLU_MAX) {
          /* INTO THE STAGED TABLE, never the live one: nothing this function
           * does may be visible until the whole source has been read. */
-         tab_insert(&c->tab, t, (int)glu, (int)tr, (int)src, (int)kind);
+         tab_insert(&c->tab, t, (int)glu, (int)tr, (int)src, (int)kind, lead);
          src_last_note((int)src, t, (int)kind);
+         if (kind == KIND_CGM)
+            load_pt(c, (struct streak_pt){.t    = t,
+                                          .glu  = (short)glu,
+                                          .src  = (unsigned short)src,
+                                          .cgm  = 1,
+                                          .lead = (unsigned char)lead});
          /* THE NEWEST ROW IN THE WHOLE FILE, not in this chunk. best_t used
           * to be a local reset on every chunk, so the last chunk that
           * happened to carry an RSSI won -- and the log is in ARRIVAL order,
@@ -981,15 +1148,26 @@ struct reading_result store_record(const struct reading_event *ev, long gap)
    /* BEFORE the insert: afterwards the newest sample from this source is the
     * one being added, and prev_glu would report the reading against itself. */
    r.prev_glu = hist_prev_glu(ev->t, ev->src, ev->t - gap);
-   r.inserted = hist_insert(ev->t, ev->glu, ev->trend, ev->src, ev->kind);
+   /* With no primary at all every CGM's reading is the one shown. */
+   const int lead =
+       (ev->prime < 0 || ev->src == ev->prime) ? READ_LEAD_YES : READ_LEAD_NO;
+   r.inserted = hist_insert(ev->t, ev->glu, ev->trend, ev->src, ev->kind, lead);
    /* Keep the whole-log answer current, so a device that later drops out
     * of the display tail still has a last-seen time without a reload. */
    src_last_note(ev->src, ev->t, ev->kind);
    /* ANYTHING THAT WAS KEPT, not HIST_NEW alone -- see store.h. Asked
     * through hist_kept() rather than as a truth value, which asks the
     * question it means rather than reading as "new". */
-   if (hist_kept(r.inserted) && !ev->warm)
+   /* THE STATISTICS ARE THE PRIMARY'S, as the streak is: see read_lead. */
+   if (hist_kept(r.inserted) && !ev->warm && lead == READ_LEAD_YES)
       stat_add(ev->t, ev->glu, ev->warm_unsure);
+   if (hist_kept(r.inserted) && ev->kind == KIND_CGM)
+      streak_record_locked(&(struct streak_pt){.t    = ev->t,
+                                               .glu  = (short)ev->glu,
+                                               .src  = (unsigned short)ev->src,
+                                               .cgm  = 1,
+                                               .lead = (unsigned char)lead},
+                           ev->start);
    hist_refresh_current(ev->prime);
    store_unlock();
 
@@ -998,9 +1176,10 @@ struct reading_result store_record(const struct reading_event *ev, long gap)
     * waiting on an SD card. Persisted on HIST_OLD as well -- the log is the
     * lifetime record and NHIST is only how much of it fits on screen. */
    if (hist_kept(r.inserted))
-      r.persisted = store_append(ev->t, ev->glu, ev->trend, ev->rssi,
-                                 ev->has_rssi, ev->src, ev->raw, ev->tz,
-                                 ev->kind, ev->rescale_pm, ev->wstate) == 0;
+      r.persisted =
+          store_append(ev->t, ev->glu, ev->trend, ev->rssi, ev->has_rssi,
+                       ev->src, ev->raw, ev->tz, ev->kind, ev->rescale_pm,
+                       ev->wstate, lead) == 0;
    return r;
 }
 

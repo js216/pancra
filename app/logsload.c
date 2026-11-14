@@ -77,8 +77,11 @@ void pancra_logs_reload(void)
     * numbers would differ from the ones the phone had produced from the very
     * same rows. */
    int prepared = stat_reload_prepare(store_path());
+   /* The session starts too, for the streak, and for the same reason. */
+   static struct sensor_start starts[MAX_SENSOR_RECS];
+   const int nstarts = sensors_starts(starts, MAX_SENSOR_RECS);
    store_lock();
-   int rc = store_load(prime);
+   int rc = store_load(prime, starts, nstarts);
    stat_reload_publish();
    store_unlock();
    if (!prepared)

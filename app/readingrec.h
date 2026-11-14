@@ -22,6 +22,8 @@
 #ifndef PANCRA_READINGREC_H
 #define PANCRA_READINGREC_H
 
+#include "streak.h" /* READ_LEAD_*: what `lead` holds */
+
 /* One reading in the display history.
  *
  * glu/trend are narrowed to 16 bits so `src` and `kind` fit in the padding
@@ -36,6 +38,7 @@ struct reading {
     * would silently reattribute readings to the wrong physical device. */
    unsigned short src;
    unsigned char kind; /* KIND_CGM / KIND_BGM -- decides how it is plotted */
+   unsigned char lead; /* READ_LEAD_*: was `src` the primary as it arrived */
    long t;             /* canonical UTC epoch seconds */
 };
 

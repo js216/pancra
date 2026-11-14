@@ -1330,8 +1330,11 @@ static void init_data(struct ANativeActivity *activity, JNIEnv *env)
        * stale when the ordering changes. */
       /* The primary BEFORE the history lock: registry -> history. */
       int prime = sensor_primary_id();
+      /* The session starts too, for the streak, and for the same reason. */
+      static struct sensor_start starts[MAX_SENSOR_RECS];
+      const int nstarts = sensors_starts(starts, MAX_SENSOR_RECS);
       hist_lock();
-      int lrc = store_load(prime);
+      int lrc = store_load(prime, starts, nstarts);
       hist_unlock();
       /* A log that exists but could not be read whole leaves the history
        * SHORT, and everything downstream -- the plot, the 1D/3D/7D

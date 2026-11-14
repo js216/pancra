@@ -25,9 +25,11 @@
 #include "sha256.h"
 #include "util.h"
 #include <sqlite3.h>
+#include <stdatomic.h> /* g_log_gen: written by any worker thread */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h> /* time: which buckets are old */
 
 /* First 16 hex chars of a SHA-256, the protocol's hash. 64 bits is ample:
  * this compares two copies of the same honest data set, and the party who
@@ -52,6 +54,19 @@ static void hash_line(struct sha256_ctx *c, const char *line)
 {
    sha256_update(c, (const unsigned char *)line, strlen(line));
    sha256_update(c, (const unsigned char *)"\n", 1);
+}
+
+static _Atomic unsigned long g_log_gen;
+static _Atomic unsigned long g_old_gen;
+
+unsigned long logs_gen(void)
+{
+   return atomic_load(&g_log_gen);
+}
+
+unsigned long logs_old_gen(void)
+{
+   return atomic_load(&g_old_gen);
 }
 
 int log_name_ok(const char *s)
@@ -459,6 +474,9 @@ void h_bucket_put(struct req *r, const char *log, int64_t bucket)
       oops(r);
       return;
    }
+   atomic_fetch_add(&g_log_gen, 1);
+   if (bucket < ((int64_t)time(NULL) / 86400) - LOGS_RECENT_DAYS)
+      atomic_fetch_add(&g_old_gen, 1);
    char msg[64];
    snprintf(msg, sizeof msg, "stored %" PRIwire " rows\n", stored);
    http_text(r->c, 200, "OK", msg);

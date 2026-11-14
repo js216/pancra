@@ -9,10 +9,13 @@
 #include "clock.h"
 #include "dexdriver.h" /* LINK_MAX: the alarm walks every CGM link */
 #include "log.h"
+#include "readingrec.h" /* struct reading: the newest few of a sensor */
+#include "reconcile.h"  /* link_for_sensor: the live session of a new sensor */
 #include "sensors.h"
 #include "settings.h"
 #include "shell.h"
 #include "store.h"
+#include "streak.h" /* streak_first_points: a new sensor's first readings */
 #include "thread.h"
 #include <stdatomic.h>
 
@@ -429,18 +432,27 @@ static void nudge_emit(enum nudge_band ng)
    dexble_nudge(ng == NG_LOW ? AJ_LOW : AJ_HIGH, sp.nudge_sound, sp.nudge_vib);
 }
 
-/* ONE SAMPLE INTO THE THREE RUNNING ANSWERS. The worst band on ANY worn CGM
- * wins, and a LOW outranks a HIGH; a sensor with no current reading
- * contributes nothing rather than voting "in range", which would clear the
- * latch on a dropout and re-arm the nudge to fire again. */
+/* ONE SAMPLE INTO THE THREE RUNNING ANSWERS. `lead` says the sample is judged
+ * at the user's limits and may nudge; any other answers only at AL_OTHER_LO.
+ * The worst band wins, and a LOW outranks a HIGH; a sensor with no current
+ * reading contributes nothing rather than voting "in range", which would clear
+ * the latch on a dropout and re-arm the nudge to fire again. */
 static void alarm_merge_sample(int glu, long t, long now,
-                               const struct prefs *sp, enum alarm_level *zone,
-                               bool *stranded, enum nudge_band *nzone)
+                               const struct prefs *sp, bool lead,
+                               enum alarm_level *zone, bool *stranded,
+                               enum nudge_band *nzone)
 {
-   *zone = alarm_zone_merge(
-       *zone, alarm_zone(glu, t, now, sp->alarm_low, sp->alarm_high));
-   if (alarm_stranded(glu, t, now, sp->alarm_low, sp->alarm_high))
+   int lo = AL_OTHER_LO;
+   int hi = AL_OTHER_HI;
+   if (lead) {
+      lo = sp->alarm_low;
+      hi = sp->alarm_high;
+   }
+   *zone = alarm_zone_merge(*zone, alarm_zone(glu, t, now, lo, hi));
+   if (alarm_stranded(glu, t, now, lo, hi))
       *stranded = true;
+   if (!lead)
+      return;
    enum nudge_band nz = nudge_zone(glu, t, now, sp->nudge_low, sp->nudge_high);
    /* MERGED THROUGH THE ALARM'S RULE, which is a rule about SEVERITY and not
     * about either enum's numbering: low beats high beats neither. The two
@@ -451,6 +463,30 @@ static void alarm_merge_sample(int glu, long t, long now,
                    ? nz
                    : (enum nudge_band)alarm_zone_merge(
                          (enum alarm_level) * nzone, (enum alarm_level)nz);
+}
+
+long sensor_session_start(int id)
+{
+   /* THE REGISTRY LEARNS A SESSION'S START A TICK AFTER THE FIRST READING, so
+    * until then the start comes from the live session clock. */
+   struct sensor_rec rec;
+   long start = sensor_rec_of(id, &rec) ? rec.activation : 0;
+   if (start <= 0) {
+      struct dex_session s;
+      const int link = link_for_sensor(id);
+      if (link >= 0 && driver_session_of(link, &s) && s.session_seconds > 0)
+         start = realtime_s() - (long)s.session_seconds;
+   }
+   return start;
+}
+
+bool alarm_settling(int id)
+{
+   struct reading r[STREAK_N_SKIP + 1];
+   const int n = hist_copy_src(id, r, STREAK_N_SKIP + 1);
+   if (n < 1)
+      return false;
+   return streak_first_points(sensor_session_start(id), r[0].t, n);
 }
 
 /* Gather the alarm zone, the stranded flag and the NUDGE zone across every
@@ -481,15 +517,26 @@ static void alarm_gather(long now, enum alarm_level *zone, bool *stranded,
     * once, and no per-sensor array has to exist. */
    int nlive                    = 0;
    const struct sensor_view *vp = sensors_view_ref();
+   /* WITH NO LIVE PRIMARY EVERY CGM LEADS: nothing on the screen to follow is
+    * no reason for the alarms to stop. */
+   bool have_primary = false;
+   for (int i = 0; i < vp->n_live; i++)
+      if (vp->have_rec[i] && sensor_kind(vp->rec[i].type) == KIND_CGM &&
+          vp->slot[i].primary)
+         have_primary = true;
    for (int i = 0; i < vp->n_live; i++) {
       if (!vp->have_rec[i] || sensor_kind(vp->rec[i].type) != KIND_CGM)
          continue;
       nlive++;
       /* ONE QUESTION PER SENSOR: the newest CGM instant it has. The GLUCOSE
-       * is needed and not just its time, so this asks for the reading. */
+       * is needed and not just its time, so this asks for the reading. A
+       * sensor still settling contributes nothing, as one with no reading. */
       struct reading r;
-      if (hist_copy_src(vp->slot[i].id, &r, 1) == 1)
-         alarm_merge_sample(r.glu, r.t, now, &sp, zone, stranded, nzone);
+      if (hist_copy_src(vp->slot[i].id, &r, 1) == 1 &&
+          !alarm_settling(vp->slot[i].id))
+         alarm_merge_sample(r.glu, r.t, now, &sp,
+                            (bool)(vp->slot[i].primary || !have_primary), zone,
+                            stranded, nzone);
    }
    sensors_view_put(vp);
 
@@ -497,7 +544,7 @@ static void alarm_gather(long now, enum alarm_level *zone, bool *stranded,
       /* THE PAIR, FROM ONE INSTANT. store_now takes the lock itself and
        * returns the glucose and its time together. */
       struct reading_now cur = store_now(realtime_s());
-      alarm_merge_sample(cur.glu, cur.t, now, &sp, zone, stranded, nzone);
+      alarm_merge_sample(cur.glu, cur.t, now, &sp, true, zone, stranded, nzone);
    }
 }
 
@@ -633,9 +680,9 @@ void pancra_alarm_check(void)
    /* The DISCONNECT/stale alarm stays bound to the CURRENT reading -- the
     * primary's, i.e. the number the user is watching going stale is the fact
     * it announces. The excursion zone and the stranded sustain are gathered
-    * across EVERY CGM (alarm_gather): a low on the non-primary sensor rings
-    * too. All the reads happen BEFORE alarm_lock (lock-order: hist never
-    * nests inside alarm). */
+    * across every CGM (alarm_gather), the primary at the user's limits and
+    * the others at AL_OTHER_LO. All the reads happen BEFORE alarm_lock
+    * (lock-order: hist never nests inside alarm). */
    struct alarm_reading cur = current_reading();
    long now                 = realtime_s();
    enum alarm_level zone    = AL_NONE;

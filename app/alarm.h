@@ -30,6 +30,7 @@
  */
 #ifndef ALARM_H
 #define ALARM_H
+#include <stdbool.h>
 
 /* Silence a sounding alarm and report whether that CONSUMED the gesture: any
  * press silences, and that press then does nothing else. Returns 0 when
@@ -41,6 +42,15 @@ int alarm_silence_tap(void);
  * decoded. The imminent-hypo override reads it, gated on freshness -- the
  * prediction must be current, not a value frozen at disconnect. */
 void alarm_note_pred(int link, int pred_mgdl, long now);
+/* WHEN SENSOR `id`'S SESSION STARTED, epoch seconds, 0 when not known: the
+ * registry's activation, or the live session clock before the registry has
+ * learned it. Takes the registry and driver locks one at a time, so it is
+ * called with neither held. */
+long sensor_session_start(int id);
+/* Is sensor `id` still on its first readings, the ones no alarm acts on? See
+ * STREAK_N_SKIP. Takes the registry, driver and history locks one at a time, so
+ * it is called with alarm_lock NOT held. */
+bool alarm_settling(int id);
 
 /* Is the disconnect (stale-data) alarm currently latched? For the screen. */
 int alarm_disc_latched(void);

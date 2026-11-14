@@ -68,6 +68,7 @@
 #define UI_MARK_FOOD 0xFF66DDFFU /* a meal on the glucose plot */
 #define UI_MARK_WT   0xFF88CCFFU /* a weighing on the glucose plot           */
 #define UI_MARK_FAST 0xFFFFAA66U /* fast insulin: its rows, dots and trace */
+#define UI_WT_TREND  0xFF88CCFFU /* the weight log's fitted line and legend */
 
 /* ---- bars -------------------------------------------------------------- */
 #define UI_BAR_AGE    0xFF444444U /* the track the reading-age bar runs in   */

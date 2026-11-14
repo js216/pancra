@@ -193,10 +193,10 @@ void meter_release_link(int link)
 
 /* The excursion verdict across EVERY registered CGM, each judged on its OWN
  * newest sample with the standard freshness gate, merged worst-first (a LOW
- * anywhere outranks anything -- alarm_zone_merge). The DISPLAY belongs to
- * the primary; the ALARM watches every sensor the user wears, so a low on
- * the non-primary sensor rings too. Stranded is merged the same way, so an
- * out-of-range sensor going silent sustains the alarm whichever one it is.
+ * anywhere outranks anything -- alarm_zone_merge). The primary is judged at
+ * the user's limits, and any other sensor only at AL_OTHER_LO. Stranded is
+ * merged the same way, so a sensor going silent past its own limits sustains
+ * the alarm whichever one it is.
  * With no CGM registered at all (a pre-registry install) the
  * current reading -- src-0 legacy data -- is judged instead.
  *

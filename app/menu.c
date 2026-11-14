@@ -1301,9 +1301,7 @@ void menu_action(int action, int ix)
       if (!r)
          r = kp_commit_datetime();
       if (!r)
-         r = kp_commit_pair();
-      if (r == COMMIT_STAY)
-         return; /* the family deliberately left the screen alone */
+         (void)kp_commit_pair();
    }
    shell_repaint();
 }

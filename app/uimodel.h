@@ -288,14 +288,13 @@ struct ui_plotview {
    int nchg;
    /* Seconds CONTINUOUSLY in range, ending at the newest reading; 0 when the
     * newest reading is out of range, which is also when nothing is drawn.
-    * See alarm_streak_s for the rule, including what a gap in the readings
+    * See streak_acc_add for the rule, including what a gap in the readings
     * does to it. */
    long streak_s;
    /* THE RECORD THIS ONE IS MEASURED AGAINST, in seconds, or 0 when there is
-    * no record yet. Copied from the stored preferences, not recomputed here:
-    * the record is raised on the reading path (reading.c), so a frame only
-    * ever reads it -- and a frame that recomputed it would be a frame that
-    * wrote a file. */
+    * no record yet: the longest run in the log (store_streak) or the one the
+    * settings remember, whichever is longer. A frame only reads both; the
+    * settings are written on the reading path (reading.c). */
    long best_streak_s;
    struct ui_stat stat[5]; /* rolling stats: 1d / 3d / 7d / 30d / 90d */
    /* THE RIGHT EDGE OF THE WINDOW, an instant: `now` on the main screen, the
