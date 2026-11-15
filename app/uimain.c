@@ -1100,7 +1100,7 @@ void ui_glu_scrub_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * 18 characters. Each layout below is 5 + value + 10 or 9 to the
     * character. */
 
-   /* INSULIN ON THE 3H AND 12H PLOTS: "22:30  1.5U  FAST 1H30".
+   /* INSULIN ON THE 3H, 12H AND 24H PLOTS: "22:30  1.5U  FAST 1H30".
     *
     * Both types share the layout, so stepping from a FAST dose to a SLOW
     * one moves nothing either. The dose with its U is four wide, which
@@ -1110,13 +1110,16 @@ void ui_glu_scrub_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * character the row does not have -- next to the clock, "1H30" can
     * only be an interval.
     *
-    * THE AGE IS FOR A FAST DOSE UNDER TEN HOURS OLD, which keeps it to its
-    * four characters. A SLOW dose, an older FAST dose and a dose stamped
-    * in the future, which has no age, have blanks in its place. A dose of
-    * four characters ("16.5") is wider than its field, and makes the row
-    * one character too long for the full size. */
+    * THE AGE IS IN HOURS AND MINUTES UNDER TEN HOURS, AND IN HOURS FROM
+    * THERE ("10H", "23H"), which keeps it to its four characters up to 99
+    * hours, past anything these spans show; by then the minutes say
+    * nothing the dose's clock time does not. A dose stamped in the future
+    * has no age, and blanks in its place. A dose of four characters
+    * ("16.5") is wider than its field, and makes the row one character too
+    * long for the full size. */
    static char insu[16];
-   if (ins && (m->plot.plot_hours == 3 || m->plot.plot_hours == 12)) {
+   if (ins && (m->plot.plot_hours == 3 || m->plot.plot_hours == 12 ||
+               m->plot.plot_hours == 24)) {
       const struct ui_point *d = &m->plot.hist[m->plot.scrub];
       const int fast           = d->src == INS_FAST;
       const long dage          = m->now - d->t;
@@ -1125,8 +1128,10 @@ void ui_glu_scrub_row(struct ANativeWindow_Buffer *fb, const struct screen *m,
       (void)ins_units_str(d->glu, iu, sizeof iu);
       (void)snprintf(gv, sizeof gv, "%.10sU", iu);
       gvw = 4;
-      if (fast && dage >= 0 && dage < 10L * 3600)
+      if (dage >= 0 && dage < 10L * 3600)
          fmt_ago_hm(dage, ago, sizeof ago);
+      else if (dage >= 0 && dage < 100L * 3600)
+         (void)snprintf(ago, sizeof ago, "%ldH", dage / 3600);
       (void)snprintf(insu, sizeof insu, "%s %4s", fast ? "FAST" : "SLOW", ago);
       unit = insu;
    }
