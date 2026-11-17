@@ -1038,8 +1038,13 @@ static int keypad_action(int action, int ix)
    if (action == MA_DIGIT) { /* ix IS the digit */
       int cap = kp_slots(forms_kp_mode());
       forms_kp_err_clear(); /* a new keystroke retires the last refusal */
-      if (forms_kp_len() < cap && ix >= 0 && ix <= 9)
+      /* A weight takes one decimal digit, and the point may be one the
+       * keypad put in; a digit past it is a weight no row can hold. */
+      if (forms_kp_len() < cap && ix >= 0 && ix <= 9 &&
+          !forms_kp_weight_full()) {
          forms_kp_type((char)('0' + ix));
+         forms_kp_weight_point(sp.wunits);
+      }
    } else if (action == MA_DOT) {
       /* '.' exists where the VALUE has a decimal point: the four thresholds
        * in mmol/L ("5.5") and a weight always ("162.4"). The guard keeps a

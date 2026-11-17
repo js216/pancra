@@ -120,6 +120,15 @@ void forms_kp_clear(void);
 void forms_kp_seed(const char *text);
 /* Type one character; refused when the field is full. */
 void forms_kp_type(char c);
+/* A WEIGHT'S POINT, put in as the digits arrive. With no point typed, when
+ * the digits are no weight in `units` (WT_KG / WT_LB) as they stand but are
+ * one read as tenths, the point goes before the last digit: "1645" lb becomes
+ * "164.5", "745" kg becomes "74.5". Any four digits are past the range in
+ * either unit, so four digits always carry a tenth. Digits that are a weight
+ * as they stand ("164" lb, "102" kg) are left alone. */
+void forms_kp_weight_point(int units);
+/* Does a weight entry already hold its one decimal digit? */
+int forms_kp_weight_full(void);
 /* How many characters are in it, and a copy of them. */
 int forms_kp_len(void);
 void forms_kp_text(char *out, int cap);

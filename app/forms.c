@@ -1098,6 +1098,30 @@ void forms_kp_type(char c)
       g_kp.entry[g_kp.len++] = c;
 }
 
+void forms_kp_weight_point(int units)
+{
+   if (g_kp.mode != KP_WEIGHT || g_kp.len < 2 ||
+       g_kp.len >= (int)sizeof g_kp.entry - 1)
+      return;
+   int ip = 0;
+   for (int i = 0; i < g_kp.len; i++) {
+      if (g_kp.entry[i] < '0' || g_kp.entry[i] > '9')
+         return; /* a point already, or not a number */
+      ip = (ip * 10) + (g_kp.entry[i] - '0');
+   }
+   if (wt_from_tenths(ip * 10, units) > 0 || wt_from_tenths(ip, units) <= 0)
+      return;
+   g_kp.entry[g_kp.len]     = g_kp.entry[g_kp.len - 1];
+   g_kp.entry[g_kp.len - 1] = '.';
+   g_kp.len++;
+}
+
+int forms_kp_weight_full(void)
+{
+   return g_kp.mode == KP_WEIGHT && g_kp.len >= 2 &&
+          g_kp.entry[g_kp.len - 2] == '.';
+}
+
 int forms_kp_len(void)
 {
    return g_kp.len;
