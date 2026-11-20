@@ -115,6 +115,8 @@ struct streak_acc {
    long run_t;     /* the newest reading of the current run */
    long cur;       /* the current run, in seconds; 0 when out of range */
    long best;      /* the longest run applied, in seconds */
+   long runs;      /* the runs that have ended */
+   long run_sum;   /* their lengths added up, in seconds */
 
    /* The sensors inside their first STREAK_SKIP_S: each one's start and how
     * many of its CGM readings have been applied since. */
@@ -153,6 +155,11 @@ int streak_acc_add(struct streak_acc *a, const struct streak_pt *x, long start,
 void streak_acc_build(struct streak_acc *a, const struct streak_pt *r, int n,
                       const struct src_span *sp, int nsp,
                       const struct sensor_start *s, int ns);
+
+/* THE MEAN RUN, in seconds: every run applied, the one still going
+ * included, added up and divided by how many there were. A run of one
+ * reading is 0 s long and counts. -1 when there has been none. */
+long streak_acc_mean(const struct streak_acc *a);
 
 /* A run of time in the coarsest unit that still says something: days and
  * hours from one day up ("12D 5H"), hours from one hour up ("5 H"), minutes

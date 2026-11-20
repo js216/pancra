@@ -89,6 +89,10 @@ int store_spans(struct src_span *out, int cap);
  * for a caller holding hist_lock. */
 void store_streak_locked(long *cur, long *best);
 void store_streak(long *cur, long *best);
+/* THE MEAN IN-RANGE RUN over the CGM readings in (from, end], in seconds, by
+ * the streak's own rules (streak.h); -1 when the window holds no run. The
+ * caller holds the history lock. */
+long store_streak_mean_locked(long from, long end);
 
 /* Forget every last-seen date. Called by store_load before it re-reads the
  * file: these are maxima, so a restore that REPLACES readings.csv would

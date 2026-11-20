@@ -388,6 +388,21 @@ void store_streak_locked(long *cur, long *best)
    *best = g_sacc.best > g_sacc.cur ? g_sacc.best : g_sacc.cur;
 }
 
+long store_streak_mean_locked(long from, long end)
+{
+   int hi = 0; /* the newest row inside the window */
+   while (hi < g_nspts && g_spts[hi].t > end)
+      hi++;
+   int lo = hi; /* one past the oldest */
+   while (lo < g_nspts && g_spts[lo].t > from)
+      lo++;
+   static struct src_span sp[STREAK_SPANS];
+   const int nsp = store_spans_locked(sp, STREAK_SPANS);
+   struct streak_acc a;
+   streak_acc_build(&a, g_spts + hi, lo - hi, sp, nsp, g_sst, g_nsst);
+   return streak_acc_mean(&a);
+}
+
 void store_streak(long *cur, long *best)
 {
    store_lock();

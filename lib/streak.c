@@ -102,6 +102,23 @@ static int first_rank(struct streak_acc *a, int src, long start, long t)
    return ++a->first[k].n;
 }
 
+/* The current run, if any, is over: into the count and the total. */
+static void run_end(struct streak_acc *a)
+{
+   if (!a->run_start)
+      return;
+   a->runs++;
+   a->run_sum += a->run_t - a->run_start;
+   a->run_start = 0;
+}
+
+long streak_acc_mean(const struct streak_acc *a)
+{
+   const long n   = a->runs + (a->run_start ? 1 : 0);
+   const long sum = a->run_sum + (a->run_start ? a->run_t - a->run_start : 0);
+   return n > 0 ? sum / n : -1;
+}
+
 int streak_acc_add(struct streak_acc *a, const struct streak_pt *x, long start,
                    const struct src_span *sp, int nsp)
 {
@@ -120,11 +137,13 @@ int streak_acc_add(struct streak_acc *a, const struct streak_pt *x, long start,
    if (rank > 0 && streak_first_points(start, x->t, rank))
       return 1;
    if (x->glu < TIR_LOW_MGDL || x->glu > TIR_HIGH_MGDL) {
-      a->run_start = 0;
-      a->cur       = 0;
+      run_end(a);
+      a->cur = 0;
       return 1;
    }
-   if (!a->run_start || x->t - a->run_t > STREAK_GAP_S)
+   if (a->run_start && x->t - a->run_t > STREAK_GAP_S)
+      run_end(a);
+   if (!a->run_start)
       a->run_start = x->t;
    a->run_t = x->t;
    a->cur   = x->t - a->run_start;

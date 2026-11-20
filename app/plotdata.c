@@ -462,8 +462,10 @@ static void plong_build(const char *path, long end, long span, long (*tz)(long))
    for (int c = 0; c < PCOL_MAX; c++)
       for (int j = 0; j < g_nchg_col[c] && g_npchg < UI_CHG_MAX; j++)
          g_pchg[g_npchg++] = g_chg_col[c][j];
-   if (tz)
+   if (tz) {
       sum_finish();
+      g_sum.mttf_s = store_streak_mean_locked(from, end);
+   }
    g_plong_end  = end;
    g_plong_span = span;
    g_plong_size = plot_log_size(path);

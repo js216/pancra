@@ -326,6 +326,9 @@ extern const int ui_agp_pct[UI_AGP_PCT]; /* 5, 25, 50, 75, 95 */
  * count, the way the main screen's TIR counts them. */
 struct ui_glusum {
    int n_low, n_in, n_high;
+   /* The mean in-range run, in seconds, by the streak's rules; -1 when the
+    * window holds none. */
+   long mttf_s;
 
    struct {
       int have;

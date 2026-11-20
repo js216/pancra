@@ -71,10 +71,39 @@ static void shares(const int n[3], int pct[3])
    }
 }
 
+/* A mean run as the figures print it: minutes under an hour ("40M"), hours
+ * under a day ("23H"), days and hours under ten days ("2D 5H"), days alone
+ * under a year ("364D"), where an hour is too little to matter, and whole
+ * years of 365 days from there ("1YR" .. "999YR"); "--" when there was no
+ * run. Returns 0, writing nothing, past 999 years, the most three digits
+ * hold. */
+static int fmt_mttf(long s, char *out, size_t cap)
+{
+   if (s < 0) {
+      (void)snprintf(out, cap, "--");
+      return 1;
+   }
+   if (s >= 1000L * 365 * 86400)
+      return 0;
+   if (s < 3600)
+      (void)snprintf(out, cap, "%ldM", s / 60);
+   else if (s < 86400)
+      (void)snprintf(out, cap, "%ldH", s / 3600);
+   else if (s < 10L * 86400)
+      (void)snprintf(out, cap, "%ldD %ldH", s / 86400, (s % 86400) / 3600);
+   else if (s < 365L * 86400)
+      (void)snprintf(out, cap, "%ldD", s / 86400);
+   else
+      (void)snprintf(out, cap, "%ldYR", s / (365L * 86400));
+   return 1;
+}
+
 /* THE BAR AND ITS FIGURES: one full-width bar, red, green and orange in
- * proportion, and under it the three shares in the same colours: below 70 at
- * the left, in range in the middle, above 180 at the right. Returns the
- * y below the figures. */
+ * proportion, and under it one row in the same colours: the share below 70 at
+ * the left, above 180 at the right, and between them the share in range and
+ * the mean time to leaving it, "TIR 78% / MTTF 23H". MTTF is the
+ * window's average in-range run, by the streak's own rules (streak.h).
+ * Returns the y below the figures. */
 static int range_rows(struct ANativeWindow_Buffer *fb, const struct screen *m,
                       int x, int w, int y, int sc)
 {
@@ -115,12 +144,17 @@ static int range_rows(struct ANativeWindow_Buffer *fb, const struct screen *m,
    char pre[2][8];
    (void)snprintf(pre[0], sizeof pre[0], "%d%% ", pct[0]);
    (void)snprintf(pre[1], sizeof pre[1], "%d%% ", pct[2]);
-   char tir[16];
-   (void)snprintf(tir, sizeof tir, "TIR %d%%", pct[1]);
-   /* Below range at the left edge, above it at the right, in range between
-    * them, each inset like the bar's own ends. The comparison is the sign,
-    * one character cell wide, between the share and the threshold. */
+   char mt[16];
+   char tir[40];
+   if (fmt_mttf(sum->mttf_s, mt, sizeof mt))
+      (void)snprintf(tir, sizeof tir, "TIR %d%% / MTTF %s", pct[1], mt);
+   else
+      (void)snprintf(tir, sizeof tir, "TIR %d%%", pct[1]);
+   /* Below range at the left edge, above it at the right, each inset like
+    * the bar's own ends. The comparison is the sign, one character cell
+    * wide, between the share and the threshold. */
    const int inset = 2 * sc;
+   const int wlo   = (((str_len(pre[0]) + 1 + str_len(lo)) * 6) - 1) * sc;
    const int whi   = (((str_len(pre[1]) + 1 + str_len(hi)) * 6) - 1) * sc;
    const int wtir  = ((str_len(tir) * 6) - 1) * sc;
    const char *const post[2]    = {lo, hi};
@@ -135,7 +169,13 @@ static int range_rows(struct ANativeWindow_Buffer *fb, const struct screen *m,
       cx += 6 * sc;
       draw_str(px, fb, cx, y, sc, post[k], scol[k]);
    }
-   draw_str(px, fb, x + ((w - wtir) / 2), y, sc, tir, col[1]);
+   /* CENTRED IN THE ROOM BETWEEN THE SHARES, not on the bar: the two
+    * shares differ in width, and centring on the bar would bring the
+    * in-range line closer to the wider one, which is the side it collides
+    * with first on a narrow screen. */
+   const int gl = x + inset + wlo;
+   const int gr = x + w - inset - whi;
+   draw_str(px, fb, gl + ((gr - gl - wtir) / 2), y, sc, tir, col[1]);
    return y + (7 * sc);
 }
 
